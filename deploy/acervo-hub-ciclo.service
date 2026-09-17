@@ -1,0 +1,21 @@
+[Unit]
+Description=Ciclo de reconciliação do acervo-hub
+Documentation=https://github.com/vitoramaral10/acervo-hub
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+
+# Ajuste para o diretório que contém o compose.yaml e o config.toml.
+WorkingDirectory=%h/acervo-hub
+
+# Começa em `plan`. Trocar para `apply` é uma decisão consciente, feita depois
+# de um ciclo simulado bater com a realidade.
+ExecStart=/usr/bin/docker compose --profile ciclo run --rm acervo-hub \
+    -c /etc/acervo-hub/config.toml plan
+
+# Saída 3 é "ciclo abortado por trava": a leitura do mundo não era confiável,
+# nada foi alterado. Não é falha de execução e não deve sujar o status da
+# unidade nem disparar alerta.
+SuccessExitStatus=3

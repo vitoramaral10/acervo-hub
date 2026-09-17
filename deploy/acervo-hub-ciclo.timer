@@ -1,0 +1,15 @@
+[Unit]
+Description=Agenda o ciclo de reconciliação do acervo-hub
+
+[Timer]
+OnCalendar=*-*-* 05:30:00
+
+# Recupera a execução perdida se a máquina estava desligada na hora.
+Persistent=true
+
+# Espalha a carga: o ciclo lista a fila e faz stat em todo o acervo, e não há
+# motivo para isso cair no mesmo segundo que qualquer outro job noturno.
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

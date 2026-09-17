@@ -83,6 +83,38 @@ Códigos de saída: `0` sucesso, `1` falha de execução, `3` ciclo abortado por
 é próprio para que um agendador distinga "a leitura do mundo não era confiável" de "algo
 quebrou".
 
+### Em container
+
+```sh
+docker build -t acervo-hub .
+```
+
+Imagem final de **~7 MB**: multi-stage com alvo musl, distroless `static` como base,
+binário estático de ~5 MB e nada mais. Sem shell, sem gerenciador de pacotes, sem `curl` —
+o que não está lá não precisa ser corrigido nem serve a quem entrar.
+
+`deploy/` traz o serviço para um stack Compose existente e as unidades systemd que agendam
+o ciclo. Três pontos do desenho que valem atenção:
+
+**O acervo é montado somente leitura, e isso é trava, não zelo.** O janitor só precisa de
+`stat(2)` para checar hardlink; toda remoção passa pela API do cliente de download. O
+container, portanto, não consegue apagar arquivo do acervo nem se a lógica de decisão
+estiver errada.
+
+**O ciclo é one-shot, não daemon.** Fica sob um `profile` do Compose para não subir junto
+com o resto do stack; quem dispara é o timer. O padrão do container é `plan` — executar de
+verdade exige dizer `apply`.
+
+**O diretório de estado precisa ser do UID 65532**, senão os strikes não sobrevivem ao fim
+do container e três strikes nunca se completam:
+
+```sh
+mkdir -p state && sudo chown 65532:65532 state
+```
+
+O `SuccessExitStatus=3` na unidade systemd é proposital: ciclo abortado por trava não é
+falha de execução e não deve sujar o status nem disparar alerta.
+
 ### Travas que abortam o ciclo inteiro
 
 Nenhuma é ajuste fino. Se uma dispara, a leitura do mundo está errada e **nenhuma** remoção
