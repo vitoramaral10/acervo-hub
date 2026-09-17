@@ -10,7 +10,11 @@
 
 services:
   acervo-hub:
-    image: ghcr.io/vitoramaral10/acervo-hub:latest
+    # A tag `main` acompanha o último build da branch principal. `latest` só
+    # nasce em tag semver (`v*`), então apontar para ela aqui deixaria a
+    # referência pendurada até o primeiro release. Para fixar uma versão,
+    # troque por `:vX.Y.Z` ou pelo digest.
+    image: ghcr.io/vitoramaral10/acervo-hub:main
     profiles: ["ciclo"]
     user: "65532:65532"
 
