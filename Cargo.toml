@@ -38,6 +38,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 
+[profile.release]
+# O binário vai para uma imagem distroless: símbolo de debug ali só ocupa
+# espaço, e `lto` com uma unidade de codegen paga em tamanho o que custa em
+# tempo de build — que fica no cache mount de qualquer forma.
+strip = "symbols"
+lto = true
+codegen-units = 1
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"

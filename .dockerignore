@@ -1,0 +1,20 @@
+# O contexto sobe inteiro para o daemon: tudo que não é fonte fica de fora.
+.git
+.github
+.gitignore
+.claude
+
+target/
+**/*.rs.bk
+
+# Nunca deve entrar numa camada.
+.env
+.env.*
+config.toml
+*.local.toml
+
+README.md
+LICENSE
+Dockerfile
+.dockerignore
+deploy/
