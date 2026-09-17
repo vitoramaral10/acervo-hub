@@ -1,0 +1,25 @@
+[package]
+name = "acervo-indexers"
+version = "0.0.0"
+description = "Busca agregada em indexadores Torznab com rate limit compartilhado."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+quick-xml.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+wiremock.workspace = true
+
+[lints]
+workspace = true
