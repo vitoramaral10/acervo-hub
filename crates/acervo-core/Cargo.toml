@@ -1,0 +1,11 @@
+[package]
+name = "acervo-core"
+version = "0.0.0"
+description = "Domínio puro do acervo-hub: obras, downloads, fila e tamanhos. Sem IO."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

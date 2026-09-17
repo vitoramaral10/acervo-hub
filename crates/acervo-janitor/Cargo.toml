@@ -1,0 +1,14 @@
+[package]
+name = "acervo-janitor"
+version = "0.0.0"
+description = "Reconciliação da biblioteca: decide o que remover, sem executar nada."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+acervo-core = { path = "../acervo-core" }
+
+[lints]
+workspace = true
