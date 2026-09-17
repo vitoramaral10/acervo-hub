@@ -1,0 +1,70 @@
+# Exemplo de configuração do acervo-hub.
+#
+# Guarda chave de API e senha em texto puro: use `chmod 600`. O binário avisa
+# no log se o arquivo estiver legível por outros usuários.
+#
+# Campo escrito errado é erro, não é ignorado — uma trava de segurança caindo
+# no padrão em silêncio é pior do que a configuração não subir.
+
+# Timeout de cada chamada HTTP, em segundos.
+http_timeout_seconds = 30
+
+[qbittorrent]
+url = "http://localhost:8080"
+username = "USUARIO"
+password = "SENHA"
+
+# Uma entrada por instância. `kind` é "series" ou "movie" e decide qual campo
+# da fila aponta para a obra — ler o campo do outro produto esconderia órfão.
+[[instances]]
+name = "series"
+kind = "series"
+url = "http://localhost:8989"
+api_key = "CHAVE_DA_API"
+
+[[instances]]
+name = "filmes"
+kind = "movie"
+url = "http://localhost:7878"
+api_key = "CHAVE_DA_API"
+
+# Caminho como o CLIENTE DE DOWNLOAD o vê → caminho no host onde o acervo-hub
+# roda. Sem isso, o `stat` cairia no lugar errado da árvore do host. Omitir a
+# seção inteira só funciona se ambos enxergam a mesma árvore.
+[paths]
+"/media" = "/mnt/acervo"
+
+# Raízes da biblioteca, no host. Servem para medir o acervo, que é o
+# denominador da trava proporcional. Biblioteca medindo zero aborta o ciclo.
+[library]
+roots = ["/mnt/acervo/series", "/mnt/acervo/movies"]
+
+[policy]
+# Execuções consecutivas em que um item precisa aparecer como órfão antes de
+# sair. Um strike por ciclo, sem janela de espera.
+orphan_strikes = 3
+
+# Apagar também os ARQUIVOS de órfão em tracker privado. Com `false`, o item
+# sai da fila e o torrent fica — conservador por padrão.
+delete_private_orphans = false
+
+# Órfão de fila cujo torrent não está mais no cliente: pular em vez de agir.
+skip_orphan_if_missing_in_client = true
+
+# Carência de seed para torrent privado que perdeu o vínculo com a biblioteca.
+# `0` desliga a carência e apaga no ciclo seguinte — rápido, mas expõe a
+# hit&run se o torrent for recente.
+private_seed_grace_hours = 120
+
+# Arquivo mexido dentro desta janela nunca é apagado.
+recent_change_grace_hours = 24
+
+# Travas de lote. Estourar qualquer uma aborta o ciclo INTEIRO sem apagar nada,
+# em vez de apagar "só um pouco".
+max_batch_gib = 300
+max_batch_fraction = 0.30
+
+[state]
+# Onde os strikes sobrevivem ao reinício do processo. Sem isso, três strikes
+# nunca se completam.
+ledger = "~/.local/state/acervo-hub/strikes.json"

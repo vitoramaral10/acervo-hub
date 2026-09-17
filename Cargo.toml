@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/acervo-core",
+    "crates/acervo-janitor",
+    "crates/acervo-fs",
+    "crates/acervo-arr",
+    "crates/acervo-clients",
+    "crates/acervo-hub",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+repository = "https://github.com/vitoramaral10/acervo-hub"
+
+[workspace.dependencies]
+acervo-core = { path = "crates/acervo-core" }
+acervo-janitor = { path = "crates/acervo-janitor" }
+acervo-fs = { path = "crates/acervo-fs" }
+acervo-arr = { path = "crates/acervo-arr" }
+acervo-clients = { path = "crates/acervo-clients" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "cookies",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
