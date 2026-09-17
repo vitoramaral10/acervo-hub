@@ -38,17 +38,20 @@ where  w.id is null;
 
 Workspace Cargo, binário único `acervo-hub`:
 
-| Crate | Responsabilidade |
-|---|---|
-| `acervo-core` | Domínio puro, zero IO: `Work`, `Item`, `Release`, `Decision` |
-| `acervo-janitor` | Reconciliação: órfãos de fila, hardlink perdido, limpeza de download |
-| `acervo-indexers` | Busca em indexadores (Torznab/Newznab), rate limit compartilhado |
-| `acervo-metadata` | Provedores de metadados + cache |
-| `acervo-parser` | Parsing de nome de release |
-| `acervo-decision` | Perfis de qualidade, formatos customizados, pontuação |
-| `acervo-clients` | Clientes de download (trait `DownloadClient`) |
-| `acervo-library` | Import, hardlink, rename, varredura de filesystem |
-| `acervo-api` | HTTP: superfície nova + compatibilidade com a API v3 existente |
+| Crate | Responsabilidade | Estado |
+|---|---|---|
+| `acervo-core` | Domínio puro, zero IO: `Work`, `Item`, `Download`, `Inventory` | existe |
+| `acervo-janitor` | Reconciliação: órfãos de fila, hardlink perdido, limpeza de download | existe |
+| `acervo-fs` | Tradução de caminho container→host e `stat(2)` | existe |
+| `acervo-arr` | Cliente da API v3: fila, inventário, remoção | existe |
+| `acervo-clients` | Clientes de download (hoje qBittorrent) | existe |
+| `acervo-hub` | Binário: configuração, coleta, relato, execução | existe |
+| `acervo-indexers` | Busca em indexadores (Torznab/Newznab), rate limit compartilhado | |
+| `acervo-metadata` | Provedores de metadados + cache | |
+| `acervo-parser` | Parsing de nome de release | |
+| `acervo-decision` | Perfis de qualidade, formatos customizados, pontuação | |
+| `acervo-library` | Import, hardlink, rename, varredura de filesystem | |
+| `acervo-api` | HTTP: superfície nova + compatibilidade com a API v3 existente | |
 
 ### Duas decisões que mandam no projeto
 
@@ -62,12 +65,40 @@ acumulada contra a criatividade dos grupos de scene. É tabela de dados, não l�
 validar um port exige corpus real. Quando o parser erra, não há crash: há import silencioso
 no lugar errado.
 
+## Como rodar
+
+```sh
+cp config.example.toml config.toml   # preencha urls, chaves e caminhos
+chmod 600 config.toml                # guarda segredo em texto puro
+
+cargo run --bin acervo-hub -- -c config.toml plan    # lê, planeja, relata
+cargo run --bin acervo-hub -- -c config.toml apply   # ... e executa
+```
+
+`plan` nunca altera nada, nem grava strikes — repetir a simulação não leva um item ao
+limite sem ninguém ter decidido. O modo não é um ramo de código separado: é um campo do
+plano, para que o que se valida em seco seja exatamente o que roda de verdade.
+
+Códigos de saída: `0` sucesso, `1` falha de execução, `3` ciclo abortado por trava. O `3`
+é próprio para que um agendador distinga "a leitura do mundo não era confiável" de "algo
+quebrou".
+
+### Travas que abortam o ciclo inteiro
+
+Nenhuma é ajuste fino. Se uma dispara, a leitura do mundo está errada e **nenhuma** remoção
+daquele ciclo é confiável — inclusive as que pareciam corretas:
+
+- instância `*arr` que não respondeu;
+- instância que respondeu mas não reporta nenhuma obra (meio-viva é pior que morta);
+- biblioteca medindo zero, que desligaria silenciosamente a trava proporcional;
+- lote acima do teto absoluto ou da fração do acervo.
+
 ## Roteiro
 
 A migração é *strangler*, na ordem do risco. Cada fase é reversível e entrega valor sozinha.
 
-- [ ] **Fase 1 — `acervo-janitor`.** Substitui só o faxineiro, falando as APIs v3
-      existentes. Risco baixo, valor imediato.
+- [x] **Fase 1 — `acervo-janitor`.** Substitui só o faxineiro, falando as APIs v3
+      existentes. Risco baixo, valor imediato. *Falta validar contra instâncias reais.*
 - [ ] **Fase 2 — `acervo-indexers`.** Absorve o agregador de indexadores. Torznab é
       contrato fechado.
 - [ ] **Fase 3 — filmes.** Árvore mais simples; o gerenciador de séries segue de pé como
