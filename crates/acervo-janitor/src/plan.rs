@@ -96,6 +96,12 @@ pub enum Abort {
     },
     /// O lote passou do teto proporcional à biblioteca.
     BatchFractionTooLarge { fraction: f64, limit: f64 },
+    /// A biblioteca mediu zero mas há remoção planejada.
+    ///
+    /// Biblioteca de tamanho zero desliga silenciosamente a trava proporcional
+    /// — qualquer lote seria 0% dela. Quase sempre significa raiz não montada,
+    /// que é exatamente quando tudo parece órfão.
+    LibraryUnmeasured { reclaim: Allocated },
 }
 
 impl fmt::Display for Abort {
@@ -115,6 +121,10 @@ impl fmt::Display for Abort {
                 "lote é {:.1}% da biblioteca, teto {:.1}%",
                 fraction * 100.0,
                 limit * 100.0
+            ),
+            Self::LibraryUnmeasured { reclaim } => write!(
+                f,
+                "biblioteca mediu zero com {reclaim} a remover — raiz não montada?"
             ),
         }
     }

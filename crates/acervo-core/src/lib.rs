@@ -13,7 +13,7 @@ pub mod work;
 
 pub use download::{Download, DownloadState, FileFacts};
 pub use ids::{DownloadHash, InstanceName, ItemId, QueueItemId, WorkId};
-pub use inventory::{Inventory, UnreachableInstance};
+pub use inventory::{Inventory, UnreachableInstance, UnreadableDownload};
 pub use queue::{InstanceSnapshot, QueueItem};
 pub use size::{Allocated, Apparent};
 pub use work::{ExternalIds, Item, Kind, Ordinal, Work};

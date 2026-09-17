@@ -308,3 +308,23 @@ fn dry_run_produz_o_mesmo_plano_do_modo_real() {
     assert!(seco.mode.is_dry_run());
     assert!(!real.mode.is_dry_run());
 }
+
+#[test]
+fn biblioteca_que_mede_zero_aborta_em_vez_de_liberar_a_trava() {
+    // Raiz não montada mede zero, e zero no denominador faria qualquer lote
+    // parecer 0% do acervo — desligando a trava proporcional exatamente no
+    // cenário em que tudo parece órfão.
+    let mut inv = Inventory::new(Allocated::ZERO);
+    inv.snapshots.push(snapshot("filmes", vec![]));
+    inv.downloads = vec![seed("aa", 1, 4 * GIB)];
+
+    let erro = reconcile(
+        &inv,
+        &politica_aplicando(),
+        &mut StrikeLedger::new(),
+        agora(),
+    )
+    .expect_err("biblioteca sem medida tem de abortar");
+
+    assert!(matches!(erro, Abort::LibraryUnmeasured { .. }));
+}

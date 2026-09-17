@@ -8,7 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-acervo-core = { path = "../acervo-core" }
+acervo-core.workspace = true
+serde.workspace = true
 
 [lints]
 workspace = true

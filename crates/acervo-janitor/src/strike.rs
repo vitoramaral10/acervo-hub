@@ -8,12 +8,14 @@
 use std::collections::HashMap;
 
 use acervo_core::QueueItem;
+use serde::{Deserialize, Serialize};
 
 /// Chave estável de um item entre ciclos.
 ///
 /// Prefere o hash do download ao id do item: ids de fila são reatribuídos
 /// quando a instância reinicia, e um id reciclado herdaria strikes alheios.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct StrikeKey(String);
 
 impl StrikeKey {
@@ -33,7 +35,11 @@ impl StrikeKey {
 }
 
 /// Strikes acumulados, entre execuções.
-#[derive(Debug, Clone, Default)]
+///
+/// Serializa como um mapa simples de chave para contagem: o estado precisa
+/// sobreviver ao reinício do processo, senão três strikes nunca se completam.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct StrikeLedger {
     counts: HashMap<StrikeKey, u32>,
 }

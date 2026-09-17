@@ -77,6 +77,10 @@ fn check_batch_is_within_limits(
     library: Allocated,
     policy: &Policy,
 ) -> Result<(), Abort> {
+    if library == Allocated::ZERO && reclaim > Allocated::ZERO {
+        return Err(Abort::LibraryUnmeasured { reclaim });
+    }
+
     if reclaim > policy.guards.max_batch {
         return Err(Abort::BatchTooLarge {
             reclaim,
