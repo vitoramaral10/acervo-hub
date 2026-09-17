@@ -46,7 +46,7 @@ Workspace Cargo, binário único `acervo-hub`:
 | `acervo-arr` | Cliente da API v3: fila, inventário, remoção | existe |
 | `acervo-clients` | Clientes de download (hoje qBittorrent) | existe |
 | `acervo-hub` | Binário: configuração, coleta, relato, execução | existe |
-| `acervo-indexers` | Busca em indexadores (Torznab/Newznab), rate limit compartilhado | |
+| `acervo-indexers` | Busca em indexadores (Torznab/Newznab), rate limit compartilhado | em construção |
 | `acervo-metadata` | Provedores de metadados + cache | |
 | `acervo-parser` | Parsing de nome de release | |
 | `acervo-decision` | Perfis de qualidade, formatos customizados, pontuação | |
@@ -131,8 +131,9 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
 
 - [x] **Fase 1 — `acervo-janitor`.** Substitui só o faxineiro, falando as APIs v3
       existentes. Risco baixo, valor imediato. *Falta validar contra instâncias reais.*
-- [ ] **Fase 2 — `acervo-indexers`.** Absorve o agregador de indexadores. Torznab é
-      contrato fechado.
+- [ ] **Fase 2 — `acervo-indexers`.** Absorve o agregador de indexadores. O cliente
+      Torznab, a agregação e o rate limit compartilhado existem; ainda faltam as definições
+      Cardigann e a superfície compatível com os consumidores atuais.
 - [ ] **Fase 3 — filmes.** Árvore mais simples; o gerenciador de séries segue de pé como
       controle.
 - [ ] **Fase 4 — séries.** Só depois de o parser passar no corpus real.

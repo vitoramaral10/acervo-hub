@@ -65,6 +65,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "acervo-indexers"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "quick-xml",
+ "reqwest",
+ "thiserror",
+ "time",
+ "tokio",
+ "url",
+ "wiremock",
+]
+
+[[package]]
 name = "acervo-janitor"
 version = "0.0.0"
 dependencies = [
@@ -145,6 +160,17 @@ checksum = "47e4f2b81832e72834d7518d8487a0396a28cc408186a2e8854c0f98011faf12"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "async-trait"
+version = "0.1.92"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -913,6 +939,15 @@ checksum = "6f42ea446cab60335f76979ec15e12619a2165b5ae2c12166bef27d283a9fadf"
 dependencies = [
  "idna",
  "psl-types",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.38.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
