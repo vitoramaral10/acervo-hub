@@ -38,6 +38,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 
+# Só de desenvolvimento: sobe um servidor HTTP que responde o que os produtos
+# reais respondem, para os testes de contrato dos adaptadores.
+wiremock = "0.6"
+
 [profile.release]
 # O binário vai para uma imagem distroless: símbolo de debug ali só ocupa
 # espaço, e `lto` com uma unidade de codegen paga em tamanho o que custa em
