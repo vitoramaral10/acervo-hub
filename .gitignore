@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Configuração local e segredos
+.env
+.env.*
+!.env.example
+config.local.toml
+
+# Artefatos de desenvolvimento
+/.claude/worktrees/
