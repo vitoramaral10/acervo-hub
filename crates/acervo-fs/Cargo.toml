@@ -1,0 +1,16 @@
+[package]
+name = "acervo-fs"
+version = "0.0.0"
+description = "Tradução de caminho container→host e leitura de stat(2)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+acervo-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
