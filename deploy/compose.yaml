@@ -1,0 +1,53 @@
+# Serviço do acervo-hub para um stack Compose existente.
+#
+# O ciclo é one-shot, não um daemon: `profiles` impede que `docker compose up`
+# o levante junto com o resto. Quem dispara é o timer do systemd (ver
+# `acervo-hub-ciclo.timer`) ou a mão, com `docker compose run`.
+#
+#   docker compose --profile ciclo run --rm acervo-hub   # simula (padrão)
+#   docker compose --profile ciclo run --rm acervo-hub \
+#       -c /etc/acervo-hub/config.toml apply             # executa
+
+services:
+  acervo-hub:
+    image: ghcr.io/vitoramaral10/acervo-hub:latest
+    profiles: ["ciclo"]
+    user: "65532:65532"
+
+    # Rootfs somente leitura: o processo não reescreve o próprio binário, então
+    # uma escrita arbitrária não vira persistência.
+    read_only: true
+    tmpfs:
+      - /tmp
+
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+    # Sem limite, um processo em loop derruba o host. O ciclo cabe folgado aqui.
+    mem_limit: 128m
+    pids_limit: 64
+    cpus: "0.50"
+
+    volumes:
+      # Segredo entra montado, nunca assado na imagem. `chmod 600` no host.
+      - ./config.toml:/etc/acervo-hub/config.toml:ro
+
+      # Os strikes precisam sobreviver ao fim do container: sem isso, três
+      # strikes nunca se completam. O diretório precisa ser do UID 65532:
+      #   mkdir -p state && sudo chown 65532:65532 state
+      - ./state:/var/lib/acervo-hub
+
+      # O acervo entra SOMENTE LEITURA, e isso é uma trava de verdade, não
+      # zelo: o janitor só precisa de `stat(2)` para checar hardlink. Toda
+      # remoção acontece pela API do cliente de download, então o container
+      # fisicamente não consegue apagar arquivo do acervo — nem se a lógica
+      # de decisão estiver errada.
+      - /mnt/acervo:/mnt/acervo:ro
+
+    command: ["-c", "/etc/acervo-hub/config.toml", "plan"]
+
+    networks: [media]
+
+networks:
+  media:
+    external: true
