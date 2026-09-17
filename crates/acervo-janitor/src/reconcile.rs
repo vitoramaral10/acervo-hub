@@ -138,10 +138,10 @@ fn plan_orphaned_queue(
         }
 
         actions.push(removal_for(item, download, policy));
-        if let Some(d) = download {
-            if delete_files_for(d, policy) {
-                *reclaim = *reclaim + d.reclaimable();
-            }
+        if let Some(d) = download
+            && delete_files_for(d, policy)
+        {
+            *reclaim = *reclaim + d.reclaimable();
         }
     }
 
@@ -215,10 +215,11 @@ fn evaluate_download(
     if modified_within(download, now, policy.guards.recent_change_grace) {
         return Some(SkipReason::RecentlyModified);
     }
-    if let Some(grace) = policy.private_seed_grace {
-        if download.private && download.seeded_for < grace {
-            return Some(SkipReason::SeedGrace);
-        }
+    if let Some(grace) = policy.private_seed_grace
+        && download.private
+        && download.seeded_for < grace
+    {
+        return Some(SkipReason::SeedGrace);
     }
     None
 }
