@@ -74,15 +74,18 @@ ledger = "~/.local/state/acervo-hub/strikes.json"
 # Nada abaixo é lido por `plan`/`apply`, e nada acima é exigido por `serve`:
 # um arquivo só pode servir aos dois, ou cada modo ter o seu.
 #
-# Nos gerenciadores de série e de filme, cadastre um indexador Torznab com URL
-# `http://<host>:9797/<nome>` (ou `/all` para todos de uma vez) e a chave
-# abaixo como API key.
+# `acervo-hub sync --apply` cadastra cada indexador nas `[[instances]]` acima,
+# com as categorias certas para cada uma. À mão, seria um indexador Torznab
+# com URL `http://<host>:9797/<nome>` e a chave abaixo como API key.
 
 [server]
 # Em container, `0.0.0.0:9797`. Fora dele, o padrão só aceita a própria máquina.
 bind = "127.0.0.1:9797"
 # Ao menos 16 caracteres. Quem tem a chave recebe links de download com passkey.
 api_key = "TROQUE_POR_UMA_CHAVE_LONGA"
+# Como os gerenciadores alcançam este serviço. É o endereço que `sync`
+# cadastra neles; em Compose, o nome do serviço na rede interna.
+public_url = "http://acervo-hub-indexadores:9797"
 
 # Endpoint Torznab existente — por exemplo, o feed de um indexador no agregador
 # atual. As capacidades são lidas no início; se ele não responder, fica fora do

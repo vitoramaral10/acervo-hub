@@ -59,6 +59,10 @@ services:
   #
   # Em `config.toml`, `[server] bind = "0.0.0.0:9797"` — dentro do container,
   # o padrão `127.0.0.1` não seria alcançável pelos vizinhos.
+  #
+  # Cadastrar os indexadores nos gerenciadores (simula sem `--apply`):
+  #   docker compose run --rm acervo-hub-indexadores \
+  #       -c /etc/acervo-hub/config.toml sync --apply
   acervo-hub-indexadores:
     image: ghcr.io/vitoramaral10/acervo-hub:main
     user: "65532:65532"

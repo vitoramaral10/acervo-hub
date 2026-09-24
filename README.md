@@ -74,6 +74,8 @@ chmod 600 config.toml                # guarda segredo em texto puro
 cargo run --bin acervo-hub -- -c config.toml plan    # lê, planeja, relata
 cargo run --bin acervo-hub -- -c config.toml apply   # ... e executa
 cargo run --bin acervo-hub -- -c config.toml serve   # serve os indexadores
+cargo run --bin acervo-hub -- -c config.toml sync    # planeja o cadastro nos *arr
+cargo run --bin acervo-hub -- -c config.toml sync --apply
 ```
 
 `serve` é o outro modo de vida do binário: processo longo que responde Torznab em
@@ -85,6 +87,10 @@ filme cadastram essa URL como cadastrariam o agregador atual. Três escolhas do 
   lançamentos", o indexador simplesmente não é consultado.
 - **Paginação é local.** Nem todo indexador pagina; pedir a página 2 a quem não pagina
   devolve a 1 de novo, e o consumidor tomaria a repetição por release nova.
+- **O cadastro nos gerenciadores é declarativo.** `sync` compara o que cada instância tem
+  com o que deveria ter e cria, atualiza ou remove — só os indexadores com o sufixo
+  ` (acervo-hub)`. Os do agregador atual ficam intocados, então os dois convivem durante a
+  migração. Habilitações, prioridade e tags ajustadas na interface são preservadas.
 - **Falha total não vira lista vazia.** Se todos os indexadores consultados falham, a
   resposta é erro Torznab `900`: "nada encontrado" e "tracker fora do ar" pedem reações
   opostas de quem consulta.
@@ -154,7 +160,21 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
       ele não cobre é recusado na carga, com o motivo. Contra um corpus de 573 definições,
       carrega 26; as recusas mais comuns são resposta JSON (130), login por `form` (113) e
       a seção `download` (59). O teste `corpus` (ignorado por padrão) refaz essa conta.
-      *Falta validar contra os trackers de verdade.*
+      `sync` cadastra os indexadores nos gerenciadores, como a tela de apps do agregador
+      atual. Validado contra instâncias reais descartáveis dos dois gerenciadores: ambos
+      aceitam o indexador e o feed, e o `sync` cria, mantém e corrige sem apagar ajuste
+      manual. *Falta validar contra os trackers de verdade.*
+
+### Migrando do agregador atual
+
+1. Copie as definições que você usa para `definicoes/` e liste-as em `[[indexers]]`, com
+   as credenciais em `settings`.
+2. Suba `acervo-hub-indexadores` e rode `sync` — sem `--apply`, ele só mostra o plano.
+3. `sync --apply`. Cada gerenciador passa a ter os dois cadastros lado a lado: o antigo e
+   o ` (acervo-hub)`.
+4. Compare as buscas manuais pelos dois. Satisfeito, desabilite os cadastros antigos no
+   gerenciador e pare a sincronização do agregador antes de desligá-lo — senão ele os
+   recria.
 - [ ] **Fase 3 — filmes.** Árvore mais simples; o gerenciador de séries segue de pé como
       controle.
 - [ ] **Fase 4 — séries.** Só depois de o parser passar no corpus real.
