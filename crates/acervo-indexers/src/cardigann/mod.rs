@@ -745,9 +745,27 @@ impl Indexer for CardigannClient {
         let urls = self.query_urls(query, &vars)?;
         let now = OffsetDateTime::now_utc();
         let mut releases = Vec::new();
+        // Rotas com o mesmo caminho são páginas da mesma listagem. Página
+        // vazia, ou menor que a anterior, é a última: pedir as seguintes só
+        // gasta o intervalo do tracker para receber nada — num site lento com
+        // cinco páginas fixas, era a diferença entre 6 s e 30 s.
+        let mut previous: Option<(String, usize)> = None;
+        let mut exhausted: Option<String> = None;
         for (url, follow_redirect) in urls {
+            let path = url.path().to_owned();
+            if exhausted.as_deref() == Some(path.as_str()) {
+                continue;
+            }
             let page = self.fetch(&url, follow_redirect).await?;
-            releases.extend(self.definition.parse(&page.body, &page.url, &vars, now)?);
+            let (found, rows) = self.definition.parse(&page.body, &page.url, &vars, now)?;
+            releases.extend(found);
+            let shorter = previous
+                .as_ref()
+                .is_some_and(|(last_path, last_rows)| *last_path == path && rows < *last_rows);
+            if rows == 0 || shorter {
+                exhausted = Some(path.clone());
+            }
+            previous = Some((path, rows));
         }
         let identified = match &query.mode {
             SearchMode::General => false,

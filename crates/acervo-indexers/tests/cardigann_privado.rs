@@ -80,6 +80,13 @@ async fn mount_form_login(server: &MockServer, logins: u64) {
 
 async fn mount_form_pages(server: &MockServer) {
     Mock::given(path("/torrents-search.php"))
+        .and(query_param("page", "2"))
+        .respond_with(html(FORM_PAGE1))
+        .expect(0)
+        .named("página depois da última")
+        .mount(server)
+        .await;
+    Mock::given(path("/torrents-search.php"))
         .and(header("cookie", "sessao=xyz"))
         .and(query_param_is_missing("page"))
         .and(query_param("search", "Um%Filme"))

@@ -65,6 +65,11 @@ search:
     - path: torrents-search.php
       inputs:
         page: 1
+    # A página 1 vem com menos linhas que a 0: é a última, e esta não pode ser
+    # pedida.
+    - path: torrents-search.php
+      inputs:
+        page: 2
   inputs:
     search: "{{ re_replace .Keywords \"[\\s]+\" \"%\" }}"
     free: "{{ if .Config.freeleech }}1{{ else }}2{{ end }}"

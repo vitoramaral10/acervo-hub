@@ -4,6 +4,7 @@ import {
   ArrowUp,
   ArrowUpDown,
   CircleAlert,
+  Loader2,
   Download,
   ExternalLink,
   Magnet,
@@ -404,9 +405,10 @@ function ResultCard({ release }: { release: Release }) {
 function ResultsSkeleton() {
   return (
     <div aria-busy="true" aria-label="Buscando" className="overflow-hidden rounded-lg border border-border bg-surface">
-      <div className="border-b border-border px-4 py-3">
-        <Skeleton className="h-4 w-28" />
-      </div>
+      <p className="flex items-center gap-2 border-b border-border px-4 py-2.5 text-sm text-content-muted">
+        <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+        Buscando nos indexadores… tracker lento com várias páginas pode levar meio minuto.
+      </p>
       {Array.from({ length: 8 }, (_, index) => (
         <div key={index} className="flex items-center gap-4 border-b border-border px-4 py-3.5 last:border-0">
           <div className="flex-1 space-y-2">

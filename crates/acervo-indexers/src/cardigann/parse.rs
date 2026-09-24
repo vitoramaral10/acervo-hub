@@ -21,13 +21,15 @@ impl CardigannDefinition {
     /// anúncio ou separador no meio da tabela não pode derrubar a busca. Mas
     /// se **nenhuma** linha rende, é erro — página inteira ilegível é o site
     /// que mudou de layout, e isso não pode virar "nada encontrado".
+    /// Devolve também quantas linhas a página tinha, com ou sem release —
+    /// é o que diz se ela era a última de uma listagem paginada.
     pub(super) fn parse(
         &self,
         html: &str,
         page: &Url,
         request: &Vars,
         now: OffsetDateTime,
-    ) -> Result<Vec<(Release, String)>, IndexerError> {
+    ) -> Result<(Vec<(Release, String)>, usize), IndexerError> {
         let document = Html::parse_document(html);
         let rendered;
         let rows = match &self.rows {
@@ -39,7 +41,9 @@ impl CardigannDefinition {
         };
         let mut releases = Vec::new();
         let mut first_failure = None;
+        let mut count = 0;
         for row in rows.select(document.root_element()) {
+            count += 1;
             match self.release(row, page, request, now) {
                 Ok(release) => releases.push(release),
                 Err(field) => {
@@ -53,7 +57,7 @@ impl CardigannDefinition {
                 indexer: self.id.clone(),
                 field,
             }),
-            _ => Ok(releases),
+            _ => Ok((releases, count)),
         }
     }
 
