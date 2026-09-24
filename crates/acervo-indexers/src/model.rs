@@ -229,6 +229,15 @@ pub struct Capabilities {
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexerError {
+    #[error("definição Cardigann inválida ou não suportada em `{section}`: {reason}")]
+    Definition {
+        section: &'static str,
+        reason: &'static str,
+    },
+
+    #[error("consulta Cardigann não suportada: {reason}")]
+    UnsupportedQuery { reason: &'static str },
+
     #[error("url inválida para o indexador `{indexer}`: {source}")]
     BadUrl {
         indexer: String,

@@ -12,6 +12,9 @@ async-trait.workspace = true
 futures.workspace = true
 quick-xml.workspace = true
 reqwest.workspace = true
+scraper.workspace = true
+serde.workspace = true
+serde_yaml_ng.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
