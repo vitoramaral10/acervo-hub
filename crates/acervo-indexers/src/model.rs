@@ -229,6 +229,24 @@ pub struct Capabilities {
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexerError {
+    #[error("definição Cardigann inválida ou não suportada em `{section}`: {reason}")]
+    Definition {
+        section: &'static str,
+        reason: &'static str,
+    },
+
+    #[error("chave `{key}` não suportada pelo subconjunto Cardigann implementado")]
+    UnsupportedDefinitionKey { key: String },
+
+    #[error("consulta não suportada: {reason}")]
+    UnsupportedQuery { reason: &'static str },
+
+    #[error("login em `{indexer}` falhou: {reason}")]
+    Login {
+        indexer: String,
+        reason: &'static str,
+    },
+
     #[error("url inválida para o indexador `{indexer}`: {source}")]
     BadUrl {
         indexer: String,

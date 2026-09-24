@@ -1,0 +1,71 @@
+---
+id: arquivo-publico
+name: Arquivo público
+description: Catálogo público de filmes e séries em HTML
+language: pt-BR
+type: public
+encoding: UTF-8
+requestDelay: 0
+links:
+  - https://tracker.invalid/
+caps:
+  categorymappings:
+    - {id: 7, cat: TV/HD, desc: Séries HD}
+    - {id: 8, cat: Movies/HD, desc: Filmes HD}
+    - {id: 9, cat: TV/Anime}
+    - {id: 9, cat: Movies/Other}
+  modes:
+    search: [q]
+    tv-search: [q, season, ep, tvdbid, imdbid]
+    movie-search: [q, year, tmdbid, imdbid]
+settings:
+  - name: token
+    type: password
+    label: Chave opcional de busca
+    default: segredo-fixture
+  - name: verified
+    type: checkbox
+    label: Apenas verificados
+    default: true
+search:
+  paths:
+    - path: browse
+      method: get
+      inputs:
+        order: seeders
+  inputs:
+    q: '{{ .Keywords }}'
+    imdb: '{{ .Query.IMDBIDShort }}'
+    tvdb: '{{ .Query.TVDBID }}'
+    tmdb: '{{ .Query.TMDBID }}'
+    token: '{{ .Config.token }}'
+    verified: '{{ .Config.verified }}'
+  rows:
+    selector: table.results > tbody > tr.release
+  fields:
+    title:
+      selector: a.title
+      filters:
+        - name: trim
+        - name: replace
+          args: ['_', '.']
+    details:
+      selector: a.title
+      attribute: href
+    download:
+      selector: a.download
+      attribute: href
+    size:
+      selector: td.size
+    seeders:
+      selector: td.seeders
+    leechers:
+      selector: td.leechers
+      optional: true
+      default: 0
+    category:
+      selector: a.category
+      attribute: href
+      filters:
+        - name: split
+          args: ['=', -1]

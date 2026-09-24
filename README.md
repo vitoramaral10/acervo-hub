@@ -46,12 +46,12 @@ Workspace Cargo, binário único `acervo-hub`:
 | `acervo-arr` | Cliente da API v3: fila, inventário, remoção | existe |
 | `acervo-clients` | Clientes de download (hoje qBittorrent) | existe |
 | `acervo-hub` | Binário: configuração, coleta, relato, execução | existe |
-| `acervo-indexers` | Busca em indexadores (Torznab/Newznab), rate limit compartilhado | em construção |
+| `acervo-indexers` | Busca em indexadores (Torznab e Cardigann), rate limit compartilhado | em construção |
 | `acervo-metadata` | Provedores de metadados + cache | |
 | `acervo-parser` | Parsing de nome de release | |
 | `acervo-decision` | Perfis de qualidade, formatos customizados, pontuação | |
 | `acervo-library` | Import, hardlink, rename, varredura de filesystem | |
-| `acervo-api` | HTTP: superfície nova + compatibilidade com a API v3 existente | |
+| `acervo-api` | HTTP: superfície nova + compatibilidade com a API v3 existente | Torznab existe |
 
 ### Duas decisões que mandam no projeto
 
@@ -73,7 +73,21 @@ chmod 600 config.toml                # guarda segredo em texto puro
 
 cargo run --bin acervo-hub -- -c config.toml plan    # lê, planeja, relata
 cargo run --bin acervo-hub -- -c config.toml apply   # ... e executa
+cargo run --bin acervo-hub -- -c config.toml serve   # serve os indexadores
 ```
+
+`serve` é o outro modo de vida do binário: processo longo que responde Torznab em
+`/<indexador>/api`, e em `/all/api` por todos de uma vez. Os gerenciadores de série e de
+filme cadastram essa URL como cadastrariam o agregador atual. Três escolhas do desenho:
+
+- **A consulta chega a cada indexador reduzida ao que ele anunciou.** Parâmetro que ele não
+  entende é retirado — mas se, sem ele, uma busca por episódio viraria "últimos
+  lançamentos", o indexador simplesmente não é consultado.
+- **Paginação é local.** Nem todo indexador pagina; pedir a página 2 a quem não pagina
+  devolve a 1 de novo, e o consumidor tomaria a repetição por release nova.
+- **Falha total não vira lista vazia.** Se todos os indexadores consultados falham, a
+  resposta é erro Torznab `900`: "nada encontrado" e "tracker fora do ar" pedem reações
+  opostas de quem consulta.
 
 `plan` nunca altera nada, nem grava strikes — repetir a simulação não leva um item ao
 limite sem ninguém ter decidido. O modo não é um ramo de código separado: é um campo do
@@ -89,8 +103,8 @@ quebrou".
 docker build -t acervo-hub .
 ```
 
-Imagem final de **~7 MB**: multi-stage com alvo musl, distroless `static` como base,
-binário estático de ~5 MB e nada mais. Sem shell, sem gerenciador de pacotes, sem `curl` —
+Imagem final de **~9 MB**: multi-stage com alvo musl, distroless `static` como base,
+o binário estático e nada mais. Sem shell, sem gerenciador de pacotes, sem `curl` —
 o que não está lá não precisa ser corrigido nem serve a quem entrar.
 
 `deploy/` traz o serviço para um stack Compose existente e as unidades systemd que agendam
@@ -132,8 +146,15 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
 - [x] **Fase 1 — `acervo-janitor`.** Substitui só o faxineiro, falando as APIs v3
       existentes. Risco baixo, valor imediato. *Falta validar contra instâncias reais.*
 - [ ] **Fase 2 — `acervo-indexers`.** Absorve o agregador de indexadores. O cliente
-      Torznab, a agregação e o rate limit compartilhado existem; ainda faltam as definições
-      Cardigann e a superfície compatível com os consumidores atuais.
+      Torznab, a agregação, o rate limit compartilhado, o executor Cardigann v11 e a
+      superfície Torznab (`serve`) existem. O executor roda tracker público e privado —
+      login por formulário ou por cookie, sessão refeita quando o site deixa de
+      reconhecê-la, download intermediado com a sessão —, com o subconjunto de templates
+      Go, filtros e seletores (`:contains` incluído) que as definições reais usam. O que
+      ele não cobre é recusado na carga, com o motivo. Contra um corpus de 573 definições,
+      carrega 26; as recusas mais comuns são resposta JSON (130), login por `form` (113) e
+      a seção `download` (59). O teste `corpus` (ignorado por padrão) refaz essa conta.
+      *Falta validar contra os trackers de verdade.*
 - [ ] **Fase 3 — filmes.** Árvore mais simples; o gerenciador de séries segue de pé como
       controle.
 - [ ] **Fase 4 — séries.** Só depois de o parser passar no corpus real.

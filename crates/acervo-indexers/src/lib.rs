@@ -5,11 +5,13 @@
 //! política de falha parcial ao consultar vários indexadores.
 
 mod aggregate;
+mod cardigann;
 mod model;
 mod rate;
 mod torznab;
 
 pub use aggregate::{AggregateSearch, Indexer, IndexerFailure, SearchReport};
+pub use cardigann::{CardigannClient, CardigannDefinition};
 pub use model::{
     Capabilities, Category, IndexerError, Release, SearchMode, SearchQuery, SearchSupport,
 };
