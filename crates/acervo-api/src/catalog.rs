@@ -454,13 +454,16 @@ fn identifies(query: &SearchQuery) -> bool {
         }
 }
 
+/// Ano de filme não entra: ele não identifica o filme, só filtra, e quem
+/// decide o release confere o ano de qualquer forma. Descartá-lo alarga um
+/// pouco a busca (a refilmagem de mesmo nome); pular o indexador perderia
+/// todos os resultados de quem não anuncia `year`.
 fn narrows(query: &SearchQuery) -> bool {
     match &query.mode {
         SearchMode::Tv {
             season, episode, ..
         } => season.is_some() || episode.is_some(),
-        SearchMode::Movie { year, .. } => year.is_some(),
-        SearchMode::General => false,
+        SearchMode::Movie { .. } | SearchMode::General => false,
     }
 }
 
@@ -519,6 +522,18 @@ mod tests {
             }],
             ..Capabilities::default()
         }
+    }
+
+    #[test]
+    fn ano_sem_suporte_sai_da_consulta_e_o_indexador_segue() {
+        let caps = Capabilities {
+            movie: support(&["q"]),
+            ..Capabilities::default()
+        };
+        let query = SearchQuery::movie("Filme").with_year(2025);
+        let adapted = adapt(&query, &caps).expect("consulta o indexador");
+        assert_eq!(adapted.term.as_deref(), Some("Filme"));
+        assert!(matches!(adapted.mode, SearchMode::Movie { year: None, .. }));
     }
 
     #[test]
