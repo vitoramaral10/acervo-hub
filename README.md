@@ -206,6 +206,12 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
       manual. Contra um tracker privado real, login por formulário, busca em várias páginas e
       download intermediado funcionam; o login por cookie aguarda um cookie válido para ser
       conferido em produção.
+      Consultas iguais são reaproveitadas: pedido idêntico em andamento espera a mesma
+      resposta, e a resposta fica guardada por 30 minutos (5 para o feed recente). Os
+      gerenciadores e a decisão em sombra passam pelo mesmo serviço, e cada tracker vê uma
+      requisição por consulta. A busca roda até o fim mesmo se o consumidor desistir, e a
+      tentativa seguinte a encontra pronta. Em produção desde 24/09/2026 como único
+      agregador: o anterior foi desligado.
 
 ### Migrando do agregador atual
 

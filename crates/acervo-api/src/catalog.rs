@@ -8,8 +8,9 @@ use acervo_indexers::{
     Capabilities, Category, Indexer, IndexerFailure, Release, SearchMode, SearchQuery,
     SearchSupport,
 };
-use futures::future::join_all;
+use futures::future::{BoxFuture, FutureExt, Shared, join_all};
 use time::OffsetDateTime;
+use tokio::time::{Duration, Instant};
 
 use crate::TorznabError;
 
@@ -78,12 +79,51 @@ pub struct IndexerView {
     pub health: Health,
 }
 
-/// Catálogo compartilhado entre as rotas. Clones veem as mesmas entradas e a
-/// mesma saúde; trocar a credencial de um indexador troca para todos.
+/// Por quanto tempo uma busca com termo é reaproveitada.
+const SEARCH_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// Por quanto tempo o feed recente (busca sem termo, o RSS dos gerenciadores)
+/// é reaproveitado: menos que o intervalo de RSS deles, para ninguém ver um
+/// feed envelhecido.
+const RECENT_TTL: Duration = Duration::from_secs(5 * 60);
+
+type Fetch = Shared<BoxFuture<'static, Result<Arc<Vec<Release>>, String>>>;
+
+/// Uma consulta a um indexador em andamento ou já respondida.
+struct Slot {
+    started: Instant,
+    ttl: Duration,
+    fetch: Fetch,
+}
+
+/// Consultas reaproveitadas, por indexador e consulta já reduzida.
+///
+/// Quem pede o que já está a caminho espera a mesma resposta, e quem pede o
+/// que chegou há pouco a recebe sem ir ao tracker: o gerenciador de séries,
+/// o de filmes e a decisão em sombra passam por aqui, e cada tracker vê uma
+/// requisição só. Erro não fica guardado — a próxima consulta tenta de novo.
+#[derive(Default)]
+struct Requests {
+    slots: HashMap<(String, String), Slot>,
+}
+
+impl std::fmt::Debug for Requests {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Requests")
+            .field("slots", &self.slots.len())
+            .finish()
+    }
+}
+
+/// Catálogo compartilhado entre as rotas. Clones veem as mesmas entradas, a
+/// mesma saúde e as mesmas consultas guardadas; trocar a credencial de um
+/// indexador troca para todos.
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     entries: Arc<RwLock<BTreeMap<String, Entry>>>,
     health: Arc<Mutex<HashMap<String, Health>>>,
+    requests: Arc<Mutex<Requests>>,
 }
 
 /// Resultado de uma consulta servida: página já cortada e falhas parciais.
@@ -119,6 +159,7 @@ impl Catalog {
         Ok(Self {
             entries: Arc::new(RwLock::new(catalog)),
             health: Arc::default(),
+            requests: Arc::default(),
         })
     }
 
@@ -129,12 +170,86 @@ impl Catalog {
     }
 
     fn record(&self, name: &str, outcome: Result<usize, String>) {
-        let mut health = self.health.lock().unwrap_or_else(PoisonError::into_inner);
-        let entry = health.entry(name.to_owned()).or_default();
-        match outcome {
-            Ok(results) => entry.success(results),
-            Err(error) => entry.failure(error),
+        record(&self.health, name, outcome);
+    }
+
+    /// Esquece o que foi guardado de um indexador: a sessão ou a credencial
+    /// dele mudou, e a resposta antiga não vale mais.
+    fn forget(&self, name: &str) {
+        self.requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .slots
+            .retain(|(indexer, _), _| indexer != name);
+    }
+
+    /// A consulta ao indexador, reaproveitando a que está a caminho ou a que
+    /// chegou há pouco.
+    fn fetch(&self, entry: &Entry, query: SearchQuery) -> Fetch {
+        let name = entry.indexer.name().to_owned();
+        let key = (name.clone(), format!("{query:?}"));
+        let ttl = if query.term.is_some() {
+            SEARCH_TTL
+        } else {
+            RECENT_TTL
+        };
+        let mut requests = self.requests.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        requests
+            .slots
+            .retain(|_, slot| now.duration_since(slot.started) < slot.ttl);
+        if let Some(slot) = requests.slots.get(&key) {
+            tracing::debug!(indexer = name, "consulta reaproveitada");
+            return slot.fetch.clone();
         }
+        let indexer = Arc::clone(&entry.indexer);
+        let health = Arc::clone(&self.health);
+        let slots = Arc::clone(&self.requests);
+        let slot_key = key.clone();
+        let started = now;
+        let fetch = async move {
+            let outcome = indexer
+                .search(&query)
+                .await
+                .map_err(|error| error.to_string());
+            record(
+                &health,
+                &name,
+                outcome.as_ref().map(Vec::len).map_err(Clone::clone),
+            );
+            if outcome.is_err() {
+                // Erro não fica guardado. Só sai o próprio slot: outro pode
+                // ter entrado no lugar depois de um `forget`.
+                let mut requests = slots.lock().unwrap_or_else(PoisonError::into_inner);
+                if requests
+                    .slots
+                    .get(&slot_key)
+                    .is_some_and(|slot| slot.started == started)
+                {
+                    requests.slots.remove(&slot_key);
+                }
+            }
+            outcome.map(Arc::new)
+        };
+        // Tarefa própria: se quem pediu desiste (o gerenciador corta em 100 s
+        // e o tracker leva quase isso), a busca termina assim mesmo, e a
+        // próxima tentativa encontra a resposta pronta.
+        let task = tokio::spawn(fetch);
+        let fetch = async move {
+            task.await
+                .unwrap_or_else(|error| Err(format!("busca interrompida: {error}")))
+        }
+        .boxed()
+        .shared();
+        requests.slots.insert(
+            key,
+            Slot {
+                started,
+                ttl,
+                fetch: fetch.clone(),
+            },
+        );
+        fetch
     }
 
     #[must_use]
@@ -211,6 +326,7 @@ impl Catalog {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(name)
             .is_some();
+        self.forget(name);
         self.health
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -234,6 +350,7 @@ impl Catalog {
             .ok_or_else(|| CatalogError::Unknown(name.to_owned()))?;
         *slot = entry;
         drop(entries);
+        self.forget(name);
         self.health
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -321,25 +438,19 @@ impl Catalog {
             .collect();
         let consulted = eligible.len();
 
-        let pending = eligible.into_iter().map(|(entry, adapted)| async move {
+        let pending = eligible.into_iter().map(|(entry, adapted)| {
             let name = entry.indexer.name().to_owned();
-            (name, entry.indexer.search(&adapted).await)
+            let fetch = self.fetch(&entry, adapted);
+            async move { (name, fetch.await) }
         });
 
         let mut page = Page::default();
         for (indexer, result) in join_all(pending).await {
             match result {
-                Ok(mut releases) => {
-                    self.record(&indexer, Ok(releases.len()));
-                    page.releases.append(&mut releases);
-                }
+                Ok(releases) => page.releases.extend(releases.iter().cloned()),
                 Err(error) => {
                     tracing::warn!(indexer, %error, "indexador falhou na busca");
-                    self.record(&indexer, Err(error.to_string()));
-                    page.failures.push(IndexerFailure {
-                        indexer,
-                        error: error.to_string(),
-                    });
+                    page.failures.push(IndexerFailure { indexer, error });
                 }
             }
         }
@@ -354,6 +465,15 @@ impl Catalog {
         let limit = usize::from(query.limit.unwrap_or(crate::request::MAX_RESULTS));
         page.releases = page.releases.into_iter().skip(offset).take(limit).collect();
         Ok(page)
+    }
+}
+
+fn record(health: &Mutex<HashMap<String, Health>>, name: &str, outcome: Result<usize, String>) {
+    let mut health = health.lock().unwrap_or_else(PoisonError::into_inner);
+    let entry = health.entry(name.to_owned()).or_default();
+    match outcome {
+        Ok(results) => entry.success(results),
+        Err(error) => entry.failure(error),
     }
 }
 
