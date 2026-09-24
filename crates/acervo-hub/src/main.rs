@@ -2,7 +2,8 @@
 //!
 //! Um ciclo é sempre a mesma sequência: ler o mundo, planejar, relatar e — só
 //! com `apply` — executar. O modo não muda o caminho de código, só o que
-//! acontece no último passo.
+//! acontece no último passo. `serve` é o outro modo de vida do binário: um
+//! processo longo que responde buscas Torznab.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -17,12 +18,13 @@ mod collect;
 mod config;
 mod ledger;
 mod report;
+mod serve;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "acervo-hub",
     version,
-    about = "Reconcilia a biblioteca de mídia"
+    about = "Reconcilia a biblioteca de mídia e serve os indexadores"
 )]
 struct Cli {
     /// Arquivo de configuração.
@@ -39,14 +41,17 @@ enum Command {
     Plan,
     /// Lê, planeja, relata e executa.
     Apply,
+    /// Serve os indexadores configurados pela API Torznab.
+    Serve,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "acervo_hub=info,acervo_arr=info,acervo_fs=info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "acervo_hub=info,acervo_arr=info,acervo_fs=info,acervo_api=info".into()
+            }),
         )
         .with_target(false)
         .init();
@@ -62,12 +67,16 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
+    let config = config::Config::load(&config::expand_tilde(&cli.config))?;
     let mode = match cli.command {
         Command::Plan => Mode::DryRun,
         Command::Apply => Mode::Apply,
+        Command::Serve => {
+            serve::run(&config).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
     };
 
-    let config = config::Config::load(&config::expand_tilde(&cli.config))?;
     let session = collect::collect(&config).await?;
     report::inventory(&session.inventory);
 

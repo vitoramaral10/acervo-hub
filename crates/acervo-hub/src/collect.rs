@@ -33,10 +33,11 @@ pub struct Session {
 /// Falha ao autenticar ou consultar o cliente de download, ou ao montar algum
 /// cliente HTTP.
 pub async fn collect(config: &Config) -> Result<Session> {
+    let qbit_config = config.janitor()?;
     let qbit = QbitClient::login(
-        &config.qbittorrent.url,
-        &config.qbittorrent.username,
-        &config.qbittorrent.password,
+        &qbit_config.url,
+        &qbit_config.username,
+        &qbit_config.password,
         config.http_timeout(),
     )
     .await
