@@ -22,6 +22,9 @@ pub const SUFFIX: &str = " (acervo-hub)";
 /// Anime tem campo próprio no gerenciador de séries.
 const ANIME: u32 = 5070;
 
+/// Folga para o cadastro, que espera o teste do indexador pela instância.
+const SAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
 #[derive(Debug)]
 pub enum Action {
     Create(TorznabSpec),
@@ -148,7 +151,10 @@ pub async fn run(config: &Config, apply: bool) -> Result<usize> {
             &spec.url,
             &spec.api_key,
             spec.kind.into(),
-            config.http_timeout(),
+            // Ao salvar, a instância testa o indexador antes de responder — e
+            // o teste é uma busca real, que num tracker de várias páginas com
+            // intervalo entre elas passa fácil de um minuto.
+            config.http_timeout().max(SAVE_TIMEOUT),
         )
         .with_context(|| format!("montando o cliente da instância `{}`", spec.name))?;
         let existing = match client.indexers().await {
