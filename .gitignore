@@ -13,3 +13,4 @@ config.local.toml
 
 # Front-end: dependências ficam fora; o build em crates/acervo-api/src/ui/dist entra.
 /web/node_modules/
+/web/*.tsbuildinfo
