@@ -136,12 +136,27 @@ async fn read_download(
     let mut facts: Vec<FileFacts> = Vec::with_capacity(files.len());
     for file in &files {
         let path = client_path(torrent, file);
-        let fact = acervo_fs::facts_for(&path, map).map_err(|err| UnreadableDownload {
-            hash: hash.clone(),
-            name: torrent.name.clone(),
-            path: path.clone(),
-            reason: err.to_string(),
-        })?;
+        let fact = match acervo_fs::facts_for(&path, map) {
+            Ok(fact) => fact,
+            // Download incompleto cujo arquivo o cliente ainda não criou: não
+            // há nada no disco, e o torrent segue na decisão — um órfão pausado
+            // que nunca começou precisa poder sair da fila. Em torrent
+            // completo, arquivo ausente é caminho errado, e caminho errado
+            // faria um seed parecer sem hardlink: esse continua sendo erro.
+            Err(acervo_fs::FsError::Stat { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound && torrent.progress < 1.0 =>
+            {
+                continue;
+            }
+            Err(err) => {
+                return Err(UnreadableDownload {
+                    hash: hash.clone(),
+                    name: torrent.name.clone(),
+                    path: path.clone(),
+                    reason: err.to_string(),
+                });
+            }
+        };
         facts.push(fact);
     }
 
@@ -150,6 +165,7 @@ async fn read_download(
         name: torrent.name.clone(),
         state: state_from_qbit(&torrent.state),
         private: torrent.is_private(),
+        category: torrent.category.clone(),
         ratio: torrent.ratio,
         seeded_for: torrent.seeded_for(),
         files: facts,

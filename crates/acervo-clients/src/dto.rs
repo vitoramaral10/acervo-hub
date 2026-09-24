@@ -19,6 +19,11 @@ pub struct TorrentInfo {
     /// Só existe a partir do qBittorrent 5.0.
     #[serde(default)]
     pub private: Option<bool>,
+    #[serde(default)]
+    pub category: String,
+    /// De 0.0 a 1.0.
+    #[serde(default)]
+    pub progress: f64,
 }
 
 impl TorrentInfo {

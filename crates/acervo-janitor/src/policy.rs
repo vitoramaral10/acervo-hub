@@ -62,6 +62,10 @@ pub struct Policy {
     /// biblioteca. `None` apaga assim que o vínculo cai — rápido, mas expõe a
     /// hit&run se o torrent for recente.
     pub private_seed_grace: Option<Duration>,
+    /// Categorias do cliente cujos seeds a limpeza pode apagar por perda de
+    /// hardlink. Fora delas é download manual e nunca é tocado. Vazia, a
+    /// regra não apaga nada: o padrão seguro é não saber o que é de quem.
+    pub managed_categories: Vec<String>,
     pub guards: Guards,
 }
 
@@ -73,6 +77,7 @@ impl Default for Policy {
             delete_private_orphans: false,
             skip_orphan_if_missing_in_client: true,
             private_seed_grace: Some(Duration::from_secs(120 * 60 * 60)),
+            managed_categories: Vec::new(),
             guards: Guards::default(),
         }
     }

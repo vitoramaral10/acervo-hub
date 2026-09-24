@@ -36,6 +36,7 @@ fn seed(hash: &str, links: u64, bytes: u64) -> Download {
         name: format!("seed {hash}"),
         state: DownloadState::Seeding,
         private: false,
+        category: "tv-sonarr".into(),
         ratio: 0.0,
         seeded_for: 500 * HORA,
         files: vec![arquivo(links, bytes, 90 * HORA)],
@@ -64,6 +65,7 @@ fn politica_aplicando() -> Policy {
     Policy {
         mode: Mode::Apply,
         private_seed_grace: None,
+        managed_categories: vec!["tv-sonarr".into(), "radarr".into()],
         ..Policy::default()
     }
 }
@@ -193,6 +195,7 @@ fn orfao_privado_sai_da_fila_mas_preserva_os_arquivos_por_padrao() {
     ));
     inv.downloads = vec![Download {
         private: true,
+        category: "tv-sonarr".into(),
         ..seed("aa", 1, 4 * GIB)
     }];
 
@@ -327,4 +330,41 @@ fn biblioteca_que_mede_zero_aborta_em_vez_de_liberar_a_trava() {
     .expect_err("biblioteca sem medida tem de abortar");
 
     assert!(matches!(erro, Abort::LibraryUnmeasured { .. }));
+}
+
+#[test]
+fn download_manual_sem_hardlink_nunca_e_apagado() {
+    // Curso, ISO, qualquer coisa baixada à mão: não está na biblioteca porque
+    // nunca esteve, e não é a limpeza que decide o destino dela.
+    let mut manual = seed("manual", 1, 50 * GIB);
+    manual.category = "cursos".into();
+    let mut inv = Inventory::new(Allocated::from_bytes(1743 * GIB));
+    inv.snapshots.push(snapshot("filmes", vec![]));
+    inv.downloads = vec![manual];
+
+    let plano = reconcile(
+        &inv,
+        &politica_aplicando(),
+        &mut StrikeLedger::new(),
+        agora(),
+    )
+    .expect("sem abort");
+
+    assert!(plano.actions.is_empty());
+    assert_eq!(plano.skipped[0].reason, SkipReason::UnmanagedCategory);
+}
+
+#[test]
+fn sem_categorias_gerenciadas_a_regra_de_hardlink_nao_apaga_nada() {
+    let mut inv = Inventory::new(Allocated::from_bytes(1743 * GIB));
+    inv.snapshots.push(snapshot("filmes", vec![]));
+    inv.downloads = vec![seed("orfao", 1, GIB)];
+    let politica = Policy {
+        managed_categories: Vec::new(),
+        ..politica_aplicando()
+    };
+
+    let plano = reconcile(&inv, &politica, &mut StrikeLedger::new(), agora()).expect("sem abort");
+
+    assert!(plano.actions.is_empty());
 }

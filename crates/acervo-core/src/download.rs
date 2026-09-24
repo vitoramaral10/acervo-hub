@@ -59,6 +59,9 @@ pub struct Download {
     pub state: DownloadState,
     /// Tracker privado. Muda a política: hit&run custa acesso ao tracker.
     pub private: bool,
+    /// Categoria no cliente. É o que separa o que os *arr baixaram do que
+    /// alguém baixou à mão — e só o primeiro é da conta da limpeza.
+    pub category: String,
     pub ratio: f64,
     pub seeded_for: Duration,
     pub files: Vec<FileFacts>,
@@ -112,6 +115,7 @@ mod tests {
             name: "exemplo".into(),
             state: DownloadState::Seeding,
             private: true,
+            category: "tv-sonarr".into(),
             ratio: 0.0,
             seeded_for: Duration::ZERO,
             files,

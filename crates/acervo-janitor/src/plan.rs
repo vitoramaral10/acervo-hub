@@ -45,6 +45,8 @@ pub enum Action {
 pub enum SkipReason {
     /// Está em fila de alguma instância — caso da reconciliação de fila.
     InQueue,
+    /// Categoria fora das gerenciadas: download manual.
+    UnmanagedCategory,
     /// Ainda compartilha inode com a biblioteca: apagar libera zero.
     StillLinked,
     /// Só seed entra na avaliação.
@@ -61,6 +63,7 @@ impl fmt::Display for SkipReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             Self::InQueue => "está em fila de um *arr",
+            Self::UnmanagedCategory => "categoria fora das gerenciadas (download manual)",
             Self::StillLinked => "ainda tem hardlink na biblioteca",
             Self::NotSeeding => "não está em seeding",
             Self::RecentlyModified => "arquivo mexido recentemente",

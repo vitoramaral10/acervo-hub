@@ -170,6 +170,10 @@ pub struct PolicyConfig {
     pub max_batch_gib: u64,
     #[serde(default = "default_max_fraction")]
     pub max_batch_fraction: f64,
+    /// Categorias do cliente que os *arr usam. Só seed nelas pode ser apagado
+    /// por perda de hardlink; vazia, essa regra não apaga nada.
+    #[serde(default)]
+    pub managed_categories: Vec<String>,
 }
 
 impl Default for PolicyConfig {
@@ -182,6 +186,7 @@ impl Default for PolicyConfig {
             recent_change_grace_hours: default_recent_grace(),
             max_batch_gib: default_max_batch_gib(),
             max_batch_fraction: default_max_fraction(),
+            managed_categories: Vec::new(),
         }
     }
 }
@@ -196,6 +201,7 @@ impl PolicyConfig {
             skip_orphan_if_missing_in_client: self.skip_orphan_if_missing_in_client,
             private_seed_grace: (self.private_seed_grace_hours > 0)
                 .then(|| Duration::from_secs(self.private_seed_grace_hours * 3600)),
+            managed_categories: self.managed_categories.clone(),
             guards: Guards {
                 recent_change_grace: Duration::from_secs(self.recent_change_grace_hours * 3600),
                 max_batch: Allocated::from_bytes(self.max_batch_gib * 1024 * 1024 * 1024),

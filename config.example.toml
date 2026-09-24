@@ -64,6 +64,11 @@ recent_change_grace_hours = 24
 max_batch_gib = 300
 max_batch_fraction = 0.30
 
+# Categorias do cliente que os gerenciadores usam. Só seed nelas pode ser
+# apagado por ter perdido o hardlink; o resto é download manual e nunca é
+# tocado. Vazia, essa regra não apaga nada.
+managed_categories = ["tv-sonarr", "radarr"]
+
 [state]
 # Onde os strikes sobrevivem ao reinício do processo. Sem isso, três strikes
 # nunca se completam.

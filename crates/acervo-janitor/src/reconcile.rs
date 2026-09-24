@@ -206,6 +206,9 @@ fn evaluate_download(
     if queued.contains(&download.hash) {
         return Some(SkipReason::InQueue);
     }
+    if !policy.managed_categories.contains(&download.category) {
+        return Some(SkipReason::UnmanagedCategory);
+    }
     if !download.state.is_seeding() {
         return Some(SkipReason::NotSeeding);
     }
