@@ -16,6 +16,7 @@ use clap::{Parser, Subcommand};
 mod apply;
 mod collect;
 mod config;
+mod credentials;
 mod ledger;
 mod report;
 mod search;

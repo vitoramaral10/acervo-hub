@@ -21,6 +21,7 @@ acervo-indexers.workspace = true
 acervo-janitor.workspace = true
 
 anyhow.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 clap.workspace = true
 serde.workspace = true

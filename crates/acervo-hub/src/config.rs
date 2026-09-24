@@ -76,7 +76,7 @@ pub struct TorznabIndexer {
     pub request_interval_seconds: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CardigannIndexer {
     /// Arquivo YAML da definição, no formato v11.
@@ -137,12 +137,17 @@ pub struct StateConfig {
     /// Onde os strikes sobrevivem entre execuções.
     #[serde(default = "default_ledger_path")]
     pub ledger: PathBuf,
+    /// Credenciais trocadas pela interface web. Ficam fora do `config.toml`
+    /// para que ele possa ser montado somente leitura; valem por cima dele.
+    #[serde(default = "default_credentials_path")]
+    pub credentials: PathBuf,
 }
 
 impl Default for StateConfig {
     fn default() -> Self {
         Self {
             ledger: default_ledger_path(),
+            credentials: default_credentials_path(),
         }
     }
 }
@@ -379,6 +384,9 @@ const fn default_request_interval() -> f64 {
 }
 fn default_ledger_path() -> PathBuf {
     PathBuf::from("~/.local/state/acervo-hub/strikes.json")
+}
+fn default_credentials_path() -> PathBuf {
+    PathBuf::from("~/.local/state/acervo-hub/credenciais.toml")
 }
 
 #[cfg(test)]
