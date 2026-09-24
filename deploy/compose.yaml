@@ -52,6 +52,37 @@ services:
 
     networks: [media]
 
+  # Superfície Torznab: processo longo, ao contrário do ciclo. Sobe com o resto
+  # do stack. Os gerenciadores o alcançam pela rede `media` em
+  # `http://acervo-hub-indexadores:9797/<indexador>`; nenhuma porta vai para o
+  # host, porque a chave dá acesso a links com passkey.
+  #
+  # Em `config.toml`, `[server] bind = "0.0.0.0:9797"` — dentro do container,
+  # o padrão `127.0.0.1` não seria alcançável pelos vizinhos.
+  acervo-hub-indexadores:
+    image: ghcr.io/vitoramaral10/acervo-hub:main
+    user: "65532:65532"
+    restart: unless-stopped
+
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+    mem_limit: 128m
+    pids_limit: 64
+    cpus: "0.50"
+
+    volumes:
+      - ./config.toml:/etc/acervo-hub/config.toml:ro
+      # Definições Cardigann, se houver. Não precisa do acervo nem do estado.
+      - ./definicoes:/etc/acervo-hub/definicoes:ro
+
+    command: ["-c", "/etc/acervo-hub/config.toml", "serve"]
+
+    networks: [media]
+
 networks:
   media:
     external: true

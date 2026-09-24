@@ -18,7 +18,10 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub qbittorrent: QbitConfig,
+    /// Só o ciclo de limpeza usa; `serve` sobe sem ele.
+    #[serde(default)]
+    pub qbittorrent: Option<QbitConfig>,
+    #[serde(default)]
     pub instances: Vec<InstanceConfig>,
     /// Caminho como o cliente vê → caminho no host.
     #[serde(default)]
@@ -31,6 +34,55 @@ pub struct Config {
     pub state: StateConfig,
     #[serde(default = "default_timeout_seconds")]
     pub http_timeout_seconds: u64,
+    /// Superfície Torznab. Só `serve` usa.
+    #[serde(default)]
+    pub server: Option<ServerConfig>,
+    #[serde(default)]
+    pub indexers: Vec<IndexerConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerConfig {
+    #[serde(default = "default_bind")]
+    pub bind: String,
+    /// Chave que os consumidores mandam em `apikey`. Vale para todos os
+    /// indexadores servidos.
+    pub api_key: String,
+}
+
+/// Um indexador servido. `kind` decide de onde vêm as capacidades: a
+/// definição Cardigann as declara; um endpoint Torznab as anuncia em `t=caps`.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum IndexerConfig {
+    Torznab(TorznabIndexer),
+    Cardigann(CardigannIndexer),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TorznabIndexer {
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Intervalo mínimo entre duas requisições ao mesmo indexador.
+    #[serde(default = "default_request_interval")]
+    pub request_interval_seconds: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CardigannIndexer {
+    /// Arquivo YAML da definição, no formato v11.
+    pub definition: PathBuf,
+    /// Qual dos `links` da definição usar.
+    #[serde(default)]
+    pub link: usize,
+    /// Sobrescreve os `settings` declarados na definição.
+    #[serde(default)]
+    pub settings: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,11 +211,23 @@ impl Config {
         let config: Self = toml::from_str(&text)
             .with_context(|| format!("interpretando a configuração em `{}`", path.display()))?;
 
-        config.validate()?;
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&config.policy.max_batch_fraction),
+            "`policy.max_batch_fraction` precisa ficar entre 0.0 e 1.0"
+        );
         Ok(config)
     }
 
-    fn validate(&self) -> Result<()> {
+    /// O que o ciclo de limpeza exige além do que o arquivo já garante.
+    ///
+    /// # Errors
+    ///
+    /// Sem cliente de download, sem instância ou sem raiz de biblioteca.
+    pub fn janitor(&self) -> Result<&QbitConfig> {
+        let qbit = self
+            .qbittorrent
+            .as_ref()
+            .context("seção `[qbittorrent]` ausente: o ciclo age pelo cliente de download")?;
         anyhow::ensure!(
             !self.instances.is_empty(),
             "nenhuma instância configurada: sem fila para cruzar, todo download \
@@ -174,12 +238,41 @@ impl Config {
             "`library.roots` está vazio: sem medir a biblioteca, a trava \
              proporcional não tem denominador"
         );
-        anyhow::ensure!(
-            (0.0..=1.0).contains(&self.policy.max_batch_fraction),
-            "`policy.max_batch_fraction` precisa ficar entre 0.0 e 1.0"
-        );
 
-        Ok(())
+        Ok(qbit)
+    }
+
+    /// O que `serve` exige.
+    ///
+    /// # Errors
+    ///
+    /// Sem `[server]`, chave curta demais ou nenhum indexador.
+    pub fn server(&self) -> Result<&ServerConfig> {
+        let server = self
+            .server
+            .as_ref()
+            .context("seção `[server]` ausente: `serve` precisa de endereço e chave")?;
+        // A superfície devolve links de download de tracker, com passkey.
+        // Chave curta é chave adivinhável.
+        anyhow::ensure!(
+            server.api_key.len() >= 16,
+            "`server.api_key` precisa de ao menos 16 caracteres"
+        );
+        anyhow::ensure!(
+            !self.indexers.is_empty(),
+            "nenhum `[[indexers]]` configurado: não haveria o que servir"
+        );
+        for indexer in &self.indexers {
+            if let IndexerConfig::Torznab(spec) = indexer {
+                anyhow::ensure!(
+                    spec.request_interval_seconds.is_finite()
+                        && (0.0..=3600.0).contains(&spec.request_interval_seconds),
+                    "`request_interval_seconds` de `{}` precisa ficar entre 0 e 3600",
+                    spec.name
+                );
+            }
+        }
+        Ok(server)
     }
 
     #[must_use]
@@ -246,6 +339,14 @@ const fn default_max_batch_gib() -> u64 {
 const fn default_max_fraction() -> f64 {
     0.30
 }
+fn default_bind() -> String {
+    // Só a própria máquina, a menos que se diga o contrário. Em container, a
+    // configuração diz `0.0.0.0:9797`.
+    "127.0.0.1:9797".into()
+}
+const fn default_request_interval() -> f64 {
+    2.0
+}
 fn default_ledger_path() -> PathBuf {
     PathBuf::from("~/.local/state/acervo-hub/strikes.json")
 }
@@ -270,10 +371,69 @@ mod tests {
         api_key = "k"
     "#;
 
+    fn load(text: &str) -> Result<Config> {
+        let path = std::env::temp_dir().join(format!(
+            "acervo-hub-config-{}-{:?}.toml",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, text)?;
+        let config = Config::load(&path);
+        std::fs::remove_file(&path)?;
+        config
+    }
+
     fn parse(text: &str) -> Result<Config> {
-        let config: Config = toml::from_str(text)?;
-        config.validate()?;
+        let config = load(text)?;
+        config.janitor()?;
         Ok(config)
+    }
+
+    const SERVIDOR: &str = r#"
+        [server]
+        api_key = "0123456789abcdef"
+
+        [[indexers]]
+        kind = "torznab"
+        name = "agregador"
+        url = "http://localhost:9696/1/api"
+        api_key = "k"
+
+        [[indexers]]
+        kind = "cardigann"
+        definition = "/etc/acervo-hub/definicoes/publico.yml"
+        settings = { token = "t" }
+    "#;
+
+    #[test]
+    fn exemplo_versionado_serve_aos_dois_modos() {
+        let config = load(include_str!("../../../config.example.toml")).unwrap();
+        config.janitor().unwrap();
+        config.server().unwrap();
+    }
+
+    #[test]
+    fn servidor_sobe_sem_a_configuracao_do_ciclo() {
+        let config = load(SERVIDOR).unwrap();
+        assert_eq!(config.server().unwrap().bind, "127.0.0.1:9797");
+        assert_eq!(config.indexers.len(), 2);
+        assert!(config.janitor().is_err());
+    }
+
+    #[test]
+    fn campo_errado_em_indexador_tambem_e_erro() {
+        let torto = SERVIDOR.replace("api_key = \"k\"", "apikey = \"k\"");
+        assert!(load(&torto).is_err());
+        let tipo = SERVIDOR.replace("kind = \"torznab\"", "kind = \"newznab\"");
+        assert!(load(&tipo).is_err());
+    }
+
+    #[test]
+    fn chave_curta_ou_sem_indexador_e_recusada() {
+        let curta = SERVIDOR.replace("0123456789abcdef", "curta");
+        assert!(load(&curta).unwrap().server().is_err());
+        let vazio = SERVIDOR.split("[[indexers]]").next().unwrap();
+        assert!(load(vazio).unwrap().server().is_err());
     }
 
     #[test]
@@ -290,7 +450,7 @@ mod tests {
     #[test]
     fn campo_escrito_errado_e_erro_e_nao_silencio() {
         let torto = MINIMA.to_string() + "\n[policy]\norphan_strikez = 99\n";
-        let erro = parse(&torto).unwrap_err().to_string();
+        let erro = format!("{:#}", parse(&torto).unwrap_err());
         assert!(erro.contains("orphan_strikez"), "erro veio: {erro}");
     }
 

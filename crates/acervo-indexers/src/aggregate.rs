@@ -11,6 +11,27 @@ pub trait Indexer: std::fmt::Debug + Send + Sync {
     fn name(&self) -> &str;
 
     async fn search(&self, query: &SearchQuery) -> Result<Vec<Release>, IndexerError>;
+
+    /// Os links de download deste indexador só funcionam com a sessão dele?
+    ///
+    /// Tracker privado entrega `.torrent` só a quem está logado. Quem consulta
+    /// não tem a sessão, então o download precisa passar por aqui.
+    fn proxies_downloads(&self) -> bool {
+        false
+    }
+
+    /// Baixa um `.torrent` com a sessão do indexador.
+    ///
+    /// # Errors
+    ///
+    /// Indexador que não intermedia downloads, link fora da origem dele,
+    /// sessão recusada ou resposta que não é `.torrent`.
+    async fn download(&self, url: &url::Url) -> Result<Vec<u8>, IndexerError> {
+        let _ = url;
+        Err(IndexerError::UnsupportedQuery {
+            reason: "este indexador não intermedia downloads",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

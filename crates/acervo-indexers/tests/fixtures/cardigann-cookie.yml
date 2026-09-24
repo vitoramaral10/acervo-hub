@@ -1,0 +1,118 @@
+---
+id: cookie-privado
+name: Cookie privado
+description: Tracker privado de teste com login por cookie
+language: pt-BR
+type: private
+encoding: UTF-8
+requestDelay: 0
+links:
+  - https://tracker.invalid/
+
+caps:
+  categorymappings:
+    - {id: 1, cat: Movies, desc: "Filmes"}
+    - {id: 2, cat: TV, desc: "TV"}
+    - {id: 14, cat: TV, desc: "Anime"}
+    - {id: 7, cat: Other, desc: "Outros"}
+  modes:
+    search: [q]
+    tv-search: [q, season, ep]
+    movie-search: [q, imdbid]
+
+settings:
+  - name: cookie
+    type: text
+    label: Cookie
+  - name: info_cookie
+    type: info_cookie
+  - name: freeleech
+    type: checkbox
+    label: Só freeleech
+    default: false
+
+login:
+  method: cookie
+  inputs:
+    cookie: "{{ .Config.cookie }}"
+  test:
+    path: index.php
+    selector: a[href^="/logout.php?auth="]
+
+search:
+  paths:
+    - path: torrents.php
+  inputs:
+    $raw: "{{ range .Categories }}filter_cat[{{.}}]=1&{{end}}"
+    searchstr: "{{ if .Query.IMDBID }}{{ .Query.IMDBID }}%{{ else }}{{ .Keywords }}{{ end }}"
+    freetorrent: "{{ if .Config.freeleech }}1{{ else }}{{ end }}"
+  keywordsfilters:
+    - name: re_replace
+      args: ["(S[0-9]+E[0-9]+|S[0-9]+)", ""]
+
+  rows:
+    selector: "table.torrent_table > tbody > tr:not(tr.colhead).group,
+              table.torrent_table tbody tr:not(tr.colhead):contains('{{ .Query.Episode }}')"
+    filters:
+      - name: andmatch
+
+  fields:
+    download:
+      selector: a[title="Baixar"]
+      attribute: href
+    _rawTitle:
+      selector: div.group_info
+      filters:
+        - name: re_replace
+          args: ["(\n.*)", ""]
+    _year:
+      text: "{{ .Result._rawTitle }}"
+      filters:
+        - name: regexp
+          args: "\\[([0-9]*)\\]"
+    details:
+      selector: a[href^="torrents.php?id="]
+      attribute: href
+    title_video:
+      text: "{{ .Result._rawTitle }}"
+      filters:
+        - name: re_replace
+          args: ["\\[[0-9]*\\].*", ""]
+        - name: re_replace
+          args: ["(.*)\\[(!?[^/]*?)\\]", "$2"]
+        - name: append
+          args: "{{ .Result._year }}"
+    title_other:
+      text: "{{ .Result._rawTitle }}"
+      filters:
+        - name: re_replace
+          args: ["\\[|\\]", " "]
+    category_details:
+      selector: td.cats_col > a
+      attribute: href
+      filters:
+        - name: regexp
+          args: "filter_cat\\[(\\d+?)\\]"
+    category:
+      text: "{{ .Result.category_details }}"
+    # O parêntese a mais no fim existe em definição real e é tolerado.
+    title:
+      text: "{{ if
+                  or (eq .Result.category_details \"1\")
+                 (or (eq .Result.category_details \"2\")
+                 (or eq .Result.category_details \"14\"))))
+             }}{{.Result.title_video}}{{ else }}{{.Result.title_other}}{{ end }}"
+    size:
+      selector: td:nth-last-child(4)
+    grabs:
+      selector: td:nth-last-child(3)
+    seeders:
+      selector: td:nth-last-child(2)
+    leechers:
+      selector: td:nth-last-child(1)
+    downloadvolumefactor:
+      case:
+        strong[title*="Free"]: 0
+        "*": 1
+    minimumseedtime:
+      text: 604800

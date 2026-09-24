@@ -235,8 +235,17 @@ pub enum IndexerError {
         reason: &'static str,
     },
 
-    #[error("consulta Cardigann não suportada: {reason}")]
+    #[error("chave `{key}` não suportada pelo subconjunto Cardigann implementado")]
+    UnsupportedDefinitionKey { key: String },
+
+    #[error("consulta não suportada: {reason}")]
     UnsupportedQuery { reason: &'static str },
+
+    #[error("login em `{indexer}` falhou: {reason}")]
+    Login {
+        indexer: String,
+        reason: &'static str,
+    },
 
     #[error("url inválida para o indexador `{indexer}`: {source}")]
     BadUrl {

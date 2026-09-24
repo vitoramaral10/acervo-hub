@@ -1,0 +1,137 @@
+---
+id: formulario-privado
+name: Formulário privado
+description: Tracker privado de teste com login por formulário e várias páginas
+language: pt-BR
+type: private
+encoding: UTF-8
+requestDelay: 0
+links:
+  - https://tracker.invalid/
+legacylinks:
+  - http://antigo.tracker.invalid/
+
+caps:
+  categorymappings:
+    - {id: 119, cat: Movies, desc: "Filmes"}
+    - {id: 120, cat: TV, desc: "Séries"}
+    - {id: 69, cat: TV/Anime, desc: "Anime"}
+  modes:
+    search: [q]
+    tv-search: [q, season, ep]
+    movie-search: [q]
+    book-search: [q]
+  allowrawsearch: true
+
+settings:
+  - name: username
+    type: text
+    label: Usuário
+  - name: password
+    type: password
+    label: Senha
+  - name: info_results
+    type: info
+    label: Resultados
+    default: "Use a visualização em <b>lista</b>."
+  - name: freeleech
+    type: checkbox
+    label: Só freeleech
+    default: false
+  - name: sort
+    type: select
+    label: Ordenação
+    default: id
+    options:
+      id: created
+      seeders: seeders
+
+login:
+  path: account-login.php
+  method: post
+  inputs:
+    username: "{{ .Config.username }}"
+    password: "{{ .Config.password }}"
+    returnto: /
+  error:
+    - selector: div.alert-primary
+  test:
+    path: index.php
+    selector: a[href="account-logout.php"]
+
+search:
+  paths:
+    - path: torrents-search.php
+    - path: torrents-search.php
+      inputs:
+        page: 1
+  inputs:
+    search: "{{ re_replace .Keywords \"[\\s]+\" \"%\" }}"
+    free: "{{ if .Config.freeleech }}1{{ else }}2{{ end }}"
+    sort: "{{ .Config.sort }}"
+  keywordsfilters:
+    - name: re_replace
+      args: ["(\\s*\\b((19|20)\\d{2})\\b)", ""]
+
+  rows:
+    selector: ul.list-group li.list-group-item
+
+  fields:
+    category_default:
+      selector: div.addon img
+      attribute: src
+      optional: true
+      case:
+        "[src$=\"/filmes.png\"]": 119
+        "[src$=\"/series.png\"]": 120
+    category:
+      selector: a[href*="cat="]
+      attribute: href
+      optional: true
+      default: "{{ .Result.category_default }}"
+      filters:
+        - name: querystring
+          args: cat
+    _quality:
+      selector: span.badge:contains("1080p"), span.badge:contains("4k")
+      optional: true
+      filters:
+        - name: replace
+          args: ["4k", "2160p"]
+    _language:
+      selector: span.idioma
+      optional: true
+    title:
+      selector: a[href*="torrents-details.php?id="]
+      filters:
+        - name: re_replace
+          args: ["^(.*?)[\\(](.*?)[\\)](.*?)$", "$2$3"]
+        - name: append
+          args: "{{ if .Result._quality }} {{ .Result._quality }}{{ else }}{{ end }}"
+        - name: append
+          args: '{{ if eq .Result._language "Dublado" }} Dublado{{ else }}{{ end }}'
+    details:
+      selector: a[href*="torrents-details.php?id="]
+      attribute: href
+    download:
+      selector: a[href*="download.php?id="]
+      attribute: href
+    date:
+      selector: p:contains("Lançado:")
+      optional: true
+      default: now
+      filters:
+        - name: regexp
+          args: "Lançado: (.+?)$"
+        - name: dateparse
+          args: "dd/MM/yy HH:mm:ss"
+    size:
+      selector: span.tamanho
+    seeders:
+      selector: div.controls a:nth-child(1)
+    leechers:
+      selector: div.controls a:nth-child(2)
+    downloadvolumefactor:
+      case:
+        "span.badge:contains(\"FREE\")": 0
+        "*": 1
