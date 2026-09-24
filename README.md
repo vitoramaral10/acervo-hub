@@ -132,8 +132,11 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
 - [x] **Fase 1 — `acervo-janitor`.** Substitui só o faxineiro, falando as APIs v3
       existentes. Risco baixo, valor imediato. *Falta validar contra instâncias reais.*
 - [ ] **Fase 2 — `acervo-indexers`.** Absorve o agregador de indexadores. O cliente
-      Torznab, a agregação e o rate limit compartilhado existem; ainda faltam as definições
-      Cardigann e a superfície compatível com os consumidores atuais.
+      Torznab, a agregação, o rate limit compartilhado e um executor Cardigann v11
+      conservador existem. O executor cobre indexador público, GET e HTML UTF-8, e recusa
+      no load qualquer recurso fora desse recorte (login, POST, JSON, filtros e templates
+      Go além dos básicos) em vez de rodá-lo pela metade. Falta a superfície compatível
+      com os consumidores atuais.
 - [ ] **Fase 3 — filmes.** Árvore mais simples; o gerenciador de séries segue de pé como
       controle.
 - [ ] **Fase 4 — séries.** Só depois de o parser passar no corpus real.
