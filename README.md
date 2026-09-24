@@ -79,6 +79,30 @@ cargo run --bin acervo-hub -- -c config.toml sync --apply
 cargo run --bin acervo-hub -- -c config.toml search "termo" [-i indexador] [-k 5000]
 ```
 
+### Interface web
+
+`serve` também serve uma interface em `/`: o estado de cada indexador (último sucesso,
+último erro, falhas seguidas), um botão de teste, a troca de credencial — cookie vencido,
+senha nova — sem editar arquivo, e a busca manual com download do `.torrent` pela sessão
+do tracker. Entra-se com a mesma chave de `server.api_key`.
+
+- **A credencial trocada pela tela não reescreve o `config.toml`**, que pode ficar somente
+  leitura. Ela vai para `[state] credentials` (gravação atômica, permissão 600) e vale por
+  cima da config na próxima subida. Segredo nunca volta para a tela: campo em branco
+  mantém o valor atual.
+- **Sessão em cookie `HttpOnly` e `SameSite=Strict`**, e toda ação que muda estado exige
+  um cabeçalho que formulário de outra origem não consegue mandar. A CSP só aceita script
+  servido pelo próprio binário.
+- O front é React + TypeScript + Tailwind, em `web/`. O build é versionado em
+  `crates/acervo-api/src/ui/dist` e embutido no binário: `cargo build` e a imagem não
+  precisam de Node. Mudou o front? `npm run --prefix web build` — o CI confere.
+
+```sh
+npm ci --prefix web
+npm run --prefix web dev      # Vite em :5173, falando com um serve em 127.0.0.1:9797
+npm run --prefix web build    # atualiza o build embutido
+```
+
 `serve` é o outro modo de vida do binário: processo longo que responde Torznab em
 `/<indexador>/api`, e em `/all/api` por todos de uma vez. Os gerenciadores de série e de
 filme cadastram essa URL como cadastrariam o agregador atual. Três escolhas do desenho:

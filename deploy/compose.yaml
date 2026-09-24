@@ -80,10 +80,19 @@ services:
 
     volumes:
       - ./config.toml:/etc/acervo-hub/config.toml:ro
-      # Definições Cardigann, se houver. Não precisa do acervo nem do estado.
+      # Definições Cardigann, se houver. Não precisa do acervo.
       - ./definicoes:/etc/acervo-hub/definicoes:ro
+      # Credenciais trocadas pela interface web. Com
+      # `[state] credentials = "/var/lib/acervo-hub/credenciais.toml"` no
+      # config; o diretório precisa ser do UID do container.
+      - ./state:/var/lib/acervo-hub
 
     command: ["-c", "/etc/acervo-hub/config.toml", "serve"]
+
+    # A interface web (e a API Torznab) só na própria máquina: de fora, por
+    # túnel SSH ou atrás de um proxy com TLS.
+    ports:
+      - 127.0.0.1:9797:9797
 
     networks: [media]
 
