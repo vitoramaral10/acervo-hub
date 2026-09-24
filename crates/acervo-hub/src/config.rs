@@ -58,6 +58,19 @@ pub struct ServerConfig {
     /// primeiro que tiver um id vence.
     #[serde(default)]
     pub catalogs: Vec<PathBuf>,
+    /// De quantos em quantos minutos o serviço reimporta o catálogo de filmes
+    /// e roda a decisão em sombra. Sem valor, não roda sozinho. Roda aqui, e
+    /// não num processo à parte, para dividir sessão e consultas guardadas com
+    /// o que os gerenciadores pedem.
+    #[serde(default)]
+    pub shadow_interval_minutes: Option<u64>,
+    /// Quantos filmes cada rodada de sombra busca.
+    #[serde(default = "default_shadow_limit")]
+    pub shadow_limit: usize,
+}
+
+fn default_shadow_limit() -> usize {
+    5
 }
 
 /// Um indexador servido. `kind` decide de onde vêm as capacidades: a

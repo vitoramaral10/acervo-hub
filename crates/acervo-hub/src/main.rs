@@ -149,10 +149,13 @@ async fn run() -> Result<ExitCode> {
                     .any(|instance| instance.erro.is_some()),
                 MoviesAction::Check => movies::check(&config).await? > 0,
                 MoviesAction::Shadow { report: true, .. } => shadow::report(&config).await? > 0,
-                MoviesAction::Shadow { limit, .. } => shadow::run(&config, limit, true)
-                    .await?
-                    .iter()
-                    .any(|line| line.erro.is_some()),
+                MoviesAction::Shadow { limit, .. } => {
+                    let catalog = acervo_api::Catalog::new(serve::entries(&config).await?)?;
+                    shadow::run(&config, &catalog, limit, true)
+                        .await?
+                        .iter()
+                        .any(|line| line.erro.is_some())
+                }
             };
             return Ok(if failed {
                 ExitCode::FAILURE

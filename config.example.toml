@@ -99,6 +99,12 @@ public_url = "http://acervo-hub-indexadores:9797"
 # indexador" — por exemplo, o Definitions do agregador atual. As que o
 # executor ainda não roda aparecem com o motivo.
 catalogs = ["/etc/acervo-hub/definicoes", "/etc/acervo-hub/catalogo"]
+# Decisão em sombra dentro do serviço: a cada tantos minutos, reimporta o
+# catálogo de filmes e busca `shadow_limit` filmes que faltam. Roda aqui, e não
+# num processo à parte, para dividir com os gerenciadores a sessão e as
+# consultas guardadas (cada tracker vê uma requisição por consulta).
+# shadow_interval_minutes = 120
+# shadow_limit = 5
 
 # Endpoint Torznab existente — por exemplo, o feed de um indexador no agregador
 # atual. As capacidades são lidas no início; se ele não responder, fica fora do

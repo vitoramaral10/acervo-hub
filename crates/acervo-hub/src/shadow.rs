@@ -268,13 +268,20 @@ fn summarize(decisions: &[Decision], movie: i64) -> Vec<(String, usize)> {
 }
 
 /// Busca em sombra até `limit` filmes que faltam, começando pelos que estão
-/// há mais tempo sem sombra.
+/// há mais tempo sem sombra. `catalog` é o dos indexadores servidos: dentro
+/// do serviço, a sombra divide sessão e consultas guardadas com os
+/// gerenciadores.
 ///
 /// # Errors
 ///
 /// Catálogo vazio, gerenciador de filmes inalcançável ou nenhum indexador.
 #[allow(clippy::too_many_lines)]
-pub async fn run(config: &Config, limit: usize, print: bool) -> Result<Vec<ShadowLine>> {
+pub async fn run(
+    config: &Config,
+    catalog: &Catalog,
+    limit: usize,
+    print: bool,
+) -> Result<Vec<ShadowLine>> {
     let client = movie_client(config)?;
     let (queue, roots, indexer_config, media_config, remote_indexers) = tokio::try_join!(
         client.movie_queue(),
@@ -316,7 +323,6 @@ pub async fn run(config: &Config, limit: usize, print: bool) -> Result<Vec<Shado
         .collect();
     let settings = settings(&remote, definitions);
 
-    let catalog = Catalog::new(crate::serve::entries(config).await?)?;
     let served: Vec<String> = catalog.views().into_iter().map(|view| view.name).collect();
     if served.is_empty() {
         bail!("nenhum indexador ativo para buscar");

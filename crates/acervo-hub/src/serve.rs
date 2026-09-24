@@ -20,6 +20,40 @@ use crate::credentials::{self, Overrides};
 use crate::definitions::Definitions;
 use crate::registry::{self, Added, Registry};
 
+/// Reimporta o catálogo de filmes e roda a sombra de tempos em tempos, com o
+/// catálogo de indexadores servido. Erro numa rodada fica no log e a próxima
+/// tenta de novo.
+async fn shadow_loop(config: Arc<Config>, catalog: Catalog, minutes: u64, limit: usize) {
+    let mut every = tokio::time::interval(Duration::from_secs(minutes * 60));
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // A primeira batida é imediata; espera um ciclo para não somar a sombra
+    // à subida do serviço.
+    every.tick().await;
+    loop {
+        every.tick().await;
+        match crate::movies::import(&config, true, false).await {
+            Ok(report) => {
+                for instance in report.iter().filter(|i| i.erro.is_some()) {
+                    tracing::warn!(
+                        instancia = instance.nome,
+                        erro = instance.erro,
+                        "importação de filmes falhou"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!("importação de filmes falhou: {error:#}"),
+        }
+        match crate::shadow::run(&config, &catalog, limit, false).await {
+            Ok(lines) => tracing::info!(
+                filmes = lines.len(),
+                pegaria = lines.iter().filter(|l| l.pegaria.is_some()).count(),
+                "sombra"
+            ),
+            Err(error) => tracing::warn!("sombra falhou: {error:#}"),
+        }
+    }
+}
+
 /// Nome da "definição" que adiciona um endpoint Torznab qualquer.
 const TORZNAB: &str = "torznab";
 
@@ -29,11 +63,20 @@ const TORZNAB: &str = "torznab";
 ///
 /// Configuração incompleta, definição inválida ou endereço ocupado.
 pub async fn run(config: Config) -> Result<()> {
+    let config = Arc::new(config);
     let server = config.server()?;
     let bind = server.bind.clone();
     let api_key = server.api_key.clone();
     let catalog = Catalog::new(entries(&config).await?)?;
-    let admin = HubAdmin::new(config)?;
+    if let Some(minutes) = server.shadow_interval_minutes.filter(|m| *m > 0) {
+        tokio::spawn(shadow_loop(
+            Arc::clone(&config),
+            catalog.clone(),
+            minutes,
+            server.shadow_limit,
+        ));
+    }
+    let admin = HubAdmin::new(config, catalog.clone())?;
     tracing::info!(indexadores = catalog.len(), bind = %bind, "servindo Torznab e a interface web");
 
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -202,7 +245,10 @@ enum Source {
 /// Administração pela interface.
 #[derive(Debug)]
 struct HubAdmin {
-    config: Config,
+    config: Arc<Config>,
+    /// O catálogo servido: a sombra busca por ele e divide as consultas com
+    /// os gerenciadores.
+    catalog: Catalog,
     definitions: Definitions,
     /// Indexadores Cardigann da config, pelo id da definição.
     config_cardigann: BTreeMap<String, CardigannIndexer>,
@@ -214,7 +260,7 @@ struct HubAdmin {
 }
 
 impl HubAdmin {
-    fn new(config: Config) -> Result<Self> {
+    fn new(config: Arc<Config>, catalog: Catalog) -> Result<Self> {
         let catalogs: Vec<PathBuf> = config
             .server
             .as_ref()
@@ -245,6 +291,7 @@ impl HubAdmin {
             credentials: expand_tilde(&config.state.credentials),
             registry: expand_tilde(&config.state.registry),
             config,
+            catalog,
             definitions,
             config_cardigann,
             config_torznab,
@@ -696,7 +743,7 @@ impl Admin for HubAdmin {
     }
 
     async fn shadow(&self, limit: usize) -> Result<serde_json::Value, String> {
-        let lines = crate::shadow::run(&self.config, limit, false)
+        let lines = crate::shadow::run(&self.config, &self.catalog, limit, false)
             .await
             .map_err(|e| format!("{e:#}"))?;
         serde_json::to_value(lines).map_err(|e| e.to_string())
@@ -783,7 +830,8 @@ mod tests {
              settings = {{ cookie = \"do-arquivo\" }}\n"
         );
         let config = load_config(&dir.0, &indexers);
-        let admin = HubAdmin::new(load_config(&dir.0, &indexers)).unwrap();
+        let admin =
+            HubAdmin::new(Arc::new(load_config(&dir.0, &indexers)), Catalog::default()).unwrap();
         assert_eq!(admin.origin("cookie-privado"), Some("config"));
 
         admin.remove("cookie-privado").await.unwrap();
@@ -833,7 +881,8 @@ mod tests {
             velho.uri()
         );
         let config = load_config(&dir.0, &indexers);
-        let admin = HubAdmin::new(load_config(&dir.0, &indexers)).unwrap();
+        let admin =
+            HubAdmin::new(Arc::new(load_config(&dir.0, &indexers)), Catalog::default()).unwrap();
         let settings = admin
             .settings("outro")
             .expect("Torznab do config é editável");
