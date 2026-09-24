@@ -1,15 +1,15 @@
 [package]
-name = "acervo-parser"
+name = "acervo-decision"
 version = "0.0.0"
-description = "Lê nome de release: título, ano, qualidade, idioma, grupo e edição."
+description = "Decide que release de filme pegar: casamento com o filme, rejeições e ordem de preferência."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
+acervo-parser.workspace = true
 fancy-regex.workspace = true
-unicode-normalization.workspace = true
 
 [dev-dependencies]
 serde.workspace = true

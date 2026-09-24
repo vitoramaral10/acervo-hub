@@ -10,6 +10,7 @@ members = [
     "crates/acervo-api",
     "crates/acervo-parser",
     "crates/acervo-store",
+    "crates/acervo-decision",
     "crates/acervo-hub",
 ]
 
@@ -29,6 +30,7 @@ acervo-indexers = { path = "crates/acervo-indexers" }
 acervo-api = { path = "crates/acervo-api" }
 acervo-parser = { path = "crates/acervo-parser" }
 acervo-store = { path = "crates/acervo-store" }
+acervo-decision = { path = "crates/acervo-decision" }
 
 anyhow = "1"
 async-trait = "0.1"
@@ -42,6 +44,7 @@ clap = { version = "4", features = ["derive"] }
 # Lookaround e backreference, que os padrões portados do parser de release
 # usam e o `regex` não tem. Rust puro: o build estático musl continua.
 fancy-regex = "0.19"
+unicode-normalization = "0.1"
 futures = "0.3"
 quick-xml = "0.38"
 # SQLite compilado junto (`bundled`): nada de biblioteca do sistema, e o build

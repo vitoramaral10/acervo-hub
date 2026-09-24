@@ -62,6 +62,8 @@ pub enum Language {
     Georgian,
     /// O idioma original da obra, seja qual for.
     Original,
+    /// Qualquer um: só aparece em perfil, nunca sai do parser.
+    Any,
 }
 
 impl Language {
@@ -120,6 +122,7 @@ impl Language {
             Self::Mongolian => 56,
             Self::Georgian => 57,
             Self::Original => -2,
+            Self::Any => -1,
         }
     }
 
@@ -178,7 +181,73 @@ impl Language {
             Self::Mongolian => "Mongolian",
             Self::Georgian => "Georgian",
             Self::Original => "Original",
+            Self::Any => "Any",
         }
+    }
+
+    /// Todos, para busca por nome ou id.
+    pub const ALL: [Self; 53] = [
+        Self::Unknown,
+        Self::English,
+        Self::French,
+        Self::Spanish,
+        Self::German,
+        Self::Italian,
+        Self::Danish,
+        Self::Dutch,
+        Self::Japanese,
+        Self::Icelandic,
+        Self::Chinese,
+        Self::Russian,
+        Self::Polish,
+        Self::Vietnamese,
+        Self::Swedish,
+        Self::Norwegian,
+        Self::Finnish,
+        Self::Turkish,
+        Self::Portuguese,
+        Self::Flemish,
+        Self::Greek,
+        Self::Korean,
+        Self::Hungarian,
+        Self::Hebrew,
+        Self::Lithuanian,
+        Self::Czech,
+        Self::Hindi,
+        Self::Romanian,
+        Self::Thai,
+        Self::Bulgarian,
+        Self::PortugueseBr,
+        Self::Arabic,
+        Self::Ukrainian,
+        Self::Persian,
+        Self::Bengali,
+        Self::Slovak,
+        Self::Latvian,
+        Self::SpanishLatino,
+        Self::Catalan,
+        Self::Tamil,
+        Self::Telugu,
+        Self::Malayalam,
+        Self::Kannada,
+        Self::Albanian,
+        Self::Afrikaans,
+        Self::Marathi,
+        Self::Tagalog,
+        Self::Urdu,
+        Self::Romansh,
+        Self::Mongolian,
+        Self::Georgian,
+        Self::Original,
+        Self::Any,
+    ];
+
+    /// Pelo nome que a API v3 usa ("Portuguese (Brazil)").
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|l| l.name().eq_ignore_ascii_case(name))
     }
 }
 

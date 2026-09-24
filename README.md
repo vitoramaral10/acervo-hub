@@ -234,6 +234,15 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
         `movies check` confere cada arquivo contra o disco. Contra o gerenciador em
         produção: 294 filmes, 132 arquivos, todos confirmados no disco com o tamanho
         exato; reimportar dá 294 iguais.
+  - [x] **Motor de decisão** (`acervo-decision`). Porte do da referência: casamento do
+        release com o filme (ids do indexador, título limpo, numerais romanos, ano), agregação
+        de idiomas ("Original" e nome sem idioma viram o idioma original do filme), as
+        especificações de rejeição — perfil, idioma, tamanho por minuto, teto global,
+        seeders, disco bruto, legenda embutida, upgrade e corte, repack, fila, espaço livre —
+        e a ordem de preferência. Contra 40 buscas interativas reais (470 releases), com a
+        decisão da referência como gabarito: nenhuma divergência em casamento, motivos,
+        ordem ou escolha. Ficam de fora histórico e lista de bloqueio, que são estado do
+        gerenciador.
   - [ ] **Decisão em sombra**: RSS e busca pelos perfis de qualidade, comparando o que o
         acervo-hub pegaria com o que o gerenciador pegou, sem baixar nada.
   - [ ] **Grab e import**: envio ao cliente, hardlink e renomeação na biblioteca.

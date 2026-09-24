@@ -27,6 +27,9 @@ pub struct ParsedMovie {
     pub release_hash: Option<String>,
     pub imdb_id: Option<String>,
     pub tmdb_id: Option<u32>,
+    /// Nome sem símbolos, com o título trocado por "A Movie": é onde a
+    /// agregação de idiomas procura o que sobrou.
+    pub simple_release_title: String,
 }
 
 impl ParsedMovie {
@@ -220,6 +223,7 @@ fn details(
             .and_then(|c| group(&c, "imdbid").map(str::to_owned)),
         tmdb_id: captures(&TMDB_ID, &simple_release_title)
             .and_then(|c| group(&c, "tmdbid").and_then(|id| id.parse().ok())),
+        simple_release_title,
     })
 }
 

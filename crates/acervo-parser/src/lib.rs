@@ -14,6 +14,7 @@ mod group;
 mod language;
 mod movie;
 mod quality;
+mod title;
 
 pub use group::parse_release_group;
 pub use language::{Language, parse_languages};
@@ -21,3 +22,4 @@ pub use movie::{ParsedMovie, parse_movie_title};
 pub use quality::{
     Modifier, Quality, QualityModel, Revision, Source, parse_quality, parse_quality_name,
 };
+pub use title::{clean_movie_title, normalize_movie_title, remove_accents};
