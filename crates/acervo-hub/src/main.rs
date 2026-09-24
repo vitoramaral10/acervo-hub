@@ -19,6 +19,7 @@ mod config;
 mod ledger;
 mod report;
 mod serve;
+mod sync;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -43,6 +44,13 @@ enum Command {
     Apply,
     /// Serve os indexadores configurados pela API Torznab.
     Serve,
+    /// Cadastra os indexadores servidos nos gerenciadores. Sem `--apply`, só
+    /// mostra o plano.
+    Sync {
+        /// Executa o plano em vez de só mostrá-lo.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[tokio::main]
@@ -74,6 +82,14 @@ async fn run() -> Result<ExitCode> {
         Command::Serve => {
             serve::run(&config).await?;
             return Ok(ExitCode::SUCCESS);
+        }
+        Command::Sync { apply } => {
+            let failures = sync::run(&config, apply).await?;
+            return Ok(if failures > 0 {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            });
         }
     };
 

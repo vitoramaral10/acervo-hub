@@ -49,6 +49,10 @@ pub struct ServerConfig {
     /// Chave que os consumidores mandam em `apikey`. Vale para todos os
     /// indexadores servidos.
     pub api_key: String,
+    /// Como os gerenciadores alcançam este serviço — o endereço que `sync`
+    /// cadastra neles. Em Compose, o nome do serviço na rede interna.
+    #[serde(default)]
+    pub public_url: Option<String>,
 }
 
 /// Um indexador servido. `kind` decide de onde vêm as capacidades: a
@@ -275,6 +279,32 @@ impl Config {
         Ok(server)
     }
 
+    /// O que `sync` exige além de `serve`: o endereço público e as instâncias.
+    ///
+    /// # Errors
+    ///
+    /// Sem `server.public_url`, URL inválida ou nenhuma instância.
+    pub fn sync(&self) -> Result<(&ServerConfig, String)> {
+        let server = self.server()?;
+        let public_url = server
+            .public_url
+            .as_deref()
+            .context("`server.public_url` ausente: `sync` precisa saber como os gerenciadores alcançam este serviço")?;
+        let parsed = url::Url::parse(public_url)
+            .with_context(|| format!("`server.public_url` inválida: `{public_url}`"))?;
+        anyhow::ensure!(
+            matches!(parsed.scheme(), "http" | "https")
+                && parsed.query().is_none()
+                && parsed.username().is_empty(),
+            "`server.public_url` precisa ser HTTP(S), sem query e sem credencial"
+        );
+        anyhow::ensure!(
+            !self.instances.is_empty(),
+            "nenhuma `[[instances]]` configurada: não haveria onde cadastrar"
+        );
+        Ok((server, public_url.trim_end_matches('/').to_owned()))
+    }
+
     #[must_use]
     pub fn http_timeout(&self) -> Duration {
         Duration::from_secs(self.http_timeout_seconds)
@@ -410,6 +440,17 @@ mod tests {
         let config = load(include_str!("../../../config.example.toml")).unwrap();
         config.janitor().unwrap();
         config.server().unwrap();
+        let (_, public_url) = config.sync().unwrap();
+        assert_eq!(public_url, "http://acervo-hub-indexadores:9797");
+    }
+
+    #[test]
+    fn sync_exige_endereco_publico_valido() {
+        let exemplo = include_str!("../../../config.example.toml");
+        let sem = exemplo.replace("public_url = \"http://acervo-hub-indexadores:9797\"\n", "");
+        assert!(load(&sem).unwrap().sync().is_err());
+        let com_credencial = exemplo.replace("http://acervo-hub-indexadores", "http://u:p@acervo");
+        assert!(load(&com_credencial).unwrap().sync().is_err());
     }
 
     #[test]

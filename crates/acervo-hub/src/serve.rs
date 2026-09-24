@@ -17,7 +17,7 @@ use crate::config::{CardigannIndexer, Config, IndexerConfig, TorznabIndexer, exp
 /// indexador utilizável.
 pub async fn run(config: &Config) -> Result<()> {
     let server = config.server()?;
-    let catalog = catalog(config).await?;
+    let catalog = Catalog::new(entries(config).await?)?;
     tracing::info!(
         indexadores = catalog.len(),
         bind = %server.bind,
@@ -42,7 +42,11 @@ pub async fn run(config: &Config) -> Result<()> {
 /// resultado". Endpoint Torznab que não responde `caps` é diferente — é rede,
 /// e um tracker fora do ar não pode tirar os outros do ar junto. Ele fica de
 /// fora, com aviso, até o próximo reinício.
-async fn catalog(config: &Config) -> Result<Catalog> {
+///
+/// # Errors
+///
+/// Definição Cardigann ilegível ou inválida, ou nenhum indexador utilizável.
+pub async fn entries(config: &Config) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
     for spec in &config.indexers {
         match spec {
@@ -60,7 +64,7 @@ async fn catalog(config: &Config) -> Result<Catalog> {
         !entries.is_empty(),
         "nenhum indexador utilizável: não haveria o que servir"
     );
-    Ok(Catalog::new(entries)?)
+    Ok(entries)
 }
 
 fn cardigann(spec: &CardigannIndexer, timeout: Duration) -> Result<Entry> {
