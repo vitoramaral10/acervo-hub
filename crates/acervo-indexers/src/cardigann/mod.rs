@@ -524,15 +524,23 @@ impl CardigannClient {
         }
 
         if let Some(test) = &login.test {
+            // Cookie recusado quase sempre é cookie vencido, e o conserto é do
+            // operador: dizer isso poupa a investigação.
+            let refused = match login.method {
+                LoginMethod::Cookie(_) => {
+                    "o site recusou o cookie (vencido?); copie um novo do navegador logado"
+                }
+                LoginMethod::Form { .. } => "a página de teste não reconheceu a sessão",
+            };
             let url = same_origin(&self.base, &test.path, "login.test.path")?;
             let response = self.get(url, session.cookie.as_ref()).await?;
             if response.status().is_redirection() || !response.status().is_success() {
-                return Err(self.login_error("a página de teste não reconheceu a sessão"));
+                return Err(self.login_error(refused));
             }
             if let Some(selector) = &test.selector {
                 let body = self.read_text(response).await?;
                 if !matches_document(selector, &body) {
-                    return Err(self.login_error("a página de teste não reconheceu a sessão"));
+                    return Err(self.login_error(refused));
                 }
             }
         }

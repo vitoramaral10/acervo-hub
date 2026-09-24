@@ -164,7 +164,9 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
       `sync` cadastra os indexadores nos gerenciadores, como a tela de apps do agregador
       atual. Validado contra instâncias reais descartáveis dos dois gerenciadores: ambos
       aceitam o indexador e o feed, e o `sync` cria, mantém e corrige sem apagar ajuste
-      manual. *Falta validar contra os trackers de verdade.*
+      manual. Contra um tracker privado real, login por formulário, busca em várias páginas e
+      download intermediado funcionam; o login por cookie aguarda um cookie válido para ser
+      conferido em produção.
 
 ### Migrando do agregador atual
 
