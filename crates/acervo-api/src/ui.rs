@@ -613,10 +613,17 @@ async fn update_settings(
         .update(&name, values)
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
-    server
-        .catalog
-        .replace(&name, entry)
-        .map_err(|error| UiError(StatusCode::NOT_FOUND, error.to_string()))?;
+    // Indexador desativado não está no catálogo servido: a credencial fica
+    // salva e vale quando ele for ativado. Não é erro.
+    if server.catalog.replace(&name, entry).is_err() {
+        return Ok(ok(json!({
+            "ok": true,
+            "teste": {
+                "ok": false,
+                "erro": "credencial salva; o indexador está desativado — ative-o para testar",
+            },
+        })));
+    }
     // Testa na hora: credencial salva que não funciona precisa aparecer já.
     let result = test_result(server.catalog.test(&name).await);
     Ok(ok(json!({ "ok": true, "teste": result })))

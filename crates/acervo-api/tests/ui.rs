@@ -530,3 +530,33 @@ async fn sincronizar_recebe_os_indexadores_servidos() {
     assert_eq!(status, 200);
     assert_eq!(body, json!({ "aplicado": false, "indexadores": 1 }));
 }
+
+#[tokio::test]
+async fn credencial_de_indexador_desativado_e_salva_sem_erro() {
+    let base = serve().await;
+    let cookie = login(&base).await;
+    send(
+        &base,
+        reqwest::Method::PUT,
+        "/ui/api/indexadores/privado/ativo",
+        &cookie,
+        json!({ "ativo": false }),
+    )
+    .await;
+    let (status, body) = send(
+        &base,
+        reqwest::Method::PUT,
+        "/ui/api/indexadores/privado/settings",
+        &cookie,
+        json!({ "cookie": "bom" }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["ok"], true);
+    assert!(
+        body["teste"]["erro"]
+            .as_str()
+            .unwrap()
+            .contains("desativado")
+    );
+}
