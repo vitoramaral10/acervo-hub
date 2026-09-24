@@ -146,14 +146,15 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
 - [x] **Fase 1 — `acervo-janitor`.** Substitui só o faxineiro, falando as APIs v3
       existentes. Risco baixo, valor imediato. *Falta validar contra instâncias reais.*
 - [ ] **Fase 2 — `acervo-indexers`.** Absorve o agregador de indexadores. O cliente
-      Torznab, a agregação, o rate limit compartilhado, um executor Cardigann v11
-      conservador e a superfície Torznab (`serve`) existem. O executor cobre indexador
-      público, GET e HTML UTF-8, e recusa no load qualquer recurso fora desse recorte em
-      vez de rodá-lo pela metade. *Esse recorte ainda não carrega nenhuma definição real:*
-      contra um corpus de 573, todas são recusadas — as públicas usam settings `select`,
-      templates em campo, filtros `re_replace`/`dateparse` e a seção `download`. O teste
-      `corpus` (ignorado por padrão) mede isso e ordena o que falta pelo quanto destrava.
-      Até lá, `serve` já funciona na frente de endpoints Torznab existentes.
+      Torznab, a agregação, o rate limit compartilhado, o executor Cardigann v11 e a
+      superfície Torznab (`serve`) existem. O executor roda tracker público e privado —
+      login por formulário ou por cookie, sessão refeita quando o site deixa de
+      reconhecê-la, download intermediado com a sessão —, com o subconjunto de templates
+      Go, filtros e seletores (`:contains` incluído) que as definições reais usam. O que
+      ele não cobre é recusado na carga, com o motivo. Contra um corpus de 573 definições,
+      carrega 26; as recusas mais comuns são resposta JSON (130), login por `form` (113) e
+      a seção `download` (59). O teste `corpus` (ignorado por padrão) refaz essa conta.
+      *Falta validar contra os trackers de verdade.*
 - [ ] **Fase 3 — filmes.** Árvore mais simples; o gerenciador de séries segue de pé como
       controle.
 - [ ] **Fase 4 — séries.** Só depois de o parser passar no corpus real.
