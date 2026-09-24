@@ -41,7 +41,19 @@ pub fn save(path: &Path, overrides: &Overrides) -> Result<()> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("criando o diretório de estado `{}`", dir.display()))?;
     let text = toml::to_string(overrides).context("serializando as credenciais")?;
-    let temporary = path.with_extension("toml.tmp");
+    write_atomic(path, &text)
+}
+
+/// Grava texto com arquivo temporário + `rename`, permissão 600.
+///
+/// # Errors
+///
+/// Diretório inexistente e não criável, ou falha de escrita.
+pub fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("criando o diretório de estado `{}`", dir.display()))?;
+    let temporary = path.with_extension("tmp");
     {
         let mut file = std::fs::OpenOptions::new()
             .write(true)

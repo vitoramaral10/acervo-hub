@@ -13,6 +13,7 @@ use acervo_arr::{ArrClient, ArrKind, RemoteIndexer, TorznabSpec};
 use acervo_core::InstanceName;
 use acervo_indexers::Capabilities;
 use anyhow::{Context, Result};
+use serde::Serialize;
 
 use crate::config::Config;
 
@@ -124,27 +125,65 @@ pub fn plan(existing: Vec<RemoteIndexer>, desired: Vec<TorznabSpec>) -> Vec<Acti
     actions
 }
 
-/// Planeja e, com `apply`, executa. Devolve quantas ações falharam.
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncReport {
+    pub aplicado: bool,
+    pub instancias: Vec<InstanceSync>,
+    pub falhas: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InstanceSync {
+    pub nome: String,
+    pub tipo: &'static str,
+    pub erro: Option<String>,
+    pub acoes: Vec<ActionSync>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ActionSync {
+    pub acao: &'static str,
+    pub indexador: String,
+    pub categorias: Vec<u32>,
+    pub falha: Option<String>,
+}
+
+impl Action {
+    fn sync_line(&self) -> ActionSync {
+        let (acao, indexador, categorias) = match self {
+            Self::Create(spec) => ("criar", spec.name.clone(), spec.categories.clone()),
+            Self::Update(_, spec) => ("atualizar", spec.name.clone(), spec.categories.clone()),
+            Self::Delete(remote) => ("remover", remote.name.clone(), Vec::new()),
+            Self::Keep(name) => ("manter", name.clone(), Vec::new()),
+        };
+        ActionSync {
+            acao,
+            indexador,
+            categorias,
+            falha: None,
+        }
+    }
+}
+
+/// Planeja e, com `apply`, executa, para os indexadores dados.
 ///
 /// Instância que não responde é relatada e pulada: as outras seguem.
 ///
 /// # Errors
 ///
-/// Configuração incompleta ou nenhum indexador utilizável.
-pub async fn run(config: &Config, apply: bool) -> Result<usize> {
+/// Configuração incompleta.
+pub async fn execute(
+    config: &Config,
+    indexers: &[(String, Capabilities)],
+    apply: bool,
+    print: bool,
+) -> Result<SyncReport> {
     let (server, public_url) = config.sync()?;
-    let indexers: Vec<(String, Capabilities)> = crate::serve::entries(config)
-        .await?
-        .into_iter()
-        .map(
-            |Entry {
-                 indexer,
-                 capabilities,
-             }| (indexer.name().to_owned(), capabilities),
-        )
-        .collect();
-
-    let mut failures = 0;
+    let mut report = SyncReport {
+        aplicado: apply,
+        instancias: Vec::new(),
+        falhas: 0,
+    };
     for spec in &config.instances {
         let client = ArrClient::new(
             InstanceName::new(spec.name.clone()),
@@ -157,40 +196,80 @@ pub async fn run(config: &Config, apply: bool) -> Result<usize> {
             config.http_timeout().max(SAVE_TIMEOUT),
         )
         .with_context(|| format!("montando o cliente da instância `{}`", spec.name))?;
+        let mut instance = InstanceSync {
+            nome: spec.name.clone(),
+            tipo: match client.kind() {
+                ArrKind::Series => "series",
+                ArrKind::Movie => "filmes",
+            },
+            erro: None,
+            acoes: Vec::new(),
+        };
         let existing = match client.indexers().await {
             Ok(existing) => existing,
             Err(error) => {
-                println!(
-                    "{}: inalcançável ({}), nada feito",
-                    spec.name,
-                    error.short()
-                );
-                failures += 1;
+                if print {
+                    println!(
+                        "{}: inalcançável ({}), nada feito",
+                        spec.name,
+                        error.short()
+                    );
+                }
+                instance.erro = Some(error.short());
+                report.falhas += 1;
+                report.instancias.push(instance);
                 continue;
             }
         };
-        let wanted = desired(client.kind(), &indexers, &public_url, &server.api_key);
+        let wanted = desired(client.kind(), indexers, &public_url, &server.api_key);
         for action in plan(existing, wanted) {
-            println!("{}: {}", spec.name, action.describe());
-            if !apply {
-                continue;
+            if print {
+                println!("{}: {}", spec.name, action.describe());
             }
-            let result = match &action {
-                Action::Create(spec) => client.create_indexer(spec).await,
-                Action::Update(remote, spec) => client.update_indexer(remote, spec).await,
-                Action::Delete(remote) => client.delete_indexer(remote.id).await,
-                Action::Keep(_) => Ok(()),
-            };
-            if let Err(error) = result {
-                println!("{}:   falhou: {}", spec.name, error.short());
-                failures += 1;
+            let mut line = action.sync_line();
+            if apply {
+                let result = match &action {
+                    Action::Create(spec) => client.create_indexer(spec).await,
+                    Action::Update(remote, spec) => client.update_indexer(remote, spec).await,
+                    Action::Delete(remote) => client.delete_indexer(remote.id).await,
+                    Action::Keep(_) => Ok(()),
+                };
+                if let Err(error) = result {
+                    if print {
+                        println!("{}:   falhou: {}", spec.name, error.short());
+                    }
+                    line.falha = Some(error.short());
+                    report.falhas += 1;
+                }
             }
+            instance.acoes.push(line);
         }
+        report.instancias.push(instance);
     }
-    if !apply {
+    if print && !apply {
         println!("Simulação: nada foi alterado. Use `sync --apply` para executar.");
     }
-    Ok(failures)
+    Ok(report)
+}
+
+/// `sync` da CLI: os indexadores servidos, como `serve` os montaria.
+///
+/// # Errors
+///
+/// Configuração incompleta ou nenhum indexador utilizável.
+pub async fn run(config: &Config, apply: bool) -> Result<usize> {
+    config.sync()?;
+    let indexers: Vec<(String, Capabilities)> = crate::serve::entries(config)
+        .await?
+        .into_iter()
+        .map(
+            |Entry {
+                 indexer,
+                 capabilities,
+             }| (indexer.name().to_owned(), capabilities),
+        )
+        .collect();
+    Ok(execute(config, &indexers, apply, true).await?.falhas)
 }
 
 #[cfg(test)]

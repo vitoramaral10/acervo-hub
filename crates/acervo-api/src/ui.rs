@@ -32,9 +32,10 @@ const STYLE: &str = include_str!("ui/dist/app.css");
 const SCRIPT: &str = include_str!("ui/dist/app.js");
 const ICON: &str = include_str!("ui/dist/icone.svg");
 
-/// Quem sabe reconfigurar um indexador: ler os settings que ele declara e
-/// montá-lo de novo com valores novos. Mora no binário, que conhece o arquivo
-/// de configuração e onde a credencial é persistida.
+/// O que a interface administra e só o binário sabe fazer: a configuração,
+/// o catálogo de definições, os gerenciadores e o ciclo de limpeza.
+///
+/// Mensagens de erro vão para a tela e não podem conter valor de setting.
 #[async_trait]
 pub trait Admin: Send + Sync + std::fmt::Debug {
     /// Settings editáveis do indexador; `None` se ele não tem nenhum.
@@ -45,13 +46,92 @@ pub trait Admin: Send + Sync + std::fmt::Debug {
     ///
     /// # Errors
     ///
-    /// Setting desconhecido, valor inválido ou falha ao gravar; a mensagem vai
-    /// para a tela e não pode conter valor de setting.
+    /// Setting desconhecido, valor inválido ou falha ao gravar.
     async fn update(
         &self,
         indexer: &str,
         values: BTreeMap<String, String>,
     ) -> Result<Entry, String>;
+
+    /// De onde o indexador vem: `config` (arquivo, só leitura) ou `interface`.
+    fn origin(&self, indexer: &str) -> Option<&'static str>;
+
+    /// Indexadores desativados — fora do catálogo servido, mas ainda listados.
+    fn disabled(&self) -> Vec<(String, &'static str)>;
+
+    /// Todas as definições conhecidas, suportadas ou não.
+    fn definitions(&self) -> Vec<DefinitionView>;
+
+    /// Settings que uma definição pede para ser adicionada.
+    fn definition_settings(&self, definition: &str) -> Option<Vec<SettingView>>;
+
+    /// Adiciona um indexador a partir de uma definição do catálogo.
+    ///
+    /// # Errors
+    ///
+    /// Definição desconhecida ou não suportada, id já em uso, settings
+    /// inválidos, falha ao gravar.
+    async fn add(
+        &self,
+        definition: &str,
+        values: BTreeMap<String, String>,
+    ) -> Result<Entry, String>;
+
+    /// Remove um indexador adicionado pela interface.
+    ///
+    /// # Errors
+    ///
+    /// Indexador do `config.toml` (só leitura) ou falha ao gravar.
+    async fn remove(&self, indexer: &str) -> Result<(), String>;
+
+    /// Ativa ou desativa. Ativar devolve o indexador montado, para entrar no
+    /// catálogo servido.
+    ///
+    /// # Errors
+    ///
+    /// Indexador desconhecido ou falha ao montar ou gravar.
+    async fn set_enabled(&self, indexer: &str, enabled: bool) -> Result<Option<Entry>, String>;
+
+    /// Gerenciadores configurados (Sonarr, Radarr).
+    fn apps(&self) -> serde_json::Value;
+
+    /// Planeja e, com `apply`, executa o cadastro dos indexadores nos
+    /// gerenciadores.
+    ///
+    /// # Errors
+    ///
+    /// Configuração incompleta.
+    async fn sync(
+        &self,
+        indexers: Vec<(String, acervo_indexers::Capabilities)>,
+        apply: bool,
+    ) -> Result<serde_json::Value, String>;
+
+    /// Resultado do último ciclo de limpeza, se houver.
+    fn last_cycle(&self) -> Option<serde_json::Value>;
+
+    /// Roda o ciclo de limpeza em simulação, agora.
+    ///
+    /// # Errors
+    ///
+    /// Configuração do ciclo ausente ou falha de leitura.
+    async fn simulate_cycle(&self) -> Result<serde_json::Value, String>;
+}
+
+/// Uma definição do catálogo, como a tela a lista.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DefinitionView {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub language: String,
+    pub private: bool,
+    /// O executor roda esta definição.
+    pub supported: bool,
+    /// Por que não roda, quando não roda.
+    pub reason: Option<String>,
+    /// Já existe um indexador com este id.
+    pub added: bool,
 }
 
 /// Um setting como a tela o vê. Segredo nunca carrega valor.
@@ -88,7 +168,24 @@ pub(crate) fn routes() -> Router<Arc<Server>> {
         .route("/ui/api/entrar", post(login))
         .route("/ui/api/sair", post(logout))
         .route("/ui/api/sessao", get(session))
-        .route("/ui/api/indexadores", get(indexers))
+        .route("/ui/api/indexadores", get(indexers).post(add_indexer))
+        .route(
+            "/ui/api/indexadores/{nome}",
+            axum::routing::delete(remove_indexer),
+        )
+        .route(
+            "/ui/api/indexadores/{nome}/ativo",
+            axum::routing::put(set_enabled),
+        )
+        .route("/ui/api/catalogo", get(definitions))
+        .route(
+            "/ui/api/catalogo/{definicao}/settings",
+            get(definition_settings),
+        )
+        .route("/ui/api/aplicativos", get(apps))
+        .route("/ui/api/aplicativos/sincronizar", post(sync))
+        .route("/ui/api/limpeza", get(last_cycle))
+        .route("/ui/api/limpeza/simular", post(simulate_cycle))
         .route("/ui/api/indexadores/{nome}/testar", post(test))
         .route(
             "/ui/api/indexadores/{nome}/settings",
@@ -261,41 +358,208 @@ fn timestamp(value: Option<time::OffsetDateTime>) -> serde_json::Value {
         .map_or(serde_json::Value::Null, serde_json::Value::String)
 }
 
+fn indexer_json(server: &Server, view: &crate::IndexerView) -> serde_json::Value {
+    let caps = &view.capabilities;
+    let admin = server.admin.as_ref();
+    json!({
+        "nome": view.name,
+        "ativo": true,
+        "origem": admin.and_then(|admin| admin.origin(&view.name)).unwrap_or("config"),
+        "privado": view.proxies_downloads,
+        "editavel": admin.and_then(|admin| admin.settings(&view.name)).is_some(),
+        "modos": {
+            "busca": caps.general.available,
+            "series": caps.tv.available,
+            "filmes": caps.movie.available,
+        },
+        "categorias": caps.categories.iter().map(|category| json!({
+            "id": category.id,
+            "nome": category.name,
+        })).collect::<Vec<_>>(),
+        "saude": {
+            "ultimo_sucesso": timestamp(view.health.last_success),
+            "ultima_falha": timestamp(view.health.last_failure),
+            "ultimo_erro": view.health.last_error,
+            "falhas_seguidas": view.health.consecutive_failures,
+            "resultados": view.health.last_results,
+        },
+    })
+}
+
 async fn indexers(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::GET)?;
-    let list: Vec<_> = server
+    let mut list: Vec<_> = server
+        .catalog
+        .views()
+        .iter()
+        .map(|view| indexer_json(&server, view))
+        .collect();
+    if let Some(admin) = &server.admin {
+        for (name, origin) in admin.disabled() {
+            list.push(json!({
+                "nome": name,
+                "ativo": false,
+                "origem": origin,
+                "privado": false,
+                "editavel": admin.settings(&name).is_some(),
+                "modos": { "busca": false, "series": false, "filmes": false },
+                "categorias": [],
+                "saude": {
+                    "ultimo_sucesso": null, "ultima_falha": null, "ultimo_erro": null,
+                    "falhas_seguidas": 0, "resultados": null,
+                },
+            }));
+        }
+    }
+    list.sort_by(|a, b| a["nome"].as_str().cmp(&b["nome"].as_str()));
+    Ok(ok(json!({ "indexadores": list })))
+}
+
+#[derive(Deserialize)]
+struct AddBody {
+    definicao: String,
+    #[serde(default)]
+    settings: BTreeMap<String, String>,
+}
+
+async fn add_indexer(
+    State(server): State<Arc<Server>>,
+    headers: HeaderMap,
+    Json(body): Json<AddBody>,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::POST)?;
+    let entry = admin(&server)?
+        .add(&body.definicao, body.settings)
+        .await
+        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    let name = entry.indexer.name().to_owned();
+    server
+        .catalog
+        .insert(entry)
+        .map_err(|error| UiError(StatusCode::CONFLICT, error.to_string()))?;
+    let result = test_result(server.catalog.test(&name).await);
+    Ok(ok(json!({ "ok": true, "nome": name, "teste": result })))
+}
+
+async fn remove_indexer(
+    State(server): State<Arc<Server>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::DELETE)?;
+    admin(&server)?
+        .remove(&name)
+        .await
+        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    server.catalog.remove(&name);
+    Ok(ok(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct EnabledBody {
+    ativo: bool,
+}
+
+async fn set_enabled(
+    State(server): State<Arc<Server>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<EnabledBody>,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::PUT)?;
+    let entry = admin(&server)?
+        .set_enabled(&name, body.ativo)
+        .await
+        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    if body.ativo {
+        if let Some(entry) = entry {
+            server
+                .catalog
+                .insert(entry)
+                .map_err(|error| UiError(StatusCode::CONFLICT, error.to_string()))?;
+        }
+    } else {
+        server.catalog.remove(&name);
+    }
+    Ok(ok(json!({ "ok": true })))
+}
+
+async fn definitions(
+    State(server): State<Arc<Server>>,
+    headers: HeaderMap,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::GET)?;
+    Ok(ok(json!({ "definicoes": admin(&server)?.definitions() })))
+}
+
+async fn definition_settings(
+    State(server): State<Arc<Server>>,
+    Path(definition): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::GET)?;
+    let views = admin(&server)?
+        .definition_settings(&definition)
+        .ok_or_else(|| {
+            UiError(
+                StatusCode::NOT_FOUND,
+                "definição desconhecida ou não suportada".into(),
+            )
+        })?;
+    Ok(ok(json!({ "settings": views })))
+}
+
+async fn apps(State(server): State<Arc<Server>>, headers: HeaderMap) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::GET)?;
+    Ok(ok(json!({ "aplicativos": admin(&server)?.apps() })))
+}
+
+#[derive(Deserialize)]
+struct SyncBody {
+    #[serde(default)]
+    aplicar: bool,
+}
+
+async fn sync(
+    State(server): State<Arc<Server>>,
+    headers: HeaderMap,
+    Json(body): Json<SyncBody>,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::POST)?;
+    let indexers = server
         .catalog
         .views()
         .into_iter()
-        .map(|view| {
-            let caps = &view.capabilities;
-            json!({
-                "nome": view.name,
-                "privado": view.proxies_downloads,
-                "editavel": server.admin.as_ref().and_then(|admin| admin.settings(&view.name)).is_some(),
-                "modos": {
-                    "busca": caps.general.available,
-                    "series": caps.tv.available,
-                    "filmes": caps.movie.available,
-                },
-                "categorias": caps.categories.iter().map(|category| json!({
-                    "id": category.id,
-                    "nome": category.name,
-                })).collect::<Vec<_>>(),
-                "saude": {
-                    "ultimo_sucesso": timestamp(view.health.last_success),
-                    "ultima_falha": timestamp(view.health.last_failure),
-                    "ultimo_erro": view.health.last_error,
-                    "falhas_seguidas": view.health.consecutive_failures,
-                    "resultados": view.health.last_results,
-                },
-            })
-        })
+        .map(|view| (view.name, view.capabilities))
         .collect();
-    Ok(ok(json!({ "indexadores": list })))
+    let report = admin(&server)?
+        .sync(indexers, body.aplicar)
+        .await
+        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    Ok(ok(report))
+}
+
+async fn last_cycle(
+    State(server): State<Arc<Server>>,
+    headers: HeaderMap,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::GET)?;
+    Ok(ok(json!({ "ultimo": admin(&server)?.last_cycle() })))
+}
+
+async fn simulate_cycle(
+    State(server): State<Arc<Server>>,
+    headers: HeaderMap,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::POST)?;
+    let report = admin(&server)?
+        .simulate_cycle()
+        .await
+        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    Ok(ok(report))
 }
 
 fn test_result(outcome: Result<usize, String>) -> serde_json::Value {

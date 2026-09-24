@@ -53,18 +53,23 @@ pub struct ServerConfig {
     /// cadastra neles. Em Compose, o nome do serviço na rede interna.
     #[serde(default)]
     pub public_url: Option<String>,
+    /// Diretórios de definições Cardigann que a interface oferece para
+    /// adicionar — por exemplo, o `Definitions` do agregador atual. O
+    /// primeiro que tiver um id vence.
+    #[serde(default)]
+    pub catalogs: Vec<PathBuf>,
 }
 
 /// Um indexador servido. `kind` decide de onde vêm as capacidades: a
 /// definição Cardigann as declara; um endpoint Torznab as anuncia em `t=caps`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum IndexerConfig {
     Torznab(TorznabIndexer),
     Cardigann(CardigannIndexer),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TorznabIndexer {
     pub name: String,
@@ -141,6 +146,9 @@ pub struct StateConfig {
     /// para que ele possa ser montado somente leitura; valem por cima dele.
     #[serde(default = "default_credentials_path")]
     pub credentials: PathBuf,
+    /// Indexadores adicionados e desativados pela interface web.
+    #[serde(default = "default_registry_path")]
+    pub registry: PathBuf,
 }
 
 impl Default for StateConfig {
@@ -148,7 +156,16 @@ impl Default for StateConfig {
         Self {
             ledger: default_ledger_path(),
             credentials: default_credentials_path(),
+            registry: default_registry_path(),
         }
+    }
+}
+
+impl StateConfig {
+    /// Resultado do último ciclo de limpeza, ao lado do ledger de strikes.
+    #[must_use]
+    pub fn last_cycle(&self) -> PathBuf {
+        expand_tilde(&self.ledger).with_file_name("ultimo-ciclo.json")
     }
 }
 
@@ -273,10 +290,6 @@ impl Config {
             server.api_key.len() >= 16,
             "`server.api_key` precisa de ao menos 16 caracteres"
         );
-        anyhow::ensure!(
-            !self.indexers.is_empty(),
-            "nenhum `[[indexers]]` configurado: não haveria o que servir"
-        );
         for indexer in &self.indexers {
             if let IndexerConfig::Torznab(spec) = indexer {
                 anyhow::ensure!(
@@ -394,6 +407,9 @@ fn default_ledger_path() -> PathBuf {
 fn default_credentials_path() -> PathBuf {
     PathBuf::from("~/.local/state/acervo-hub/credenciais.toml")
 }
+fn default_registry_path() -> PathBuf {
+    PathBuf::from("~/.local/state/acervo-hub/indexadores.toml")
+}
 
 #[cfg(test)]
 mod tests {
@@ -487,8 +503,9 @@ mod tests {
     fn chave_curta_ou_sem_indexador_e_recusada() {
         let curta = SERVIDOR.replace("0123456789abcdef", "curta");
         assert!(load(&curta).unwrap().server().is_err());
+        // Sem indexador sobe: eles podem ser adicionados pela interface.
         let vazio = SERVIDOR.split("[[indexers]]").next().unwrap();
-        assert!(load(vazio).unwrap().server().is_err());
+        assert!(load(vazio).unwrap().server().is_ok());
     }
 
     #[test]

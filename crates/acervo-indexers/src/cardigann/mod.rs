@@ -184,6 +184,38 @@ impl SettingInfo {
     }
 }
 
+/// Cabeçalho de uma definição, lido mesmo quando ela é recusada — o que um
+/// catálogo precisa para listar tudo, inclusive o que ainda não roda.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionHeader {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub language: String,
+    pub private: bool,
+}
+
+impl DefinitionHeader {
+    /// `None` se o YAML nem tem `id` e `name`.
+    #[must_use]
+    pub fn peek(yaml: &str) -> Option<Self> {
+        let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).ok()?;
+        let text = |key: &str| {
+            value
+                .get(key)
+                .and_then(serde_yaml_ng::Value::as_str)
+                .map(str::to_owned)
+        };
+        Some(Self {
+            id: text("id")?,
+            name: text("name")?,
+            description: text("description").unwrap_or_default(),
+            language: text("language").unwrap_or_default(),
+            private: text("type").is_some_and(|kind| kind != "public"),
+        })
+    }
+}
+
 fn unknown_key(message: &str) -> Option<String> {
     let start = message.find("unknown field `")? + "unknown field `".len();
     let end = message[start..].find('`')?;

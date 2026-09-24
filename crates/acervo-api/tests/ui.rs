@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use acervo_api::{Admin, Catalog, Entry, SettingView, router_with_admin};
+use acervo_api::{Admin, Catalog, DefinitionView, Entry, SettingView, router_with_admin};
 use acervo_indexers::{
     Capabilities, Category, Indexer, IndexerError, Release, SearchQuery, SearchSupport,
 };
@@ -82,6 +82,7 @@ fn entry(cookie: &str) -> Entry {
 #[derive(Debug, Default)]
 struct FakeAdmin {
     saved: Mutex<BTreeMap<String, String>>,
+    disabled: Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -111,6 +112,107 @@ impl Admin for FakeAdmin {
         let cookie = values.get("cookie").cloned().unwrap_or_default();
         self.saved.lock().unwrap().extend(values);
         Ok(entry(&cookie))
+    }
+
+    fn origin(&self, indexer: &str) -> Option<&'static str> {
+        match indexer {
+            "privado" => Some("config"),
+            "novo" => Some("interface"),
+            _ => None,
+        }
+    }
+
+    fn disabled(&self) -> Vec<(String, &'static str)> {
+        self.disabled
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|name| (name.clone(), "config"))
+            .collect()
+    }
+
+    fn definitions(&self) -> Vec<DefinitionView> {
+        vec![
+            DefinitionView {
+                id: "novo".into(),
+                name: "Novo".into(),
+                description: String::new(),
+                language: "pt-BR".into(),
+                private: false,
+                supported: true,
+                reason: None,
+                added: false,
+            },
+            DefinitionView {
+                id: "api-json".into(),
+                name: "Tracker JSON".into(),
+                description: String::new(),
+                language: "en-US".into(),
+                private: true,
+                supported: false,
+                reason: Some("chave `response` não suportada".into()),
+                added: false,
+            },
+        ]
+    }
+
+    fn definition_settings(&self, definition: &str) -> Option<Vec<SettingView>> {
+        (definition == "novo").then(Vec::new)
+    }
+
+    async fn add(
+        &self,
+        definition: &str,
+        _values: BTreeMap<String, String>,
+    ) -> Result<Entry, String> {
+        if definition != "novo" {
+            return Err("definição desconhecida".into());
+        }
+        Ok(Entry {
+            indexer: Arc::new(Private {
+                name: "novo".into(),
+                cookie: "bom".into(),
+            }),
+            capabilities: caps(),
+        })
+    }
+
+    async fn remove(&self, indexer: &str) -> Result<(), String> {
+        if indexer == "privado" {
+            return Err("indexador do config.toml".into());
+        }
+        Ok(())
+    }
+
+    async fn set_enabled(&self, indexer: &str, enabled: bool) -> Result<Option<Entry>, String> {
+        let mut disabled = self.disabled.lock().unwrap();
+        if enabled {
+            disabled.retain(|name| name != indexer);
+            Ok(Some(entry("bom")))
+        } else {
+            disabled.push(indexer.to_owned());
+            Ok(None)
+        }
+    }
+
+    fn apps(&self) -> Value {
+        json!({ "instancias": [{ "nome": "sonarr", "tipo": "series" }] })
+    }
+
+    async fn sync(
+        &self,
+        indexers: Vec<(String, Capabilities)>,
+        apply: bool,
+    ) -> Result<Value, String> {
+        Ok(json!({ "aplicado": apply, "indexadores": indexers.len() }))
+    }
+
+    fn last_cycle(&self) -> Option<Value> {
+        None
+    }
+
+    async fn simulate_cycle(&self) -> Result<Value, String> {
+        Ok(json!({ "modo": "simulacao" }))
     }
 }
 
@@ -291,4 +393,140 @@ async fn indexador_sem_admin_ou_desconhecido_nao_edita() {
         .await
         .unwrap();
     assert_eq!(response.status().as_u16(), 422);
+}
+
+async fn send(
+    base: &str,
+    method: reqwest::Method,
+    path: &str,
+    cookie: &str,
+    body: Value,
+) -> (u16, Value) {
+    let response = http()
+        .request(method, format!("{base}{path}"))
+        .header(COOKIE, cookie)
+        .header("X-Acervo", "1")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.json().await.unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn catalogo_lista_suportadas_e_recusadas_com_motivo() {
+    let base = serve().await;
+    let cookie = login(&base).await;
+    let (status, body) = get(&base, "/ui/api/catalogo", &cookie).await;
+    assert_eq!(status, 200);
+    let list = body["definicoes"].as_array().unwrap();
+    assert_eq!(list[0]["supported"], true);
+    assert_eq!(list[1]["supported"], false);
+    assert!(list[1]["reason"].as_str().unwrap().contains("response"));
+}
+
+#[tokio::test]
+async fn adicionar_testa_e_entra_no_catalogo_e_remover_tira() {
+    let base = serve().await;
+    let cookie = login(&base).await;
+
+    let (status, body) = send(
+        &base,
+        reqwest::Method::POST,
+        "/ui/api/indexadores",
+        &cookie,
+        json!({ "definicao": "novo", "settings": {} }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["nome"], "novo");
+    assert_eq!(body["teste"]["ok"], true);
+    let (_, list) = get(&base, "/ui/api/indexadores", &cookie).await;
+    let names: Vec<_> = list["indexadores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["nome"].clone())
+        .collect();
+    assert!(names.contains(&json!("novo")));
+    // Aparece servido pela API Torznab também.
+    let (status, _) = get(&base, &format!("/novo/api?t=caps&apikey={KEY}"), "").await;
+    assert_eq!(status, 200);
+
+    // Indexador do config não se remove pela tela.
+    let (status, _) = send(
+        &base,
+        reqwest::Method::DELETE,
+        "/ui/api/indexadores/privado",
+        &cookie,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 422);
+    let (status, _) = send(
+        &base,
+        reqwest::Method::DELETE,
+        "/ui/api/indexadores/novo",
+        &cookie,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, _) = get(&base, &format!("/novo/api?t=caps&apikey={KEY}"), "").await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn desativar_tira_de_circulacao_e_mantem_na_lista() {
+    let base = serve().await;
+    let cookie = login(&base).await;
+    let (status, _) = send(
+        &base,
+        reqwest::Method::PUT,
+        "/ui/api/indexadores/privado/ativo",
+        &cookie,
+        json!({ "ativo": false }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, _) = get(&base, &format!("/privado/api?t=caps&apikey={KEY}"), "").await;
+    assert_eq!(status, 404);
+    let (_, list) = get(&base, "/ui/api/indexadores", &cookie).await;
+    let privado = list["indexadores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["nome"] == "privado")
+        .unwrap()
+        .clone();
+    assert_eq!(privado["ativo"], false);
+
+    let (status, _) = send(
+        &base,
+        reqwest::Method::PUT,
+        "/ui/api/indexadores/privado/ativo",
+        &cookie,
+        json!({ "ativo": true }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, _) = get(&base, &format!("/privado/api?t=caps&apikey={KEY}"), "").await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn sincronizar_recebe_os_indexadores_servidos() {
+    let base = serve().await;
+    let cookie = login(&base).await;
+    let (status, body) = send(
+        &base,
+        reqwest::Method::POST,
+        "/ui/api/aplicativos/sincronizar",
+        &cookie,
+        json!({ "aplicar": false }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, json!({ "aplicado": false, "indexadores": 1 }));
 }

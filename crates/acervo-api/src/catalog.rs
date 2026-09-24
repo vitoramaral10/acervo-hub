@@ -177,6 +177,47 @@ impl Catalog {
             .collect()
     }
 
+    /// Acrescenta um indexador — adicionado ou reativado pela interface.
+    ///
+    /// # Errors
+    ///
+    /// Nome inválido, reservado ou já presente.
+    pub fn insert(&self, entry: Entry) -> Result<(), CatalogError> {
+        let name = entry.indexer.name().to_owned();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(CatalogError::InvalidName(name));
+        }
+        if name == ALL || name == UI {
+            return Err(CatalogError::ReservedName);
+        }
+        let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
+        if entries.contains_key(&name) {
+            return Err(CatalogError::Duplicate(name));
+        }
+        entries.insert(name, entry);
+        Ok(())
+    }
+
+    /// Tira um indexador de circulação — removido ou desativado. Devolve se
+    /// ele estava no catálogo.
+    pub fn remove(&self, name: &str) -> bool {
+        let removed = self
+            .entries
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(name)
+            .is_some();
+        self.health
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(name);
+        removed
+    }
+
     /// Troca um indexador já catalogado — por exemplo, com credencial nova.
     /// A saúde é zerada: ela descrevia o indexador antigo.
     ///

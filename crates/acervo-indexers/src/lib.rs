@@ -11,7 +11,9 @@ mod rate;
 mod torznab;
 
 pub use aggregate::{AggregateSearch, Indexer, IndexerFailure, SearchReport};
-pub use cardigann::{CardigannClient, CardigannDefinition, SettingInfo, SettingInfoKind};
+pub use cardigann::{
+    CardigannClient, CardigannDefinition, DefinitionHeader, SettingInfo, SettingInfoKind,
+};
 pub use model::{
     Capabilities, Category, IndexerError, Release, SearchMode, SearchQuery, SearchSupport,
 };
