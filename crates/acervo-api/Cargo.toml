@@ -1,7 +1,7 @@
 [package]
 name = "acervo-api"
 version = "0.0.0"
-description = "Superfície HTTP do acervo-hub: Torznab para os consumidores atuais."
+description = "Superfície HTTP do acervo-hub: Torznab para os consumidores atuais e a interface web."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -10,16 +10,19 @@ repository.workspace = true
 [dependencies]
 acervo-indexers.workspace = true
 
+async-trait.workspace = true
 axum.workspace = true
 futures.workspace = true
 quick-xml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 time = { workspace = true, features = ["formatting"] }
+tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-async-trait.workspace = true
 reqwest.workspace = true
 tokio = { workspace = true, features = ["net"] }
 

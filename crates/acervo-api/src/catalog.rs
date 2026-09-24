@@ -1,19 +1,23 @@
 //! Os indexadores servidos e o despacho de uma consulta entre eles.
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use acervo_indexers::{
     Capabilities, Category, Indexer, IndexerFailure, Release, SearchMode, SearchQuery,
     SearchSupport,
 };
 use futures::future::join_all;
+use time::OffsetDateTime;
 
 use crate::TorznabError;
 
 /// Nome reservado para a busca em todos os indexadores de uma vez.
 pub const ALL: &str = "all";
+
+/// Nome reservado para as rotas da interface web.
+pub const UI: &str = "ui";
 
 /// Um indexador e as capacidades que ele anunciou.
 ///
@@ -29,15 +33,57 @@ pub struct Entry {
 pub enum CatalogError {
     #[error("nome de indexador inválido `{0}`: use letras minúsculas, números e hífens")]
     InvalidName(String),
-    #[error("`{ALL}` é reservado para a busca agregada")]
+    #[error("`{ALL}` e `{UI}` são nomes reservados")]
     ReservedName,
     #[error("indexador `{0}` registrado duas vezes")]
     Duplicate(String),
+    #[error("indexador `{0}` não está no catálogo")]
+    Unknown(String),
 }
 
+/// O que se sabe da saúde de um indexador desde que o processo subiu.
+///
+/// Fica em memória de propósito: o estado que importa é o de agora, e um
+/// reinício que zera o histórico não esconde nada que a próxima busca não
+/// mostre de novo.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Health {
+    pub last_success: Option<OffsetDateTime>,
+    pub last_failure: Option<OffsetDateTime>,
+    pub last_error: Option<String>,
+    pub consecutive_failures: u32,
+    pub last_results: Option<usize>,
+}
+
+impl Health {
+    fn success(&mut self, results: usize) {
+        self.last_success = Some(OffsetDateTime::now_utc());
+        self.last_results = Some(results);
+        self.consecutive_failures = 0;
+    }
+
+    fn failure(&mut self, error: String) {
+        self.last_failure = Some(OffsetDateTime::now_utc());
+        self.last_error = Some(error);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+    }
+}
+
+/// Um indexador visto de fora: o que uma interface lista.
+#[derive(Debug, Clone)]
+pub struct IndexerView {
+    pub name: String,
+    pub capabilities: Capabilities,
+    pub proxies_downloads: bool,
+    pub health: Health,
+}
+
+/// Catálogo compartilhado entre as rotas. Clones veem as mesmas entradas e a
+/// mesma saúde; trocar a credencial de um indexador troca para todos.
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
-    entries: BTreeMap<String, Entry>,
+    entries: Arc<RwLock<BTreeMap<String, Entry>>>,
+    health: Arc<Mutex<HashMap<String, Health>>>,
 }
 
 /// Resultado de uma consulta servida: página já cortada e falhas parciais.
@@ -62,7 +108,7 @@ impl Catalog {
             {
                 return Err(CatalogError::InvalidName(name));
             }
-            if name == ALL {
+            if name == ALL || name == UI {
                 return Err(CatalogError::ReservedName);
             }
             if catalog.contains_key(&name) {
@@ -70,33 +116,94 @@ impl Catalog {
             }
             catalog.insert(name, entry);
         }
-        Ok(Self { entries: catalog })
+        Ok(Self {
+            entries: Arc::new(RwLock::new(catalog)),
+            health: Arc::default(),
+        })
+    }
+
+    // Nenhum lock atravessa `await`: as entradas são copiadas (são `Arc`) e
+    // o lock solto antes de qualquer requisição.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, Entry>> {
+        self.entries.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn record(&self, name: &str, outcome: Result<usize, String>) {
+        let mut health = self.health.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = health.entry(name.to_owned()).or_default();
+        match outcome {
+            Ok(results) => entry.success(results),
+            Err(error) => entry.failure(error),
+        }
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.read().len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.read().is_empty()
     }
 
-    fn targets(&self, target: &str) -> Result<Vec<&Entry>, TorznabError> {
+    fn targets(&self, target: &str) -> Result<Vec<Entry>, TorznabError> {
+        let entries = self.read();
         if target == ALL {
-            return Ok(self.entries.values().collect());
+            return Ok(entries.values().cloned().collect());
         }
-        self.entries
+        entries
             .get(target)
-            .map(|entry| vec![entry])
+            .map(|entry| vec![entry.clone()])
             .ok_or(TorznabError::NoSuchIndexer)
+    }
+
+    /// Indexadores, com capacidades e saúde, em ordem de nome.
+    #[must_use]
+    pub fn views(&self) -> Vec<IndexerView> {
+        let health = self
+            .health
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        self.read()
+            .iter()
+            .map(|(name, entry)| IndexerView {
+                name: name.clone(),
+                capabilities: entry.capabilities.clone(),
+                proxies_downloads: entry.indexer.proxies_downloads(),
+                health: health.get(name).cloned().unwrap_or_default(),
+            })
+            .collect()
+    }
+
+    /// Troca um indexador já catalogado — por exemplo, com credencial nova.
+    /// A saúde é zerada: ela descrevia o indexador antigo.
+    ///
+    /// # Errors
+    ///
+    /// Nome que não está no catálogo, ou que não bate com o do indexador novo.
+    pub fn replace(&self, name: &str, entry: Entry) -> Result<(), CatalogError> {
+        if entry.indexer.name() != name {
+            return Err(CatalogError::InvalidName(entry.indexer.name().to_owned()));
+        }
+        let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
+        let slot = entries
+            .get_mut(name)
+            .ok_or_else(|| CatalogError::Unknown(name.to_owned()))?;
+        *slot = entry;
+        drop(entries);
+        self.health
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(name);
+        Ok(())
     }
 
     /// O indexador precisa intermediar os downloads dele?
     #[must_use]
     pub fn proxies_downloads(&self, name: &str) -> bool {
-        self.entries
+        self.read()
             .get(name)
             .is_some_and(|entry| entry.indexer.proxies_downloads())
     }
@@ -108,11 +215,38 @@ impl Catalog {
     /// Indexador desconhecido (inclusive `all`), ou falha do indexador — link
     /// fora da origem dele, sessão recusada, resposta que não é `.torrent`.
     pub async fn download(&self, name: &str, link: &url::Url) -> Result<Vec<u8>, TorznabError> {
-        let entry = self.entries.get(name).ok_or(TorznabError::NoSuchIndexer)?;
+        let entry = self
+            .read()
+            .get(name)
+            .cloned()
+            .ok_or(TorznabError::NoSuchIndexer)?;
         entry.indexer.download(link).await.map_err(|error| {
             tracing::warn!(indexer = name, %error, "download falhou");
+            self.record(name, Err(error.to_string()));
             TorznabError::DownloadFailed
         })
+    }
+
+    /// Busca recente num indexador só, sem termo — o que o gerenciador faz no
+    /// RSS. Serve de teste: exercita login, página e parser de uma vez.
+    ///
+    /// # Errors
+    ///
+    /// Indexador desconhecido, ou a mensagem do erro do indexador.
+    pub async fn test(&self, name: &str) -> Result<usize, String> {
+        let entry = self
+            .read()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| "indexador desconhecido".to_owned())?;
+        let outcome = entry
+            .indexer
+            .search(&SearchQuery::general(""))
+            .await
+            .map(|releases| releases.len())
+            .map_err(|error| error.to_string());
+        self.record(name, outcome.clone());
+        outcome
     }
 
     /// Capacidades de um indexador, ou a união de todos em `all`.
@@ -121,11 +255,8 @@ impl Catalog {
     ///
     /// Indexador desconhecido.
     pub fn capabilities(&self, target: &str) -> Result<Capabilities, TorznabError> {
-        Ok(merge(
-            self.targets(target)?
-                .into_iter()
-                .map(|entry| &entry.capabilities),
-        ))
+        let targets = self.targets(target)?;
+        Ok(merge(targets.iter().map(|entry| &entry.capabilities)))
     }
 
     /// Consulta os indexadores elegíveis em paralelo e corta a página.
@@ -157,9 +288,13 @@ impl Catalog {
         let mut page = Page::default();
         for (indexer, result) in join_all(pending).await {
             match result {
-                Ok(mut releases) => page.releases.append(&mut releases),
+                Ok(mut releases) => {
+                    self.record(&indexer, Ok(releases.len()));
+                    page.releases.append(&mut releases);
+                }
                 Err(error) => {
                     tracing::warn!(indexer, %error, "indexador falhou na busca");
+                    self.record(&indexer, Err(error.to_string()));
                     page.failures.push(IndexerFailure {
                         indexer,
                         error: error.to_string(),

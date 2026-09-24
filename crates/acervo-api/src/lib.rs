@@ -8,6 +8,7 @@
 mod catalog;
 mod render;
 mod request;
+mod ui;
 
 use std::sync::Arc;
 
@@ -19,7 +20,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use time::OffsetDateTime;
 
-pub use catalog::{ALL, Catalog, CatalogError, Entry, Page};
+pub use catalog::{ALL, Catalog, CatalogError, Entry, Health, IndexerView, Page, UI};
+pub use ui::{Admin, SettingView};
 
 /// Erros do contrato Torznab, com os códigos que os consumidores entendem.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -77,6 +79,7 @@ impl IntoResponse for TorznabError {
 struct Server {
     catalog: Catalog,
     api_key: String,
+    admin: Option<Arc<dyn Admin>>,
 }
 
 impl std::fmt::Debug for Server {
@@ -85,6 +88,7 @@ impl std::fmt::Debug for Server {
             .debug_struct("Server")
             .field("catalog", &self.catalog)
             .field("api_key", &"<redacted>")
+            .field("admin", &self.admin)
             .finish()
     }
 }
@@ -95,14 +99,26 @@ impl std::fmt::Debug for Server {
 /// A chave vale para todos os indexadores e é aceita em `apikey` ou no
 /// cabeçalho `X-Api-Key`, como os consumidores mandam.
 pub fn router(catalog: Catalog, api_key: impl Into<String>) -> Router {
+    router_with_admin(catalog, api_key, None)
+}
+
+/// Como [`router`], com a interface podendo reconfigurar indexadores por meio
+/// de `admin`. Sem ele, a interface lista, testa e busca, mas não edita.
+pub fn router_with_admin(
+    catalog: Catalog,
+    api_key: impl Into<String>,
+    admin: Option<Arc<dyn Admin>>,
+) -> Router {
     let server = Arc::new(Server {
         catalog,
         api_key: api_key.into(),
+        admin,
     });
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/{indexer}/api", get(torznab))
         .route("/{indexer}/download", get(download))
+        .merge(ui::routes())
         .with_state(server)
 }
 
