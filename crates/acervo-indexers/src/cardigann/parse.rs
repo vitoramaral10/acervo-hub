@@ -1,204 +1,284 @@
+//! HTML de resultados → releases.
+
+use std::collections::BTreeMap;
+
+use regex::Regex;
 use scraper::{ElementRef, Html};
+use time::OffsetDateTime;
 use url::Url;
 
 use super::CardigannDefinition;
-use super::definition::{CompiledField, CompiledFilter};
+use super::definition::{Field, Rows, Source};
+use super::filters::{parse_count, parse_date, parse_size};
+use super::selector::Css;
+use super::template::{Value, Vars};
 use crate::{IndexerError, Release};
 
 impl CardigannDefinition {
-    pub(super) fn parse(&self, html: &str, base: &Url) -> Result<Vec<Release>, IndexerError> {
+    /// Converte uma página de resultados.
+    ///
+    /// Linha que não rende release é pulada, como no motor de referência: um
+    /// anúncio ou separador no meio da tabela não pode derrubar a busca. Mas
+    /// se **nenhuma** linha rende, é erro — página inteira ilegível é o site
+    /// que mudou de layout, e isso não pode virar "nada encontrado".
+    pub(super) fn parse(
+        &self,
+        html: &str,
+        page: &Url,
+        request: &Vars,
+        now: OffsetDateTime,
+    ) -> Result<Vec<(Release, String)>, IndexerError> {
         let document = Html::parse_document(html);
-        document
-            .select(&self.rows)
-            .map(|row| self.release(row, base))
-            .collect()
-    }
-
-    fn release(&self, row: ElementRef<'_>, base: &Url) -> Result<Release, IndexerError> {
-        let title = self.required(row, "title")?;
-        // `magnet` só é lido na falta de `download`: lido antes, um magnet
-        // obrigatório ausente derrubaria uma linha que já tem link direto.
-        let download = match self.extract(row, "download")? {
-            Some(value) => value,
-            None => self
-                .extract(row, "magnet")?
-                .ok_or_else(|| self.bad("download"))?,
+        let rendered;
+        let rows = match &self.rows {
+            Rows::Fixed(css) => css,
+            Rows::Templated(template) => {
+                rendered = Css::parse(&template.render(request), "search.rows.selector")?;
+                &rendered
+            }
         };
-        let download_url = self.item_url(base, &download, "download", true)?;
-        let info_url = self
-            .extract(row, "details")?
-            .map(|value| self.item_url(base, &value, "details", false))
-            .transpose()?;
-        let size = parse_size(&self.required(row, "size")?).ok_or_else(|| self.bad("size"))?;
-        let category = self.required(row, "category")?;
-        let categories = self
-            .mappings
-            .get(&category)
-            .cloned()
-            .ok_or_else(|| self.bad("category"))?;
-        Ok(Release {
-            indexer: self.id.clone(),
-            guid: info_url.as_ref().unwrap_or(&download_url).to_string(),
-            title,
-            download_url,
-            info_url,
-            size,
-            published: None,
-            seeders: self.count(row, "seeders")?,
-            leechers: self.count(row, "leechers")?,
-            grabs: self.count(row, "grabs")?,
-            categories,
-            tags: Vec::new(),
-        })
+        let mut releases = Vec::new();
+        let mut first_failure = None;
+        for row in rows.select(document.root_element()) {
+            match self.release(row, page, request, now) {
+                Ok(release) => releases.push(release),
+                Err(field) => {
+                    tracing::debug!(indexer = self.id, field, "linha sem release");
+                    first_failure.get_or_insert(field);
+                }
+            }
+        }
+        match first_failure {
+            Some(field) if releases.is_empty() => Err(IndexerError::InvalidRelease {
+                indexer: self.id.clone(),
+                field,
+            }),
+            _ => Ok(releases),
+        }
     }
 
-    fn extract(
+    /// Release e o texto em que o `andmatch` procura (título + descrição).
+    fn release(
         &self,
         row: ElementRef<'_>,
-        field: &'static str,
-    ) -> Result<Option<String>, IndexerError> {
-        self.fields.get(field).map_or(Ok(None), |selector| {
-            selector.extract(row).map_err(|()| self.bad(field))
-        })
-    }
-
-    fn required(&self, row: ElementRef<'_>, field: &'static str) -> Result<String, IndexerError> {
-        self.extract(row, field)?.ok_or_else(|| self.bad(field))
-    }
-
-    fn count(&self, row: ElementRef<'_>, field: &'static str) -> Result<Option<u32>, IndexerError> {
-        self.extract(row, field)?
-            .map(|value| value.parse().map_err(|_| self.bad(field)))
-            .transpose()
-    }
-
-    fn item_url(
-        &self,
-        base: &Url,
-        value: &str,
-        field: &'static str,
-        magnet: bool,
-    ) -> Result<Url, IndexerError> {
-        let url = base.join(value).map_err(|_| self.bad(field))?;
-        if !(matches!(url.scheme(), "http" | "https") || magnet && url.scheme() == "magnet")
-            || !url.username().is_empty()
-            || url.password().is_some()
-        {
-            return Err(self.bad(field));
+        page: &Url,
+        request: &Vars,
+        now: OffsetDateTime,
+    ) -> Result<(Release, String), &'static str> {
+        let mut vars = request.clone();
+        let mut values: BTreeMap<&str, String> = BTreeMap::new();
+        for (name, field) in &self.fields {
+            // Campo que falha fica nulo e a linha segue: é assim que os
+            // campos auxiliares `_x` funcionam na referência. O que decide se
+            // a linha rende release são os campos essenciais, conferidos no
+            // fim.
+            let value = evaluate(field, row, &vars);
+            if let Some(value) = &value {
+                values.insert(name, value.clone());
+            }
+            vars.set(format!(".Result.{name}"), Value::from_option(value));
         }
-        Ok(url)
-    }
 
-    fn bad(&self, field: &'static str) -> IndexerError {
-        IndexerError::InvalidRelease {
-            indexer: self.id.clone(),
-            field,
-        }
+        let title = values.get("title").cloned().ok_or("title")?;
+        let download = values
+            .get("download")
+            .or_else(|| values.get("magnet"))
+            .ok_or("download")?;
+        let download_url = item_url(page, download, true).ok_or("download")?;
+        let info_url = values
+            .get("details")
+            .or_else(|| values.get("comments"))
+            .and_then(|value| item_url(page, value, false));
+        let size = values
+            .get("size")
+            .and_then(|value| parse_size(value))
+            .ok_or("size")?;
+        let count = |name: &str| {
+            values
+                .get(name)
+                .and_then(|value| parse_count(value).ok().flatten())
+        };
+        let categories = values
+            .get("category")
+            .and_then(|value| self.mappings.get(value.trim()))
+            .cloned()
+            .unwrap_or_default();
+        let published = values.get("date").and_then(|value| parse_date(value, now));
+        let haystack = format!(
+            "{title} {}",
+            values.get("description").map_or("", String::as_str)
+        );
+        Ok((
+            Release {
+                indexer: self.id.clone(),
+                guid: info_url.as_ref().unwrap_or(&download_url).to_string(),
+                title,
+                download_url,
+                info_url,
+                size,
+                published,
+                seeders: count("seeders"),
+                leechers: count("leechers"),
+                grabs: count("grabs"),
+                categories,
+                tags: Vec::new(),
+            },
+            haystack,
+        ))
     }
 }
 
-impl CompiledField {
-    fn extract(&self, row: ElementRef<'_>) -> Result<Option<String>, ()> {
-        let value = if let Some(text) = &self.text {
-            Some(text.clone())
-        } else {
-            self.selector
-                .as_ref()
-                .and_then(|selector| row.select(selector).next())
-                .and_then(|element| {
-                    self.attribute.as_ref().map_or_else(
-                        || Some(element.text().collect::<String>()),
-                        |attribute| element.value().attr(attribute).map(str::to_owned),
-                    )
-                })
-        };
-        let Some(mut value) = value
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| self.default.clone())
-        else {
-            return if self.optional { Ok(None) } else { Err(()) };
-        };
-        for filter in &self.filters {
-            value = match filter {
-                CompiledFilter::Trim => value.trim().to_owned(),
-                CompiledFilter::Replace(from, to) => value.replace(from, to),
-                CompiledFilter::Append(suffix) => format!("{value}{suffix}"),
-                CompiledFilter::Prepend(prefix) => format!("{prefix}{value}"),
-                CompiledFilter::Split(separator, index) => {
-                    let parts: Vec<_> = value.split(separator).collect();
-                    let offset = if *index < 0 {
-                        parts.len().checked_sub(index.unsigned_abs()).ok_or(())?
-                    } else {
-                        usize::try_from(*index).map_err(|_| ())?
-                    };
-                    parts.get(offset).ok_or(())?.to_string()
-                }
+/// Valor final do campo, ou `None` quando falhou ou veio vazio.
+fn evaluate(field: &Field, row: ElementRef<'_>, vars: &Vars) -> Option<String> {
+    let extracted = extract(&field.source, row, vars).and_then(|mut value| {
+        for filter in &field.filters {
+            value = filter.apply(value, vars).ok()?;
+        }
+        Some(value)
+    });
+    let value = extracted
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if value.is_some() || !field.optional {
+        return value;
+    }
+    // O default da referência é templado e não passa pelos filtros.
+    field
+        .default
+        .as_ref()
+        .map(|default| default.render(vars).trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn extract(source: &Source, row: ElementRef<'_>, vars: &Vars) -> Option<String> {
+    match source {
+        Source::Text(template) => Some(template.render(vars)),
+        Source::Select {
+            selector,
+            attribute,
+            remove,
+            case,
+        } => {
+            let element = match selector {
+                Some(css) => css.select(row).next()?,
+                None => row,
             };
-        }
-        let value = value.trim().to_owned();
-        if value.is_empty() {
-            if self.optional { Ok(None) } else { Err(()) }
-        } else {
-            Ok(Some(value))
+            if !case.is_empty() {
+                // Com `case`, `attribute` não vale: o valor é o da primeira
+                // chave que casa, na ordem declarada.
+                return case
+                    .iter()
+                    .find(|(css, _)| css.matches_or_contains(element))
+                    .map(|(_, value)| value.render(vars));
+            }
+            if let Some(attribute) = attribute {
+                return element.value().attr(attribute).map(str::to_owned);
+            }
+            let mut text = String::new();
+            visible_text(element, remove.as_ref(), &mut text);
+            Some(text)
         }
     }
 }
 
-// Aritmética inteira evita arredondar u64::MAX ou aceitar NaN, expoentes e
-// valores negativos. O formato aceito é decimal sem separador de milhar.
-fn parse_size(value: &str) -> Option<u64> {
-    let compact: String = value
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect();
-    let boundary = compact
-        .find(|character: char| !character.is_ascii_digit() && character != '.')
-        .unwrap_or(compact.len());
-    let number = &compact[..boundary];
-    let suffix = compact[boundary..].to_ascii_lowercase();
-    let factor: u128 = match suffix.as_str() {
-        "" | "b" => 1,
-        "kb" | "kib" => 1024,
-        "mb" | "mib" => 1024 * 1024,
-        "gb" | "gib" => 1024 * 1024 * 1024,
-        "tb" | "tib" => 1024_u128.pow(4),
-        _ => return None,
-    };
-    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
-    if whole.is_empty()
-        || !whole.bytes().all(|byte| byte.is_ascii_digit())
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-        || fraction.len() > 18
-    {
-        return None;
+/// Texto do elemento sem os descendentes que `remove` tira.
+fn visible_text(element: ElementRef<'_>, remove: Option<&Css>, output: &mut String) {
+    for child in element.children() {
+        if let Some(child_element) = ElementRef::wrap(child) {
+            if remove.is_some_and(|css| css.matches(child_element)) {
+                continue;
+            }
+            visible_text(child_element, remove, output);
+        } else if let Some(text) = child.value().as_text() {
+            output.push_str(text);
+        }
     }
-    let whole = whole.parse::<u128>().ok()?.checked_mul(factor)?;
-    let fraction = if fraction.is_empty() {
-        0
-    } else {
-        fraction.parse::<u128>().ok()?.checked_mul(factor)?
-            / 10_u128.pow(u32::try_from(fraction.len()).ok()?)
-    };
-    u64::try_from(whole.checked_add(fraction)?).ok()
+}
+
+fn item_url(page: &Url, value: &str, allow_magnet: bool) -> Option<Url> {
+    let url = page.join(value.trim()).ok()?;
+    let allowed =
+        matches!(url.scheme(), "http" | "https") || (allow_magnet && url.scheme() == "magnet");
+    (allowed && url.username().is_empty() && url.password().is_none()).then_some(url)
+}
+
+/// Filtro de linhas `andmatch`, com a regra da referência: termos de dois
+/// caracteres ou mais, sem `and`/`the`/`an`/`of`; com mais de um termo, ao
+/// menos dois precisam aparecer no título ou na descrição.
+pub(super) fn and_match(releases: &mut Vec<(Release, String)>, term: &str) {
+    let separator = Regex::new(r"[^\w]+").expect("regex fixa");
+    let terms: Vec<String> = separator
+        .split(term)
+        .filter(|word| word.chars().count() > 1)
+        .map(str::to_lowercase)
+        .filter(|word| !matches!(word.as_str(), "and" | "the" | "an" | "of"))
+        .collect();
+    if terms.is_empty() {
+        return;
+    }
+    let needed = terms.len().min(2);
+    releases.retain(|(_, haystack)| {
+        let haystack = haystack.to_lowercase();
+        terms
+            .iter()
+            .filter(|word| haystack.contains(word.as_str()))
+            .count()
+            >= needed
+    });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_size;
+    use super::*;
+
+    fn release(title: &str) -> (Release, String) {
+        (
+            Release {
+                indexer: "x".into(),
+                guid: "g".into(),
+                title: title.into(),
+                download_url: Url::parse("https://tracker.invalid/d").unwrap(),
+                info_url: None,
+                size: 1,
+                published: None,
+                seeders: None,
+                leechers: None,
+                grabs: None,
+                categories: Vec::new(),
+                tags: Vec::new(),
+            },
+            title.into(),
+        )
+    }
 
     #[test]
-    fn tamanhos_fracionarios_sem_overflow_ou_valores_ambiguos() {
-        assert_eq!(parse_size("1.5 GiB"), Some(1_610_612_736));
-        assert_eq!(parse_size("18446744073709551615 B"), Some(u64::MAX));
-        for value in [
-            "NaN",
-            "-1 GB",
-            "1,024 MB",
-            "1.2.3 GB",
-            "18446744073709551616",
-            "9999999999999999999999999999999999999999 TB",
-        ] {
-            assert_eq!(parse_size(value), None, "{value}");
-        }
+    fn andmatch_exige_dois_termos_e_ignora_palavras_vazias() {
+        let mut releases = vec![
+            release("The Office S01E01"),
+            release("Office Space 1999"),
+            release("Parks and Recreation"),
+        ];
+        and_match(&mut releases, "The Office S01E01");
+        let titles: Vec<_> = releases.iter().map(|(r, _)| r.title.as_str()).collect();
+        assert_eq!(titles, ["The Office S01E01"]);
+
+        let mut single = vec![release("Office Space"), release("Outra Coisa")];
+        and_match(&mut single, "office");
+        assert_eq!(single.len(), 1);
+    }
+
+    #[test]
+    fn remove_tira_o_texto_do_descendente() {
+        let document =
+            Html::parse_fragment(r#"<div><a>Título <span class="tag">NOVO</span></a></div>"#);
+        let css = Css::parse("a", "t").unwrap();
+        let element = css.select(document.root_element()).next().unwrap();
+        let mut text = String::new();
+        visible_text(
+            element,
+            Some(&Css::parse("span.tag", "t").unwrap()),
+            &mut text,
+        );
+        assert_eq!(text.trim(), "Título");
     }
 }
