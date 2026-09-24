@@ -18,6 +18,7 @@ mod collect;
 mod config;
 mod ledger;
 mod report;
+mod search;
 mod serve;
 mod sync;
 
@@ -51,6 +52,17 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Busca manual nos indexadores configurados.
+    Search {
+        /// Termo da busca.
+        term: String,
+        /// Só este indexador; sem ele, todos.
+        #[arg(long, short)]
+        indexer: Option<String>,
+        /// Categoria Newznab (repetível), como 5000 para TV ou 2000 para filmes.
+        #[arg(long = "categoria", short = 'k')]
+        categories: Vec<u32>,
+    },
 }
 
 #[tokio::main]
@@ -82,6 +94,18 @@ async fn run() -> Result<ExitCode> {
         Command::Serve => {
             serve::run(&config).await?;
             return Ok(ExitCode::SUCCESS);
+        }
+        Command::Search {
+            term,
+            indexer,
+            categories,
+        } => {
+            let failures = search::run(&config, &term, indexer.as_deref(), &categories).await?;
+            return Ok(if failures > 0 {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            });
         }
         Command::Sync { apply } => {
             let failures = sync::run(&config, apply).await?;

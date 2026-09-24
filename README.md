@@ -76,6 +76,7 @@ cargo run --bin acervo-hub -- -c config.toml apply   # ... e executa
 cargo run --bin acervo-hub -- -c config.toml serve   # serve os indexadores
 cargo run --bin acervo-hub -- -c config.toml sync    # planeja o cadastro nos *arr
 cargo run --bin acervo-hub -- -c config.toml sync --apply
+cargo run --bin acervo-hub -- -c config.toml search "termo" [-i indexador] [-k 5000]
 ```
 
 `serve` é o outro modo de vida do binário: processo longo que responde Torznab em
