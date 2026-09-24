@@ -128,6 +128,60 @@ impl CardigannDefinition {
     pub fn is_private(&self) -> bool {
         self.private
     }
+
+    /// Settings que a definição declara, na ordem dela — o que uma interface
+    /// precisa para montar o formulário. Nenhum valor vai junto.
+    #[must_use]
+    pub fn settings(&self) -> Vec<SettingInfo> {
+        self.settings
+            .iter()
+            .map(|setting| SettingInfo {
+                name: setting.name.clone(),
+                label: setting.label.clone(),
+                kind: match &setting.kind {
+                    SettingKind::Text => SettingInfoKind::Text,
+                    SettingKind::Password => SettingInfoKind::Password,
+                    SettingKind::Checkbox => SettingInfoKind::Checkbox,
+                    SettingKind::Select(options) => {
+                        SettingInfoKind::Select(options.iter().cloned().collect())
+                    }
+                },
+                default: setting.default.clone(),
+            })
+            .collect()
+    }
+}
+
+/// Um setting declarado pela definição.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingInfo {
+    pub name: String,
+    pub label: String,
+    pub kind: SettingInfoKind,
+    pub default: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingInfoKind {
+    Text,
+    Password,
+    Checkbox,
+    /// Chaves aceitas, em ordem.
+    Select(Vec<String>),
+}
+
+impl SettingInfo {
+    /// Valor que não deve voltar para a tela: senha, cookie, chave, token.
+    ///
+    /// Definições declaram cookie como `text`, então o tipo sozinho não basta.
+    #[must_use]
+    pub fn is_secret(&self) -> bool {
+        let name = self.name.to_ascii_lowercase();
+        matches!(self.kind, SettingInfoKind::Password)
+            || ["cookie", "pass", "key", "token", "secret", "pid", "rss"]
+                .iter()
+                .any(|word| name.contains(word))
+    }
 }
 
 fn unknown_key(message: &str) -> Option<String> {

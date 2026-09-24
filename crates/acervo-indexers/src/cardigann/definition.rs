@@ -249,6 +249,7 @@ pub(super) enum SettingKind {
 #[derive(Debug)]
 pub(super) struct Setting {
     pub name: String,
+    pub label: String,
     pub kind: SettingKind,
     pub default: Option<String>,
 }
@@ -644,7 +645,10 @@ fn compile_settings(raw: Vec<RawSetting>) -> Result<Vec<Setting>, IndexerError> 
         {
             return Err(invalid("settings", "nome inválido"));
         }
-        let _ = setting.label;
+        let label = setting
+            .label
+            .filter(|label| !label.trim().is_empty())
+            .unwrap_or_else(|| setting.name.clone());
         let default = setting
             .default
             .as_ref()
@@ -658,6 +662,7 @@ fn compile_settings(raw: Vec<RawSetting>) -> Result<Vec<Setting>, IndexerError> 
         }
         settings.push(Setting {
             name: setting.name,
+            label,
             kind,
             default,
         });
