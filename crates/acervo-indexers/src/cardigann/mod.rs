@@ -202,6 +202,8 @@ pub struct CardigannClient {
     http: reqwest::Client,
     budget: Arc<RateBudget>,
     session: Arc<Mutex<Session>>,
+    /// Maior página já vista por rota: o tamanho de página do site, aprendido.
+    page_sizes: Arc<std::sync::Mutex<BTreeMap<String, usize>>>,
 }
 
 #[derive(Default)]
@@ -285,6 +287,7 @@ impl CardigannClient {
             http,
             budget,
             session: Arc::new(Mutex::new(Session::default())),
+            page_sizes: Arc::default(),
         })
     }
 
@@ -762,7 +765,20 @@ impl Indexer for CardigannClient {
             let shorter = previous
                 .as_ref()
                 .is_some_and(|(last_path, last_rows)| *last_path == path && rows < *last_rows);
-            if rows == 0 || shorter {
+            // O tamanho de página do site não vem na definição, mas se aprende:
+            // é a maior página já vista nesta rota. Página menor que ele já é a
+            // última, sem precisar pedir a seguinte para descobrir.
+            let below_known_size = {
+                let mut sizes = self
+                    .page_sizes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let known = sizes.entry(path.clone()).or_insert(0);
+                let below = rows < *known;
+                *known = (*known).max(rows);
+                below
+            };
+            if rows == 0 || shorter || below_known_size {
                 exhausted = Some(path.clone());
             }
             previous = Some((path, rows));

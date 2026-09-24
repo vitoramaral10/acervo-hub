@@ -252,6 +252,39 @@ async fn formulario_loga_uma_vez_e_junta_as_paginas() {
 }
 
 #[tokio::test]
+async fn tamanho_de_pagina_aprendido_poupa_a_segunda_pagina() {
+    let server = MockServer::start().await;
+    mount_form_login(&server, 1).await;
+    // Primeira busca: página 0 com 3 linhas, página 1 com 1 → aprende que a
+    // página cheia tem 3.
+    mount_form_pages(&server).await;
+    let client = form_client(&server);
+    client
+        .search(&SearchQuery::general("Um Filme"))
+        .await
+        .unwrap();
+
+    // Segunda busca, outro termo: a página 0 vem com 1 linha, menos que 3. É a
+    // última — a página 1 não pode ser pedida.
+    Mock::given(path("/torrents-search.php"))
+        .and(query_param_is_missing("page"))
+        .and(query_param("search", "Outra"))
+        .respond_with(html(FORM_PAGE1))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/torrents-search.php"))
+        .and(query_param("page", "1"))
+        .and(query_param("search", "Outra"))
+        .respond_with(html(FORM_PAGE1))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let results = client.search(&SearchQuery::general("Outra")).await.unwrap();
+    assert_eq!(results.len(), 1);
+}
+
+#[tokio::test]
 async fn sessao_que_cai_no_meio_refaz_o_login_uma_vez() {
     let server = MockServer::start().await;
     mount_form_login(&server, 2).await;
