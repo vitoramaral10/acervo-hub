@@ -94,10 +94,20 @@ url = "http://localhost:9696/1/api"
 api_key = "CHAVE_DA_API"
 request_interval_seconds = 2.0
 
-# Definição Cardigann v11 executada aqui mesmo. Só o recorte público, GET e
-# HTML UTF-8; definição fora dele é recusada na subida, com o motivo.
+# Definição Cardigann v11 executada aqui mesmo, no formato do diretório de
+# definições do agregador atual. Definição com recurso fora do subconjunto
+# implementado é recusada na subida, com o motivo.
 [[indexers]]
 kind = "cardigann"
 definition = "/etc/acervo-hub/definicoes/publico.yml"
 link = 0
 settings = { }
+
+# Tracker privado: `settings` leva o que a definição declara — usuário e senha
+# para login por formulário, ou o cookie da sessão para login por cookie. Os
+# links de download saem apontando para este serviço, que baixa o .torrent com
+# a sessão; o cliente de download nunca vê a credencial.
+[[indexers]]
+kind = "cardigann"
+definition = "/etc/acervo-hub/definicoes/privado.yml"
+settings = { username = "USUARIO", password = "SENHA" }

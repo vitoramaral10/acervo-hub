@@ -91,6 +91,7 @@ dependencies = [
  "async-trait",
  "futures",
  "quick-xml",
+ "regex",
  "reqwest",
  "scraper",
  "serde",
@@ -98,6 +99,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
  "url",
  "wiremock",
 ]

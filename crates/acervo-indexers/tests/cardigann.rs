@@ -52,30 +52,39 @@ fn carrega_metadados_caps_e_mapeamentos_de_categoria_v11() {
 fn recursos_nao_implementados_falham_no_load_sem_expor_yaml() {
     let cases = [
         format!("{YAML}\nlogin:\n  method: post\n"),
+        format!("{YAML}\nlogin:\n  method: form\n  path: login\n"),
         YAML.replace("method: get", "method: post"),
         YAML.replace("method: get", "response: {type: json}"),
         YAML.replace("UTF-8", "windows-1252"),
         YAML.replace("type: public", "type: private"),
         YAML.replace("name: trim", "name: regexp"),
-        YAML.replace("{{ .Keywords }}", "{{ if .Keywords }}q{{ end }}"),
+        YAML.replace("name: trim", "name: timeago"),
         YAML.replace("{{ .Keywords }}", "{{ .Config.unknown }}"),
+        YAML.replace("{{ .Keywords }}", "{{ printf .Keywords }}"),
         YAML.replace("path: browse", "path: '{{ .Keywords }}'"),
         YAML.replace("path: browse", "path: https://other.invalid/search"),
         YAML.replace("path: browse", "path: //other.invalid/search"),
-        YAML.replace("name: trim", "name: trim\n          args: ignored"),
         YAML.replace("TV/HD", "unknown-category"),
         YAML.replace("requestDelay: 0", "requestDelay: -.inf"),
+        YAML.replace("table.results > tbody > tr.release", "tr[[secret-value"),
         YAML.replace(
             "table.results > tbody > tr.release",
-            "tr:contains(secret-value)",
+            "tr:contains(secret-value) td",
         ),
-        YAML.replace("q: '{{ .Keywords }}'", "q: ignored-capabilities"),
-        YAML.replace("selector: a.title", "selector: a.title\n      remove: span"),
+        YAML.replace("args: ['_', '.']", "args: ['(?=x)', '.']")
+            .replace("name: replace", "name: re_replace"),
     ];
     for yaml in cases {
         let error = CardigannDefinition::from_yaml_v11(&yaml).unwrap_err();
-        assert!(matches!(error, IndexerError::Definition { .. }));
+        assert!(
+            matches!(
+                error,
+                IndexerError::Definition { .. } | IndexerError::UnsupportedDefinitionKey { .. }
+            ),
+            "{error}"
+        );
         assert!(!format!("{error:?} {error}").contains("segredo-fixture"));
+        assert!(!format!("{error:?} {error}").contains("secret-value"));
     }
 }
 
@@ -217,28 +226,48 @@ async fn consulta_incompativel_nao_faz_http() {
 }
 
 #[tokio::test]
-async fn campos_invalidos_e_urls_inseguras_falham_sem_virar_resultado_vazio() {
-    for html in [
-        HTML.replace("1.5 GiB", "NaN"),
-        HTML.replace("cat=7", "cat=999"),
-        HTML.replace(
-            "/download/42?passkey=segredo-download",
-            "javascript:secret-value",
+async fn linha_ruim_e_pulada_mas_pagina_inteira_ilegivel_e_erro() {
+    // Uma linha ruim sai; as outras ficam — como na referência.
+    for (html, remaining) in [
+        (HTML.replace("1.5 GiB", "NaN"), 2),
+        (
+            HTML.replace(
+                "/download/42?passkey=segredo-download",
+                "javascript:secret-value",
+            ),
+            2,
         ),
-        HTML.replace("class=\"title\"", "class=\"missing\""),
+        // Categoria sem mapeamento não descarta o release: ele só fica sem
+        // categoria, e cai em qualquer busca que filtre por uma.
+        (HTML.replace("cat=7", "cat=999"), 3),
     ] {
         let server = MockServer::start().await;
         Mock::given(path("/browse"))
             .respond_with(response(&html))
             .mount(&server)
             .await;
-        let error = client(&yaml_at(&server))
+        let results = client(&yaml_at(&server))
             .search(&SearchQuery::general("q"))
             .await
-            .unwrap_err();
-        assert!(matches!(error, IndexerError::InvalidRelease { .. }));
-        assert!(!format!("{error:?} {error}").contains("secret-value"));
+            .unwrap();
+        assert_eq!(results.len(), remaining);
+        assert!(!format!("{results:?}").contains("secret-value"));
     }
+
+    // Nenhuma linha rende: o site mudou de layout, e isso não é "nada
+    // encontrado".
+    let server = MockServer::start().await;
+    Mock::given(path("/browse"))
+        .respond_with(response(
+            &HTML.replace("class=\"title\"", "class=\"missing\""),
+        ))
+        .mount(&server)
+        .await;
+    let error = client(&yaml_at(&server))
+        .search(&SearchQuery::general("q"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, IndexerError::InvalidRelease { .. }));
 }
 
 #[tokio::test]

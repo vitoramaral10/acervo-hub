@@ -93,6 +93,28 @@ impl Catalog {
             .ok_or(TorznabError::NoSuchIndexer)
     }
 
+    /// O indexador precisa intermediar os downloads dele?
+    #[must_use]
+    pub fn proxies_downloads(&self, name: &str) -> bool {
+        self.entries
+            .get(name)
+            .is_some_and(|entry| entry.indexer.proxies_downloads())
+    }
+
+    /// Baixa um `.torrent` pela sessão do indexador.
+    ///
+    /// # Errors
+    ///
+    /// Indexador desconhecido (inclusive `all`), ou falha do indexador — link
+    /// fora da origem dele, sessão recusada, resposta que não é `.torrent`.
+    pub async fn download(&self, name: &str, link: &url::Url) -> Result<Vec<u8>, TorznabError> {
+        let entry = self.entries.get(name).ok_or(TorznabError::NoSuchIndexer)?;
+        entry.indexer.download(link).await.map_err(|error| {
+            tracing::warn!(indexer = name, %error, "download falhou");
+            TorznabError::DownloadFailed
+        })
+    }
+
     /// Capacidades de um indexador, ou a união de todos em `all`.
     ///
     /// # Errors

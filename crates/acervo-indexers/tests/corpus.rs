@@ -23,7 +23,7 @@ fn corpus_real_carrega_ou_e_recusado_sem_panico() {
         panic!("defina ACERVO_CARDIGANN_CORPUS");
     };
     let mut loaded = Vec::new();
-    let mut refused: BTreeMap<String, usize> = BTreeMap::new();
+    let mut refused: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut total = 0;
 
     for entry in std::fs::read_dir(dir).unwrap() {
@@ -35,20 +35,29 @@ fn corpus_real_carrega_ou_e_recusado_sem_panico() {
         let yaml = std::fs::read_to_string(&path).unwrap();
         let outcome = std::panic::catch_unwind(|| CardigannDefinition::from_yaml_v11(&yaml))
             .unwrap_or_else(|_| panic!("{}: o loader entrou em pânico", path.display()));
-        match outcome {
-            Ok(definition) => loaded.push(definition.id().to_owned()),
-            Err(IndexerError::Definition { section, reason }) => {
-                *refused.entry(format!("{section}: {reason}")).or_default() += 1;
+        let stem = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let reason = match outcome {
+            Ok(definition) => {
+                loaded.push(definition.id().to_owned());
+                continue;
             }
+            Err(IndexerError::Definition { section, reason }) => format!("{section}: {reason}"),
+            Err(IndexerError::UnsupportedDefinitionKey { key }) => format!("chave `{key}`"),
             Err(other) => panic!("{}: erro fora do contrato: {other}", path.display()),
-        }
+        };
+        refused.entry(reason).or_default().push(stem);
     }
 
     let mut reasons: Vec<_> = refused.into_iter().collect();
-    reasons.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    reasons.sort_by_key(|(_, files)| std::cmp::Reverse(files.len()));
     println!("{total} definições, {} carregadas", loaded.len());
-    for (reason, count) in reasons {
-        println!("{count:>5}  {reason}");
+    for (reason, mut files) in reasons {
+        files.sort();
+        let sample = files.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
+        println!("{:>5}  {reason}  [{sample}]", files.len());
     }
     loaded.sort();
     println!("carregadas: {}", loaded.join(", "));
