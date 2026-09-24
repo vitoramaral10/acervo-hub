@@ -9,8 +9,10 @@ use acervo_core::{DownloadHash, InstanceName, InstanceSnapshot, QueueItem, Queue
 use url::Url;
 
 mod dto;
+mod indexer;
 
 pub use dto::QueueRecord;
+pub use indexer::{RemoteIndexer, TorznabSpec};
 
 /// Qual árvore a instância gerencia.
 ///
