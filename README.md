@@ -175,8 +175,13 @@ daquele ciclo é confiável — inclusive as que pareciam corretas:
 A migração é *strangler*, na ordem do risco. Cada fase é reversível e entrega valor sozinha.
 
 - [x] **Fase 1 — `acervo-janitor`.** Substitui só o faxineiro, falando as APIs v3
-      existentes. Risco baixo, valor imediato. *Falta validar contra instâncias reais.*
-- [ ] **Fase 2 — `acervo-indexers`.** Absorve o agregador de indexadores. O cliente
+      existentes. Risco baixo, valor imediato. Validado contra uma stack real e em produção,
+      de hora em hora em modo `apply`, no lugar do faxineiro anterior. A primeira volta
+      simulada pegou o que os testes não pegavam: o login do qBittorrent 5.1+ (204 sem
+      corpo) e um download manual de 50 GB que seria apagado por não ter hardlink — daí
+      `policy.managed_categories`, que restringe essa regra às categorias dos
+      gerenciadores.
+- [x] **Fase 2 — `acervo-indexers`.** Absorve o agregador de indexadores. Em produção. O cliente
       Torznab, a agregação, o rate limit compartilhado, o executor Cardigann v11 e a
       superfície Torznab (`serve`) existem. O executor roda tracker público e privado —
       login por formulário ou por cookie, sessão refeita quando o site deixa de
