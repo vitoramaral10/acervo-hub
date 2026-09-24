@@ -6,7 +6,7 @@ import {
   Film,
   CirclePause,
   FileCode2,
-  KeyRound,
+  Pencil,
   Lock,
   Plus,
   RefreshCw,
@@ -188,7 +188,7 @@ function IndexerCard({ indexer, onEdit }: { indexer: Indexer; onEdit: () => void
               {indexer.nome}
             </h2>
             {indexer.origem === 'config' && (
-              <Tooltip content="Vem do config.toml: edite o arquivo para mudar a definição ou removê-lo. Aqui dá para desativar e trocar credencial.">
+              <Tooltip content="Veio do config.toml. O que você muda aqui vale por cima do arquivo, que não é alterado.">
                 <span className="inline-flex text-content-subtle">
                   <FileCode2 className="size-3.5" aria-hidden="true" />
                   <span className="sr-only">do config.toml</span>
@@ -278,23 +278,21 @@ function IndexerCard({ indexer, onEdit }: { indexer: Indexer; onEdit: () => void
           {test.isPending ? 'Testando…' : 'Testar'}
         </Button>
         {indexer.editavel && (
-          <Button size="sm" variant="ghost" onClick={onEdit} aria-label={`Credenciais de ${indexer.nome}`}>
-            <KeyRound aria-hidden="true" />
-            Credenciais
+          <Button size="sm" variant="ghost" onClick={onEdit} aria-label={`Editar ${indexer.nome}`}>
+            <Pencil aria-hidden="true" />
+            Editar
           </Button>
         )}
-        {indexer.origem === 'interface' && (
-          <Button
-            size="sm"
-            variant="ghost"
-            className="ml-auto hover:text-danger"
-            onClick={() => setConfirming(true)}
-            aria-label={`Remover ${indexer.nome}`}
-          >
-            <Trash2 aria-hidden="true" />
-            Remover
-          </Button>
-        )}
+        <Button
+          size="sm"
+          variant="ghost"
+          className="ml-auto hover:text-danger"
+          onClick={() => setConfirming(true)}
+          aria-label={`Remover ${indexer.nome}`}
+        >
+          <Trash2 aria-hidden="true" />
+          Remover
+        </Button>
       </footer>
 
       <Dialog open={confirming} onOpenChange={setConfirming}>
@@ -302,8 +300,10 @@ function IndexerCard({ indexer, onEdit }: { indexer: Indexer; onEdit: () => void
           <DialogHeader>
             <DialogTitle>Remover {indexer.nome}?</DialogTitle>
             <DialogDescription>
-              Sai do acervo-hub junto com as credenciais guardadas. O cadastro dele no Sonarr e no Radarr só some na
-              próxima sincronização.
+              Sai do acervo-hub junto com as credenciais guardadas pela tela. O cadastro dele no Sonarr e no Radarr só
+              some na próxima sincronização.
+              {indexer.origem === 'config' &&
+                ' Ele veio do config.toml: o arquivo não muda, e dá para trazê-lo de volta pelo catálogo.'}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

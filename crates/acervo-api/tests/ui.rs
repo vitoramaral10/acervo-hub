@@ -179,7 +179,7 @@ impl Admin for FakeAdmin {
 
     async fn remove(&self, indexer: &str) -> Result<(), String> {
         if indexer == "privado" {
-            return Err("indexador do config.toml".into());
+            return Err("recusado".into());
         }
         Ok(())
     }
@@ -454,7 +454,7 @@ async fn adicionar_testa_e_entra_no_catalogo_e_remover_tira() {
     let (status, _) = get(&base, &format!("/novo/api?t=caps&apikey={KEY}"), "").await;
     assert_eq!(status, 200);
 
-    // Indexador do config não se remove pela tela.
+    // Recusa do administrador vira 422.
     let (status, _) = send(
         &base,
         reqwest::Method::DELETE,

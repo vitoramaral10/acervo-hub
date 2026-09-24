@@ -46,10 +46,10 @@ function CredentialsForm({ name, onClose }: { name: string; onClose: () => void 
       void queryClient.invalidateQueries({ queryKey: ['indexadores'] })
       void queryClient.invalidateQueries({ queryKey: ['settings', name] })
       if (teste.ok) {
-        toast.success(`${name}: credenciais salvas e testadas — ${formatCount(teste.resultados)} resultados`)
+        toast.success(`${name}: salvo e testado — ${formatCount(teste.resultados)} resultados`)
         onClose()
       } else {
-        setFailure(`Salvas, mas o teste falhou: ${teste.erro ?? 'motivo desconhecido'}`)
+        setFailure(`Salvo, mas o teste falhou: ${teste.erro ?? 'motivo desconhecido'}`)
       }
     },
     onError: (error: Error) => setFailure(error.message),
@@ -68,7 +68,7 @@ function CredentialsForm({ name, onClose }: { name: string; onClose: () => void 
       }}
     >
       <DialogHeader>
-        <DialogTitle>Credenciais de {name}</DialogTitle>
+        <DialogTitle>Editar {name}</DialogTitle>
         <DialogDescription>
           Campo secreto em branco mantém o valor atual. Ao salvar, o indexador é testado na hora.
         </DialogDescription>

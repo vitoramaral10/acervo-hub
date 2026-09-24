@@ -20,6 +20,10 @@ pub struct Registry {
     pub disabled: BTreeSet<String>,
     #[serde(default)]
     pub added: Vec<Added>,
+    /// Indexadores do `config.toml` removidos pela tela. O arquivo segue
+    /// intacto; o nome aqui o tira do ar e da lista até ser adicionado de novo.
+    #[serde(default)]
+    pub removed: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -94,6 +98,7 @@ mod tests {
                     request_interval_seconds: 2.0,
                 }),
             ],
+            removed: ["do-arquivo".to_owned()].into(),
         };
         save(&path, &registry).unwrap();
         assert_eq!(load(&path).unwrap(), registry);
