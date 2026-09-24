@@ -15,9 +15,9 @@ mod movie;
 pub use dto::QueueRecord;
 pub use indexer::{RemoteIndexer, TorznabSpec};
 pub use movie::{
-    Named, RemoteMovie, RemoteMovieFile, RemoteProfileItem, RemoteQuality, RemoteQualityDefinition,
-    RemoteQualityModel, RemoteQualityProfile, RemoteQueueItem, RemoteRevision, RemoteRootFolder,
-    RemoteTitle,
+    Named, RemoteGrab, RemoteMovie, RemoteMovieFile, RemoteProfileItem, RemoteQuality,
+    RemoteQualityDefinition, RemoteQualityModel, RemoteQualityProfile, RemoteQueueItem,
+    RemoteRevision, RemoteRootFolder, RemoteTitle,
 };
 
 /// Qual árvore a instância gerencia.

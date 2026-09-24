@@ -1,13 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { CircleAlert, CircleCheck, CircleDashed, CloudDownload, Film, HardDrive, SearchX } from 'lucide-react'
+import { CircleAlert, CircleCheck, CircleDashed, CloudDownload, Film, HardDrive, Radar, SearchX } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { PageHeader } from '@/components/PageHeader'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge, Skeleton, Tooltip } from '@/components/ui/misc'
-import { type Movie, type MovieImport, api } from '@/lib/api'
-import { formatCount, formatSize } from '@/lib/format'
+import { type Movie, type MovieImport, type MovieShadow, api } from '@/lib/api'
+import { formatAgo, formatCount, formatSize } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
 type Filter = 'todos' | 'com-arquivo' | 'sem-arquivo' | 'problemas'
@@ -25,6 +25,62 @@ const DISK = {
   size_differs: { label: 'Tamanho diferente', tone: 'warning', icon: CircleAlert },
   unreadable: { label: 'Não deu para ler', tone: 'warning', icon: CircleAlert },
 } as const
+
+/** Motivos de rejeição, na voz da tela. */
+const REASONS: Record<string, string> = {
+  UnknownMovie: 'de outro filme',
+  WrongMovie: 'de outro filme',
+  UnableToParse: 'nome ilegível',
+  QualityNotWanted: 'qualidade fora do perfil',
+  WantedLanguage: 'sem o idioma original',
+  BelowMinimumSize: 'pequeno demais',
+  AboveMaximumSize: 'grande demais',
+  MaximumSizeExceeded: 'acima do teto',
+  MinimumSeeders: 'poucos seeders',
+  MinimumFreeSpace: 'disco sem espaço',
+  Raw: 'disco bruto',
+  HardcodeSubtitles: 'legenda embutida',
+  Sample: 'amostra',
+  QueueCutoffMet: 'já baixando',
+  QueueHigherPreference: 'já baixando',
+  QueueUpgradesNotAllowed: 'já baixando',
+}
+
+function ShadowLine({ shadow }: { shadow: MovieShadow }) {
+  const when = formatAgo(shadow.quando)
+  if (shadow.erro) {
+    return (
+      <p className="mt-1 flex items-center gap-1.5 text-xs text-danger">
+        <Radar className="size-3.5 shrink-0" aria-hidden="true" />
+        <span className="truncate">Sombra {when}: a busca falhou — {shadow.erro}</span>
+      </p>
+    )
+  }
+  if (shadow.pegaria) {
+    return (
+      <p className="mt-1 flex items-center gap-1.5 text-xs text-accent" title={shadow.pegaria}>
+        <Radar className="size-3.5 shrink-0" aria-hidden="true" />
+        <span className="truncate">
+          Sombra {when}: pegaria <span className="font-mono">{shadow.pegaria}</span>
+        </span>
+      </p>
+    )
+  }
+  const reasons =
+    shadow.releases === 0
+      ? 'nenhum resultado'
+      : shadow.motivos
+          .map(([reason, count]) => `${REASONS[reason] ?? reason} (${count})`)
+          .join(', ')
+  return (
+    <p className="mt-1 flex items-center gap-1.5 text-xs text-content-subtle">
+      <Radar className="size-3.5 shrink-0" aria-hidden="true" />
+      <span className="truncate">
+        Sombra {when}: nada entre {formatCount(shadow.releases)} — {reasons}
+      </span>
+    </p>
+  )
+}
 
 const hasProblem = (movie: Movie) => movie.arquivo !== null && movie.arquivo.disco !== 'ok'
 
@@ -75,6 +131,13 @@ export function MoviesPage() {
     onSettled: () => void queryClient.invalidateQueries({ queryKey: ['filmes'] }),
   })
 
+  const shadow = useMutation({
+    mutationFn: () => api.shadow(5),
+    onSuccess: ({ filmes }) => toast.success(`Sombra: ${filmes.length} filmes buscados — veja abaixo`),
+    onError: (error: Error) => toast.error(error.message),
+    onSettled: () => void queryClient.invalidateQueries({ queryKey: ['filmes'] }),
+  })
+
   const list = movies.data?.filmes
   const counts = useMemo(() => {
     const all = list ?? []
@@ -104,12 +167,18 @@ export function MoviesPage() {
     <>
       <PageHeader
         title="Filmes"
-        description="O catálogo do acervo-hub, espelhado do Radarr. Nesta fase ele só copia: o Radarr continua decidindo e baixando. Cada arquivo é conferido contra o disco."
+        description="O catálogo do acervo-hub, espelhado do Radarr. Nesta fase o Radarr continua decidindo e baixando; a sombra busca nos indexadores daqui e mostra o que o acervo-hub pegaria, sem pegar nada."
         action={
-          <Button variant="primary" onClick={() => importer.mutate()} loading={importer.isPending}>
-            {!importer.isPending && <CloudDownload aria-hidden="true" />}
-            {importer.isPending ? 'Importando…' : 'Importar do Radarr'}
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={() => shadow.mutate()} loading={shadow.isPending} disabled={counts.total === 0}>
+              {!shadow.isPending && <Radar aria-hidden="true" />}
+              {shadow.isPending ? 'Buscando em sombra…' : 'Rodar sombra'}
+            </Button>
+            <Button variant="primary" onClick={() => importer.mutate()} loading={importer.isPending}>
+              {!importer.isPending && <CloudDownload aria-hidden="true" />}
+              {importer.isPending ? 'Importando…' : 'Importar do Radarr'}
+            </Button>
+          </div>
         }
       />
 
@@ -261,6 +330,7 @@ function MovieRow({ movie }: { movie: Movie }) {
             {file.release}
           </p>
         )}
+        {!file && movie.sombra && <ShadowLine shadow={movie.sombra} />}
         {file && (
           <p className="mt-1 flex flex-wrap gap-1.5 md:hidden">
             <Badge>{file.qualidade}</Badge>

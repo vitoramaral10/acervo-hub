@@ -695,6 +695,13 @@ impl Admin for HubAdmin {
         serde_json::to_value(list).map_err(|e| e.to_string())
     }
 
+    async fn shadow(&self, limit: usize) -> Result<serde_json::Value, String> {
+        let lines = crate::shadow::run(&self.config, limit, false)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        serde_json::to_value(lines).map_err(|e| e.to_string())
+    }
+
     async fn import_movies(&self, apply: bool) -> Result<serde_json::Value, String> {
         let _guard = self.write.lock().await;
         let report = crate::movies::import(&self.config, apply, false)

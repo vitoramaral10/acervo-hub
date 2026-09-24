@@ -115,6 +115,29 @@ pub struct QualityDefinition {
     pub preferred_size: Option<f64>,
 }
 
+/// O que a decisão em sombra pegaria.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowPick {
+    pub title: String,
+    pub indexer: String,
+    pub quality: Quality,
+    pub size: u64,
+}
+
+/// Uma busca em sombra por um filme: o que pegaria, ou por que não.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowRun {
+    pub movie_id: i64,
+    /// RFC 3339, em UTC.
+    pub at: String,
+    pub releases: usize,
+    pub pick: Option<ShadowPick>,
+    /// Motivo de rejeição e quantos releases ele barrou.
+    pub rejections: Vec<(String, usize)>,
+    /// A busca falhou antes de decidir.
+    pub error: Option<String>,
+}
+
 /// Tudo o que uma instância tem, para espelhar.
 #[derive(Debug, Clone)]
 pub struct Import {
@@ -198,6 +221,21 @@ const MIGRATIONS: &[&str] = &[
         max_size REAL,
         preferred_size REAL
     );
+",
+    r"
+    CREATE TABLE shadow_runs (
+        id INTEGER PRIMARY KEY,
+        movie_id INTEGER NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+        at TEXT NOT NULL,
+        releases INTEGER NOT NULL,
+        pick_title TEXT,
+        pick_indexer TEXT,
+        pick_quality INTEGER,
+        pick_size INTEGER,
+        rejections TEXT NOT NULL,
+        error TEXT
+    );
+    CREATE INDEX shadow_runs_by_movie ON shadow_runs(movie_id, at);
 ",
 ];
 
@@ -319,6 +357,77 @@ impl Store {
             })
         })
         .collect()
+    }
+
+    /// Grava uma busca em sombra.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita, ou filme que não está no catálogo.
+    pub fn record_shadow(&mut self, run: &ShadowRun) -> Result<()> {
+        let rejections = serde_json::to_string(&run.rejections).unwrap_or_else(|_| "[]".into());
+        self.connection.execute(
+            "INSERT INTO shadow_runs (movie_id, at, releases, pick_title, pick_indexer,
+                 pick_quality, pick_size, rejections, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                run.movie_id,
+                run.at,
+                i64::try_from(run.releases).unwrap_or(i64::MAX),
+                run.pick.as_ref().map(|p| p.title.clone()),
+                run.pick.as_ref().map(|p| p.indexer.clone()),
+                run.pick.as_ref().map(|p| p.quality.id()),
+                run.pick
+                    .as_ref()
+                    .map(|p| i64::try_from(p.size).unwrap_or(i64::MAX)),
+                rejections,
+                run.error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// A busca em sombra mais recente de cada filme.
+    ///
+    /// # Errors
+    ///
+    /// Falha de leitura ou registro inconsistente.
+    pub fn latest_shadow_runs(&self) -> Result<Vec<ShadowRun>> {
+        let mut statement = self.connection.prepare(
+            "SELECT movie_id, at, releases, pick_title, pick_indexer, pick_quality, pick_size,
+                    rejections, error
+             FROM shadow_runs r
+             WHERE id = (SELECT id FROM shadow_runs WHERE movie_id = r.movie_id
+                         ORDER BY at DESC, id DESC LIMIT 1)
+             ORDER BY at",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut runs = Vec::new();
+        while let Some(row) = rows.next()? {
+            let pick = match (
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<u8>>(5)?,
+            ) {
+                (Some(title), Some(id)) => Some(ShadowPick {
+                    title,
+                    indexer: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    quality: quality(id)?,
+                    size: u64::try_from(row.get::<_, Option<i64>>(6)?.unwrap_or(0)).unwrap_or(0),
+                }),
+                _ => None,
+            };
+            let rejections: String = row.get(7)?;
+            runs.push(ShadowRun {
+                movie_id: row.get(0)?,
+                at: row.get(1)?,
+                releases: usize::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+                pick,
+                rejections: serde_json::from_str(&rejections)
+                    .map_err(|e| StoreError::Corrupt(format!("rejeições da sombra: {e}")))?,
+                error: row.get(8)?,
+            });
+        }
+        Ok(runs)
     }
 
     /// Espelha a origem: cria, atualiza e remove o que for preciso. Com
@@ -782,6 +891,38 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(version, i64::try_from(MIGRATIONS.len()).unwrap());
+    }
+
+    #[test]
+    fn sombra_guarda_a_ultima_de_cada_filme() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .import(&import(vec![(1, movie(10, "Um", false))]), true)
+            .unwrap();
+        let id = store.movies().unwrap()[0].id;
+        let run = |at: &str, pick: bool| ShadowRun {
+            movie_id: id,
+            at: at.into(),
+            releases: 3,
+            pick: pick.then(|| ShadowPick {
+                title: "Um.2020.1080p.WEB-DL-GRUPO".into(),
+                indexer: "tracker".into(),
+                quality: Quality::WebDl1080p,
+                size: 4_000_000_000,
+            }),
+            rejections: vec![("MinimumSeeders".into(), 2)],
+            error: None,
+        };
+        store
+            .record_shadow(&run("2026-01-01T00:00:00Z", false))
+            .unwrap();
+        store
+            .record_shadow(&run("2026-01-02T00:00:00Z", true))
+            .unwrap();
+        assert_eq!(
+            store.latest_shadow_runs().unwrap(),
+            [run("2026-01-02T00:00:00Z", true)]
+        );
     }
 
     #[test]

@@ -158,6 +158,16 @@ export interface Movie {
   pasta: string
   adicionado: string | null
   arquivo: MovieFile | null
+  sombra: MovieShadow | null
+}
+
+export interface MovieShadow {
+  quando: string
+  releases: number
+  pegaria: string | null
+  qualidade: string | null
+  motivos: [string, number][]
+  erro: string | null
 }
 
 export interface MovieImport {
@@ -205,6 +215,7 @@ export const api = {
   lastCycle: () => request<{ ultimo: CycleReport | null }>('GET', '/ui/api/limpeza'),
   simulateCycle: () => request<CycleReport>('POST', '/ui/api/limpeza/simular'),
   movies: () => request<{ filmes: Movie[] }>('GET', '/ui/api/filmes'),
+  shadow: (limite: number) => request<{ filmes: unknown[] }>('POST', '/ui/api/filmes/sombra', { limite }),
   importMovies: (aplicar: boolean) =>
     request<{ instancias: MovieImport[] }>('POST', '/ui/api/filmes/importar', { aplicar }),
   search: (params: { q: string; indexador: string; cat: string }) => {

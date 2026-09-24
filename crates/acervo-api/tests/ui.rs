@@ -222,6 +222,10 @@ impl Admin for FakeAdmin {
     async fn import_movies(&self, apply: bool) -> Result<Value, String> {
         Ok(json!([{ "nome": "filmes", "resumo": { "applied": apply } }]))
     }
+
+    async fn shadow(&self, limit: usize) -> Result<Value, String> {
+        Ok(json!([{ "filme": "Filme (2020)", "limite": limit }]))
+    }
 }
 
 async fn serve() -> String {
@@ -587,6 +591,18 @@ async fn filmes_lista_e_importa() {
     .await;
     assert_eq!(status, 200);
     assert_eq!(body["instancias"][0]["resumo"]["applied"], true);
+
+    let (status, body) = send(
+        &base,
+        reqwest::Method::POST,
+        "/ui/api/filmes/sombra",
+        &cookie,
+        json!({ "limite": 500 }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    // O limite tem teto: cada filme é uma busca nos trackers.
+    assert_eq!(body["filmes"][0]["limite"], 20);
 
     // Sem sessão, nada.
     let (status, _) = get(&base, "/ui/api/filmes", "").await;

@@ -131,6 +131,14 @@ pub trait Admin: Send + Sync + std::fmt::Debug {
     ///
     /// Catálogo impossível de abrir.
     async fn import_movies(&self, apply: bool) -> Result<serde_json::Value, String>;
+
+    /// Uma rodada de decisão em sombra: busca até `limit` filmes que faltam e
+    /// grava o que pegaria, sem pegar nada.
+    ///
+    /// # Errors
+    ///
+    /// Catálogo vazio ou gerenciador de filmes inalcançável.
+    async fn shadow(&self, limit: usize) -> Result<serde_json::Value, String>;
 }
 
 /// Uma definição do catálogo, como a tela a lista.
@@ -203,6 +211,7 @@ pub(crate) fn routes() -> Router<Arc<Server>> {
         .route("/ui/api/limpeza/simular", post(simulate_cycle))
         .route("/ui/api/filmes", get(movies))
         .route("/ui/api/filmes/importar", post(import_movies))
+        .route("/ui/api/filmes/sombra", post(shadow))
         .route("/ui/api/indexadores/{nome}/testar", post(test))
         .route(
             "/ui/api/indexadores/{nome}/settings",
@@ -602,6 +611,29 @@ async fn import_movies(
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     Ok(ok(json!({ "instancias": report })))
+}
+
+#[derive(Deserialize)]
+struct ShadowBody {
+    #[serde(default = "default_shadow_limit")]
+    limite: usize,
+}
+
+const fn default_shadow_limit() -> usize {
+    5
+}
+
+async fn shadow(
+    State(server): State<Arc<Server>>,
+    headers: HeaderMap,
+    Json(body): Json<ShadowBody>,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::POST)?;
+    let report = admin(&server)?
+        .shadow(body.limite.clamp(1, 20))
+        .await
+        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    Ok(ok(json!({ "filmes": report })))
 }
 
 fn test_result(outcome: Result<usize, String>) -> serde_json::Value {

@@ -16,6 +16,7 @@ acervo-api.workspace = true
 acervo-arr.workspace = true
 acervo-clients.workspace = true
 acervo-core.workspace = true
+acervo-decision.workspace = true
 acervo-fs.workspace = true
 acervo-indexers.workspace = true
 acervo-janitor.workspace = true

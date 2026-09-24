@@ -82,6 +82,7 @@ dependencies = [
  "acervo-arr",
  "acervo-clients",
  "acervo-core",
+ "acervo-decision",
  "acervo-fs",
  "acervo-indexers",
  "acervo-janitor",

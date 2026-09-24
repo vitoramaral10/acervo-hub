@@ -84,6 +84,15 @@ struct QueuePage {
     records: Vec<RemoteQueueItem>,
 }
 
+/// Um release enviado ao cliente, do histórico.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGrab {
+    pub source_title: String,
+    /// RFC 3339; compara como texto.
+    pub date: String,
+}
+
 /// Raiz da biblioteca e o espaço livre nela.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -224,6 +233,47 @@ impl ArrClient {
             )
             .await?;
         Ok(page.records)
+    }
+
+    /// Configuração de indexadores (tetos, flags, legenda embutida), como a
+    /// instância a devolve.
+    ///
+    /// # Errors
+    ///
+    /// Falha de rede, status não-2xx ou resposta fora do formato.
+    pub async fn indexer_config(&self) -> Result<serde_json::Value, ArrError> {
+        let path = "api/v3/config/indexer";
+        self.get(self.url(path)?, &[], path).await
+    }
+
+    /// Configuração de gerenciamento de mídia (propers, espaço livre).
+    ///
+    /// # Errors
+    ///
+    /// Falha de rede, status não-2xx ou resposta fora do formato.
+    pub async fn media_management_config(&self) -> Result<serde_json::Value, ArrError> {
+        let path = "api/v3/config/mediamanagement";
+        self.get(self.url(path)?, &[], path).await
+    }
+
+    /// Filmes pegos (enviados ao cliente) de um filme, do mais novo ao mais
+    /// velho.
+    ///
+    /// # Errors
+    ///
+    /// Falha de rede, status não-2xx ou resposta fora do formato.
+    pub async fn movie_grabs(&self, movie_id: i64) -> Result<Vec<RemoteGrab>, ArrError> {
+        let path = "api/v3/history/movie";
+        let id = movie_id.to_string();
+        let mut grabs: Vec<RemoteGrab> = self
+            .get(
+                self.url(path)?,
+                &[("movieId", id.as_str()), ("eventType", "grabbed")],
+                path,
+            )
+            .await?;
+        grabs.sort_by(|a, b| b.date.cmp(&a.date));
+        Ok(grabs)
     }
 
     /// # Errors

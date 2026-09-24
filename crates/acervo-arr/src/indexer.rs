@@ -58,6 +58,18 @@ impl RemoteIndexer {
         })
     }
 
+    /// Prioridade do indexador na instância; menor é melhor.
+    #[must_use]
+    pub fn priority(&self) -> Option<i64> {
+        self.raw.get("priority")?.as_i64()
+    }
+
+    /// Mínimo de seeders configurado na instância.
+    #[must_use]
+    pub fn minimum_seeders(&self) -> Option<u64> {
+        self.field("minimumSeeders")?.as_u64()
+    }
+
     fn field(&self, name: &str) -> Option<&Value> {
         self.raw
             .get("fields")?

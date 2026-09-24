@@ -243,8 +243,10 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
         decisão da referência como gabarito: nenhuma divergência em casamento, motivos,
         ordem ou escolha. Ficam de fora histórico e lista de bloqueio, que são estado do
         gerenciador.
-  - [ ] **Decisão em sombra**: RSS e busca pelos perfis de qualidade, comparando o que o
-        acervo-hub pegaria com o que o gerenciador pegou, sem baixar nada.
+  - [ ] **Decisão em sombra**. `movies shadow` busca os filmes que faltam nos indexadores
+        daqui e grava o que o acervo-hub pegaria, sem pegar nada; `movies shadow --report`
+        compara cada escolha com o primeiro grab do gerenciador depois dela. A tela de filmes
+        mostra a última sombra de cada um. Falta acumular dias de comparação antes do corte.
   - [ ] **Grab e import**: envio ao cliente, hardlink e renomeação na biblioteca.
   - [ ] **API v3 de filmes** para os clientes que dependem dela (pedidos e legendas), e o
         corte.

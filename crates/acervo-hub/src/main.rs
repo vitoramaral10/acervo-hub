@@ -24,6 +24,7 @@ mod registry;
 mod report;
 mod search;
 mod serve;
+mod shadow;
 mod sync;
 
 #[derive(Debug, Parser)]
@@ -85,6 +86,17 @@ enum MoviesAction {
     },
     /// Confere cada arquivo do catálogo contra o disco.
     Check,
+    /// Busca os filmes que faltam nos indexadores daqui e decide o que
+    /// pegaria, sem pegar nada.
+    Shadow {
+        /// Quantos filmes buscar nesta rodada.
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Em vez de buscar, compara a última sombra de cada filme com o que o
+        /// gerenciador pegou depois.
+        #[arg(long)]
+        report: bool,
+    },
 }
 
 #[tokio::main]
@@ -136,6 +148,11 @@ async fn run() -> Result<ExitCode> {
                     .iter()
                     .any(|instance| instance.erro.is_some()),
                 MoviesAction::Check => movies::check(&config).await? > 0,
+                MoviesAction::Shadow { report: true, .. } => shadow::report(&config).await? > 0,
+                MoviesAction::Shadow { limit, .. } => shadow::run(&config, limit, true)
+                    .await?
+                    .iter()
+                    .any(|line| line.erro.is_some()),
             };
             return Ok(if failed {
                 ExitCode::FAILURE

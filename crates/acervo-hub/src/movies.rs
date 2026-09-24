@@ -272,6 +272,17 @@ pub struct FileView {
     pub disco_detalhe: Option<String>,
 }
 
+/// A última decisão em sombra do filme.
+#[derive(Debug, Serialize)]
+pub struct ShadowView {
+    pub quando: String,
+    pub releases: usize,
+    pub pegaria: Option<String>,
+    pub qualidade: Option<&'static str>,
+    pub motivos: Vec<(String, usize)>,
+    pub erro: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct MovieView {
     pub id: i64,
@@ -286,6 +297,7 @@ pub struct MovieView {
     pub pasta: String,
     pub adicionado: Option<String>,
     pub arquivo: Option<FileView>,
+    pub sombra: Option<ShadowView>,
 }
 
 fn disk(path: &Path, expected: u64, map: &acervo_fs::PathMap) -> (Disk, Option<String>) {
@@ -307,7 +319,11 @@ fn disk(path: &Path, expected: u64, map: &acervo_fs::PathMap) -> (Disk, Option<S
     }
 }
 
-fn view(entry: CatalogMovie, map: &acervo_fs::PathMap) -> MovieView {
+fn view(
+    entry: CatalogMovie,
+    map: &acervo_fs::PathMap,
+    shadow: Option<acervo_store::ShadowRun>,
+) -> MovieView {
     let movie = entry.movie;
     let arquivo = movie.file.map(|file| {
         let full = Path::new(&movie.path).join(&file.relative_path);
@@ -338,6 +354,14 @@ fn view(entry: CatalogMovie, map: &acervo_fs::PathMap) -> MovieView {
         pasta: movie.path,
         adicionado: movie.added,
         arquivo,
+        sombra: shadow.map(|run| ShadowView {
+            quando: run.at,
+            releases: run.releases,
+            qualidade: run.pick.as_ref().map(|p| p.quality.name()),
+            pegaria: run.pick.map(|p| p.title),
+            motivos: run.rejections,
+            erro: run.error,
+        }),
     }
 }
 
@@ -355,10 +379,18 @@ pub async fn list(config: &Config) -> Result<Vec<MovieView>> {
         }
         let store = Store::open(&database)
             .with_context(|| format!("abrindo o catálogo `{}`", database.display()))?;
+        let mut shadows: std::collections::HashMap<i64, acervo_store::ShadowRun> = store
+            .latest_shadow_runs()?
+            .into_iter()
+            .map(|run| (run.movie_id, run))
+            .collect();
         Ok(store
             .movies()?
             .into_iter()
-            .map(|entry| view(entry, &map))
+            .map(|entry| {
+                let shadow = shadows.remove(&entry.id);
+                view(entry, &map, shadow)
+            })
             .collect())
     })
     .await
