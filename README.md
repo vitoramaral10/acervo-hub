@@ -81,14 +81,22 @@ cargo run --bin acervo-hub -- -c config.toml search "termo" [-i indexador] [-k 5
 
 ### Interface web
 
-`serve` também serve uma interface em `/`: o estado de cada indexador (último sucesso,
-último erro, falhas seguidas), um botão de teste, a troca de credencial — cookie vencido,
-senha nova — sem editar arquivo, e a busca manual com download do `.torrent` pela sessão
-do tracker. Entra-se com a mesma chave de `server.api_key`.
+`serve` também serve uma interface em `/`, com o que se fazia pela tela do agregador atual:
 
-- **A credencial trocada pela tela não reescreve o `config.toml`**, que pode ficar somente
-  leitura. Ela vai para `[state] credentials` (gravação atômica, permissão 600) e vale por
-  cima da config na próxima subida. Segredo nunca volta para a tela: campo em branco
+- **Indexadores** — estado de cada um (último sucesso, último erro, falhas seguidas), teste,
+  ativar e desativar, trocar credencial, remover, e **adicionar** a partir do catálogo de
+  definições (`server.catalogs`) ou de qualquer endpoint Torznab. As definições que o
+  executor ainda não roda aparecem com o motivo, em vez de sumirem.
+- **Busca** manual em todos os indexadores, com download do `.torrent` pela sessão.
+- **Aplicativos** — o `sync` na tela: mostra o que mudaria no Sonarr e no Radarr e aplica.
+- **Limpeza** — o último ciclo (gravado ao lado do ledger) e uma simulação na hora.
+
+Entra-se com a mesma chave de `server.api_key`.
+
+- **A tela não reescreve o `config.toml`**, que pode ficar somente leitura. Indexadores
+  adicionados e desativados vão para `[state] registry`; credenciais, para
+  `[state] credentials` (gravação atômica, permissão 600). Os dois valem por cima da config.
+  Indexador do arquivo não se remove pela tela — desativa-se. Segredo nunca volta para a tela: campo em branco
   mantém o valor atual.
 - **Sessão em cookie `HttpOnly` e `SameSite=Strict`**, e toda ação que muda estado exige
   um cabeçalho que formulário de outra origem não consegue mandar. A CSP só aceita script

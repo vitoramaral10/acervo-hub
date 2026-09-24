@@ -1,24 +1,31 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Library, LogOut, Monitor, Moon, Search, Server, Sun } from 'lucide-react'
+import { Blocks, Brush, Library, LogOut, Monitor, Moon, Search, Server, Sun } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Tooltip } from '@/components/ui/misc'
 import { api, isUnauthorized } from '@/lib/api'
 import { type Theme, saveTheme, storedTheme } from '@/lib/theme'
 import { cn } from '@/lib/utils'
+import { AppsPage } from '@/pages/Apps'
+import { CleanupPage } from '@/pages/Cleanup'
 import { IndexersPage } from '@/pages/Indexers'
 import { LoginPage } from '@/pages/Login'
 import { SearchPage } from '@/pages/Search'
 
-type View = 'indexadores' | 'busca'
+type View = 'indexadores' | 'busca' | 'aplicativos' | 'limpeza'
+
+const VIEWS: View[] = ['indexadores', 'busca', 'aplicativos', 'limpeza']
 
 function viewFromHash(): View {
-  return window.location.hash === '#busca' ? 'busca' : 'indexadores'
+  const hash = window.location.hash.slice(1) as View
+  return VIEWS.includes(hash) ? hash : 'indexadores'
 }
 
 const NAV: { view: View; label: string; icon: typeof Server }[] = [
   { view: 'indexadores', label: 'Indexadores', icon: Server },
   { view: 'busca', label: 'Busca', icon: Search },
+  { view: 'aplicativos', label: 'Aplicativos', icon: Blocks },
+  { view: 'limpeza', label: 'Limpeza', icon: Brush },
 ]
 
 export function App() {
@@ -89,7 +96,7 @@ export function App() {
               )}
             >
               <Icon className="size-4" aria-hidden="true" />
-              <span>{label}</span>
+              <span className="sr-only sm:not-sr-only">{label}</span>
             </a>
           ))}
         </nav>
@@ -105,7 +112,17 @@ export function App() {
         </div>
       </aside>
       <main id="conteudo" tabIndex={-1} className="min-w-0 px-4 py-6 outline-none sm:px-6 md:px-10 md:py-10">
-        <div className="mx-auto max-w-6xl">{view === 'busca' ? <SearchPage /> : <IndexersPage />}</div>
+        <div className="mx-auto max-w-6xl">
+          {view === 'busca' ? (
+            <SearchPage />
+          ) : view === 'aplicativos' ? (
+            <AppsPage />
+          ) : view === 'limpeza' ? (
+            <CleanupPage />
+          ) : (
+            <IndexersPage />
+          )}
+        </div>
       </main>
     </div>
   )

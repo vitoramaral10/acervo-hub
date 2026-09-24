@@ -45,6 +45,8 @@ export interface Health {
 
 export interface Indexer {
   nome: string
+  ativo: boolean
+  origem: 'config' | 'interface'
   privado: boolean
   editavel: boolean
   modos: { busca: boolean; series: boolean; filmes: boolean }
@@ -86,6 +88,50 @@ export interface SearchResponse {
   falhas: { indexador: string; erro: string }[]
 }
 
+export interface Definition {
+  id: string
+  name: string
+  description: string
+  language: string
+  private: boolean
+  supported: boolean
+  reason: string | null
+  added: boolean
+}
+
+export interface SyncAction {
+  acao: 'criar' | 'atualizar' | 'remover' | 'manter'
+  indexador: string
+  categorias: number[]
+  falha: string | null
+}
+
+export interface SyncReport {
+  aplicado: boolean
+  falhas: number
+  instancias: { nome: string; tipo: string; erro: string | null; acoes: SyncAction[] }[]
+}
+
+export interface Apps {
+  endereco_publico: string | null
+  instancias: { nome: string; tipo: 'series' | 'filmes'; url: string }[]
+}
+
+export interface CycleReport {
+  quando: string
+  modo: 'simulacao' | 'aplicado'
+  instancias: { nome: string; fila: number | null; obras: number | null; erro: string | null }[]
+  torrents: number
+  ilegiveis: { nome: string; motivo: string }[]
+  biblioteca: string
+  abortado: string | null
+  acoes: { tipo: string; instancia: string | null; titulo: string; detalhe: string }[]
+  espaco: string
+  pulados: { motivo: string; quantos: number }[]
+  executadas: number | null
+  falharam: number | null
+}
+
 export const api = {
   session: () => request<{ ok: boolean }>('GET', '/ui/api/sessao'),
   login: (chave: string) => request<{ ok: boolean }>('POST', '/ui/api/entrar', { chave }),
@@ -101,6 +147,22 @@ export const api = {
       `/ui/api/indexadores/${encodeURIComponent(name)}/settings`,
       values,
     ),
+  catalog: () => request<{ definicoes: Definition[] }>('GET', '/ui/api/catalogo'),
+  definitionSettings: (id: string) =>
+    request<{ settings: Setting[] }>('GET', `/ui/api/catalogo/${encodeURIComponent(id)}/settings`),
+  addIndexer: (definicao: string, settings: Record<string, string>) =>
+    request<{ ok: boolean; nome: string; teste: TestResult }>('POST', '/ui/api/indexadores', {
+      definicao,
+      settings,
+    }),
+  removeIndexer: (name: string) =>
+    request<{ ok: boolean }>('DELETE', `/ui/api/indexadores/${encodeURIComponent(name)}`),
+  setEnabled: (name: string, ativo: boolean) =>
+    request<{ ok: boolean }>('PUT', `/ui/api/indexadores/${encodeURIComponent(name)}/ativo`, { ativo }),
+  apps: () => request<{ aplicativos: Apps }>('GET', '/ui/api/aplicativos'),
+  sync: (aplicar: boolean) => request<SyncReport>('POST', '/ui/api/aplicativos/sincronizar', { aplicar }),
+  lastCycle: () => request<{ ultimo: CycleReport | null }>('GET', '/ui/api/limpeza'),
+  simulateCycle: () => request<CycleReport>('POST', '/ui/api/limpeza/simular'),
   search: (params: { q: string; indexador: string; cat: string }) => {
     const query = new URLSearchParams()
     query.set('q', params.q)

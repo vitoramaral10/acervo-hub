@@ -91,6 +91,10 @@ api_key = "TROQUE_POR_UMA_CHAVE_LONGA"
 # Como os gerenciadores alcançam este serviço. É o endereço que `sync`
 # cadastra neles; em Compose, o nome do serviço na rede interna.
 public_url = "http://acervo-hub-indexadores:9797"
+# Diretórios de definições Cardigann que a interface oferece em "Adicionar
+# indexador" — por exemplo, o Definitions do agregador atual. As que o
+# executor ainda não roda aparecem com o motivo.
+catalogs = ["/etc/acervo-hub/definicoes", "/etc/acervo-hub/catalogo"]
 
 # Endpoint Torznab existente — por exemplo, o feed de um indexador no agregador
 # atual. As capacidades são lidas no início; se ele não responder, fica fora do

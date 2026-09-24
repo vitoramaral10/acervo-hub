@@ -4,26 +4,40 @@ import {
   CircleCheck,
   CircleDashed,
   Film,
+  CirclePause,
+  FileCode2,
   KeyRound,
   Lock,
+  Plus,
   RefreshCw,
   Search,
   ServerOff,
+  Trash2,
   Tv,
 } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
+import { AddIndexerDialog } from '@/components/AddIndexerDialog'
 import { CredentialsDialog } from '@/components/CredentialsDialog'
 import { PageHeader } from '@/components/PageHeader'
 import { Button } from '@/components/ui/button'
-import { Badge, Skeleton, Tooltip } from '@/components/ui/misc'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Badge, Skeleton, Switch, Tooltip } from '@/components/ui/misc'
 import { type Indexer, api } from '@/lib/api'
 import { formatAgo, formatCount } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
-type Status = 'ok' | 'failing' | 'idle'
+type Status = 'ok' | 'failing' | 'idle' | 'off'
 
 function statusOf(indexer: Indexer): Status {
+  if (!indexer.ativo) return 'off'
   if (indexer.saude.falhas_seguidas > 0) return 'failing'
   if (indexer.saude.ultimo_sucesso) return 'ok'
   return 'idle'
@@ -33,14 +47,17 @@ const STATUS = {
   ok: { label: 'Funcionando', tone: 'success', icon: CircleCheck },
   failing: { label: 'Com falha', tone: 'danger', icon: CircleAlert },
   idle: { label: 'Sem uso ainda', tone: 'neutral', icon: CircleDashed },
+  off: { label: 'Desativado', tone: 'neutral', icon: CirclePause },
 } as const
 
 export function IndexersPage() {
   const indexers = useQuery({ queryKey: ['indexadores'], queryFn: api.indexers, refetchInterval: 30_000 })
   const [editing, setEditing] = useState<string | null>(null)
+  const [adding, setAdding] = useState(false)
   const list = indexers.data?.indexadores ?? []
   const failing = list.filter((indexer) => statusOf(indexer) === 'failing').length
   const working = list.filter((indexer) => statusOf(indexer) === 'ok').length
+  const active = list.filter((indexer) => indexer.ativo).length
 
   return (
     <>
@@ -48,10 +65,16 @@ export function IndexersPage() {
         title="Indexadores"
         description="Estado desde que o serviço subiu. Cada busca — do Sonarr, do Radarr ou daqui — atualiza esta tela."
         action={
-          <Button onClick={() => void indexers.refetch()} loading={indexers.isFetching && !indexers.isPending}>
-            {!(indexers.isFetching && !indexers.isPending) && <RefreshCw aria-hidden="true" />}
-            Atualizar
-          </Button>
+          <div className="flex gap-2">
+            <Button onClick={() => void indexers.refetch()} loading={indexers.isFetching && !indexers.isPending}>
+              {!(indexers.isFetching && !indexers.isPending) && <RefreshCw aria-hidden="true" />}
+              Atualizar
+            </Button>
+            <Button variant="primary" onClick={() => setAdding(true)}>
+              <Plus aria-hidden="true" />
+              Adicionar indexador
+            </Button>
+          </div>
         }
       />
 
@@ -66,16 +89,19 @@ export function IndexersPage() {
       ) : list.length === 0 ? (
         <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed border-border-strong px-6 py-16 text-center">
           <ServerOff className="size-8 text-content-subtle" aria-hidden="true" />
-          <p className="font-medium">Nenhum indexador configurado</p>
+          <p className="font-medium">Nenhum indexador ainda</p>
           <p className="max-w-md text-sm text-content-muted">
-            Adicione um bloco <code className="font-mono">[[indexers]]</code> no <code className="font-mono">config.toml</code> e
-            reinicie o serviço.
+            Escolha um tracker no catálogo de definições, ou aponte para qualquer endpoint Torznab.
           </p>
+          <Button variant="primary" onClick={() => setAdding(true)}>
+            <Plus aria-hidden="true" />
+            Adicionar indexador
+          </Button>
         </div>
       ) : (
         <>
           <dl className="mb-6 grid grid-cols-3 gap-3 sm:max-w-lg">
-            <Stat label="Indexadores" value={list.length} />
+            <Stat label="Ativos" value={active} />
             <Stat label="Funcionando" value={working} tone={working > 0 ? 'success' : undefined} />
             <Stat label="Com falha" value={failing} tone={failing > 0 ? 'danger' : undefined} />
           </dl>
@@ -90,6 +116,7 @@ export function IndexersPage() {
       )}
 
       <CredentialsDialog name={editing} onClose={() => setEditing(null)} />
+      <AddIndexerDialog open={adding} onClose={() => setAdding(false)} />
     </>
   )
 }
@@ -123,13 +150,36 @@ function IndexerCard({ indexer, onEdit }: { indexer: Indexer; onEdit: () => void
     onError: (error: Error) => toast.error(error.message),
     onSettled: () => void queryClient.invalidateQueries({ queryKey: ['indexadores'] }),
   })
+  const toggle = useMutation({
+    mutationFn: (ativo: boolean) => api.setEnabled(indexer.nome, ativo),
+    onSuccess: (_, ativo) =>
+      toast.success(ativo ? `${indexer.nome} ativado` : `${indexer.nome} desativado — não é servido nem sincronizado`),
+    onError: (error: Error) => toast.error(error.message),
+    onSettled: () => void queryClient.invalidateQueries({ queryKey: ['indexadores'] }),
+  })
+  const [confirming, setConfirming] = useState(false)
+  const remove = useMutation({
+    mutationFn: () => api.removeIndexer(indexer.nome),
+    onSuccess: () => {
+      toast.success(`${indexer.nome} removido`)
+      setConfirming(false)
+    },
+    onError: (error: Error) => toast.error(error.message),
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ['indexadores'] })
+      void queryClient.invalidateQueries({ queryKey: ['catalogo'] })
+    },
+  })
   const health = indexer.saude
   const StatusIcon = status.icon
 
   return (
     <article
       aria-labelledby={`indexador-${indexer.nome}`}
-      className="flex h-full flex-col gap-4 rounded-lg border border-border bg-surface p-5 transition-colors hover:border-border-strong"
+      className={cn(
+        'flex h-full flex-col gap-4 rounded-lg border border-border bg-surface p-5 transition-colors hover:border-border-strong',
+        !indexer.ativo && 'bg-bg',
+      )}
     >
       <header className="flex items-start justify-between gap-3">
         <div className="min-w-0">
@@ -137,6 +187,14 @@ function IndexerCard({ indexer, onEdit }: { indexer: Indexer; onEdit: () => void
             <h2 id={`indexador-${indexer.nome}`} className="truncate text-base font-semibold tracking-tight">
               {indexer.nome}
             </h2>
+            {indexer.origem === 'config' && (
+              <Tooltip content="Vem do config.toml: edite o arquivo para mudar a definição ou removê-lo. Aqui dá para desativar e trocar credencial.">
+                <span className="inline-flex text-content-subtle">
+                  <FileCode2 className="size-3.5" aria-hidden="true" />
+                  <span className="sr-only">do config.toml</span>
+                </span>
+              </Tooltip>
+            )}
             {indexer.privado && (
               <Tooltip content="Tracker privado: login e download passam pela sessão guardada aqui.">
                 <span className="inline-flex text-content-subtle">
@@ -162,15 +220,28 @@ function IndexerCard({ indexer, onEdit }: { indexer: Indexer; onEdit: () => void
                 <Search aria-hidden="true" /> Busca livre
               </Badge>
             )}
-            <Badge>{indexer.categorias.length} categorias</Badge>
+            {indexer.ativo && <Badge>{indexer.categorias.length} categorias</Badge>}
           </div>
         </div>
-        <Badge tone={status.tone} className="py-1">
-          <StatusIcon aria-hidden="true" />
-          {status.label}
-        </Badge>
+        <div className="flex shrink-0 items-center gap-3">
+          <Badge tone={status.tone} className="py-1">
+            <StatusIcon aria-hidden="true" />
+            {status.label}
+          </Badge>
+          <Switch
+            checked={indexer.ativo}
+            disabled={toggle.isPending}
+            onCheckedChange={(ativo) => toggle.mutate(ativo)}
+            aria-label={indexer.ativo ? `Desativar ${indexer.nome}` : `Ativar ${indexer.nome}`}
+          />
+        </div>
       </header>
 
+      {!indexer.ativo ? (
+        <p className="border-t border-border pt-4 text-sm text-content-muted">
+          Desativado: não é servido ao Sonarr e ao Radarr nem entra na busca. Ative para voltar.
+        </p>
+      ) : (
       <dl className="grid grid-cols-3 gap-3 border-t border-border pt-4 text-sm">
         <div>
           <dt className="text-xs text-content-subtle">Último sucesso</dt>
@@ -187,6 +258,7 @@ function IndexerCard({ indexer, onEdit }: { indexer: Indexer; onEdit: () => void
           </dd>
         </div>
       </dl>
+      )}
 
       {health.falhas_seguidas > 0 && health.ultimo_erro && (
         <p className="rounded-md bg-danger-bg px-3 py-2 text-sm text-danger">
@@ -195,7 +267,13 @@ function IndexerCard({ indexer, onEdit }: { indexer: Indexer; onEdit: () => void
       )}
 
       <footer className="mt-auto flex flex-wrap gap-2">
-        <Button size="sm" onClick={() => test.mutate()} loading={test.isPending} aria-label={`Testar ${indexer.nome}`}>
+        <Button
+          size="sm"
+          onClick={() => test.mutate()}
+          loading={test.isPending}
+          disabled={!indexer.ativo}
+          aria-label={`Testar ${indexer.nome}`}
+        >
           {!test.isPending && <RefreshCw aria-hidden="true" />}
           {test.isPending ? 'Testando…' : 'Testar'}
         </Button>
@@ -205,7 +283,39 @@ function IndexerCard({ indexer, onEdit }: { indexer: Indexer; onEdit: () => void
             Credenciais
           </Button>
         )}
+        {indexer.origem === 'interface' && (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="ml-auto hover:text-danger"
+            onClick={() => setConfirming(true)}
+            aria-label={`Remover ${indexer.nome}`}
+          >
+            <Trash2 aria-hidden="true" />
+            Remover
+          </Button>
+        )}
       </footer>
+
+      <Dialog open={confirming} onOpenChange={setConfirming}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Remover {indexer.nome}?</DialogTitle>
+            <DialogDescription>
+              Sai do acervo-hub junto com as credenciais guardadas. O cadastro dele no Sonarr e no Radarr só some na
+              próxima sincronização.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setConfirming(false)}>
+              Cancelar
+            </Button>
+            <Button variant="danger" loading={remove.isPending} onClick={() => remove.mutate()}>
+              Remover
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </article>
   )
 }
