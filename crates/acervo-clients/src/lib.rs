@@ -24,10 +24,7 @@ pub enum QbitError {
         path: String,
     },
 
-    #[error(
-        "login recusado. Com 2FA ligado e sem chave de API no produto, não há \
-         como autenticar por aqui"
-    )]
+    #[error("login recusado: usuário ou senha do qBittorrent incorretos")]
     LoginRefused,
 }
 
@@ -74,16 +71,24 @@ impl QbitClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            return Err(QbitError::Status {
-                status: response.status(),
-                path: "api/v2/auth/login".into(),
-            });
-        }
-
-        // A API responde 200 com corpo "Fails." em credencial errada.
-        if response.text().await?.trim() != "Ok." {
-            return Err(QbitError::LoginRefused);
+        // Duas gerações da API convivem: até a 5.0, sucesso é 200 com corpo
+        // "Ok." e credencial errada é 200 com "Fails."; da 5.1 em diante,
+        // sucesso é 204 sem corpo e credencial errada é 401. Aceitar só a
+        // forma antiga recusava o login certo de um cliente atualizado.
+        match response.status() {
+            reqwest::StatusCode::NO_CONTENT => {}
+            reqwest::StatusCode::OK => {
+                if response.text().await?.trim() != "Ok." {
+                    return Err(QbitError::LoginRefused);
+                }
+            }
+            reqwest::StatusCode::UNAUTHORIZED => return Err(QbitError::LoginRefused),
+            status => {
+                return Err(QbitError::Status {
+                    status,
+                    path: "api/v2/auth/login".into(),
+                });
+            }
         }
 
         Ok(Self { base, http })

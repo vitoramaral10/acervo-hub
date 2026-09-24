@@ -106,6 +106,33 @@ async fn credencial_errada_responde_200_e_ainda_assim_e_recusa() {
 }
 
 #[tokio::test]
+async fn qbittorrent_5_responde_204_no_login_certo_e_401_no_errado() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/auth/login"))
+        .and(body_string_contains("password=segredo"))
+        .respond_with(
+            ResponseTemplate::new(204).insert_header("Set-Cookie", "SID=abc; HttpOnly; path=/"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/auth/login"))
+        .and(body_string_contains("password=errada"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("Fails."))
+        .mount(&server)
+        .await;
+
+    QbitClient::login(&server.uri(), "vigia", "segredo", Duration::from_secs(5))
+        .await
+        .expect("204 é sucesso no qBittorrent 5.1+");
+    let erro = QbitClient::login(&server.uri(), "vigia", "errada", Duration::from_secs(5))
+        .await
+        .unwrap_err();
+    assert!(erro.to_string().contains("recusado"), "{erro}");
+}
+
+#[tokio::test]
 async fn listagem_traz_o_que_a_decisao_precisa() {
     let server = MockServer::start().await;
     let cliente = sessao(&server).await;
