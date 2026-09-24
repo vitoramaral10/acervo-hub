@@ -36,6 +36,61 @@ pub struct RemoteMovie {
     pub added: Option<String>,
     #[serde(default)]
     pub movie_file: Option<RemoteMovieFile>,
+    #[serde(default)]
+    pub runtime: u32,
+    #[serde(default)]
+    pub secondary_year: Option<u16>,
+    #[serde(default)]
+    pub clean_title: Option<String>,
+    #[serde(default)]
+    pub is_available: bool,
+    #[serde(default)]
+    pub alternate_titles: Vec<RemoteTitle>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteTitle {
+    pub title: String,
+}
+
+/// Tamanho por minuto aceito para uma qualidade, em megabytes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteQualityDefinition {
+    pub quality: RemoteQuality,
+    #[serde(default)]
+    pub min_size: Option<f64>,
+    #[serde(default)]
+    pub max_size: Option<f64>,
+    #[serde(default)]
+    pub preferred_size: Option<f64>,
+}
+
+/// Um download na fila, com a qualidade e o filme dono.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteQueueItem {
+    #[serde(default)]
+    pub movie_id: Option<i64>,
+    #[serde(default)]
+    pub quality: Option<RemoteQualityModel>,
+    #[serde(default)]
+    pub tracked_download_state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueuePage {
+    #[serde(default)]
+    records: Vec<RemoteQueueItem>,
+}
+
+/// Raiz da biblioteca e o espaço livre nela.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteRootFolder {
+    pub path: String,
+    #[serde(default)]
+    pub free_space: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -105,6 +160,10 @@ pub struct RemoteQualityProfile {
     pub language: Option<Named>,
     #[serde(default)]
     pub items: Vec<RemoteProfileItem>,
+    #[serde(default)]
+    pub min_format_score: i32,
+    #[serde(default)]
+    pub cutoff_format_score: i32,
 }
 
 /// Uma qualidade (`quality` preenchido) ou um grupo delas (`items`).
@@ -139,6 +198,39 @@ impl ArrClient {
     /// Falha de rede, status não-2xx ou resposta fora do formato.
     pub async fn quality_profiles(&self) -> Result<Vec<RemoteQualityProfile>, ArrError> {
         let path = "api/v3/qualityprofile";
+        self.get(self.url(path)?, &[], path).await
+    }
+
+    /// # Errors
+    ///
+    /// Falha de rede, status não-2xx ou resposta fora do formato.
+    pub async fn quality_definitions(&self) -> Result<Vec<RemoteQualityDefinition>, ArrError> {
+        let path = "api/v3/qualitydefinition";
+        self.get(self.url(path)?, &[], path).await
+    }
+
+    /// Downloads na fila, com o filme de cada um.
+    ///
+    /// # Errors
+    ///
+    /// Falha de rede, status não-2xx ou resposta fora do formato.
+    pub async fn movie_queue(&self) -> Result<Vec<RemoteQueueItem>, ArrError> {
+        let path = "api/v3/queue";
+        let page: QueuePage = self
+            .get(
+                self.url(path)?,
+                &[("page", "1"), ("pageSize", "1000")],
+                path,
+            )
+            .await?;
+        Ok(page.records)
+    }
+
+    /// # Errors
+    ///
+    /// Falha de rede, status não-2xx ou resposta fora do formato.
+    pub async fn root_folders(&self) -> Result<Vec<RemoteRootFolder>, ArrError> {
+        let path = "api/v3/rootfolder";
         self.get(self.url(path)?, &[], path).await
     }
 }

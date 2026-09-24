@@ -48,6 +48,8 @@ pub struct QualityProfile {
     pub cutoff: Option<usize>,
     pub language: Option<String>,
     pub items: Vec<ProfileItem>,
+    pub min_format_score: i32,
+    pub cutoff_format_score: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +84,17 @@ pub struct Movie {
     pub path: String,
     pub added: Option<String>,
     pub file: Option<MovieFile>,
+    /// Minutos; zero é desconhecido.
+    pub runtime: u32,
+    /// Ano alternativo (estreia em outro país), aceito no casamento.
+    pub secondary_year: Option<u16>,
+    /// Título limpo da base de metadados, a forma com que o release é
+    /// comparado.
+    pub clean_title: Option<String>,
+    /// Títulos alternativos e traduções.
+    pub alternate_titles: Vec<String>,
+    /// Já passou da disponibilidade mínima.
+    pub available: bool,
 }
 
 /// Um filme do catálogo, com o id local e de onde veio.
@@ -93,6 +106,15 @@ pub struct CatalogMovie {
     pub origin: Option<(String, i64)>,
 }
 
+/// Tamanhos por minuto de filme, em megabytes, de uma qualidade.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QualityDefinition {
+    pub quality: Quality,
+    pub min_size: Option<f64>,
+    pub max_size: Option<f64>,
+    pub preferred_size: Option<f64>,
+}
+
 /// Tudo o que uma instância tem, para espelhar.
 #[derive(Debug, Clone)]
 pub struct Import {
@@ -100,6 +122,7 @@ pub struct Import {
     /// catálogo só se tiver vindo dela.
     pub source: String,
     pub profiles: Vec<QualityProfile>,
+    pub definitions: Vec<QualityDefinition>,
     /// Id do filme na origem, e o filme.
     pub movies: Vec<(i64, Movie)>,
 }
@@ -115,7 +138,8 @@ pub struct ImportSummary {
     pub applied: bool,
 }
 
-const MIGRATIONS: &[&str] = &[r"
+const MIGRATIONS: &[&str] = &[
+    r"
     CREATE TABLE quality_profiles (
         id INTEGER PRIMARY KEY,
         name TEXT NOT NULL UNIQUE,
@@ -155,7 +179,27 @@ const MIGRATIONS: &[&str] = &[r"
         scene_name TEXT,
         date_added TEXT
     );
-"];
+",
+    r"
+    ALTER TABLE movies ADD COLUMN runtime INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE movies ADD COLUMN secondary_year INTEGER;
+    ALTER TABLE movies ADD COLUMN clean_title TEXT;
+    ALTER TABLE movies ADD COLUMN available INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE quality_profiles ADD COLUMN min_format_score INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE quality_profiles ADD COLUMN cutoff_format_score INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE movie_titles (
+        movie_id INTEGER NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+        title TEXT NOT NULL
+    );
+    CREATE INDEX movie_titles_by_movie ON movie_titles(movie_id);
+    CREATE TABLE quality_definitions (
+        quality INTEGER PRIMARY KEY,
+        min_size REAL,
+        max_size REAL,
+        preferred_size REAL
+    );
+",
+];
 
 #[derive(Debug)]
 pub struct Store {
@@ -215,7 +259,9 @@ impl Store {
     /// Falha de leitura ou registro inconsistente.
     pub fn profiles(&self) -> Result<Vec<QualityProfile>> {
         let mut statement = self.connection.prepare(
-            "SELECT name, upgrade_allowed, cutoff, language, items FROM quality_profiles ORDER BY name",
+            "SELECT name, upgrade_allowed, cutoff, language, items, min_format_score,
+                    cutoff_format_score
+             FROM quality_profiles ORDER BY name",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -224,16 +270,52 @@ impl Store {
                 row.get::<_, Option<i64>>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, i32>(5)?,
+                row.get::<_, i32>(6)?,
             ))
         })?;
         rows.map(|row| {
-            let (name, upgrade_allowed, cutoff, language, items) = row?;
+            let (
+                name,
+                upgrade_allowed,
+                cutoff,
+                language,
+                items,
+                min_format_score,
+                cutoff_format_score,
+            ) = row?;
             Ok(QualityProfile {
                 items: decode_items(&items)?,
                 cutoff: cutoff.and_then(|c| usize::try_from(c).ok()),
                 name,
                 upgrade_allowed,
                 language,
+                min_format_score,
+                cutoff_format_score,
+            })
+        })
+        .collect()
+    }
+
+    /// Tamanhos por qualidade.
+    ///
+    /// # Errors
+    ///
+    /// Falha de leitura ou qualidade desconhecida.
+    pub fn quality_definitions(&self) -> Result<Vec<QualityDefinition>> {
+        let mut statement = self.connection.prepare(
+            "SELECT quality, min_size, max_size, preferred_size FROM quality_definitions ORDER BY quality",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, u8>(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        rows.map(|row| {
+            let (id, min_size, max_size, preferred_size) = row?;
+            Ok(QualityDefinition {
+                quality: quality(id)?,
+                min_size,
+                max_size,
+                preferred_size,
             })
         })
         .collect()
@@ -254,6 +336,20 @@ impl Store {
         };
         for profile in &import.profiles {
             upsert_profile(&tx, profile)?;
+        }
+        for definition in &import.definitions {
+            tx.execute(
+                "INSERT INTO quality_definitions (quality, min_size, max_size, preferred_size)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(quality) DO UPDATE SET min_size = excluded.min_size,
+                     max_size = excluded.max_size, preferred_size = excluded.preferred_size",
+                params![
+                    definition.quality.id(),
+                    definition.min_size,
+                    definition.max_size,
+                    definition.preferred_size
+                ],
+            )?;
         }
 
         let existing = read_movies(&tx)?;
@@ -343,16 +439,21 @@ fn quality(id: u8) -> Result<Quality> {
 
 fn upsert_profile(tx: &Transaction<'_>, profile: &QualityProfile) -> Result<()> {
     tx.execute(
-        "INSERT INTO quality_profiles (name, upgrade_allowed, cutoff, language, items)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO quality_profiles (name, upgrade_allowed, cutoff, language, items,
+             min_format_score, cutoff_format_score)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(name) DO UPDATE SET upgrade_allowed = excluded.upgrade_allowed,
-             cutoff = excluded.cutoff, language = excluded.language, items = excluded.items",
+             cutoff = excluded.cutoff, language = excluded.language, items = excluded.items,
+             min_format_score = excluded.min_format_score,
+             cutoff_format_score = excluded.cutoff_format_score",
         params![
             profile.name,
             profile.upgrade_allowed,
             profile.cutoff.and_then(|c| i64::try_from(c).ok()),
             profile.language,
             encode_items(&profile.items),
+            profile.min_format_score,
+            profile.cutoff_format_score,
         ],
     )?;
     Ok(())
@@ -390,14 +491,19 @@ fn write_movie(
         movie.added,
         source,
         source_id,
+        movie.runtime,
+        movie.secondary_year,
+        movie.clean_title,
+        movie.available,
     ];
     let id = if let Some(id) = id {
         tx.execute(
             "UPDATE movies SET tmdb_id = ?1, imdb_id = ?2, title = ?3, original_title = ?4,
                  original_language = ?5, year = ?6, status = ?7, minimum_availability = ?8,
                  monitored = ?9, quality_profile_id = ?10, path = ?11, added = ?12,
-                 source = ?13, source_id = ?14
-             WHERE id = ?15",
+                 source = ?13, source_id = ?14, runtime = ?15, secondary_year = ?16,
+                 clean_title = ?17, available = ?18
+             WHERE id = ?19",
             rusqlite::params_from_iter(values.iter().copied().chain([&id as &dyn rusqlite::ToSql])),
         )?;
         id
@@ -405,13 +511,21 @@ fn write_movie(
         tx.execute(
             "INSERT INTO movies (tmdb_id, imdb_id, title, original_title, original_language,
                  year, status, minimum_availability, monitored, quality_profile_id, path,
-                 added, source, source_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 added, source, source_id, runtime, secondary_year, clean_title, available)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                 ?17, ?18)",
             values,
         )?;
         tx.last_insert_rowid()
     };
 
+    tx.execute("DELETE FROM movie_titles WHERE movie_id = ?1", params![id])?;
+    for title in &movie.alternate_titles {
+        tx.execute(
+            "INSERT INTO movie_titles (movie_id, title) VALUES (?1, ?2)",
+            params![id, title],
+        )?;
+    }
     tx.execute("DELETE FROM movie_files WHERE movie_id = ?1", params![id])?;
     if let Some(file) = &movie.file {
         tx.execute(
@@ -443,7 +557,8 @@ fn read_movies(connection: &Connection) -> Result<Vec<CatalogMovie>> {
                 m.year, m.status, m.minimum_availability, m.monitored, p.name, m.path, m.added,
                 m.source, m.source_id,
                 f.relative_path, f.size, f.quality, f.revision_version, f.revision_real,
-                f.is_repack, f.languages, f.release_group, f.edition, f.scene_name, f.date_added
+                f.is_repack, f.languages, f.release_group, f.edition, f.scene_name, f.date_added,
+                m.runtime, m.secondary_year, m.clean_title, m.available
          FROM movies m
          LEFT JOIN quality_profiles p ON p.id = m.quality_profile_id
          LEFT JOIN movie_files f ON f.movie_id = m.id
@@ -500,8 +615,22 @@ fn read_movies(connection: &Connection) -> Result<Vec<CatalogMovie>> {
                 path: row.get(11)?,
                 added: row.get(12)?,
                 file,
+                runtime: row.get(26)?,
+                secondary_year: row.get(27)?,
+                clean_title: row.get(28)?,
+                available: row.get(29)?,
+                alternate_titles: Vec::new(),
             },
         });
+    }
+    let mut titles =
+        connection.prepare("SELECT movie_id, title FROM movie_titles ORDER BY rowid")?;
+    let mut rows = titles.query([])?;
+    while let Some(row) = rows.next()? {
+        let (id, title): (i64, String) = (row.get(0)?, row.get(1)?);
+        if let Some(entry) = movies.iter_mut().find(|m| m.id == id) {
+            entry.movie.alternate_titles.push(title);
+        }
     }
     Ok(movies)
 }
@@ -528,6 +657,8 @@ mod tests {
                     allowed: true,
                 },
             ],
+            min_format_score: 0,
+            cutoff_format_score: 0,
         }
     }
 
@@ -558,6 +689,11 @@ mod tests {
                 scene_name: Some(format!("{title}.2020.1080p.WEB-DL-GRUPO")),
                 date_added: Some("2026-01-02T00:00:00Z".into()),
             }),
+            runtime: 110,
+            secondary_year: None,
+            clean_title: Some(title.to_lowercase()),
+            alternate_titles: vec![format!("{title} alternativo")],
+            available: true,
         }
     }
 
@@ -565,6 +701,12 @@ mod tests {
         Import {
             source: "radarr:filmes".into(),
             profiles: vec![profile()],
+            definitions: vec![QualityDefinition {
+                quality: Quality::WebDl1080p,
+                min_size: Some(5.0),
+                max_size: Some(400.0),
+                preferred_size: None,
+            }],
             movies,
         }
     }
@@ -589,6 +731,7 @@ mod tests {
         assert_eq!(um.movie, movie(10, "Um", true));
         assert_eq!(um.origin, Some(("radarr:filmes".into(), 1)));
         assert_eq!(store.profiles().unwrap(), [profile()]);
+        assert_eq!(store.quality_definitions().unwrap().len(), 1);
     }
 
     #[test]
@@ -616,6 +759,29 @@ mod tests {
             .unwrap();
         assert_eq!(same.unchanged, 1);
         assert!(same.updated.is_empty() && same.removed.is_empty());
+    }
+
+    #[test]
+    fn banco_da_versao_1_migra_sem_perder_filme() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(MIGRATIONS[0]).unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO movies (tmdb_id, title, monitored, path) VALUES (10, 'Um', 1, '/f/Um')",
+                [],
+            )
+            .unwrap();
+        let store = Store::setup(connection).unwrap();
+        let movies = store.movies().unwrap();
+        assert_eq!(movies.len(), 1);
+        assert_eq!(movies[0].movie.runtime, 0);
+        assert!(!movies[0].movie.available);
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, i64::try_from(MIGRATIONS.len()).unwrap());
     }
 
     #[test]

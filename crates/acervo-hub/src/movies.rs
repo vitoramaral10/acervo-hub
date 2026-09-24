@@ -12,7 +12,8 @@ use acervo_arr::{ArrClient, ArrKind, RemoteMovie, RemoteProfileItem, RemoteQuali
 use acervo_core::InstanceName;
 use acervo_parser::{Quality, QualityModel, Revision};
 use acervo_store::{
-    CatalogMovie, Import, ImportSummary, Movie, MovieFile, ProfileItem, QualityProfile, Store,
+    CatalogMovie, Import, ImportSummary, Movie, MovieFile, ProfileItem, QualityDefinition,
+    QualityProfile, Store,
 };
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -113,11 +114,26 @@ async fn fetch(config: &Config, name: &str, url: &str, api_key: &str) -> Result<
         ArrKind::Movie,
         config.http_timeout(),
     )?;
-    let (profiles, movies) = tokio::try_join!(client.quality_profiles(), client.movies())?;
+    let (profiles, movies, definitions) = tokio::try_join!(
+        client.quality_profiles(),
+        client.movies(),
+        client.quality_definitions()
+    )?;
     let names: HashMap<i64, String> = profiles.iter().map(|p| (p.id, p.name.clone())).collect();
     Ok(Import {
         source: format!("radarr:{name}"),
         profiles: profiles.iter().map(profile).collect(),
+        definitions: definitions
+            .iter()
+            .filter_map(|d| {
+                Some(QualityDefinition {
+                    quality: Quality::from_id(d.quality.id)?,
+                    min_size: d.min_size,
+                    max_size: d.max_size,
+                    preferred_size: d.preferred_size,
+                })
+            })
+            .collect(),
         movies: movies
             .into_iter()
             .map(|remote| (remote.id, movie(remote, &names)))
@@ -167,6 +183,8 @@ fn profile(remote: &RemoteQualityProfile) -> QualityProfile {
         cutoff,
         language: remote.language.as_ref().map(|l| l.name.clone()),
         items: remote.items.iter().map(item).collect(),
+        min_format_score: remote.min_format_score,
+        cutoff_format_score: remote.cutoff_format_score,
     }
 }
 
@@ -215,6 +233,15 @@ fn movie(remote: RemoteMovie, profiles: &HashMap<i64, String>) -> Movie {
         path: remote.path,
         added: remote.added,
         file,
+        runtime: remote.runtime,
+        secondary_year: remote.secondary_year.filter(|year| *year != 0),
+        clean_title: blank_is_none(remote.clean_title),
+        alternate_titles: remote
+            .alternate_titles
+            .into_iter()
+            .map(|t| t.title)
+            .collect(),
+        available: remote.is_available,
     }
 }
 
