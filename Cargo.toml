@@ -7,6 +7,7 @@ members = [
     "crates/acervo-arr",
     "crates/acervo-clients",
     "crates/acervo-indexers",
+    "crates/acervo-api",
     "crates/acervo-hub",
 ]
 
@@ -23,9 +24,15 @@ acervo-fs = { path = "crates/acervo-fs" }
 acervo-arr = { path = "crates/acervo-arr" }
 acervo-clients = { path = "crates/acervo-clients" }
 acervo-indexers = { path = "crates/acervo-indexers" }
+acervo-api = { path = "crates/acervo-api" }
 
 anyhow = "1"
 async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "query",
+    "tokio",
+] }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 quick-xml = "0.38"
