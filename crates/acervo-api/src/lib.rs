@@ -11,6 +11,7 @@ mod request;
 
 use std::sync::Arc;
 
+use acervo_indexers::Release;
 use axum::Router;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -35,6 +36,8 @@ pub enum TorznabError {
     NoSuchIndexer,
     #[error("todos os {0} indexadores consultados falharam")]
     AllFailed(usize),
+    #[error("o indexador não entregou o arquivo")]
+    DownloadFailed,
 }
 
 impl TorznabError {
@@ -47,7 +50,7 @@ impl TorznabError {
             Self::IncorrectParameter(_) => 201,
             Self::NoSuchFunction => 202,
             Self::NoSuchIndexer => 300,
-            Self::AllFailed(_) => 900,
+            Self::AllFailed(_) | Self::DownloadFailed => 900,
         }
     }
 
@@ -60,7 +63,7 @@ impl TorznabError {
             Self::MissingParameter(_) | Self::IncorrectParameter(_) | Self::NoSuchFunction => {
                 StatusCode::BAD_REQUEST
             }
-            Self::AllFailed(_) => StatusCode::BAD_GATEWAY,
+            Self::AllFailed(_) | Self::DownloadFailed => StatusCode::BAD_GATEWAY,
         }
     }
 }
@@ -86,7 +89,8 @@ impl std::fmt::Debug for Server {
     }
 }
 
-/// Monta as rotas: `GET /{indexador}/api` e `GET /health`.
+/// Monta as rotas: `GET /{indexador}/api`, `GET /{indexador}/download` e
+/// `GET /health`.
 ///
 /// A chave vale para todos os indexadores e é aceita em `apikey` ou no
 /// cabeçalho `X-Api-Key`, como os consumidores mandam.
@@ -98,20 +102,23 @@ pub fn router(catalog: Catalog, api_key: impl Into<String>) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/{indexer}/api", get(torznab))
+        .route("/{indexer}/download", get(download))
         .with_state(server)
 }
 
-async fn torznab(
-    State(server): State<Arc<Server>>,
-    Path(indexer): Path<String>,
-    RawQuery(raw): RawQuery,
-    headers: HeaderMap,
-) -> Result<Response, TorznabError> {
-    let params: Vec<(String, String)> =
-        url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes())
-            .into_owned()
-            .collect();
+fn parse_query(raw: Option<String>) -> Vec<(String, String)> {
+    url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes())
+        .into_owned()
+        .collect()
+}
 
+/// A chave é conferida antes de qualquer outra coisa: sem ela, nem a
+/// existência de um indexador pelo nome é revelada.
+fn authorize(
+    server: &Server,
+    params: &[(String, String)],
+    headers: &HeaderMap,
+) -> Result<(), TorznabError> {
     let presented = params
         .iter()
         .find(|(key, _)| key == "apikey")
@@ -122,11 +129,39 @@ async fn torznab(
                 .and_then(|value| value.to_str().ok())
         })
         .unwrap_or_default();
-    // A chave é conferida antes de qualquer outra coisa: sem ela, nem a
-    // existência de um indexador pelo nome é revelada.
-    if !constant_time_eq(presented.as_bytes(), server.api_key.as_bytes()) {
-        return Err(TorznabError::IncorrectApiKey);
+    if constant_time_eq(presented.as_bytes(), server.api_key.as_bytes()) {
+        Ok(())
+    } else {
+        Err(TorznabError::IncorrectApiKey)
     }
+}
+
+/// Origem pela qual o consumidor nos alcançou, para montar links que ele
+/// consiga seguir de volta.
+fn public_origin(headers: &HeaderMap) -> String {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .filter(|host| !host.is_empty() && !host.contains(['/', '?', '#', '@', ' ']))
+        .unwrap_or("localhost");
+    let scheme = match headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some("https") => "https",
+        _ => "http",
+    };
+    format!("{scheme}://{host}")
+}
+
+async fn torznab(
+    State(server): State<Arc<Server>>,
+    Path(indexer): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Result<Response, TorznabError> {
+    let params = parse_query(raw);
+    authorize(&server, &params, &headers)?;
 
     match request::parse(&params)? {
         request::Function::Caps => {
@@ -139,13 +174,56 @@ async fn torznab(
         }
         request::Function::Search(query) => {
             let page = server.catalog.search(&indexer, &query).await?;
+            let origin = public_origin(&headers);
+            // Link de tracker privado só funciona com a sessão, que mora aqui:
+            // o consumidor baixa por nós. Magnet e link público vão direto.
+            let link = |release: &Release| {
+                if release.download_url.scheme() == "magnet"
+                    || !server.catalog.proxies_downloads(&release.indexer)
+                {
+                    return release.download_url.to_string();
+                }
+                let query: String = url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("apikey", &server.api_key)
+                    .append_pair("link", release.download_url.as_str())
+                    .finish();
+                format!("{origin}/{}/download?{query}", release.indexer)
+            };
             Ok(xml(
                 StatusCode::OK,
                 "application/rss+xml",
-                render::releases(&indexer, &page.releases, OffsetDateTime::now_utc()),
+                render::releases(&indexer, &page.releases, OffsetDateTime::now_utc(), &link),
             ))
         }
     }
+}
+
+async fn download(
+    State(server): State<Arc<Server>>,
+    Path(indexer): Path<String>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Result<Response, TorznabError> {
+    let params = parse_query(raw);
+    authorize(&server, &params, &headers)?;
+    let link = params
+        .iter()
+        .find(|(key, _)| key == "link")
+        .map(|(_, value)| value.as_str())
+        .ok_or(TorznabError::MissingParameter("link"))?;
+    let link = url::Url::parse(link).map_err(|_| TorznabError::IncorrectParameter("link"))?;
+    let torrent = server.catalog.download(&indexer, &link).await?;
+    let mut response = (StatusCode::OK, torrent).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-bittorrent"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{indexer}.torrent\""))
+    {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    Ok(response)
 }
 
 fn xml(status: StatusCode, media_type: &'static str, body: String) -> Response {

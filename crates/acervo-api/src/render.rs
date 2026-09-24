@@ -117,7 +117,15 @@ fn parent_name(child: &Category, parent: u32) -> String {
 /// quando um item não tem `pubDate`, e uma data ausente não justifica perder
 /// os outros resultados.
 #[must_use]
-pub fn releases(title: &str, releases: &[Release], now: OffsetDateTime) -> String {
+///
+/// `link` decide o endereço de download de cada release — direto, ou por
+/// este serviço quando o indexador exige sessão.
+pub fn releases(
+    title: &str,
+    releases: &[Release],
+    now: OffsetDateTime,
+    link: &dyn Fn(&Release) -> String,
+) -> String {
     document(|writer| {
         writer
             .create_element("rss")
@@ -133,7 +141,7 @@ pub fn releases(title: &str, releases: &[Release], now: OffsetDateTime) -> Strin
                         text(writer, "title", title)?;
                         text(writer, "description", "acervo-hub")?;
                         for release in releases {
-                            item(writer, release, now)?;
+                            item(writer, release, now, &link(release))?;
                         }
                         Ok(())
                     })?;
@@ -147,6 +155,7 @@ fn item<W: io::Write>(
     writer: &mut Writer<W>,
     release: &Release,
     now: OffsetDateTime,
+    download: &str,
 ) -> io::Result<()> {
     let published = release
         .published
@@ -154,7 +163,6 @@ fn item<W: io::Write>(
         .format(&Rfc2822)
         .map_err(io::Error::other)?;
     let size = release.size.to_string();
-    let download = release.download_url.as_str();
     writer
         .create_element("item")
         .write_inner_content(|writer| {
@@ -273,6 +281,7 @@ mod tests {
             "publico",
             &[release("https://tracker.invalid/dl/1?passkey=abc&x=1")],
             now,
+            &|release| release.download_url.to_string(),
         );
 
         assert!(xml.contains("<title>Uma.Série.S01E02 &lt;1080p&gt; &amp; mais</title>"));
@@ -286,7 +295,12 @@ mod tests {
     #[test]
     fn magnet_vai_tambem_como_atributo() {
         let now = OffsetDateTime::from_unix_timestamp(0).unwrap();
-        let xml = releases("p", &[release("magnet:?xt=urn:btih:abc")], now);
+        let xml = releases(
+            "p",
+            &[release("magnet:?xt=urn:btih:abc")],
+            now,
+            &|release| release.download_url.to_string(),
+        );
         assert!(
             xml.contains(r#"<torznab:attr name="magneturl" value="magnet:?xt=urn:btih:abc"/>"#)
         );

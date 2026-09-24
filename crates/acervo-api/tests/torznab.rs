@@ -262,3 +262,95 @@ fn nome_reservado_ou_repetido_e_recusado() {
     assert!(Catalog::new([entry("um"), entry("um")]).is_err());
     assert!(Catalog::new([entry("Com Espaço")]).is_err());
 }
+
+/// Indexador de tracker privado: link só funciona com a sessão dele.
+#[derive(Debug)]
+struct Private;
+
+#[async_trait]
+impl Indexer for Private {
+    fn name(&self) -> &'static str {
+        "privado"
+    }
+
+    async fn search(&self, _query: &SearchQuery) -> Result<Vec<Release>, IndexerError> {
+        Ok(vec![Release {
+            indexer: "privado".into(),
+            guid: "g".into(),
+            title: "Série.S01E01".into(),
+            download_url: url::Url::parse("https://privado.invalid/dl/1?pass=x&id=1").unwrap(),
+            info_url: None,
+            size: 1,
+            published: None,
+            seeders: Some(1),
+            leechers: None,
+            grabs: None,
+            categories: vec![5040],
+            tags: Vec::new(),
+        }])
+    }
+
+    fn proxies_downloads(&self) -> bool {
+        true
+    }
+
+    async fn download(&self, url: &url::Url) -> Result<Vec<u8>, IndexerError> {
+        if url.as_str() == "https://privado.invalid/dl/1?pass=x&id=1" {
+            Ok(b"d4:testee".to_vec())
+        } else {
+            Err(IndexerError::UnsupportedQuery {
+                reason: "outro link",
+            })
+        }
+    }
+}
+
+#[tokio::test]
+async fn link_de_tracker_privado_passa_por_aqui_e_devolve_o_torrent() {
+    let base = serve(vec![
+        Entry {
+            indexer: Arc::new(Private),
+            capabilities: caps(&["q"]),
+        },
+        Entry {
+            indexer: fake("publico", false),
+            capabilities: caps(&["q"]),
+        },
+    ])
+    .await;
+
+    let (_, _, feed) = get(&format!("{base}/all/api?t=search&q=x&apikey={KEY}")).await;
+    // O público vai direto; o privado aponta para este serviço.
+    assert!(feed.contains("<link>https://publico.invalid/dl/0</link>"));
+    let start = feed
+        .find(&format!("<link>{base}/privado/download?"))
+        .unwrap()
+        + "<link>".len();
+    let end = start + feed[start..].find("</link>").unwrap();
+    let link = feed[start..end].replace("&amp;", "&");
+
+    let response = reqwest::get(&link).await.unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        response.headers()["content-type"].to_str().unwrap(),
+        "application/x-bittorrent"
+    );
+    assert_eq!(response.bytes().await.unwrap().as_ref(), b"d4:testee");
+
+    let wrong_key = link.replace(KEY, "errada");
+    assert_eq!(
+        reqwest::get(&wrong_key).await.unwrap().status().as_u16(),
+        401
+    );
+    let (status, _, body) = get(&format!(
+        "{base}/privado/download?apikey={KEY}&link=https%3A%2F%2Fprivado.invalid%2Foutro"
+    ))
+    .await;
+    assert_eq!(status, 502);
+    assert!(body.contains(r#"code="900""#));
+    let (status, _, _) = get(&format!(
+        "{base}/all/download?apikey={KEY}&link=https%3A%2F%2Fprivado.invalid%2Fdl%2F1"
+    ))
+    .await;
+    assert_eq!(status, 404);
+}
