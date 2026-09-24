@@ -1,0 +1,18 @@
+[package]
+name = "acervo-store"
+version = "0.0.0"
+description = "Catálogo persistente do acervo-hub: filmes, arquivos e perfis de qualidade, em SQLite."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+acervo-parser.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

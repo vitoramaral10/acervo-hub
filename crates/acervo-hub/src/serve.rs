@@ -687,6 +687,21 @@ impl Admin for HubAdmin {
             .map_err(|e| format!("{e:#}"))?;
         serde_json::to_value(report).map_err(|e| e.to_string())
     }
+
+    async fn movies(&self) -> Result<serde_json::Value, String> {
+        let list = crate::movies::list(&self.config)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        serde_json::to_value(list).map_err(|e| e.to_string())
+    }
+
+    async fn import_movies(&self, apply: bool) -> Result<serde_json::Value, String> {
+        let _guard = self.write.lock().await;
+        let report = crate::movies::import(&self.config, apply, false)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        serde_json::to_value(report).map_err(|e| e.to_string())
+    }
 }
 
 async fn shutdown() {

@@ -132,6 +132,47 @@ export interface CycleReport {
   falharam: number | null
 }
 
+export interface MovieFile {
+  nome: string
+  tamanho: number
+  qualidade: string
+  idiomas: string[]
+  grupo: string | null
+  edicao: string | null
+  release: string | null
+  adicionado: string | null
+  disco: 'ok' | 'missing' | 'size_differs' | 'unreadable'
+  disco_detalhe: string | null
+}
+
+export interface Movie {
+  id: number
+  tmdb: number
+  imdb: string | null
+  titulo: string
+  titulo_original: string | null
+  ano: number | null
+  status: string | null
+  monitorado: boolean
+  perfil: string | null
+  pasta: string
+  adicionado: string | null
+  arquivo: MovieFile | null
+}
+
+export interface MovieImport {
+  nome: string
+  erro: string | null
+  resumo: {
+    created: string[]
+    updated: string[]
+    removed: string[]
+    unchanged: number
+    profiles: number
+    applied: boolean
+  } | null
+}
+
 export const api = {
   session: () => request<{ ok: boolean }>('GET', '/ui/api/sessao'),
   login: (chave: string) => request<{ ok: boolean }>('POST', '/ui/api/entrar', { chave }),
@@ -163,6 +204,9 @@ export const api = {
   sync: (aplicar: boolean) => request<SyncReport>('POST', '/ui/api/aplicativos/sincronizar', { aplicar }),
   lastCycle: () => request<{ ultimo: CycleReport | null }>('GET', '/ui/api/limpeza'),
   simulateCycle: () => request<CycleReport>('POST', '/ui/api/limpeza/simular'),
+  movies: () => request<{ filmes: Movie[] }>('GET', '/ui/api/filmes'),
+  importMovies: (aplicar: boolean) =>
+    request<{ instancias: MovieImport[] }>('POST', '/ui/api/filmes/importar', { aplicar }),
   search: (params: { q: string; indexador: string; cat: string }) => {
     const query = new URLSearchParams()
     query.set('q', params.q)

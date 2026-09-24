@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Blocks, Brush, Library, LogOut, Monitor, Moon, Search, Server, Sun } from 'lucide-react'
+import { Blocks, Brush, Film, Library, LogOut, Monitor, Moon, Search, Server, Sun } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Tooltip } from '@/components/ui/misc'
@@ -10,11 +10,12 @@ import { AppsPage } from '@/pages/Apps'
 import { CleanupPage } from '@/pages/Cleanup'
 import { IndexersPage } from '@/pages/Indexers'
 import { LoginPage } from '@/pages/Login'
+import { MoviesPage } from '@/pages/Movies'
 import { SearchPage } from '@/pages/Search'
 
-type View = 'indexadores' | 'busca' | 'aplicativos' | 'limpeza'
+type View = 'indexadores' | 'busca' | 'filmes' | 'aplicativos' | 'limpeza'
 
-const VIEWS: View[] = ['indexadores', 'busca', 'aplicativos', 'limpeza']
+const VIEWS: View[] = ['indexadores', 'busca', 'filmes', 'aplicativos', 'limpeza']
 
 function viewFromHash(): View {
   const hash = window.location.hash.slice(1) as View
@@ -24,6 +25,7 @@ function viewFromHash(): View {
 const NAV: { view: View; label: string; icon: typeof Server }[] = [
   { view: 'indexadores', label: 'Indexadores', icon: Server },
   { view: 'busca', label: 'Busca', icon: Search },
+  { view: 'filmes', label: 'Filmes', icon: Film },
   { view: 'aplicativos', label: 'Aplicativos', icon: Blocks },
   { view: 'limpeza', label: 'Limpeza', icon: Brush },
 ]
@@ -81,7 +83,7 @@ export function App() {
           <img src="/ui/icone.svg" alt="" className="size-7" />
           <span className="sr-only leading-tight md:not-sr-only">
             <span className="block text-sm font-semibold tracking-tight">acervo-hub</span>
-            <span className="block text-xs text-content-subtle">indexadores</span>
+            <span className="block text-xs text-content-subtle">mídia</span>
           </span>
         </a>
         <nav aria-label="Seções" className="flex min-w-0 flex-1 gap-1 md:flex-none md:flex-col">
@@ -115,6 +117,8 @@ export function App() {
         <div className="mx-auto max-w-6xl">
           {view === 'busca' ? (
             <SearchPage />
+          ) : view === 'filmes' ? (
+            <MoviesPage />
           ) : view === 'aplicativos' ? (
             <AppsPage />
           ) : view === 'limpeza' ? (

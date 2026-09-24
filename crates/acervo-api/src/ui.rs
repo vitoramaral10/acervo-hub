@@ -116,6 +116,21 @@ pub trait Admin: Send + Sync + std::fmt::Debug {
     ///
     /// Configuração do ciclo ausente ou falha de leitura.
     async fn simulate_cycle(&self) -> Result<serde_json::Value, String>;
+
+    /// O catálogo de filmes, com o estado de cada arquivo no disco.
+    ///
+    /// # Errors
+    ///
+    /// Catálogo ilegível.
+    async fn movies(&self) -> Result<serde_json::Value, String>;
+
+    /// Espelha os gerenciadores de filmes no catálogo; sem `apply`, só
+    /// relata o que mudaria.
+    ///
+    /// # Errors
+    ///
+    /// Catálogo impossível de abrir.
+    async fn import_movies(&self, apply: bool) -> Result<serde_json::Value, String>;
 }
 
 /// Uma definição do catálogo, como a tela a lista.
@@ -186,6 +201,8 @@ pub(crate) fn routes() -> Router<Arc<Server>> {
         .route("/ui/api/aplicativos/sincronizar", post(sync))
         .route("/ui/api/limpeza", get(last_cycle))
         .route("/ui/api/limpeza/simular", post(simulate_cycle))
+        .route("/ui/api/filmes", get(movies))
+        .route("/ui/api/filmes/importar", post(import_movies))
         .route("/ui/api/indexadores/{nome}/testar", post(test))
         .route(
             "/ui/api/indexadores/{nome}/settings",
@@ -560,6 +577,31 @@ async fn simulate_cycle(
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     Ok(ok(report))
+}
+
+async fn movies(
+    State(server): State<Arc<Server>>,
+    headers: HeaderMap,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::GET)?;
+    let list = admin(&server)?
+        .movies()
+        .await
+        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    Ok(ok(json!({ "filmes": list })))
+}
+
+async fn import_movies(
+    State(server): State<Arc<Server>>,
+    headers: HeaderMap,
+    Json(body): Json<SyncBody>,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::POST)?;
+    let report = admin(&server)?
+        .import_movies(body.aplicar)
+        .await
+        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    Ok(ok(json!({ "instancias": report })))
 }
 
 fn test_result(outcome: Result<usize, String>) -> serde_json::Value {

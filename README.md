@@ -88,6 +88,8 @@ cargo run --bin acervo-hub -- -c config.toml search "termo" [-i indexador] [-k 5
   definições (`server.catalogs`) ou de qualquer endpoint Torznab. As definições que o
   executor ainda não roda aparecem com o motivo, em vez de sumirem.
 - **Busca** manual em todos os indexadores, com download do `.torrent` pela sessão.
+- **Filmes** — o catálogo de filmes, espelhado do gerenciador de filmes, com cada arquivo
+  conferido contra o disco. Busca e filtro por arquivo ausente ou divergente.
 - **Aplicativos** — o `sync` na tela: mostra o que mudaria no Sonarr e no Radarr e aplica.
 - **Limpeza** — o último ciclo (gravado ao lado do ledger) e uma simulação na hora.
 
@@ -225,7 +227,13 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
         todos os campos de todos os títulos, esquisitices incluídas. O corpus fica fora do
         repositório (tem nome de tracker privado); o teste `corpus`, ignorado por padrão,
         refaz a conta.
-  - [ ] **Catálogo de filmes**, importado do gerenciador atual pela API v3.
+  - [x] **Catálogo de filmes** (`acervo-store`, SQLite). `movies import` espelha filmes,
+        arquivos e perfis de qualidade do gerenciador pela API v3 — sem `--apply`, numa
+        transação que é desfeita, então a simulação relata exatamente o que a aplicação
+        faria. Filme que some da origem sai do catálogo só se tiver vindo dela.
+        `movies check` confere cada arquivo contra o disco. Contra o gerenciador em
+        produção: 294 filmes, 132 arquivos, todos confirmados no disco com o tamanho
+        exato; reimportar dá 294 iguais.
   - [ ] **Decisão em sombra**: RSS e busca pelos perfis de qualidade, comparando o que o
         acervo-hub pegaria com o que o gerenciador pegou, sem baixar nada.
   - [ ] **Grab e import**: envio ao cliente, hardlink e renomeação na biblioteca.

@@ -149,6 +149,9 @@ pub struct StateConfig {
     /// Indexadores adicionados e desativados pela interface web.
     #[serde(default = "default_registry_path")]
     pub registry: PathBuf,
+    /// Catálogo (SQLite). Sem valor, fica ao lado do ledger.
+    #[serde(default)]
+    pub database: Option<PathBuf>,
 }
 
 impl Default for StateConfig {
@@ -157,6 +160,7 @@ impl Default for StateConfig {
             ledger: default_ledger_path(),
             credentials: default_credentials_path(),
             registry: default_registry_path(),
+            database: None,
         }
     }
 }
@@ -166,6 +170,15 @@ impl StateConfig {
     #[must_use]
     pub fn last_cycle(&self) -> PathBuf {
         expand_tilde(&self.ledger).with_file_name("ultimo-ciclo.json")
+    }
+
+    /// Arquivo do catálogo.
+    #[must_use]
+    pub fn database(&self) -> PathBuf {
+        self.database.as_deref().map_or_else(
+            || expand_tilde(&self.ledger).with_file_name("acervo.db"),
+            expand_tilde,
+        )
     }
 }
 

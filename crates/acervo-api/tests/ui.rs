@@ -214,6 +214,14 @@ impl Admin for FakeAdmin {
     async fn simulate_cycle(&self) -> Result<Value, String> {
         Ok(json!({ "modo": "simulacao" }))
     }
+
+    async fn movies(&self) -> Result<Value, String> {
+        Ok(json!([{ "titulo": "Filme", "ano": 2020 }]))
+    }
+
+    async fn import_movies(&self, apply: bool) -> Result<Value, String> {
+        Ok(json!([{ "nome": "filmes", "resumo": { "applied": apply } }]))
+    }
 }
 
 async fn serve() -> String {
@@ -559,4 +567,28 @@ async fn credencial_de_indexador_desativado_e_salva_sem_erro() {
             .unwrap()
             .contains("desativado")
     );
+}
+
+#[tokio::test]
+async fn filmes_lista_e_importa() {
+    let base = serve().await;
+    let cookie = login(&base).await;
+    let (status, body) = get(&base, "/ui/api/filmes", &cookie).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["filmes"][0]["titulo"], "Filme");
+
+    let (status, body) = send(
+        &base,
+        reqwest::Method::POST,
+        "/ui/api/filmes/importar",
+        &cookie,
+        json!({ "aplicar": true }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["instancias"][0]["resumo"]["applied"], true);
+
+    // Sem sessão, nada.
+    let (status, _) = get(&base, "/ui/api/filmes", "").await;
+    assert_eq!(status, 401);
 }

@@ -9,6 +9,7 @@ members = [
     "crates/acervo-indexers",
     "crates/acervo-api",
     "crates/acervo-parser",
+    "crates/acervo-store",
     "crates/acervo-hub",
 ]
 
@@ -27,6 +28,7 @@ acervo-clients = { path = "crates/acervo-clients" }
 acervo-indexers = { path = "crates/acervo-indexers" }
 acervo-api = { path = "crates/acervo-api" }
 acervo-parser = { path = "crates/acervo-parser" }
+acervo-store = { path = "crates/acervo-store" }
 
 anyhow = "1"
 async-trait = "0.1"
@@ -42,6 +44,9 @@ clap = { version = "4", features = ["derive"] }
 fancy-regex = "0.19"
 futures = "0.3"
 quick-xml = "0.38"
+# SQLite compilado junto (`bundled`): nada de biblioteca do sistema, e o build
+# estático musl segue funcionando com o musl-gcc do estágio de build.
+rusqlite = { version = "0.40", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",

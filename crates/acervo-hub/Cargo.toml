@@ -19,6 +19,8 @@ acervo-core.workspace = true
 acervo-fs.workspace = true
 acervo-indexers.workspace = true
 acervo-janitor.workspace = true
+acervo-parser.workspace = true
+acervo-store.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true

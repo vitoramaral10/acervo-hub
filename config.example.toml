@@ -73,6 +73,10 @@ managed_categories = ["tv-sonarr", "radarr"]
 # Onde os strikes sobrevivem ao reinício do processo. Sem isso, três strikes
 # nunca se completam.
 ledger = "~/.local/state/acervo-hub/strikes.json"
+# Catálogo de filmes (SQLite). Sem valor, `acervo.db` ao lado do ledger.
+# `acervo-hub movies import --apply` o preenche a partir das `[[instances]]`
+# de filmes; `acervo-hub movies check` confere cada arquivo contra o disco.
+# database = "~/.local/state/acervo-hub/acervo.db"
 
 # --- Superfície Torznab (`acervo-hub serve`) --------------------------------
 #

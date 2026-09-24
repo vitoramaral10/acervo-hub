@@ -10,9 +10,14 @@ use url::Url;
 
 mod dto;
 mod indexer;
+mod movie;
 
 pub use dto::QueueRecord;
 pub use indexer::{RemoteIndexer, TorznabSpec};
+pub use movie::{
+    Named, RemoteMovie, RemoteMovieFile, RemoteProfileItem, RemoteQuality, RemoteQualityModel,
+    RemoteQualityProfile, RemoteRevision,
+};
 
 /// Qual árvore a instância gerencia.
 ///

@@ -19,6 +19,7 @@ mod credentials;
 mod cycle;
 mod definitions;
 mod ledger;
+mod movies;
 mod registry;
 mod report;
 mod search;
@@ -55,6 +56,11 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Catálogo de filmes.
+    Movies {
+        #[command(subcommand)]
+        action: MoviesAction,
+    },
     /// Busca manual nos indexadores configurados.
     Search {
         /// Termo da busca.
@@ -66,6 +72,19 @@ enum Command {
         #[arg(long = "categoria", short = 'k')]
         categories: Vec<u32>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum MoviesAction {
+    /// Espelha os gerenciadores de filmes no catálogo. Sem `--apply`, só
+    /// mostra o que mudaria.
+    Import {
+        /// Grava em vez de só mostrar.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Confere cada arquivo do catálogo contra o disco.
+    Check,
 }
 
 #[tokio::main]
@@ -105,6 +124,20 @@ async fn run() -> Result<ExitCode> {
         } => {
             let failures = search::run(&config, &term, indexer.as_deref(), &categories).await?;
             return Ok(if failures > 0 {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            });
+        }
+        Command::Movies { action } => {
+            let failed = match action {
+                MoviesAction::Import { apply } => movies::import(&config, apply, true)
+                    .await?
+                    .iter()
+                    .any(|instance| instance.erro.is_some()),
+                MoviesAction::Check => movies::check(&config).await? > 0,
+            };
+            return Ok(if failed {
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
