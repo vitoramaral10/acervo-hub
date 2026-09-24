@@ -216,7 +216,21 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
    gerenciador e pare a sincronização do agregador antes de desligá-lo — senão ele os
    recria.
 - [ ] **Fase 3 — filmes.** Árvore mais simples; o gerenciador de séries segue de pé como
-      controle.
+      controle. Em etapas, cada uma conferida contra o gerenciador de filmes em produção
+      antes da seguinte:
+  - [x] **Parser de release** (`acervo-parser`). Porte do parser de referência: título e
+        títulos alternativos, ano, edição, qualidade e revisão, idiomas, grupo, ids
+        embutidos. Contra um corpus de 684 títulos reais — o histórico de um gerenciador em
+        produção e buscas em trackers, com a leitura dele como gabarito —, concorda em
+        todos os campos de todos os títulos, esquisitices incluídas. O corpus fica fora do
+        repositório (tem nome de tracker privado); o teste `corpus`, ignorado por padrão,
+        refaz a conta.
+  - [ ] **Catálogo de filmes**, importado do gerenciador atual pela API v3.
+  - [ ] **Decisão em sombra**: RSS e busca pelos perfis de qualidade, comparando o que o
+        acervo-hub pegaria com o que o gerenciador pegou, sem baixar nada.
+  - [ ] **Grab e import**: envio ao cliente, hardlink e renomeação na biblioteca.
+  - [ ] **API v3 de filmes** para os clientes que dependem dela (pedidos e legendas), e o
+        corte.
 - [ ] **Fase 4 — séries.** Só depois de o parser passar no corpus real.
 
 ## Licença

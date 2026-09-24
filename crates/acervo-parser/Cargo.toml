@@ -1,0 +1,18 @@
+[package]
+name = "acervo-parser"
+version = "0.0.0"
+description = "Lê nome de release: título, ano, qualidade, idioma, grupo e edição."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fancy-regex.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

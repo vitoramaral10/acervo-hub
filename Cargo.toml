@@ -8,6 +8,7 @@ members = [
     "crates/acervo-clients",
     "crates/acervo-indexers",
     "crates/acervo-api",
+    "crates/acervo-parser",
     "crates/acervo-hub",
 ]
 
@@ -25,6 +26,7 @@ acervo-arr = { path = "crates/acervo-arr" }
 acervo-clients = { path = "crates/acervo-clients" }
 acervo-indexers = { path = "crates/acervo-indexers" }
 acervo-api = { path = "crates/acervo-api" }
+acervo-parser = { path = "crates/acervo-parser" }
 
 anyhow = "1"
 async-trait = "0.1"
@@ -35,6 +37,9 @@ axum = { version = "0.8", default-features = false, features = [
     "tokio",
 ] }
 clap = { version = "4", features = ["derive"] }
+# Lookaround e backreference, que os padrões portados do parser de release
+# usam e o `regex` não tem. Rust puro: o build estático musl continua.
+fancy-regex = "0.19"
 futures = "0.3"
 quick-xml = "0.38"
 reqwest = { version = "0.12", default-features = false, features = [
