@@ -237,6 +237,30 @@ impl Admin for FakeAdmin {
     async fn downloads(&self, import: bool) -> Result<Value, String> {
         Ok(json!({ "downloads": [], "importados": if import { 0 } else { -1 } }))
     }
+
+    async fn configuration(&self) -> Result<Value, String> {
+        let set = self.saved.lock().unwrap().contains_key("tmdb_chave");
+        Ok(json!({ "tmdb": { "definida": set } }))
+    }
+
+    async fn save_configuration(
+        &self,
+        values: BTreeMap<String, Option<String>>,
+    ) -> Result<Value, String> {
+        let mut saved = self.saved.lock().unwrap();
+        for (key, value) in values {
+            match value {
+                Some(value) if value == "recusada" => return Err("chave do TMDB recusada".into()),
+                Some(value) => {
+                    saved.insert(key, value);
+                }
+                None => {
+                    saved.remove(&key);
+                }
+            }
+        }
+        Ok(json!({ "tmdb": { "definida": saved.contains_key("tmdb_chave") } }))
+    }
 }
 
 /// Contas falsas: uma usuária, sessões num conjunto em memória.
@@ -706,6 +730,37 @@ async fn filmes_lista_e_importa() {
     .await;
     assert_eq!(status, 422);
     assert_eq!(body["erro"], "filme fora do catálogo");
+
+    let (status, body) = get(&base, "/ui/api/configuracoes", &cookie).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["tmdb"]["definida"], false);
+    for (value, status, set) in [
+        (json!("recusada"), 422, false),
+        (json!("certa"), 200, true),
+        (json!(null), 200, false),
+    ] {
+        let (got, body) = send(
+            &base,
+            reqwest::Method::PUT,
+            "/ui/api/configuracoes",
+            &cookie,
+            json!({ "tmdb_chave": value }),
+        )
+        .await;
+        assert_eq!(got, status);
+        let (_, now) = get(&base, "/ui/api/configuracoes", &cookie).await;
+        assert_eq!(now["tmdb"]["definida"], set, "{body}");
+    }
+    // Segredo nunca volta para a tela.
+    let (_, body) = send(
+        &base,
+        reqwest::Method::PUT,
+        "/ui/api/configuracoes",
+        &cookie,
+        json!({ "tmdb_chave": "certa" }),
+    )
+    .await;
+    assert!(!body.to_string().contains("certa"));
 
     let (status, body) = get(&base, "/ui/api/downloads", &cookie).await;
     assert_eq!(status, 200);

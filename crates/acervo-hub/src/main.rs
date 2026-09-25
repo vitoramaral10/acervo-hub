@@ -20,6 +20,7 @@ mod cycle;
 mod definitions;
 mod grab;
 mod ledger;
+mod metadata;
 mod movies;
 mod naming;
 mod registry;

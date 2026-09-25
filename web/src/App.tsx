@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Blocks, Brush, Film, Library, LogOut, Monitor, Moon, Search, Server, Sun } from 'lucide-react'
+import { Blocks, Brush, Film, Library, LogOut, Monitor, Moon, Search, Server, SlidersHorizontal, Sun } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Tooltip } from '@/components/ui/misc'
@@ -12,10 +12,11 @@ import { IndexersPage } from '@/pages/Indexers'
 import { LoginPage } from '@/pages/Login'
 import { MoviesPage } from '@/pages/Movies'
 import { SearchPage } from '@/pages/Search'
+import { SettingsPage } from '@/pages/Settings'
 
-type View = 'indexadores' | 'busca' | 'filmes' | 'aplicativos' | 'limpeza'
+type View = 'indexadores' | 'busca' | 'filmes' | 'aplicativos' | 'limpeza' | 'configuracoes'
 
-const VIEWS: View[] = ['indexadores', 'busca', 'filmes', 'aplicativos', 'limpeza']
+const VIEWS: View[] = ['indexadores', 'busca', 'filmes', 'aplicativos', 'limpeza', 'configuracoes']
 
 function viewFromHash(): View {
   const hash = window.location.hash.slice(1) as View
@@ -28,6 +29,7 @@ const NAV: { view: View; label: string; icon: typeof Server }[] = [
   { view: 'filmes', label: 'Filmes', icon: Film },
   { view: 'aplicativos', label: 'Aplicativos', icon: Blocks },
   { view: 'limpeza', label: 'Limpeza', icon: Brush },
+  { view: 'configuracoes', label: 'Configurações', icon: SlidersHorizontal },
 ]
 
 export function App() {
@@ -128,6 +130,8 @@ export function App() {
             <AppsPage />
           ) : view === 'limpeza' ? (
             <CleanupPage />
+          ) : view === 'configuracoes' ? (
+            <SettingsPage />
           ) : (
             <IndexersPage />
           )}

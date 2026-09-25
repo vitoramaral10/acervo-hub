@@ -169,6 +169,10 @@ export interface MovieDownload {
   pego_em: string
 }
 
+export interface Configuration {
+  tmdb: { definida: boolean }
+}
+
 export interface GrabReport {
   filme: string
   releases: number
@@ -236,6 +240,9 @@ export const api = {
   grab: (id: number, aplicar: boolean) =>
     request<GrabReport>('POST', `/ui/api/filmes/${id}/pegar`, { aplicar }),
   importDownloads: () => request<{ downloads: unknown[] }>('POST', '/ui/api/downloads/importar'),
+  configuration: () => request<Configuration>('GET', '/ui/api/configuracoes'),
+  saveConfiguration: (values: Record<string, string | null>) =>
+    request<Configuration>('PUT', '/ui/api/configuracoes', values),
   importMovies: (aplicar: boolean) =>
     request<{ instancias: MovieImport[] }>('POST', '/ui/api/filmes/importar', { aplicar }),
   search: (params: { q: string; indexador: string; cat: string }) => {

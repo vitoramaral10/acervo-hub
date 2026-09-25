@@ -242,6 +242,63 @@ impl Language {
         Self::Any,
     ];
 
+    /// Pelo código ISO 639-1 que a base de metadados usa para o idioma
+    /// original (`fr`, `pt`). O que a API v3 não conhece vira `Unknown`.
+    #[must_use]
+    pub fn from_iso639_1(code: &str) -> Self {
+        match code.to_ascii_lowercase().as_str() {
+            "en" => Self::English,
+            "fr" => Self::French,
+            "es" => Self::Spanish,
+            "de" => Self::German,
+            "it" => Self::Italian,
+            "da" => Self::Danish,
+            "nl" => Self::Dutch,
+            "ja" => Self::Japanese,
+            "is" => Self::Icelandic,
+            // A base usa `cn` para cantonês.
+            "zh" | "cn" => Self::Chinese,
+            "ru" => Self::Russian,
+            "pl" => Self::Polish,
+            "vi" => Self::Vietnamese,
+            "sv" => Self::Swedish,
+            "no" | "nb" | "nn" => Self::Norwegian,
+            "fi" => Self::Finnish,
+            "tr" => Self::Turkish,
+            "pt" => Self::Portuguese,
+            "el" => Self::Greek,
+            "ko" => Self::Korean,
+            "hu" => Self::Hungarian,
+            "he" => Self::Hebrew,
+            "lt" => Self::Lithuanian,
+            "cs" => Self::Czech,
+            "hi" => Self::Hindi,
+            "ro" => Self::Romanian,
+            "th" => Self::Thai,
+            "bg" => Self::Bulgarian,
+            "ar" => Self::Arabic,
+            "uk" => Self::Ukrainian,
+            "fa" => Self::Persian,
+            "bn" => Self::Bengali,
+            "sk" => Self::Slovak,
+            "lv" => Self::Latvian,
+            "ca" => Self::Catalan,
+            "ta" => Self::Tamil,
+            "te" => Self::Telugu,
+            "ml" => Self::Malayalam,
+            "kn" => Self::Kannada,
+            "sq" => Self::Albanian,
+            "af" => Self::Afrikaans,
+            "mr" => Self::Marathi,
+            "tl" => Self::Tagalog,
+            "ur" => Self::Urdu,
+            "rm" => Self::Romansh,
+            "mn" => Self::Mongolian,
+            "ka" => Self::Georgian,
+            _ => Self::Unknown,
+        }
+    }
+
     /// Pelo nome que a API v3 usa ("Portuguese (Brazil)").
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {

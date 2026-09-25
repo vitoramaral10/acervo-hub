@@ -928,6 +928,47 @@ impl Admin for HubAdmin {
         Ok(json!({ "downloads": list, "importacao": imported }))
     }
 
+    async fn configuration(&self) -> Result<serde_json::Value, String> {
+        let store = self.database.get()?;
+        let key = store
+            .setting(crate::metadata::TMDB_KEY)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "tmdb": { "definida": key.is_some() } }))
+    }
+
+    async fn save_configuration(
+        &self,
+        values: BTreeMap<String, Option<String>>,
+    ) -> Result<serde_json::Value, String> {
+        let store = self.database.get()?;
+        let at = crate::shadow::now_rfc3339();
+        for (name, value) in values {
+            match name.as_str() {
+                "tmdb_chave" => {
+                    let value = value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+                    if let Some(key) = &value {
+                        acervo_metadata::Tmdb::new(
+                            key,
+                            crate::metadata::LANGUAGE,
+                            self.config.http_timeout(),
+                        )
+                        .map_err(|e| e.to_string())?
+                        .validate()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    }
+                    store
+                        .set_setting(crate::metadata::TMDB_KEY, value.as_deref(), &at)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                other => return Err(format!("configuração desconhecida: `{other}`")),
+            }
+        }
+        self.configuration().await
+    }
+
     async fn import_movies(&self, apply: bool) -> Result<serde_json::Value, String> {
         let _guard = self.write.lock().await;
         let report = crate::movies::import(&self.config, self.database.get()?, apply, false)

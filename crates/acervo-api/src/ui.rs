@@ -156,6 +156,25 @@ pub trait Admin: Send + Sync + std::fmt::Debug {
     ///
     /// Banco ou cliente de download inalcançável.
     async fn downloads(&self, import: bool) -> Result<serde_json::Value, String>;
+
+    /// As configurações guardadas pela tela. Segredo nunca volta: só se está
+    /// definido.
+    ///
+    /// # Errors
+    ///
+    /// Banco inalcançável.
+    async fn configuration(&self) -> Result<serde_json::Value, String>;
+
+    /// Grava configurações. Chave ausente mantém o valor, `null` apaga, texto
+    /// grava — depois de testar, quando dá para testar.
+    ///
+    /// # Errors
+    ///
+    /// Valor recusado no teste ou banco inalcançável.
+    async fn save_configuration(
+        &self,
+        values: BTreeMap<String, Option<String>>,
+    ) -> Result<serde_json::Value, String>;
 }
 
 /// Contas da interface: confere usuário e senha e guarda as sessões.
@@ -258,6 +277,10 @@ pub(crate) fn routes() -> Router<Arc<Server>> {
         .route("/ui/api/filmes/sombra", post(shadow))
         .route("/ui/api/filmes/{id}/pegar", post(grab_movie))
         .route("/ui/api/downloads", get(downloads))
+        .route(
+            "/ui/api/configuracoes",
+            get(configuration).put(save_configuration),
+        )
         .route("/ui/api/downloads/importar", post(import_downloads))
         .route("/ui/api/indexadores/{nome}/testar", post(test))
         .route(
@@ -733,6 +756,31 @@ async fn grab_movie(
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     Ok(ok(report))
+}
+
+async fn configuration(
+    State(server): State<Arc<Server>>,
+    headers: HeaderMap,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::GET).await?;
+    let body = admin(&server)?
+        .configuration()
+        .await
+        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    Ok(ok(body))
+}
+
+async fn save_configuration(
+    State(server): State<Arc<Server>>,
+    headers: HeaderMap,
+    Json(values): Json<BTreeMap<String, Option<String>>>,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::PUT).await?;
+    let body = admin(&server)?
+        .save_configuration(values)
+        .await
+        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    Ok(ok(body))
 }
 
 async fn downloads(

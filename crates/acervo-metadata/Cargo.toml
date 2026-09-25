@@ -1,0 +1,22 @@
+[package]
+name = "acervo-metadata"
+version = "0.0.0"
+description = "Metadados de filmes do acervo-hub, pela API do The Movie Database."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+reqwest.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio.workspace = true
+wiremock.workspace = true
+
+[lints]
+workspace = true

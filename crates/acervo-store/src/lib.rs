@@ -321,6 +321,13 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX grabs_by_movie ON grabs(movie_id, grabbed_at);
 ",
+    r"
+    CREATE TABLE settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+",
 ];
 
 /// Chave do lock consultivo que serializa as migrações: o serviço e um
@@ -545,6 +552,47 @@ impl Store {
             .collect::<Result<Vec<_>>>()?;
         runs.sort_by(|a, b| a.at.cmp(&b.at));
         Ok(runs)
+    }
+
+    /// Uma configuração guardada pela interface.
+    ///
+    /// # Errors
+    ///
+    /// Falha de leitura.
+    pub async fn setting(&self, key: &str) -> Result<Option<String>> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .query_opt("SELECT value FROM settings WHERE key = $1", &[&key])
+            .await?
+            .map(|row| row.try_get(0))
+            .transpose()?)
+    }
+
+    /// Grava uma configuração; `None` apaga.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn set_setting(&self, key: &str, value: Option<&str>, at: &str) -> Result<()> {
+        let client = self.pool.get().await?;
+        match value {
+            Some(value) => {
+                client
+                    .execute(
+                        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, $3)
+                         ON CONFLICT (key) DO UPDATE SET value = excluded.value,
+                             updated_at = excluded.updated_at",
+                        &[&key, &value, &at],
+                    )
+                    .await?;
+            }
+            None => {
+                client
+                    .execute("DELETE FROM settings WHERE key = $1", &[&key])
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Registra um release mandado ao cliente. Devolve o id.
@@ -1225,6 +1273,30 @@ mod tests {
             .unwrap();
         db.store.migrate().await.unwrap();
         assert_eq!(db.store.movies().await.unwrap().len(), 1);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn configuracao_grava_troca_e_apaga() {
+        let Some(db) = TestDb::new("settings").await else {
+            return;
+        };
+        let store = &db.store;
+        assert_eq!(store.setting("tmdb.key").await.unwrap(), None);
+        store
+            .set_setting("tmdb.key", Some("um"), "t1")
+            .await
+            .unwrap();
+        store
+            .set_setting("tmdb.key", Some("dois"), "t2")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.setting("tmdb.key").await.unwrap().as_deref(),
+            Some("dois")
+        );
+        store.set_setting("tmdb.key", None, "t3").await.unwrap();
+        assert_eq!(store.setting("tmdb.key").await.unwrap(), None);
         db.drop().await;
     }
 

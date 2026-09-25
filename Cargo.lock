@@ -87,6 +87,7 @@ dependencies = [
  "acervo-fs",
  "acervo-indexers",
  "acervo-janitor",
+ "acervo-metadata",
  "acervo-parser",
  "acervo-store",
  "anyhow",
@@ -131,6 +132,19 @@ version = "0.0.0"
 dependencies = [
  "acervo-core",
  "serde",
+]
+
+[[package]]
+name = "acervo-metadata"
+version = "0.0.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "url",
+ "wiremock",
 ]
 
 [[package]]
