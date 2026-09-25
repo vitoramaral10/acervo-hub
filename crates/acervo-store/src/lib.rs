@@ -7,6 +7,7 @@
 //! a aplicação faria.
 
 mod accounts;
+mod manage;
 
 use std::collections::BTreeSet;
 
@@ -16,6 +17,10 @@ use serde::{Deserialize, Serialize};
 use tokio_postgres::{NoTls, Row};
 
 pub use accounts::SESSION_DAYS;
+use manage::mirror_formats;
+pub use manage::{
+    Blocked, CustomFormat, Exclusion, HistoryEvent, HistoryPage, ImportList, NewHistory,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -58,6 +63,8 @@ pub struct QualityProfile {
     pub cutoff_format_score: i32,
     /// Id do perfil no gerenciador de onde ele veio.
     pub source_id: Option<i64>,
+    /// Nota de cada formato personalizado, pelo id dele.
+    pub format_scores: std::collections::BTreeMap<i64, i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,6 +251,11 @@ pub struct Import {
     pub movies: Vec<(i64, Movie)>,
     /// Tags da origem, com os ids de lá.
     pub tags: Vec<Tag>,
+    /// Formatos personalizados da origem, com os ids de lá.
+    pub custom_formats: Vec<CustomFormat>,
+    /// Perfis, formatos e tamanhos vêm da origem. Falso depois que o acervo
+    /// assume as regras: aí só os filmes são espelhados.
+    pub mirror_rules: bool,
 }
 
 /// O que uma importação muda. Nomes como "Título (Ano)".
@@ -406,6 +418,61 @@ const MIGRATIONS: &[&str] = &[
     r"
     ALTER TABLE grabs ADD COLUMN replaces TEXT;
 ",
+    r"
+    CREATE TABLE history (
+        id BIGSERIAL PRIMARY KEY,
+        movie_id BIGINT REFERENCES movies(id) ON DELETE SET NULL ON UPDATE CASCADE,
+        movie_title TEXT NOT NULL,
+        event TEXT NOT NULL,
+        at TEXT NOT NULL,
+        source_title TEXT,
+        quality SMALLINT,
+        indexer TEXT,
+        download_id TEXT,
+        data JSONB NOT NULL DEFAULT '{}'
+    );
+    CREATE INDEX history_by_at ON history(at DESC);
+    CREATE INDEX history_by_movie ON history(movie_id, at);
+    CREATE TABLE blocklist (
+        id BIGSERIAL PRIMARY KEY,
+        movie_id BIGINT REFERENCES movies(id) ON DELETE CASCADE ON UPDATE CASCADE,
+        source_title TEXT NOT NULL,
+        indexer TEXT,
+        quality SMALLINT,
+        size BIGINT,
+        hash TEXT,
+        at TEXT NOT NULL,
+        message TEXT
+    );
+    CREATE INDEX blocklist_by_movie ON blocklist(movie_id);
+    CREATE TABLE exclusions (
+        tmdb_id BIGINT PRIMARY KEY,
+        title TEXT NOT NULL,
+        year INTEGER
+    );
+    CREATE TABLE custom_formats (
+        id BIGSERIAL PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        specifications JSONB NOT NULL,
+        include_when_renaming BOOLEAN NOT NULL DEFAULT FALSE
+    );
+    ALTER TABLE quality_profiles ADD COLUMN format_scores JSONB NOT NULL DEFAULT '{}';
+    CREATE TABLE import_lists (
+        id BIGSERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        settings JSONB NOT NULL,
+        enabled BOOLEAN NOT NULL,
+        monitor BOOLEAN NOT NULL,
+        search_on_add BOOLEAN NOT NULL,
+        quality_profile_id BIGINT REFERENCES quality_profiles(id) ON UPDATE CASCADE,
+        root_folder TEXT NOT NULL,
+        minimum_availability TEXT NOT NULL,
+        tags JSONB NOT NULL DEFAULT '[]',
+        last_sync TEXT,
+        last_error TEXT
+    );
+",
 ];
 
 /// Chave do lock consultivo que serializa as migrações: o serviço e um
@@ -504,7 +571,7 @@ impl Store {
         let rows = client
             .query(
                 "SELECT name, upgrade_allowed, cutoff, language, items, min_format_score,
-                        cutoff_format_score, source_id
+                        cutoff_format_score, source_id, format_scores
                  FROM quality_profiles ORDER BY name",
                 &[],
             )
@@ -523,6 +590,7 @@ impl Store {
                     min_format_score: row.try_get(5)?,
                     cutoff_format_score: row.try_get(6)?,
                     source_id: row.try_get(7)?,
+                    format_scores: decode_scores(row.try_get(8)?)?,
                 })
             })
             .collect()
@@ -982,11 +1050,14 @@ impl Store {
             profiles: import.profiles.len(),
             ..ImportSummary::default()
         };
-        for profile in &import.profiles {
-            upsert_profile(&tx, profile).await?;
+        if import.mirror_rules {
+            mirror_formats(&tx, &import.custom_formats).await?;
+            for profile in &import.profiles {
+                upsert_profile(&tx, profile).await?;
+            }
         }
         write_tags(&tx, &import.tags).await?;
-        for definition in &import.definitions {
+        for definition in import.definitions.iter().filter(|_| import.mirror_rules) {
             tx.execute(
                 "INSERT INTO quality_definitions (quality, min_size, max_size, preferred_size)
                  VALUES ($1, $2, $3, $4)
@@ -1109,13 +1180,13 @@ async fn upsert_profile(client: &impl GenericClient, profile: &QualityProfile) -
     client
         .execute(
             "INSERT INTO quality_profiles (name, upgrade_allowed, cutoff, language, items,
-                 min_format_score, cutoff_format_score, source_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 min_format_score, cutoff_format_score, source_id, format_scores)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT (name) DO UPDATE SET upgrade_allowed = excluded.upgrade_allowed,
                  cutoff = excluded.cutoff, language = excluded.language, items = excluded.items,
                  min_format_score = excluded.min_format_score,
                  cutoff_format_score = excluded.cutoff_format_score,
-                 source_id = excluded.source_id",
+                 source_id = excluded.source_id, format_scores = excluded.format_scores",
             &[
                 &profile.name,
                 &profile.upgrade_allowed,
@@ -1125,10 +1196,34 @@ async fn upsert_profile(client: &impl GenericClient, profile: &QualityProfile) -
                 &profile.min_format_score,
                 &profile.cutoff_format_score,
                 &profile.source_id,
+                &encode_scores(&profile.format_scores),
             ],
         )
         .await?;
     Ok(())
+}
+
+pub(crate) fn encode_scores(scores: &std::collections::BTreeMap<i64, i32>) -> serde_json::Value {
+    serde_json::Value::Object(
+        scores
+            .iter()
+            .map(|(id, score)| (id.to_string(), serde_json::Value::from(*score)))
+            .collect(),
+    )
+}
+
+pub(crate) fn decode_scores(
+    value: serde_json::Value,
+) -> Result<std::collections::BTreeMap<i64, i32>> {
+    let raw: std::collections::BTreeMap<String, i32> = serde_json::from_value(value)
+        .map_err(|e| StoreError::Corrupt(format!("notas de formato: {e}")))?;
+    raw.into_iter()
+        .map(|(id, score)| {
+            id.parse()
+                .map(|id| (id, score))
+                .map_err(|_| StoreError::Corrupt(format!("formato `{id}`")))
+        })
+        .collect()
 }
 
 async fn write_movie(
@@ -1513,6 +1608,7 @@ mod tests {
             min_format_score: 0,
             cutoff_format_score: 0,
             source_id: Some(7),
+            format_scores: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1570,6 +1666,8 @@ mod tests {
             }],
             movies,
             tags: Vec::new(),
+            custom_formats: Vec::new(),
+            mirror_rules: true,
         }
     }
 
@@ -1863,6 +1961,131 @@ mod tests {
         assert_eq!(
             store.latest_shadow_runs().await.unwrap(),
             [run("2026-01-02T00:00:00Z", true)]
+        );
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Um roteiro só, de ponta a ponta.
+    async fn gerenciador_guarda_historico_bloqueio_formatos_e_listas() {
+        let Some(db) = TestDb::new("gerenciador").await else {
+            return;
+        };
+        let store = &db.store;
+        store
+            .import(&import(vec![(1, movie(10, "Um", true))]), true)
+            .await
+            .unwrap();
+        let movie_id = store.movies().await.unwrap()[0].id;
+
+        let event = |at: &str| NewHistory {
+            movie_id: Some(movie_id),
+            movie_title: "Um (2020)".into(),
+            event: "grabbed".into(),
+            at: at.into(),
+            source_title: Some("Um.2020.1080p.WEB-DL".into()),
+            quality: Some(Quality::WebDl1080p),
+            indexer: Some("tracker".into()),
+            download_id: None,
+            data: serde_json::json!({ "origem": "radarr" }),
+        };
+        store
+            .record_history(&event("2026-01-02T00:00:00Z"))
+            .await
+            .unwrap();
+        store
+            .record_history_batch(&[event("2026-01-01T00:00:00Z")])
+            .await
+            .unwrap();
+        let page = store.history(Some(movie_id), None, 10, 0).await.unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(page.events[0].at, "2026-01-02T00:00:00Z");
+        assert_eq!(store.history_from("radarr").await.unwrap(), 2);
+        // O filme sai; o histórico fica, sem o id.
+        store.delete_movie(movie_id).await.unwrap();
+        let page = store.history(None, Some("grabbed"), 10, 0).await.unwrap();
+        assert_eq!(page.total, 2);
+        assert!(page.events.iter().all(|e| e.movie_id.is_none()));
+
+        let blocked = store
+            .block(&Blocked {
+                id: 0,
+                movie_id: None,
+                source_title: "Ruim.2020.CAM".into(),
+                indexer: None,
+                quality: None,
+                size: Some(1),
+                hash: None,
+                at: "2026-01-01T00:00:00Z".into(),
+                message: Some("falhou".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.blocklist().await.unwrap().len(), 1);
+        assert!(store.unblock(blocked).await.unwrap());
+
+        let exclusion = Exclusion {
+            tmdb_id: 99,
+            title: "Nunca".into(),
+            year: Some(1999),
+        };
+        assert_eq!(
+            store
+                .add_exclusions(&[exclusion.clone(), exclusion.clone()])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.exclusions().await.unwrap(), [exclusion]);
+
+        let format = store
+            .save_custom_format(&CustomFormat {
+                id: 0,
+                name: "HEVC".into(),
+                specifications: serde_json::json!([{ "tipo": "titulo", "valor": "x265" }]),
+                include_when_renaming: false,
+            })
+            .await
+            .unwrap();
+        let (profile_id, mut edited) = store.profiles_by_id().await.unwrap().remove(0);
+        edited.format_scores.insert(format, 50);
+        edited.name = "Renomeado".into();
+        store.save_profile(Some(profile_id), &edited).await.unwrap();
+        assert_eq!(
+            store.profiles().await.unwrap()[0].format_scores[&format],
+            50
+        );
+        // Apagar o formato tira a nota dos perfis.
+        store.delete_custom_format(format).await.unwrap();
+        assert!(store.profiles().await.unwrap()[0].format_scores.is_empty());
+
+        let list = store
+            .save_import_list(&ImportList {
+                id: 0,
+                name: "Pessoa".into(),
+                kind: "tmdb_person".into(),
+                settings: serde_json::json!({ "pessoa": 17276 }),
+                enabled: true,
+                monitor: true,
+                search_on_add: false,
+                quality_profile_id: Some(profile_id),
+                root_folder: "/filmes".into(),
+                minimum_availability: "released".into(),
+                tags: vec![],
+                last_sync: None,
+                last_error: None,
+            })
+            .await
+            .unwrap();
+        // Perfil em uso por lista não sai.
+        assert!(store.delete_profile(profile_id).await.is_err());
+        store
+            .set_import_list_sync(list, "2026-01-01T00:00:00Z", Some("erro"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.import_lists().await.unwrap()[0].last_error.as_deref(),
+            Some("erro")
         );
         db.drop().await;
     }

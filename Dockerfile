@@ -24,12 +24,18 @@ RUN --mount=type=cache,target=/src/target,sharing=locked \
     cargo build --release --locked --target "${TARGET}" --bin acervo-hub \
  && install -D "/src/target/${TARGET}/release/acervo-hub" /out/acervo-hub
 
-# Imagem final: só o binário. Sem shell, sem gerenciador de pacotes, sem curl.
+# `ffprobe` estático: lê as faixas de áudio e legenda do que o acervo importa
+# (o app de legendas depende disso). Binário único, sem bibliotecas.
+FROM mwader/static-ffmpeg:7.1.1@sha256:11a44711684c0b9f754c047dcd64235b8b52deab251bd0e0a86f22faa160749c AS ffmpeg
+
+# Imagem final: o binário e o `ffprobe`. Sem shell, sem gerenciador de
+# pacotes, sem curl.
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab AS runtime
 
 # Root é dono e o processo não pode reescrever o próprio binário: escrita
 # arbitrária deixa de virar execução de código persistente.
 COPY --from=builder --chown=root:root --chmod=0755 /out/acervo-hub /usr/local/bin/acervo-hub
+COPY --from=ffmpeg --chown=root:root --chmod=0755 /ffprobe /usr/local/bin/ffprobe
 
 # UID numérico: `runAsNonRoot` não resolve nome de usuário.
 USER 65532:65532

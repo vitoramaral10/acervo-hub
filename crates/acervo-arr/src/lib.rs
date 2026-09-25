@@ -263,6 +263,79 @@ impl ArrClient {
         self.check_status(response, &path).map(|_| ())
     }
 
+    /// `GET` cru, para o que não tem tipo próprio aqui.
+    ///
+    /// # Errors
+    ///
+    /// Falha de rede, status não-2xx ou resposta que não é JSON.
+    pub async fn get_json(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<serde_json::Value, ArrError> {
+        self.get(self.url(path)?, query, path).await
+    }
+
+    /// `PUT` com corpo JSON; devolve a resposta, se houver.
+    ///
+    /// # Errors
+    ///
+    /// Falha de rede ou status não-2xx.
+    pub async fn put_json(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, ArrError> {
+        let response = self
+            .http
+            .put(self.url(path)?)
+            .query(query)
+            .json(body)
+            .send()
+            .await
+            .map_err(|source| self.transport(source))?;
+        let response = self.check_status(response, path)?;
+        Ok(response.json().await.unwrap_or(serde_json::Value::Null))
+    }
+
+    /// `POST` com corpo JSON; devolve a resposta.
+    ///
+    /// # Errors
+    ///
+    /// Falha de rede ou status não-2xx.
+    pub async fn post_json(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, ArrError> {
+        let response = self
+            .http
+            .post(self.url(path)?)
+            .json(body)
+            .send()
+            .await
+            .map_err(|source| self.transport(source))?;
+        let response = self.check_status(response, path)?;
+        Ok(response.json().await.unwrap_or(serde_json::Value::Null))
+    }
+
+    /// `DELETE`.
+    ///
+    /// # Errors
+    ///
+    /// Falha de rede ou status não-2xx.
+    pub async fn delete_path(&self, path: &str, query: &[(&str, &str)]) -> Result<(), ArrError> {
+        let response = self
+            .http
+            .delete(self.url(path)?)
+            .query(query)
+            .send()
+            .await
+            .map_err(|source| self.transport(source))?;
+        self.check_status(response, path).map(|_| ())
+    }
+
     fn url(&self, path: &str) -> Result<Url, ArrError> {
         self.base.join(path).map_err(|source| ArrError::BadUrl {
             instance: self.name.clone(),

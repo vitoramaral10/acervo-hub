@@ -31,12 +31,13 @@ clap.workspace = true
 fancy-regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["net", "signal"] }
+tokio = { workspace = true, features = ["net", "signal", "process"] }
 toml.workspace = true
 tracing.workspace = true
 time = { workspace = true, features = ["formatting", "macros"] }
 tracing-subscriber.workspace = true
 url.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true

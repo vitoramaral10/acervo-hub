@@ -23,18 +23,24 @@ mod config;
 mod credentials;
 mod cycle;
 mod definitions;
+mod events;
 mod grab;
 mod ledger;
 mod library;
+mod lists;
+mod mediainfo;
 mod metadata;
+mod migrate;
 mod movies;
 mod naming;
 mod registry;
 mod report;
+mod rules;
 mod search;
 mod serve;
 mod shadow;
 mod sync;
+mod web;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -158,11 +164,20 @@ enum MoviesAction {
         apply: bool,
     },
     /// O acervo passa a ser dono de todos os filmes do catálogo: importar do
-    /// gerenciador deixa de mexer neles. É o corte. Sem `--apply`, só conta.
+    /// gerenciador deixa de mexer neles. Sem `--apply`, só conta. Para o
+    /// corte completo (regras também), use `movies take-over`.
     Adopt {
         #[arg(long)]
         apply: bool,
     },
+    /// O corte: o acervo assume filmes, perfis, formatos e regras, e para de
+    /// importar do gerenciador.
+    TakeOver,
+    /// Traz do gerenciador histórico, bloqueados, exclusões, notificação e
+    /// listas de importação. Pode rodar de novo sem duplicar.
+    Migrate,
+    /// Sincroniza as listas de importação agora.
+    Lists,
 }
 
 fn print_grab(report: &grab::GrabReport) {
@@ -271,7 +286,7 @@ async fn movies_command(config: &config::Config, action: MoviesAction) -> Result
             report.escolhido.is_none()
         }
         MoviesAction::Downloads { apply } => {
-            let lines = grab::import_downloads(config, &store, apply).await?;
+            let lines = grab::import_downloads(config, &store, None, apply).await?;
             if lines.is_empty() {
                 println!("nenhum download do acervo em andamento");
             }
@@ -373,6 +388,34 @@ async fn movies_command(config: &config::Config, action: MoviesAction) -> Result
                 println!("{owned} filmes vieram do gerenciador; rode com --apply para adotá-los");
             }
             false
+        }
+        MoviesAction::TakeOver => {
+            rules::take_over(config, &store).await?;
+            println!("o acervo decide: filmes adotados, regras assumidas, importação desligada");
+            false
+        }
+        MoviesAction::Migrate => {
+            let report = migrate::run(config, &store).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            !report.avisos.is_empty()
+        }
+        MoviesAction::Lists => {
+            let catalog = acervo_api::Catalog::new(serve::entries(config).await?)?;
+            let reports = lists::sync_all(config, &store, Some(&catalog)).await?;
+            for report in &reports {
+                println!(
+                    "{}: {} encontrados, {} adicionados, {} já no catálogo, {} excluídos",
+                    report.lista,
+                    report.encontrados,
+                    report.adicionados.len(),
+                    report.ja_no_catalogo,
+                    report.excluidos
+                );
+                for (movie, error) in &report.falhas {
+                    println!("  falhou {movie}: {error}");
+                }
+            }
+            reports.iter().any(|r| !r.falhas.is_empty())
         }
         MoviesAction::Shadow { limit, .. } => {
             let catalog = acervo_api::Catalog::new(serve::entries(config).await?)?;

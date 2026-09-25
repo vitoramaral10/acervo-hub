@@ -21,7 +21,7 @@ use axum::routing::get;
 use time::OffsetDateTime;
 
 pub use catalog::{ALL, Catalog, CatalogError, Entry, Health, IndexerView, Page, UI};
-pub use ui::{Accounts, Admin, DefinitionView, SettingView};
+pub use ui::{Accounts, Admin, DefinitionView, SettingView, authorize_ui, ui_json};
 
 /// Erros do contrato Torznab, com os códigos que os consumidores entendem.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

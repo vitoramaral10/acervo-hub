@@ -2,28 +2,28 @@
 //! indexadores e decide o que pegaria, sem pegar nada. O gerenciador de
 //! filmes segue decidindo e baixando; o relatório compara as duas escolhas.
 //!
-//! A configuração de decisão (tetos, seeders mínimos, fila, espaço livre) vem
-//! do gerenciador: nesta fase ele é a autoridade, e a sombra precisa decidir
-//! com as mesmas regras para a comparação valer.
+//! As regras de decisão vêm de [`crate::rules`]: do gerenciador enquanto ele
+//! for o dono, do banco depois que o acervo assumir. A fila soma a do
+//! gerenciador (se ele responde) com os downloads do próprio acervo.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use acervo_api::{ALL, Catalog};
-use acervo_arr::{ArrClient, ArrKind, RemoteIndexer, RemoteQueueItem};
+use acervo_arr::{ArrClient, ArrKind, RemoteQueueItem};
 use acervo_core::InstanceName;
 use acervo_decision::{
-    Decision, Engine, ExistingFile, Indexer, Mode, Profile, ProfileItem, Propers,
-    QualityDefinition, Release, Settings, Target,
+    BlockedRelease, CustomFormat, Decision, Delay, Engine, ExistingFile, FormatInput, Indexer,
+    Mode, Profile, ProfileItem, Queued, Release, Settings, Target,
 };
 use acervo_indexers::SearchQuery;
-use acervo_parser::{Language, QualityModel, Revision, clean_movie_title};
+use acervo_parser::{Language, QualityModel, Revision, clean_movie_title, parse_movie_title};
 use acervo_store::{CatalogMovie, QualityProfile, ShadowPick, ShadowRun, Store};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use serde_json::Value;
 
 use crate::config::{Config, InstanceKind};
+use crate::rules::DecisionRules;
 
 /// Categoria Newznab de filmes.
 const MOVIES: u32 = 2000;
@@ -66,7 +66,46 @@ fn profile(stored: &QualityProfile) -> Profile {
             .unwrap_or(Language::Any),
         min_format_score: stored.min_format_score,
         cutoff_format_score: stored.cutoff_format_score,
+        format_scores: stored
+            .format_scores
+            .iter()
+            .map(|(id, score)| (*id, *score))
+            .collect(),
     }
+}
+
+/// Nota de formatos de um nome de release ou de arquivo no perfil.
+pub(crate) fn title_score(
+    formats: &[CustomFormat],
+    profile: &Profile,
+    title: &str,
+    original_language: Language,
+    size: u64,
+    languages: Option<&[Language]>,
+) -> i32 {
+    if formats.is_empty() {
+        return 0;
+    }
+    let parsed = parse_movie_title(title);
+    let found = parsed
+        .as_ref()
+        .map(|p| p.languages.clone())
+        .unwrap_or_default();
+    let quality = parsed.as_ref().map_or_else(
+        || acervo_parser::parse_quality(title).quality,
+        |p| p.quality.quality,
+    );
+    let input = FormatInput {
+        title,
+        release_group: parsed.as_ref().and_then(|p| p.release_group.as_deref()),
+        edition: parsed.as_ref().and_then(|p| p.edition.as_deref()),
+        languages: languages.unwrap_or(&found),
+        original_language,
+        quality,
+        size,
+        flags: 0,
+    };
+    profile.score(&acervo_decision::matching(formats, &input))
 }
 
 /// Dias desde uma data RFC 3339; desconhecida conta como antiga.
@@ -79,61 +118,19 @@ fn age_days(date: Option<&str>, now: time::OffsetDateTime) -> u32 {
     })
 }
 
-/// As regras de decisão do gerenciador de filmes. Guardadas no banco a cada
-/// leitura bem-sucedida: depois que ele sair, o acervo decide com elas.
-#[derive(Debug, Default, serde::Deserialize, Serialize)]
-struct Rules {
-    indexer_config: Value,
-    media_config: Value,
-    /// Indexador daqui → prioridade e seeders mínimos do cadastro dele lá.
-    indexers: BTreeMap<String, (i32, u32)>,
-}
-
-/// Onde as regras ficam na tabela de configurações.
-const RULES_KEY: &str = "decisao.regras";
-
-impl Rules {
-    fn from_manager(
-        indexer_config: Value,
-        media_config: Value,
-        indexers: &[RemoteIndexer],
-    ) -> Self {
-        Self {
-            indexer_config,
-            media_config,
-            indexers: indexers
-                .iter()
-                .filter_map(|i| {
-                    let name = i.name.strip_suffix(crate::sync::SUFFIX)?;
-                    Some((
-                        name.to_owned(),
-                        (
-                            i.priority()
-                                .and_then(|p| i32::try_from(p).ok())
-                                .unwrap_or(25),
-                            i.minimum_seeders()
-                                .and_then(|s| u32::try_from(s).ok())
-                                .unwrap_or(1),
-                        ),
-                    ))
-                })
-                .collect(),
-        }
-    }
-}
-
 struct Remote {
     /// A fila do gerenciador; vazia quando ele não responde.
     queue: Vec<RemoteQueueItem>,
     /// Espaço livre por pasta raiz, como o gerenciador vê a pasta.
     free: BTreeMap<String, u64>,
-    rules: Rules,
+    rules: DecisionRules,
 }
 
 fn target(
     entry: &CatalogMovie,
     profiles: &BTreeMap<String, Profile>,
     remote: &Remote,
+    formats: &[CustomFormat],
     now: time::OffsetDateTime,
 ) -> Option<Target> {
     let movie = &entry.movie;
@@ -148,6 +145,11 @@ fn target(
         clean_titles.push(clean_movie_title(title));
     }
     let source_id = entry.origin.as_ref().map(|(_, id)| *id);
+    let original_language = movie
+        .original_language
+        .as_deref()
+        .and_then(Language::from_name)
+        .unwrap_or(Language::Unknown);
     Some(Target {
         id: entry.id,
         title: metadata_title(movie),
@@ -156,44 +158,52 @@ fn target(
         secondary_year: movie.secondary_year,
         tmdb_id: movie.tmdb_id,
         imdb_id: movie.imdb_id.clone(),
-        original_language: movie
-            .original_language
-            .as_deref()
-            .and_then(Language::from_name)
-            .unwrap_or(Language::Unknown),
+        original_language,
         runtime: movie.runtime,
         monitored: movie.monitored,
         // Calculada das datas, como a referência faz, com a carência dela.
-        available: crate::library::is_available(
-            movie,
-            now.date(),
-            remote.rules.indexer_config["availabilityDelay"]
-                .as_i64()
-                .unwrap_or(0),
-        ),
-        profile,
-        file: movie.file.as_ref().map(|file| ExistingFile {
-            quality: file.quality,
-            release_group: file.release_group.clone(),
-            age_days: age_days(file.date_added.as_deref(), now),
+        available: crate::library::is_available(movie, now.date(), remote.rules.carencia_dias),
+        file: movie.file.as_ref().map(|file| {
+            let languages: Vec<Language> = file
+                .languages
+                .iter()
+                .filter_map(|l| Language::from_name(l))
+                .collect();
+            ExistingFile {
+                quality: file.quality,
+                release_group: file.release_group.clone(),
+                age_days: age_days(file.date_added.as_deref(), now),
+                format_score: title_score(
+                    formats,
+                    &profile,
+                    file.scene_name.as_deref().unwrap_or(&file.relative_path),
+                    original_language,
+                    file.size,
+                    (!languages.is_empty()).then_some(&languages[..]),
+                ),
+            }
         }),
+        profile,
         queued: remote
             .queue
             .iter()
             .filter(|item| item.movie_id.is_some() && item.movie_id == source_id)
             .filter(|item| item.tracked_download_state.as_deref() != Some("failedPending"))
             .filter_map(|item| item.quality.as_ref())
-            .map(|q| QualityModel {
-                quality: acervo_parser::Quality::from_id(q.quality.id)
-                    .unwrap_or(acervo_parser::Quality::Unknown),
-                revision: q
-                    .revision
-                    .as_ref()
-                    .map_or_else(Revision::default, |r| Revision {
-                        version: r.version,
-                        real: r.real,
-                        is_repack: r.is_repack,
-                    }),
+            .map(|q| Queued {
+                quality: QualityModel {
+                    quality: acervo_parser::Quality::from_id(q.quality.id)
+                        .unwrap_or(acervo_parser::Quality::Unknown),
+                    revision: q
+                        .revision
+                        .as_ref()
+                        .map_or_else(Revision::default, |r| Revision {
+                            version: r.version,
+                            real: r.real,
+                            is_repack: r.is_repack,
+                        }),
+                },
+                format_score: 0,
             })
             .collect(),
         free_space: std::path::Path::new(&movie.path)
@@ -203,52 +213,17 @@ fn target(
     })
 }
 
-fn settings(remote: &Remote, definitions: Vec<acervo_store::QualityDefinition>) -> Settings {
-    let indexer = &remote.rules.indexer_config;
-    let media = &remote.rules.media_config;
-    Settings {
-        definitions: definitions
-            .into_iter()
-            .map(|d| QualityDefinition {
-                quality: d.quality,
-                min_size: d.min_size,
-                max_size: d.max_size,
-                preferred_size: d.preferred_size,
-            })
-            .collect(),
-        maximum_size_mb: indexer["maximumSize"].as_u64().unwrap_or(0),
-        allow_hardcoded_subs: indexer["allowHardcodedSubs"].as_bool().unwrap_or(false),
-        whitelisted_hardcoded_subs: indexer["whitelistedHardcodedSubs"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned(),
-        propers: match media["downloadPropersAndRepacks"].as_str() {
-            Some("doNotUpgrade") => Propers::DoNotUpgrade,
-            Some("doNotPrefer") => Propers::DoNotPrefer,
-            _ => Propers::PreferAndUpgrade,
-        },
-        prefer_indexer_flags: indexer["preferIndexerFlags"].as_bool().unwrap_or(false),
-        minimum_free_space_mb: media["minimumFreeSpaceWhenImporting"]
-            .as_u64()
-            .unwrap_or(100),
-        skip_free_space_check: media["skipFreeSpaceCheckWhenImporting"]
-            .as_bool()
-            .unwrap_or(false),
-    }
-}
-
 /// Os indexadores daqui, com prioridade e seeders mínimos do cadastro deles
 /// no gerenciador (`<nome> (acervo-hub)`).
 fn indexers(served: &[String], remote: &Remote) -> Vec<Indexer> {
     served
         .iter()
         .map(|name| {
-            let (priority, minimum_seeders) =
-                remote.rules.indexers.get(name).copied().unwrap_or((25, 1));
+            let rules = remote.rules.indexer(name);
             Indexer {
                 name: name.clone(),
-                priority,
-                minimum_seeders,
+                priority: rules.prioridade,
+                minimum_seeders: rules.seeders_minimos,
                 multi_languages: Vec::new(),
             }
         })
@@ -328,6 +303,9 @@ pub(crate) struct Decider {
     pub library: Vec<Target>,
     indexers: Vec<Indexer>,
     settings: Settings,
+    formats: Vec<CustomFormat>,
+    blocklist: Vec<BlockedRelease>,
+    delay: Delay,
 }
 
 /// Uma busca decidida: os releases como vieram do indexador e a decisão de
@@ -351,57 +329,52 @@ impl Decider {
     /// # Errors
     ///
     /// Catálogo vazio, gerenciador de filmes inalcançável ou nenhum indexador.
+    #[allow(clippy::too_many_lines)] // Leitura em sequência; dividir só espalharia.
     pub async fn load(config: &Config, store: &Store, catalog: &Catalog) -> Result<Self> {
+        let owner = crate::rules::owner(config, store).await?;
+        let has_manager = config
+            .instances
+            .iter()
+            .any(|spec| matches!(spec.kind, InstanceKind::Movie));
         let live = async {
             let client = movie_client(config)?;
-            let (queue, indexer_config, media_config, remote_indexers) = tokio::try_join!(
-                client.movie_queue(),
-                client.indexer_config(),
-                client.media_management_config(),
-                client.indexers(),
+            if owner != "radarr" {
+                return anyhow::Ok((client.movie_queue().await?, None));
+            }
+            let (queue, rules) = tokio::try_join!(
+                async { Ok(client.movie_queue().await?) },
+                crate::rules::from_manager(&client),
             )?;
-            anyhow::Ok((
-                queue,
-                Rules::from_manager(indexer_config, media_config, &remote_indexers),
-            ))
+            anyhow::Ok((queue, Some(rules)))
         }
         .await;
         let (queue, rules) = match live {
-            Ok((queue, rules)) => {
-                if let Ok(text) = serde_json::to_string(&rules) {
-                    store
-                        .set_setting(RULES_KEY, Some(&text), &now_rfc3339())
-                        .await?;
-                }
+            Ok((queue, Some(rules))) => {
+                crate::rules::save(store, &rules).await?;
                 (queue, rules)
             }
+            Ok((queue, None)) => (queue, crate::rules::stored(store).await?),
             Err(error) => {
-                if config
-                    .instances
-                    .iter()
-                    .any(|spec| matches!(spec.kind, InstanceKind::Movie))
-                {
+                if has_manager {
                     tracing::warn!(
                         "gerenciador de filmes inalcançável, decidindo com as regras guardadas: {error:#}"
                     );
                 }
-                let rules = store
-                    .setting(RULES_KEY)
-                    .await?
-                    .and_then(|text| serde_json::from_str(&text).ok())
-                    .unwrap_or_default();
-                (Vec::new(), rules)
+                (Vec::new(), crate::rules::stored(store).await?)
             }
         };
-        let (movies, stored_profiles, definitions, grabs) = tokio::try_join!(
+        let (movies, stored_profiles, definitions, grabs, stored_formats, blocked) = tokio::try_join!(
             store.movies(),
             store.profiles(),
             store.quality_definitions(),
             store.grabs(),
+            store.custom_formats(),
+            store.blocklist(),
         )?;
         if movies.is_empty() {
-            bail!("catálogo vazio: rode `movies import --apply` antes");
+            bail!("catálogo vazio: adicione filmes ou importe do gerenciador antes");
         }
+        let formats = crate::rules::compiled_formats(&stored_formats);
         let remote = Remote {
             queue,
             free: free_space(config, &movies).await,
@@ -414,7 +387,7 @@ impl Decider {
             .collect();
         let mut library: Vec<Target> = movies
             .iter()
-            .filter_map(|entry| target(entry, &profiles, &remote, now))
+            .filter_map(|entry| target(entry, &profiles, &remote, &formats, now))
             .collect();
         // O que o acervo mesmo mandou ao cliente conta como fila: sem isso,
         // pegaria o mesmo filme de novo enquanto o primeiro baixa.
@@ -423,9 +396,20 @@ impl Decider {
             .filter(|g| g.state == acervo_store::GrabState::Downloading)
         {
             if let Some(target) = library.iter_mut().find(|t| t.id == grab.movie_id) {
-                target.queued.push(QualityModel {
-                    quality: grab.quality,
-                    revision: Revision::default(),
+                let format_score = title_score(
+                    &formats,
+                    &target.profile,
+                    &grab.title,
+                    target.original_language,
+                    grab.size,
+                    None,
+                );
+                target.queued.push(Queued {
+                    quality: QualityModel {
+                        quality: grab.quality,
+                        revision: Revision::default(),
+                    },
+                    format_score,
                 });
             }
         }
@@ -435,9 +419,44 @@ impl Decider {
         }
         Ok(Self {
             indexers: indexers(&served, &remote),
-            settings: settings(&remote, definitions),
+            settings: remote.rules.settings(definitions),
+            delay: remote.rules.delay(),
+            formats,
+            blocklist: blocked
+                .into_iter()
+                .map(|b| BlockedRelease {
+                    movie: b.movie_id,
+                    title: b.source_title,
+                    indexer: b.indexer,
+                })
+                .collect(),
             library,
         })
+    }
+
+    fn engine(&self) -> Engine<'_> {
+        Engine {
+            library: &self.library,
+            indexers: &self.indexers,
+            settings: &self.settings,
+            formats: &self.formats,
+            blocklist: &self.blocklist,
+            delay: self.delay,
+        }
+    }
+
+    /// Decide releases já em mãos para o filme, como a busca interativa.
+    pub fn decide_releases(
+        &self,
+        movie: i64,
+        releases: Vec<acervo_indexers::Release>,
+        mode: Mode,
+    ) -> Outcome {
+        let decisions = self.engine().search(movie, &candidates(&releases), mode);
+        Outcome {
+            releases,
+            decisions,
+        }
     }
 
     pub fn target(&self, movie_id: i64) -> Option<&Target> {
@@ -450,6 +469,19 @@ impl Decider {
     ///
     /// A busca falhou em todos os indexadores.
     pub async fn decide(&self, catalog: &Catalog, movie: &Target) -> Result<Outcome, String> {
+        let releases = Self::fetch(catalog, movie).await?;
+        Ok(self.decide_releases(movie.id, releases, Mode::Automatic))
+    }
+
+    /// Busca o filme em todos os indexadores, sem decidir.
+    ///
+    /// # Errors
+    ///
+    /// A busca falhou em todos os indexadores.
+    pub async fn fetch(
+        catalog: &Catalog,
+        movie: &Target,
+    ) -> Result<Vec<acervo_indexers::Release>, String> {
         let mut query = SearchQuery::movie(movie.title.clone()).with_categories([MOVIES]);
         if let Some(year) = movie.year {
             query = query.with_year(year);
@@ -460,32 +492,25 @@ impl Decider {
         if movie.tmdb_id != 0 {
             query = query.with_tmdb_id(u64::from(movie.tmdb_id));
         }
-        let page = catalog
+        catalog
             .search(ALL, &query)
             .await
-            .map_err(|error| error.to_string())?;
-        let candidates = candidates(&page.releases);
-        let engine = Engine {
-            library: &self.library,
-            indexers: &self.indexers,
-            settings: &self.settings,
-        };
-        let decisions = engine.search(movie.id, &candidates, Mode::Automatic);
-        Ok(Outcome {
-            releases: page.releases,
-            decisions,
-        })
+            .map(|page| page.releases)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Nome de cada formato, pelo id.
+    pub fn format_name(&self, id: i64) -> Option<&str> {
+        self.formats
+            .iter()
+            .find(|f| f.id == id)
+            .map(|f| f.name.as_str())
     }
 
     /// Releases recentes, sem filme buscado: cada um casado com a biblioteca
     /// inteira, como a sincronização de RSS da referência.
     pub fn rss(&self, releases: Vec<acervo_indexers::Release>) -> Outcome {
-        let engine = Engine {
-            library: &self.library,
-            indexers: &self.indexers,
-            settings: &self.settings,
-        };
-        let decisions = engine.rss(&candidates(&releases));
+        let decisions = self.engine().rss(&candidates(&releases));
         Outcome {
             releases,
             decisions,
@@ -512,6 +537,10 @@ fn candidates(releases: &[acervo_indexers::Release]) -> Vec<Release> {
             } else {
                 0
             },
+            #[allow(clippy::cast_precision_loss)]
+            age_hours: r
+                .published
+                .map(|at| (time::OffsetDateTime::now_utc() - at).whole_minutes() as f64 / 60.0),
         })
         .collect()
 }

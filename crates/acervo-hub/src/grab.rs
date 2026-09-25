@@ -2,10 +2,14 @@
 //! o download termina, liga o arquivo na pasta do filme.
 //!
 //! O que é pego vai ao cliente numa categoria própria, que o gerenciador de
-//! filmes não importa. A importação só cria: hardlink do arquivo baixado com o
-//! nome que o gerenciador daria, na pasta do filme. Filme que já tem arquivo
-//! fica de fora — upgrade, que troca um arquivo por outro, ainda é dele. Depois
-//! de ligar, o gerenciador relê a pasta e adota o arquivo como dele.
+//! filmes não importa. A importação liga (hardlink) o arquivo baixado com o
+//! nome que o gerenciador daria, na pasta do filme; num upgrade, troca o
+//! antigo. Filme que ainda é do gerenciador é relido por ele depois.
+//!
+//! Download que o cliente dá como perdido vai para a lista de bloqueio e o
+//! filme é buscado de novo (com a busca automática ligada). Problema na
+//! importação (arquivo no caminho, disco diferente) não é culpa do release:
+//! o download fica na fila, com o aviso, até dar certo.
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +20,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::config::Config;
+use crate::events::{self, Event, Kind};
 use crate::naming::movie_file_stem;
 use crate::shadow::{Decider, label, movie_client, now_rfc3339, summarize};
 
@@ -44,7 +49,7 @@ pub struct GrabReport {
     pub aplicado: bool,
 }
 
-async fn qbit(config: &Config) -> Result<QbitClient> {
+pub(crate) async fn qbit(config: &Config) -> Result<QbitClient> {
     let spec = config
         .qbittorrent
         .as_ref()
@@ -105,7 +110,7 @@ pub async fn send(
         .record_grab(&Grab {
             id: 0,
             movie_id,
-            hash,
+            hash: hash.clone(),
             title: release.title.clone(),
             indexer: release.indexer.clone(),
             quality,
@@ -119,7 +124,49 @@ pub async fn send(
         })
         .await
         .context("registrando o grab")?;
+    let movie = store.movies().await?.into_iter().find(|m| m.id == movie_id);
+    events::record(
+        store,
+        Event {
+            source_title: Some(release.title.clone()),
+            quality: Some(quality),
+            indexer: Some(release.indexer.clone()),
+            download_id: Some(hash),
+            poster: movie.as_ref().and_then(|m| m.extras.poster.clone()),
+            ..Event::new(
+                Kind::Grabbed,
+                Some(movie_id),
+                movie.map_or_else(String::new, |m| events::label(&m.movie.title, m.movie.year)),
+            )
+        },
+    )
+    .await;
     Ok(())
+}
+
+/// Manda um release escolhido na mão (busca interativa) ao cliente.
+///
+/// # Errors
+///
+/// Filme fora do catálogo, `.torrent` inválido ou cliente inalcançável.
+pub async fn send_chosen(
+    config: &Config,
+    store: &Store,
+    catalog: &Catalog,
+    movie_id: i64,
+    release: &acervo_indexers::Release,
+) -> Result<()> {
+    let replaces = store
+        .movies()
+        .await?
+        .into_iter()
+        .find(|m| m.id == movie_id)
+        .context("filme fora do catálogo")?
+        .movie
+        .file
+        .map(|f| f.relative_path);
+    let quality = acervo_parser::parse_quality(&release.title).quality;
+    send(config, store, catalog, movie_id, release, quality, replaces).await
 }
 
 /// Busca o filme, decide e, com `apply`, manda o escolhido ao cliente. Filme
@@ -183,7 +230,8 @@ pub async fn grab(
 pub struct ImportLine {
     pub filme: String,
     pub release: String,
-    /// `baixando`, `importaria`, `importado` ou `falhou`.
+    /// `baixando`, `importaria`, `importado`, `atencao` (importação
+    /// travada, tenta de novo) ou `falhou`.
     pub estado: &'static str,
     pub detalhe: Option<String>,
     /// Caminho do arquivo na pasta do filme, como o gerenciador vê.
@@ -273,25 +321,178 @@ fn install(source: &Path, target: &Path, old: Option<&Path>) -> Result<()> {
     }
 }
 
-/// O registro do arquivo importado, com o que o nome do release diz.
-fn imported_file(grab: &Grab, relative_path: String, size: u64) -> MovieFile {
+/// O registro do arquivo importado, com o que o nome do release diz e as
+/// faixas que o `ffprobe` leu.
+fn imported_file(
+    grab: &Grab,
+    relative_path: String,
+    size: u64,
+    probe: Option<crate::mediainfo::Probe>,
+) -> MovieFile {
     let parsed = acervo_parser::parse_movie_title(&grab.title);
+    let from_name: Vec<acervo_parser::Language> = acervo_parser::parse_languages(&grab.title)
+        .into_iter()
+        .filter(|l| *l != acervo_parser::Language::Unknown)
+        .collect();
+    let languages = probe
+        .as_ref()
+        .map(|p| p.audio_languages.clone())
+        .filter(|l| !l.is_empty())
+        .unwrap_or(from_name);
     MovieFile {
         relative_path,
         size,
         quality: acervo_parser::parse_quality(&grab.title),
-        languages: acervo_parser::parse_languages(&grab.title)
-            .into_iter()
-            .filter(|l| *l != acervo_parser::Language::Unknown)
-            .map(|l| l.name().to_owned())
-            .collect(),
+        languages: languages.into_iter().map(|l| l.name().to_owned()).collect(),
         release_group: acervo_parser::parse_release_group(&grab.title),
         edition: parsed.and_then(|p| p.edition),
         scene_name: Some(grab.title.clone()),
         date_added: Some(now_rfc3339()),
         id: None,
-        media_info: None,
+        media_info: probe.map(|p| p.media_info),
     }
+}
+
+/// Por que um download não importou.
+enum Failure {
+    /// O release é o problema: o cliente perdeu ou deu erro. Bloqueia e
+    /// busca de novo.
+    Download(String),
+    /// A importação é o problema: tenta de novo na próxima rodada.
+    Import(String),
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self::Import(message)
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(message: &str) -> Self {
+        Self::Import(message.to_owned())
+    }
+}
+
+/// Desiste de um download: marca como falho, bloqueia o release se pedido
+/// e registra o evento.
+///
+/// # Errors
+///
+/// Falha de escrita.
+pub async fn give_up(
+    store: &Store,
+    grab: &Grab,
+    movie: &acervo_store::CatalogMovie,
+    reason: &str,
+    blocklist: bool,
+    kind: Kind,
+) -> Result<()> {
+    let at = now_rfc3339();
+    store
+        .update_grab(grab.id, GrabState::Failed, Some(reason), None, &at)
+        .await?;
+    if blocklist {
+        store
+            .block(&acervo_store::Blocked {
+                id: 0,
+                movie_id: Some(grab.movie_id),
+                source_title: grab.title.clone(),
+                indexer: Some(grab.indexer.clone()),
+                quality: Some(grab.quality),
+                size: Some(grab.size),
+                hash: Some(grab.hash.clone()),
+                at: at.clone(),
+                message: Some(reason.to_owned()),
+            })
+            .await?;
+    }
+    events::record(
+        store,
+        Event {
+            source_title: Some(grab.title.clone()),
+            quality: Some(grab.quality),
+            indexer: Some(grab.indexer.clone()),
+            download_id: Some(grab.hash.clone()),
+            message: Some(reason.to_owned()),
+            poster: movie.extras.poster.clone(),
+            ..Event::new(
+                kind,
+                Some(movie.id),
+                events::label(&movie.movie.title, movie.movie.year),
+            )
+        },
+    )
+    .await;
+    Ok(())
+}
+
+/// Busca o filme de novo depois de uma falha, se a busca automática estiver
+/// ligada.
+async fn search_again(config: &Config, store: &Store, catalog: Option<&Catalog>, movie_id: i64) {
+    let Some(catalog) = catalog else {
+        return;
+    };
+    if !crate::automatic::enabled(store).await.unwrap_or(false) {
+        return;
+    }
+    match grab(config, store, catalog, movie_id, true).await {
+        Ok(report) => tracing::info!(
+            filme = report.filme,
+            pegou = report.escolhido.as_ref().map(|p| p.titulo.as_str()),
+            "nova busca depois de falha"
+        ),
+        Err(error) => tracing::info!(filme = movie_id, "nova busca depois de falha: {error:#}"),
+    }
+}
+
+/// Tira um download da fila: apaga do cliente (com os arquivos) se pedido,
+/// bloqueia o release se pedido e busca outro se pedido.
+///
+/// # Errors
+///
+/// Download desconhecido, cliente inalcançável ou falha de escrita.
+pub async fn remove_download(
+    config: &Config,
+    store: &Store,
+    catalog: &Catalog,
+    grab_id: i64,
+    remove_from_client: bool,
+    blocklist: bool,
+    search: bool,
+) -> Result<()> {
+    let grab = store
+        .grabs()
+        .await?
+        .into_iter()
+        .find(|g| g.id == grab_id)
+        .context("download desconhecido")?;
+    let movie = store
+        .movies()
+        .await?
+        .into_iter()
+        .find(|m| m.id == grab.movie_id)
+        .context("o filme do download saiu do catálogo")?;
+    if remove_from_client {
+        qbit(config)
+            .await?
+            .delete(&[acervo_core::DownloadHash::new(grab.hash.clone())], true)
+            .await
+            .context("apagando do qBittorrent")?;
+    }
+    let (reason, kind) = if blocklist {
+        ("marcado como falho na tela", Kind::Failed)
+    } else {
+        ("tirado da fila na tela", Kind::Ignored)
+    };
+    give_up(store, &grab, &movie, reason, blocklist, kind).await?;
+    if search {
+        match self::grab(config, store, catalog, movie.id, true).await {
+            Ok(_) => {}
+            Err(error) => tracing::info!(filme = movie.id, "nova busca: {error:#}"),
+        }
+    }
+    Ok(())
 }
 
 /// Importa os downloads do acervo que terminaram. Sem `apply`, só diz o que
@@ -305,6 +506,7 @@ fn imported_file(grab: &Grab, relative_path: String, size: u64) -> MovieFile {
 pub async fn import_downloads(
     config: &Config,
     store: &Store,
+    catalog: Option<&Catalog>,
     apply: bool,
 ) -> Result<Vec<ImportLine>> {
     let pending: Vec<Grab> = store
@@ -336,12 +538,18 @@ pub async fn import_downloads(
             detalhe: None,
             destino: None,
         };
-        let outcome: Result<Option<(String, String, u64)>, String> = async {
+        let outcome: Result<Option<(String, String, u64, PathBuf)>, Failure> = async {
             let torrent = client
                 .torrent(&grab.hash)
                 .await
                 .map_err(|e| e.to_string())?
-                .ok_or("o torrent sumiu do cliente")?;
+                .ok_or_else(|| Failure::Download("o torrent sumiu do cliente".into()))?;
+            if matches!(torrent.state.as_str(), "error" | "missingFiles") {
+                return Err(Failure::Download(format!(
+                    "o cliente marcou o torrent com `{}`",
+                    torrent.state
+                )));
+            }
             if torrent.progress < 1.0 {
                 line.detalhe = Some(format!("{:.0}%", torrent.progress * 100.0));
                 return Ok(None);
@@ -379,15 +587,16 @@ pub async fn import_downloads(
             let destination_host = map.to_host(&destination).map_err(|e| e.to_string())?;
             let shown = destination.display().to_string();
             if !apply {
-                return Ok(Some((shown, relative, size)));
+                return Ok(Some((shown, relative, size, destination_host)));
             }
+            let installed = destination_host.clone();
             tokio::task::spawn_blocking(move || {
-                install(&source_host, &destination_host, old_host.as_deref())
+                install(&source_host, &installed, old_host.as_deref())
             })
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| format!("{e:#}"))?;
-            Ok(Some((shown, relative, size)))
+            Ok(Some((shown, relative, size, destination_host)))
         }
         .await;
 
@@ -406,19 +615,41 @@ pub async fn import_downloads(
                         .await?;
                 }
             }
-            Ok(Some((destination, _, _))) if !apply => {
+            Ok(Some((destination, _, _, _))) if !apply => {
                 line.estado = "importaria";
                 line.destino = Some(destination);
             }
-            Ok(Some((destination, relative, size))) => {
+            Ok(Some((destination, relative, size, host))) => {
+                let probe = crate::mediainfo::probe(&host).await;
                 store
-                    .set_movie_file(entry.id, Some(&imported_file(&grab, relative, size)))
+                    .set_movie_file(entry.id, Some(&imported_file(&grab, relative, size, probe)))
                     .await?;
                 store
                     .update_grab(grab.id, GrabState::Imported, None, Some(&destination), &at)
                     .await?;
                 line.estado = "importado";
-                line.destino = Some(destination);
+                line.destino = Some(destination.clone());
+                events::record(
+                    store,
+                    Event {
+                        source_title: Some(grab.title.clone()),
+                        quality: Some(grab.quality),
+                        indexer: Some(grab.indexer.clone()),
+                        download_id: Some(grab.hash.clone()),
+                        message: Some(destination),
+                        poster: entry.extras.poster.clone(),
+                        ..Event::new(
+                            if grab.replaces.is_some() {
+                                Kind::Upgraded
+                            } else {
+                                Kind::Imported
+                            },
+                            Some(entry.id),
+                            events::label(&movie.title, movie.year),
+                        )
+                    },
+                )
+                .await;
                 // O gerenciador adota o arquivo e para de procurar o filme.
                 if let Some((_, source_id)) = &entry.origin
                     && let Err(error) = async {
@@ -434,12 +665,21 @@ pub async fn import_downloads(
                     ));
                 }
             }
-            Err(error) => {
+            Err(Failure::Download(error)) => {
                 line.estado = "falhou";
                 line.detalhe = Some(error.clone());
                 if apply {
+                    give_up(store, &grab, entry, &error, true, Kind::Failed).await?;
+                    search_again(config, store, catalog, entry.id).await;
+                }
+            }
+            Err(Failure::Import(error)) => {
+                line.estado = "atencao";
+                line.detalhe = Some(error.clone());
+                if apply {
+                    let message = format!("importação: {error}");
                     store
-                        .update_grab(grab.id, GrabState::Failed, Some(&error), None, &at)
+                        .update_grab(grab.id, GrabState::Downloading, Some(&message), None, &at)
                         .await?;
                 }
             }

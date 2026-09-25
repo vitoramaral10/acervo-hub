@@ -24,6 +24,16 @@ pub struct TorrentInfo {
     /// De 0.0 a 1.0.
     #[serde(default)]
     pub progress: f64,
+    /// Bytes por segundo.
+    #[serde(default)]
+    pub dlspeed: u64,
+    /// Segundos até terminar; 8640000 é "infinito" para o qBittorrent.
+    #[serde(default)]
+    pub eta: i64,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub num_seeds: u32,
 }
 
 impl TorrentInfo {

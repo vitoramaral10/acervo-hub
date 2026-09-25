@@ -326,6 +326,227 @@ impl Tmdb {
     }
 }
 
+/// Um resultado de busca ou de lista: o bastante para escolher o filme.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct MovieSummary {
+    pub tmdb_id: u32,
+    /// Na língua pedida, quando há tradução.
+    pub title: String,
+    pub original_title: String,
+    pub year: Option<u16>,
+    pub overview: Option<String>,
+    /// Pôster no tamanho de grade.
+    pub poster: Option<String>,
+    /// De 0 a 10.
+    pub vote_average: f64,
+    pub popularity: f64,
+}
+
+#[derive(Deserialize)]
+struct RawSummary {
+    id: u32,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    original_title: String,
+    #[serde(default)]
+    release_date: Option<String>,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    poster_path: Option<String>,
+    #[serde(default)]
+    vote_average: f64,
+    #[serde(default)]
+    popularity: f64,
+}
+
+impl RawSummary {
+    fn into_summary(self) -> MovieSummary {
+        MovieSummary {
+            tmdb_id: self.id,
+            year: self
+                .release_date
+                .as_deref()
+                .and_then(|d| d.get(..4))
+                .and_then(|y| y.parse().ok()),
+            title: self.title,
+            original_title: self.original_title,
+            overview: self.overview.filter(|o| !o.trim().is_empty()),
+            poster: self.poster_path.map(|p| format!("{GRID_IMAGES}{p}")),
+            vote_average: self.vote_average,
+            popularity: self.popularity,
+        }
+    }
+}
+
+const GRID_IMAGES: &str = "https://image.tmdb.org/t/p/w342";
+
+impl Tmdb {
+    /// Busca filmes por título, com o ano opcional.
+    ///
+    /// # Errors
+    ///
+    /// Chave recusada ou TMDB inalcançável.
+    pub async fn search(
+        &self,
+        query: &str,
+        year: Option<u16>,
+    ) -> Result<Vec<MovieSummary>, MetadataError> {
+        #[derive(Deserialize)]
+        struct Page {
+            results: Vec<RawSummary>,
+        }
+        let year = year.map(|y| y.to_string());
+        let mut params = vec![
+            ("query", query),
+            ("language", self.language.as_str()),
+            ("include_adult", "false"),
+        ];
+        if let Some(year) = &year {
+            params.push(("year", year.as_str()));
+        }
+        let page: Option<Page> = self.get("search/movie", &params).await?;
+        Ok(page
+            .map(|p| {
+                p.results
+                    .into_iter()
+                    .map(RawSummary::into_summary)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Os filmes em que a pessoa atuou (`cast`) ou trabalhou (`crew`, com o
+    /// departamento pedido), sem repetição.
+    ///
+    /// # Errors
+    ///
+    /// Chave recusada ou TMDB inalcançável.
+    pub async fn person_movies(
+        &self,
+        person_id: u32,
+        cast: bool,
+        crew_departments: &[&str],
+    ) -> Result<Vec<MovieSummary>, MetadataError> {
+        #[derive(Deserialize)]
+        struct Credits {
+            #[serde(default)]
+            cast: Vec<RawSummary>,
+            #[serde(default)]
+            crew: Vec<CrewCredit>,
+        }
+        #[derive(Deserialize)]
+        struct CrewCredit {
+            #[serde(flatten)]
+            movie: RawSummary,
+            #[serde(default)]
+            department: String,
+        }
+        let credits: Option<Credits> = self
+            .get(
+                &format!("person/{person_id}/movie_credits"),
+                &[("language", self.language.as_str())],
+            )
+            .await?;
+        let Some(credits) = credits else {
+            return Ok(Vec::new());
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let crew = credits
+            .crew
+            .into_iter()
+            .filter(|c| {
+                crew_departments
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case(&c.department))
+            })
+            .map(|c| c.movie);
+        Ok(credits
+            .cast
+            .into_iter()
+            .filter(|_| cast)
+            .chain(crew)
+            .filter(|m| seen.insert(m.id))
+            .map(RawSummary::into_summary)
+            .collect())
+    }
+
+    /// Os filmes de uma coleção.
+    ///
+    /// # Errors
+    ///
+    /// Chave recusada ou TMDB inalcançável.
+    pub async fn collection_movies(
+        &self,
+        collection_id: u32,
+    ) -> Result<Vec<MovieSummary>, MetadataError> {
+        #[derive(Deserialize)]
+        struct Collection {
+            #[serde(default)]
+            parts: Vec<RawSummary>,
+        }
+        let found: Option<Collection> = self
+            .get(
+                &format!("collection/{collection_id}"),
+                &[("language", self.language.as_str())],
+            )
+            .await?;
+        Ok(found
+            .map(|c| c.parts.into_iter().map(RawSummary::into_summary).collect())
+            .unwrap_or_default())
+    }
+
+    /// Os filmes de uma lista pública do TMDB (v3).
+    ///
+    /// # Errors
+    ///
+    /// Chave recusada ou TMDB inalcançável.
+    pub async fn list_movies(&self, list_id: &str) -> Result<Vec<MovieSummary>, MetadataError> {
+        #[derive(Deserialize)]
+        struct List {
+            #[serde(default)]
+            items: Vec<Item>,
+        }
+        #[derive(Deserialize)]
+        struct Item {
+            #[serde(default)]
+            media_type: String,
+            #[serde(flatten)]
+            movie: RawSummary,
+        }
+        let found: Option<List> = self
+            .get(
+                &format!("list/{list_id}"),
+                &[("language", self.language.as_str())],
+            )
+            .await?;
+        Ok(found
+            .map(|l| {
+                l.items
+                    .into_iter()
+                    .filter(|i| i.media_type.is_empty() || i.media_type == "movie")
+                    .map(|i| i.movie.into_summary())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Nome de uma pessoa, para rotular a lista.
+    ///
+    /// # Errors
+    ///
+    /// Chave recusada ou TMDB inalcançável.
+    pub async fn person_name(&self, person_id: u32) -> Result<Option<String>, MetadataError> {
+        #[derive(Deserialize)]
+        struct Person {
+            name: String,
+        }
+        let found: Option<Person> = self.get(&format!("person/{person_id}"), &[]).await?;
+        Ok(found.map(|p| p.name))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

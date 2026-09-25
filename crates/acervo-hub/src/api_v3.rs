@@ -571,7 +571,16 @@ async fn add_movie(
             "Quality profile does not exist".into(),
         )
     })?;
-    let id = crate::library::add(
+    let search = body
+        .add_options
+        .as_ref()
+        .is_some_and(|o| o.search_for_movie);
+    let manager_decides = crate::rules::owner(&v3.config, store)
+        .await
+        .map_err(internal)?
+        == "radarr";
+    let id = crate::library::add_anywhere(
+        &v3.config,
         store,
         &tmdb,
         &crate::library::AddRequest {
@@ -587,6 +596,7 @@ async fn add_movie(
                 .unwrap_or_else(|| "released".into()),
             tags: body.tags,
         },
+        search,
     )
     .await
     .map_err(|e| {
@@ -600,7 +610,7 @@ async fn add_movie(
             ApiError(StatusCode::BAD_REQUEST, message)
         }
     })?;
-    if body.add_options.is_some_and(|o| o.search_for_movie) {
+    if search && !manager_decides {
         search_later(&v3, vec![id]);
     }
     let movies = store.movies().await.map_err(internal)?;
@@ -638,32 +648,32 @@ async fn update_movie(
         .or(body.id)
         .ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "id ausente".into()))?;
     let profiles = profile_map(store).await?;
-    let movies = store.movies().await.map_err(internal)?;
-    let entry = movies.iter().find(|m| m.id == id).ok_or_else(not_found)?;
-    let mut movie = entry.movie.clone();
-    if let Some(monitored) = body.monitored {
-        movie.monitored = monitored;
-    }
-    if let Some(profile) = body
-        .quality_profile_id
-        .and_then(|pid| profiles.iter().find(|(_, p)| **p == pid))
+    if !store
+        .movies()
+        .await
+        .map_err(internal)?
+        .iter()
+        .any(|m| m.id == id)
     {
-        movie.quality_profile = Some(profile.0.clone());
+        return Err(not_found());
     }
-    if let Some(minimum) = body.minimum_availability {
-        movie.minimum_availability = Some(minimum);
-    }
-    if let Some(tags) = body.tags {
-        movie.tags = tags;
-    }
-    store.update_movie(id, &movie).await.map_err(internal)?;
+    let change = crate::library::MovieEdit {
+        monitored: body.monitored,
+        quality_profile: body.quality_profile_id.and_then(|pid| {
+            profiles
+                .iter()
+                .find(|(_, p)| **p == pid)
+                .map(|(name, _)| name.clone())
+        }),
+        minimum_availability: body.minimum_availability,
+        tags: body.tags,
+    };
+    let updated = crate::library::edit(&v3.config, store, id, &change)
+        .await
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     if body.add_options.is_some_and(|o| o.search_for_movie) {
         search_later(&v3, vec![id]);
     }
-    let updated = CatalogMovie {
-        movie,
-        ..entry.clone()
-    };
     Ok((
         StatusCode::ACCEPTED,
         Json(movie_json(&updated, &profiles, 0)),
@@ -681,42 +691,29 @@ async fn delete_movie(
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
     let store = store(&v3, &headers, &query)?;
-    let movies = store.movies().await.map_err(internal)?;
-    let entry = movies.iter().find(|m| m.id == id).ok_or_else(not_found)?;
-    let delete_files = query
-        .get("deleteFiles")
-        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
-    if delete_files {
-        let folder = Path::new(&entry.movie.path);
-        let inside_root = v3.config.movies.root_folders.iter().any(|root| {
-            folder
-                .parent()
-                .is_some_and(|p| p == Path::new(root.trim_end_matches('/')))
-        });
-        if !inside_root {
-            return Err(ApiError(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "a pasta `{}` não está direto numa pasta raiz; nada apagado",
-                    entry.movie.path
-                ),
-            ));
-        }
-        let host = v3.config.path_map().to_host(folder).map_err(internal)?;
-        tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&host) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-            _ => Ok(()),
-        })
+    if !store
+        .movies()
         .await
         .map_err(internal)?
-        .map_err(internal)?;
-        tracing::info!(
-            filme = entry.movie.title,
-            pasta = entry.movie.path,
-            "filme apagado a pedido"
-        );
+        .iter()
+        .any(|m| m.id == id)
+    {
+        return Err(not_found());
     }
-    store.delete_movie(id).await.map_err(internal)?;
+    let flag = |name: &str| {
+        query
+            .get(name)
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    };
+    crate::library::remove(
+        &v3.config,
+        store,
+        id,
+        flag("deleteFiles"),
+        flag("addImportExclusion"),
+    )
+    .await
+    .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     ok(json!({}))
 }
 
@@ -768,7 +765,9 @@ async fn command(
             let v3 = Arc::clone(&v3);
             tokio::spawn(async move {
                 if let Ok(store) = v3.database.get()
-                    && let Err(error) = crate::grab::import_downloads(&v3.config, store, true).await
+                    && let Err(error) =
+                        crate::grab::import_downloads(&v3.config, store, Some(&v3.catalog), true)
+                            .await
                 {
                     tracing::warn!("importação pedida pela API: {error:#}");
                 }

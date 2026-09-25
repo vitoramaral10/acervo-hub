@@ -379,16 +379,25 @@ async fn guard(
     headers: &HeaderMap,
     method: &Method,
 ) -> Result<Option<String>, UiError> {
+    check(&server.api_key, server.accounts.as_ref(), headers, method).await
+}
+
+async fn check(
+    api_key: &str,
+    accounts: Option<&Arc<dyn Accounts>>,
+    headers: &HeaderMap,
+    method: &Method,
+) -> Result<Option<String>, UiError> {
     let user = if let Some(key) = headers
         .get("x-api-key")
         .and_then(|value| value.to_str().ok())
     {
-        if !constant_time_eq(key.as_bytes(), server.api_key.as_bytes()) {
+        if !constant_time_eq(key.as_bytes(), api_key.as_bytes()) {
             return Err(unauthorized());
         }
         None
     } else {
-        let (Some(token), Some(accounts)) = (session_token(headers), &server.accounts) else {
+        let (Some(token), Some(accounts)) = (session_token(headers), accounts) else {
             return Err(unauthorized());
         };
         match accounts.session_user(token).await {
@@ -401,6 +410,32 @@ async fn guard(
         return Err(missing_csrf());
     }
     Ok(user)
+}
+
+/// A mesma entrada da tela, para rotas montadas fora deste crate: sessão
+/// (com o cabeçalho anti-CSRF em ação que muda estado) ou chave de API. O
+/// erro já é a resposta a devolver.
+///
+/// # Errors
+///
+/// Sem sessão válida nem chave certa, ou sem o cabeçalho da interface.
+pub async fn authorize_ui(
+    api_key: &str,
+    accounts: Option<&Arc<dyn Accounts>>,
+    headers: &HeaderMap,
+    method: &Method,
+) -> Result<Option<String>, Box<Response>> {
+    check(api_key, accounts, headers, method)
+        .await
+        .map_err(|error| Box::new(error.into_response()))
+}
+
+/// Resposta JSON da tela, com os cabeçalhos de segurança.
+#[must_use]
+pub fn ui_json(status: StatusCode, body: &serde_json::Value) -> Response {
+    let mut response = (status, Json(body.clone())).into_response();
+    secure_headers(response.headers_mut());
+    response
 }
 
 fn secure_cookie(headers: &HeaderMap) -> bool {

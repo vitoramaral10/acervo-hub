@@ -127,7 +127,7 @@ async fn shadow_loop(
 }
 
 /// Importa de tempos em tempos os downloads do acervo que terminaram.
-async fn import_loop(config: Arc<Config>, database: Database, minutes: u64) {
+async fn import_loop(config: Arc<Config>, database: Database, catalog: Catalog, minutes: u64) {
     let mut every = tokio::time::interval(Duration::from_secs(minutes * 60));
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -135,7 +135,7 @@ async fn import_loop(config: Arc<Config>, database: Database, minutes: u64) {
         let Ok(store) = database.get() else {
             continue;
         };
-        match crate::grab::import_downloads(&config, store, true).await {
+        match crate::grab::import_downloads(&config, store, Some(&catalog), true).await {
             Ok(lines) => {
                 for line in lines.iter().filter(|l| l.estado != "baixando") {
                     tracing::info!(
@@ -264,6 +264,11 @@ pub async fn run(config: Config) -> Result<()> {
     };
     if config.database.is_some() {
         tokio::spawn(metadata_loop(Arc::clone(&config), database.clone()));
+        tokio::spawn(crate::lists::sync_loop(
+            Arc::clone(&config),
+            database.clone(),
+            catalog.clone(),
+        ));
     }
     if config.database.is_some() && config.qbittorrent.is_some() {
         tokio::spawn(rss_loop(
@@ -278,6 +283,7 @@ pub async fn run(config: Config) -> Result<()> {
         tokio::spawn(import_loop(
             Arc::clone(&config),
             database.clone(),
+            catalog.clone(),
             import_minutes,
         ));
     }
@@ -297,6 +303,14 @@ pub async fn run(config: Config) -> Result<()> {
         catalog: catalog.clone(),
         api_key: api_key.clone(),
     });
+    let web = Arc::new(crate::web::Web {
+        config: Arc::clone(&config),
+        database: database.clone(),
+        catalog: catalog.clone(),
+        api_key: api_key.clone(),
+        accounts: accounts.clone(),
+        searches: tokio::sync::Mutex::default(),
+    });
     let admin = HubAdmin::new(config, catalog.clone(), database)?;
     tracing::info!(indexadores = catalog.len(), bind = %bind, "servindo Torznab e a interface web");
 
@@ -306,7 +320,8 @@ pub async fn run(config: Config) -> Result<()> {
     axum::serve(
         listener,
         acervo_api::router_with_admin(catalog, api_key, Some(Arc::new(admin)), accounts)
-            .merge(crate::api_v3::router(v3)),
+            .merge(crate::api_v3::router(v3))
+            .merge(crate::web::router(web)),
     )
     .with_graceful_shutdown(shutdown())
     .await
@@ -997,7 +1012,7 @@ impl Admin for HubAdmin {
         let imported = if import {
             let _guard = self.write.lock().await;
             Some(
-                crate::grab::import_downloads(&self.config, store, true)
+                crate::grab::import_downloads(&self.config, store, Some(&self.catalog), true)
                     .await
                     .map_err(|e| format!("{e:#}"))?,
             )

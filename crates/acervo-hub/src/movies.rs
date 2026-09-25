@@ -42,6 +42,10 @@ pub async fn import(
     print: bool,
 ) -> Result<Vec<InstanceImport>> {
     let mut report = Vec::new();
+    // Depois do corte, importar devolveria os filmes ao gerenciador.
+    if crate::rules::owner(config, store).await? == "acervo" {
+        return Ok(report);
+    }
     for spec in config
         .instances
         .iter()
@@ -115,16 +119,28 @@ async fn fetch(config: &Config, name: &str, url: &str, api_key: &str) -> Result<
         ArrKind::Movie,
         config.http_timeout(),
     )?;
-    let (profiles, movies, definitions, tags) = tokio::try_join!(
+    let (profiles, movies, definitions, tags, raw_profiles, raw_formats) = tokio::try_join!(
         client.quality_profiles(),
         client.movies(),
         client.quality_definitions(),
         client.tags(),
+        client.get_json("api/v3/qualityprofile", &[]),
+        client.get_json("api/v3/customformat", &[]),
     )?;
     let names: HashMap<i64, String> = profiles.iter().map(|p| (p.id, p.name.clone())).collect();
+    let scores = crate::rules::manager_scores(&raw_profiles);
     Ok(Import {
         source: format!("radarr:{name}"),
-        profiles: profiles.iter().map(profile).collect(),
+        profiles: profiles
+            .iter()
+            .map(|remote| {
+                let mut profile = profile(remote);
+                profile.format_scores = scores.get(&remote.id).cloned().unwrap_or_default();
+                profile
+            })
+            .collect(),
+        custom_formats: crate::rules::manager_formats(&raw_formats),
+        mirror_rules: true,
         definitions: definitions
             .iter()
             .filter_map(|d| {
@@ -195,6 +211,7 @@ fn profile(remote: &RemoteQualityProfile) -> QualityProfile {
         min_format_score: remote.min_format_score,
         cutoff_format_score: remote.cutoff_format_score,
         source_id: Some(remote.id),
+        format_scores: std::collections::BTreeMap::new(),
     }
 }
 
@@ -319,6 +336,10 @@ pub struct MovieView {
     pub status: Option<String>,
     pub monitorado: bool,
     pub perfil: Option<String>,
+    pub disponibilidade_minima: Option<String>,
+    pub tags: Vec<i64>,
+    /// O filme ainda é do gerenciador (veio da importação).
+    pub do_radarr: bool,
     pub pasta: String,
     pub adicionado: Option<String>,
     pub arquivo: Option<FileView>,
@@ -392,6 +413,9 @@ fn view(
         status: movie.status,
         monitorado: movie.monitored,
         perfil: movie.quality_profile,
+        disponibilidade_minima: movie.minimum_availability,
+        tags: movie.tags,
+        do_radarr: entry.origin.is_some(),
         pasta: movie.path,
         adicionado: movie.added,
         arquivo,
