@@ -272,8 +272,22 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
         nome que o gerenciador daria — a regra confere com os 134 arquivos de um gerenciador
         real —, e pede a ele que releia a pasta. Só cria: filme que já tem arquivo fica de
         fora, e upgrade continua com o gerenciador.
-  - [ ] **API v3 de filmes** para os clientes que dependem dela (pedidos e legendas), e o
-        corte.
+  - [x] **Metadados próprios** (`acervo-metadata`, TMDB, chave nas Configurações da tela).
+        Datas de cinema, digital e física, status e disponibilidade calculados com as regras
+        da referência — contra 293 filmes de um gerenciador real, batem em todos. `movies add`
+        adiciona um filme com o acervo como dono; o serviço mantém os metadados em dia.
+  - [x] **API v3 de filmes** para os apps de pedidos e de legendas: status, perfis, pastas
+        raiz, tags, filmes (listar, procurar, adicionar, atualizar, remover), fila, comandos e
+        histórico. Contra o gerenciador em produção, os 294 filmes saem idênticos nos 32
+        campos que esses apps leem, `mediaInfo` e id de arquivo incluídos.
+  - [x] **Busca automática e upgrades**, ligada nas Configurações: RSS de todos os
+        indexadores decidido contra a biblioteca inteira (é por onde vêm os upgrades) e a busca
+        rotativa dos filmes que faltam. A importação troca o arquivo antigo no upgrade e grava o
+        novo no catálogo. As regras de decisão do gerenciador ficam guardadas no banco, e o
+        espaço livre é lido do disco: o acervo decide igual depois que ele sair.
+  - [ ] **O corte**: `movies adopt` (filmes e perfis ganham os ids do gerenciador, que os apps
+        de pedidos e de legendas guardam), apontar esses apps para cá, ligar a busca automática
+        e desligar o gerenciador.
 - [ ] **Fase 4 — séries.** Só depois de o parser passar no corpus real.
 
 ## Licença

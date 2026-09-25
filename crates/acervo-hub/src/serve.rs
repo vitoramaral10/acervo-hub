@@ -112,10 +112,13 @@ async fn shadow_loop(
             }
             Err(error) => tracing::warn!("importação de filmes falhou: {error:#}"),
         }
-        match crate::shadow::run(&config, store, &catalog, limit, false).await {
+        // Com a busca automática ligada, a sombra pega o que escolher.
+        let grab = crate::automatic::enabled(store).await.unwrap_or(false);
+        match crate::shadow::search(&config, store, &catalog, limit, false, grab).await {
             Ok(lines) => tracing::info!(
                 filmes = lines.len(),
                 pegaria = lines.iter().filter(|l| l.pegaria.is_some()).count(),
+                pegando = grab,
                 "sombra"
             ),
             Err(error) => tracing::warn!("sombra falhou: {error:#}"),
@@ -179,6 +182,34 @@ async fn metadata_loop(config: Arc<Config>, database: Database) {
     }
 }
 
+/// Sincronização de RSS, quando a busca automática está ligada.
+async fn rss_loop(config: Arc<Config>, database: Database, catalog: Catalog, minutes: u64) {
+    let mut every = tokio::time::interval(Duration::from_secs(minutes * 60));
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        let Ok(store) = database.get() else {
+            continue;
+        };
+        if !crate::automatic::enabled(store).await.unwrap_or(false) {
+            continue;
+        }
+        match crate::automatic::rss(&config, store, &catalog, true).await {
+            Ok(grabs) => {
+                for grab in &grabs {
+                    tracing::info!(
+                        filme = grab.filme,
+                        release = grab.release,
+                        erro = grab.erro,
+                        "RSS pegou"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!("RSS falhou: {error:#}"),
+        }
+    }
+}
+
 /// Os downloads do acervo, do mais novo ao mais velho, com o título do filme.
 async fn downloads_json(store: &acervo_store::Store) -> Result<serde_json::Value> {
     let (grabs, movies) = tokio::try_join!(store.grabs(), store.movies())?;
@@ -233,6 +264,14 @@ pub async fn run(config: Config) -> Result<()> {
     };
     if config.database.is_some() {
         tokio::spawn(metadata_loop(Arc::clone(&config), database.clone()));
+    }
+    if config.database.is_some() && config.qbittorrent.is_some() {
+        tokio::spawn(rss_loop(
+            Arc::clone(&config),
+            database.clone(),
+            catalog.clone(),
+            config.movies.rss_interval_minutes.max(5),
+        ));
     }
     let import_minutes = config.movies.import_interval_minutes;
     if import_minutes > 0 && config.database.is_some() && config.qbittorrent.is_some() {
@@ -975,7 +1014,13 @@ impl Admin for HubAdmin {
             .setting(crate::metadata::TMDB_KEY)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(json!({ "tmdb": { "definida": key.is_some() } }))
+        let automatic = crate::automatic::enabled(store)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "tmdb": { "definida": key.is_some() },
+            "busca_automatica": automatic,
+        }))
     }
 
     async fn save_configuration(
@@ -1001,6 +1046,17 @@ impl Admin for HubAdmin {
                     }
                     store
                         .set_setting(crate::metadata::TMDB_KEY, value.as_deref(), &at)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                "busca_automatica" => {
+                    let on = value.as_deref() == Some("true");
+                    store
+                        .set_setting(
+                            crate::automatic::KEY,
+                            Some(if on { "true" } else { "false" }),
+                            &at,
+                        )
                         .await
                         .map_err(|e| e.to_string())?;
                 }

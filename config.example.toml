@@ -94,6 +94,12 @@ url = "postgres://acervo:TROQUE@localhost:5432/acervo"
 [movies]
 category = "acervo"
 import_interval_minutes = 5
+# Pastas raiz dos filmes, como os gerenciadores as veem: a API v3 as oferece
+# aos apps de pedidos, com o espaço livre de cada uma.
+root_folders = ["/media/movies"]
+# Com a busca automática ligada (Configurações, na interface), de quanto em
+# quanto tempo ler os releases recentes de todos os indexadores.
+rss_interval_minutes = 30
 
 # --- Superfície Torznab (`acervo-hub serve`) --------------------------------
 #

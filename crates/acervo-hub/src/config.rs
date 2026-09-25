@@ -63,6 +63,10 @@ pub struct MoviesConfig {
     /// oferece aos apps de pedidos.
     #[serde(default = "default_root_folders")]
     pub root_folders: Vec<String>,
+    /// De quanto em quanto tempo a busca automática lê os releases recentes
+    /// (quando ligada nas Configurações).
+    #[serde(default = "default_rss_interval")]
+    pub rss_interval_minutes: u64,
 }
 
 impl Default for MoviesConfig {
@@ -71,12 +75,17 @@ impl Default for MoviesConfig {
             category: default_movie_category(),
             import_interval_minutes: default_import_interval(),
             root_folders: default_root_folders(),
+            rss_interval_minutes: default_rss_interval(),
         }
     }
 }
 
 fn default_movie_category() -> String {
     "acervo".into()
+}
+
+fn default_rss_interval() -> u64 {
+    30
 }
 
 fn default_root_folders() -> Vec<String> {

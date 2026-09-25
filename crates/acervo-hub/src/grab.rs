@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use acervo_api::Catalog;
 use acervo_clients::{AddOptions, NewTorrent, QbitClient, client_path, info_hash, magnet_hash};
-use acervo_store::{Grab, GrabState, Store};
+use acervo_store::{Grab, GrabState, MovieFile, Store};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
@@ -59,54 +59,21 @@ async fn qbit(config: &Config) -> Result<QbitClient> {
     .context("entrando no qBittorrent")
 }
 
-/// Busca o filme, decide e, com `apply`, manda o escolhido ao cliente.
+/// Manda um release ao cliente e registra o grab. `replaces` é o arquivo que
+/// o filme tem hoje, se tiver: a importação o troca pelo novo.
 ///
 /// # Errors
 ///
-/// Filme fora do catálogo ou que já tem arquivo, busca que falhou em todos os
-/// indexadores, `.torrent` inválido, cliente inalcançável.
-pub async fn grab(
+/// `.torrent` inválido, cliente inalcançável ou falha ao registrar.
+pub async fn send(
     config: &Config,
     store: &Store,
     catalog: &Catalog,
     movie_id: i64,
-    apply: bool,
-) -> Result<GrabReport> {
-    let decider = Decider::load(config, store, catalog).await?;
-    let movie = decider
-        .target(movie_id)
-        .context("filme fora do catálogo ou sem perfil de qualidade")?;
-    if movie.file.is_some() {
-        bail!("o filme já tem arquivo; upgrade ainda é do gerenciador de filmes");
-    }
-    let outcome = decider
-        .decide(catalog, movie)
-        .await
-        .map_err(|error| anyhow::anyhow!("busca falhou: {error}"))?;
-    let mut report = GrabReport {
-        filme: label(movie),
-        releases: outcome.releases.len(),
-        escolhido: None,
-        motivos: summarize(&outcome.decisions, movie.id),
-        aplicado: false,
-    };
-    let Some((decision, release)) = outcome.pick() else {
-        return Ok(report);
-    };
-    let quality = decision
-        .parsed
-        .as_ref()
-        .map_or(acervo_parser::Quality::Unknown, |p| p.quality.quality);
-    report.escolhido = Some(Picked {
-        titulo: release.title.clone(),
-        indexador: release.indexer.clone(),
-        qualidade: quality.name(),
-        tamanho: release.size,
-    });
-    if !apply {
-        return Ok(report);
-    }
-
+    release: &acervo_indexers::Release,
+    quality: acervo_parser::Quality,
+    replaces: Option<String>,
+) -> Result<()> {
     let (torrent, hash) = if release.download_url.scheme() == "magnet" {
         let link = release.download_url.to_string();
         let hash = magnet_hash(&link).context("link magnet sem infohash")?;
@@ -148,9 +115,65 @@ pub async fn grab(
             message: None,
             imported_path: None,
             finished_at: None,
+            replaces,
         })
         .await
         .context("registrando o grab")?;
+    Ok(())
+}
+
+/// Busca o filme, decide e, com `apply`, manda o escolhido ao cliente. Filme
+/// com arquivo só é pego se a decisão aprovar como upgrade.
+///
+/// # Errors
+///
+/// Filme fora do catálogo, busca que falhou em todos os indexadores,
+/// `.torrent` inválido, cliente inalcançável.
+pub async fn grab(
+    config: &Config,
+    store: &Store,
+    catalog: &Catalog,
+    movie_id: i64,
+    apply: bool,
+) -> Result<GrabReport> {
+    let decider = Decider::load(config, store, catalog).await?;
+    let movie = decider
+        .target(movie_id)
+        .context("filme fora do catálogo ou sem perfil de qualidade")?;
+    let outcome = decider
+        .decide(catalog, movie)
+        .await
+        .map_err(|error| anyhow::anyhow!("busca falhou: {error}"))?;
+    let mut report = GrabReport {
+        filme: label(movie),
+        releases: outcome.releases.len(),
+        escolhido: None,
+        motivos: summarize(&outcome.decisions, movie.id),
+        aplicado: false,
+    };
+    let Some((decision, release)) = outcome.pick() else {
+        return Ok(report);
+    };
+    let quality = decision
+        .parsed
+        .as_ref()
+        .map_or(acervo_parser::Quality::Unknown, |p| p.quality.quality);
+    report.escolhido = Some(Picked {
+        titulo: release.title.clone(),
+        indexador: release.indexer.clone(),
+        qualidade: quality.name(),
+        tamanho: release.size,
+    });
+    if !apply {
+        return Ok(report);
+    }
+    let replaces = store
+        .movies()
+        .await?
+        .into_iter()
+        .find(|m| m.id == movie_id)
+        .and_then(|m| m.movie.file.map(|f| f.relative_path));
+    send(config, store, catalog, movie_id, release, quality, replaces).await?;
     report.aplicado = true;
     Ok(report)
 }
@@ -217,6 +240,60 @@ fn link(source: &Path, target: &Path) -> Result<()> {
     })
 }
 
+/// Põe o arquivo novo no lugar. Num upgrade com o mesmo nome, liga num nome
+/// temporário e renomeia por cima do antigo (troca atômica); com nome
+/// diferente, liga o novo e só então apaga o antigo.
+fn install(source: &Path, target: &Path, old: Option<&Path>) -> Result<()> {
+    match old {
+        Some(old) if old == target => {
+            let temporary = target.with_extension("acervo-novo");
+            match std::fs::remove_file(&temporary) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error).context("limpando o temporário");
+                }
+                _ => {}
+            }
+            link(source, &temporary)?;
+            std::fs::rename(&temporary, target)
+                .with_context(|| format!("trocando `{}`", target.display()))
+        }
+        old => {
+            link(source, target)?;
+            if let Some(old) = old {
+                match std::fs::remove_file(old) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(error)
+                            .with_context(|| format!("apagando o antigo `{}`", old.display()));
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// O registro do arquivo importado, com o que o nome do release diz.
+fn imported_file(grab: &Grab, relative_path: String, size: u64) -> MovieFile {
+    let parsed = acervo_parser::parse_movie_title(&grab.title);
+    MovieFile {
+        relative_path,
+        size,
+        quality: acervo_parser::parse_quality(&grab.title),
+        languages: acervo_parser::parse_languages(&grab.title)
+            .into_iter()
+            .filter(|l| *l != acervo_parser::Language::Unknown)
+            .map(|l| l.name().to_owned())
+            .collect(),
+        release_group: acervo_parser::parse_release_group(&grab.title),
+        edition: parsed.and_then(|p| p.edition),
+        scene_name: Some(grab.title.clone()),
+        date_added: Some(now_rfc3339()),
+        id: None,
+        media_info: None,
+    }
+}
+
 /// Importa os downloads do acervo que terminaram. Sem `apply`, só diz o que
 /// faria.
 ///
@@ -259,7 +336,7 @@ pub async fn import_downloads(
             detalhe: None,
             destino: None,
         };
-        let outcome: Result<Option<String>, String> = async {
+        let outcome: Result<Option<(String, String, u64)>, String> = async {
             let torrent = client
                 .torrent(&grab.hash)
                 .await
@@ -269,7 +346,10 @@ pub async fn import_downloads(
                 line.detalhe = Some(format!("{:.0}%", torrent.progress * 100.0));
                 return Ok(None);
             }
-            if movie.file.is_some() {
+            // Arquivo que não é o que o grab ia trocar: alguém importou por
+            // outro caminho no meio.
+            let current = movie.file.as_ref().map(|f| f.relative_path.as_str());
+            if current.is_some() && current != grab.replaces.as_deref() {
                 return Err("o filme ganhou arquivo por outro caminho".into());
             }
             let hash = acervo_core::DownloadHash::new(grab.hash.clone());
@@ -280,23 +360,34 @@ pub async fn import_downloads(
                 .and_then(|e| e.to_str())
                 .unwrap_or("mkv")
                 .to_ascii_lowercase();
-            let destination = PathBuf::from(&movie.path).join(format!(
+            let relative = format!(
                 "{}.{extension}",
                 movie_file_stem(movie, entry.extras.metadata_title.as_deref())
-            ));
+            );
+            let destination = PathBuf::from(&movie.path).join(&relative);
+            let old_host = match current {
+                Some(old) => Some(
+                    map.to_host(&PathBuf::from(&movie.path).join(old))
+                        .map_err(|e| e.to_string())?,
+                ),
+                None => None,
+            };
+            let size = video.size;
             let source_host = map
                 .to_host(&client_path(&torrent, video))
                 .map_err(|e| e.to_string())?;
             let destination_host = map.to_host(&destination).map_err(|e| e.to_string())?;
             let shown = destination.display().to_string();
             if !apply {
-                return Ok(Some(shown));
+                return Ok(Some((shown, relative, size)));
             }
-            tokio::task::spawn_blocking(move || link(&source_host, &destination_host))
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|e| format!("{e:#}"))?;
-            Ok(Some(shown))
+            tokio::task::spawn_blocking(move || {
+                install(&source_host, &destination_host, old_host.as_deref())
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?;
+            Ok(Some((shown, relative, size)))
         }
         .await;
 
@@ -315,11 +406,14 @@ pub async fn import_downloads(
                         .await?;
                 }
             }
-            Ok(Some(destination)) if !apply => {
+            Ok(Some((destination, _, _))) if !apply => {
                 line.estado = "importaria";
                 line.destino = Some(destination);
             }
-            Ok(Some(destination)) => {
+            Ok(Some((destination, relative, size))) => {
+                store
+                    .set_movie_file(entry.id, Some(&imported_file(&grab, relative, size)))
+                    .await?;
                 store
                     .update_grab(grab.id, GrabState::Imported, None, Some(&destination), &at)
                     .await?;
@@ -376,6 +470,28 @@ mod tests {
             "Filme.2020/Filme.2020.1080p.mkv"
         );
         assert!(main_video(&[file("x.nfo", 1), file("x-sample.mkv", 9)]).is_none());
+    }
+
+    #[test]
+    fn upgrade_troca_o_arquivo_antigo() {
+        let dir = std::env::temp_dir().join(format!("acervo-upgrade-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Filme")).unwrap();
+        let old = dir.join("Filme").join("Filme.mkv");
+        std::fs::write(&old, b"antigo").unwrap();
+        let new = dir.join("novo.mkv");
+        std::fs::write(&new, b"novo").unwrap();
+        // Mesmo nome: troca no lugar.
+        install(&new, &old, Some(&old)).unwrap();
+        assert_eq!(std::fs::read(&old).unwrap(), b"novo");
+        assert!(!dir.join("Filme").join("Filme.acervo-novo").exists());
+        // Nome diferente: liga o novo e apaga o antigo.
+        let other = dir.join("outro.mp4");
+        std::fs::write(&other, b"outro").unwrap();
+        let target = dir.join("Filme").join("Filme.mp4");
+        install(&other, &target, Some(&old)).unwrap();
+        assert!(!old.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"outro");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

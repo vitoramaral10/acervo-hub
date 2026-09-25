@@ -171,6 +171,7 @@ export interface MovieDownload {
 
 export interface Configuration {
   tmdb: { definida: boolean }
+  busca_automatica: boolean
 }
 
 export interface GrabReport {

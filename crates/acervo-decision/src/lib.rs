@@ -430,6 +430,19 @@ impl Engine<'_> {
         rank::prioritize(self, releases, decisions)
     }
 
+    /// Decide releases recentes sem filme buscado, como a sincronização de
+    /// RSS da referência: cada release é casado com a biblioteca inteira pelo
+    /// título e ano. Na ordem de preferência.
+    #[must_use]
+    pub fn rss(&self, releases: &[Release]) -> Vec<Decision> {
+        let decisions: Vec<Decision> = releases
+            .iter()
+            .enumerate()
+            .map(|(index, release)| self.decide(index, release, None, Mode::Automatic))
+            .collect();
+        rank::prioritize(self, releases, decisions)
+    }
+
     fn decide(
         &self,
         index: usize,

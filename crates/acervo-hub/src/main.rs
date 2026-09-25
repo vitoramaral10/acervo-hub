@@ -17,6 +17,7 @@ use clap::{Parser, Subcommand};
 
 mod api_v3;
 mod apply;
+mod automatic;
 mod collect;
 mod config;
 mod credentials;
@@ -148,6 +149,13 @@ enum MoviesAction {
         /// Todos, e não só os conferidos há mais de um dia.
         #[arg(long)]
         all: bool,
+    },
+    /// Lê os releases recentes de todos os indexadores e decide contra a
+    /// biblioteca inteira, como a busca automática faz. Sem `--apply`, só
+    /// mostra o que pegaria.
+    Rss {
+        #[arg(long)]
+        apply: bool,
     },
     /// O acervo passa a ser dono de todos os filmes do catálogo: importar do
     /// gerenciador deixa de mexer neles. É o corte. Sem `--apply`, só conta.
@@ -330,6 +338,26 @@ async fn movies_command(config: &config::Config, action: MoviesAction) -> Result
                 report.falhas.len()
             );
             !report.falhas.is_empty()
+        }
+        MoviesAction::Rss { apply } => {
+            let catalog = acervo_api::Catalog::new(serve::entries(config).await?)?;
+            let grabs = automatic::rss(config, &store, &catalog, apply).await?;
+            if grabs.is_empty() {
+                println!("nada entre os releases recentes serve à biblioteca");
+            }
+            for grab in &grabs {
+                println!(
+                    "{} {} — {}{}",
+                    if apply { "pegou  " } else { "pegaria" },
+                    grab.filme,
+                    grab.release,
+                    grab.erro
+                        .as_deref()
+                        .map(|e| format!(" (falhou: {e})"))
+                        .unwrap_or_default()
+                );
+            }
+            grabs.iter().any(|g| g.erro.is_some())
         }
         MoviesAction::Adopt { apply } => {
             let owned = store

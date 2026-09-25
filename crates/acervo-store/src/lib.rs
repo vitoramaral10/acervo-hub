@@ -227,6 +227,9 @@ pub struct Grab {
     /// Onde o arquivo foi ligado, como o gerenciador vê.
     pub imported_path: Option<String>,
     pub finished_at: Option<String>,
+    /// Arquivo que o filme tinha quando o grab saiu: um upgrade o troca.
+    /// Relativo à pasta do filme.
+    pub replaces: Option<String>,
 }
 
 /// Tudo o que uma instância tem, para espelhar.
@@ -399,6 +402,9 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE grabs DROP CONSTRAINT grabs_movie_id_fkey,
         ADD CONSTRAINT grabs_movie_id_fkey FOREIGN KEY (movie_id)
             REFERENCES movies(id) ON DELETE CASCADE ON UPDATE CASCADE;
+",
+    r"
+    ALTER TABLE grabs ADD COLUMN replaces TEXT;
 ",
 ];
 
@@ -678,6 +684,24 @@ impl Store {
         Ok(())
     }
 
+    /// Troca o arquivo do filme no catálogo (`None` tira). O disco não é
+    /// tocado aqui.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn set_movie_file(&self, movie_id: i64, file: Option<&MovieFile>) -> Result<()> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        tx.execute("DELETE FROM movie_files WHERE movie_id = $1", &[&movie_id])
+            .await?;
+        if let Some(file) = file {
+            insert_file(&tx, movie_id, file).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Grava o que só a base de metadados sabe.
     ///
     /// # Errors
@@ -859,8 +883,8 @@ impl Store {
         let row = client
             .query_one(
                 "INSERT INTO grabs (movie_id, hash, title, indexer, quality, size, grabbed_at,
-                     state, message)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                     state, message, replaces)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                  RETURNING id",
                 &[
                     &grab.movie_id,
@@ -872,6 +896,7 @@ impl Store {
                     &grab.grabbed_at,
                     &grab.state.as_str(),
                     &grab.message,
+                    &grab.replaces,
                 ],
             )
             .await?;
@@ -888,7 +913,7 @@ impl Store {
         client
             .query(
                 "SELECT id, movie_id, hash, title, indexer, quality, size, grabbed_at, state,
-                        message, imported_path, finished_at
+                        message, imported_path, finished_at, replaces
                  FROM grabs ORDER BY grabbed_at DESC, id DESC",
                 &[],
             )
@@ -908,6 +933,7 @@ impl Store {
                     message: row.try_get(9)?,
                     imported_path: row.try_get(10)?,
                     finished_at: row.try_get(11)?,
+                    replaces: row.try_get(12)?,
                 })
             })
             .collect()
@@ -1206,34 +1232,39 @@ async fn write_children(client: &impl GenericClient, id: i64, movie: &Movie) -> 
         .execute("DELETE FROM movie_files WHERE movie_id = $1", &[&id])
         .await?;
     if let Some(file) = &movie.file {
-        let languages = serde_json::to_value(&file.languages)
-            .map_err(|e| StoreError::Corrupt(format!("idiomas: {e}")))?;
-        client
-            .execute(
-                "INSERT INTO movie_files (movie_id, relative_path, size, quality,
-                     revision_version, revision_real, is_repack, languages, release_group,
-                     edition, scene_name, date_added, file_id, media_info)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                     COALESCE($13, nextval('movie_file_ids')), $14)",
-                &[
-                    &id,
-                    &file.relative_path,
-                    &i64::try_from(file.size).unwrap_or(i64::MAX),
-                    &small(file.quality.quality.id()),
-                    &small(file.quality.revision.version),
-                    &small(file.quality.revision.real),
-                    &file.quality.revision.is_repack,
-                    &languages,
-                    &file.release_group,
-                    &file.edition,
-                    &file.scene_name,
-                    &file.date_added,
-                    &file.id,
-                    &file.media_info,
-                ],
-            )
-            .await?;
+        insert_file(client, id, file).await?;
     }
+    Ok(())
+}
+
+async fn insert_file(client: &impl GenericClient, movie_id: i64, file: &MovieFile) -> Result<()> {
+    let languages = serde_json::to_value(&file.languages)
+        .map_err(|e| StoreError::Corrupt(format!("idiomas: {e}")))?;
+    client
+        .execute(
+            "INSERT INTO movie_files (movie_id, relative_path, size, quality,
+                 revision_version, revision_real, is_repack, languages, release_group,
+                 edition, scene_name, date_added, file_id, media_info)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                 COALESCE($13, nextval('movie_file_ids')), $14)",
+            &[
+                &movie_id,
+                &file.relative_path,
+                &i64::try_from(file.size).unwrap_or(i64::MAX),
+                &small(file.quality.quality.id()),
+                &small(file.quality.revision.version),
+                &small(file.quality.revision.real),
+                &file.quality.revision.is_repack,
+                &languages,
+                &file.release_group,
+                &file.edition,
+                &file.scene_name,
+                &file.date_added,
+                &file.id,
+                &file.media_info,
+            ],
+        )
+        .await?;
     Ok(())
 }
 
@@ -1770,6 +1801,7 @@ mod tests {
             message: None,
             imported_path: None,
             finished_at: None,
+            replaces: Some("Um (2020).mkv".into()),
         };
         grab.id = store.record_grab(&grab).await.unwrap();
         assert_eq!(store.grabs().await.unwrap(), [grab.clone()]);

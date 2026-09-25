@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use acervo_api::{ALL, Catalog};
-use acervo_arr::{ArrClient, ArrKind, RemoteIndexer, RemoteQueueItem, RemoteRootFolder};
+use acervo_arr::{ArrClient, ArrKind, RemoteIndexer, RemoteQueueItem};
 use acervo_core::InstanceName;
 use acervo_decision::{
     Decision, Engine, ExistingFile, Indexer, Mode, Profile, ProfileItem, Propers,
@@ -79,12 +79,55 @@ fn age_days(date: Option<&str>, now: time::OffsetDateTime) -> u32 {
     })
 }
 
-struct Remote {
-    queue: Vec<RemoteQueueItem>,
-    roots: Vec<RemoteRootFolder>,
+/// As regras de decisão do gerenciador de filmes. Guardadas no banco a cada
+/// leitura bem-sucedida: depois que ele sair, o acervo decide com elas.
+#[derive(Debug, Default, serde::Deserialize, Serialize)]
+struct Rules {
     indexer_config: Value,
     media_config: Value,
-    indexers: Vec<RemoteIndexer>,
+    /// Indexador daqui → prioridade e seeders mínimos do cadastro dele lá.
+    indexers: BTreeMap<String, (i32, u32)>,
+}
+
+/// Onde as regras ficam na tabela de configurações.
+const RULES_KEY: &str = "decisao.regras";
+
+impl Rules {
+    fn from_manager(
+        indexer_config: Value,
+        media_config: Value,
+        indexers: &[RemoteIndexer],
+    ) -> Self {
+        Self {
+            indexer_config,
+            media_config,
+            indexers: indexers
+                .iter()
+                .filter_map(|i| {
+                    let name = i.name.strip_suffix(crate::sync::SUFFIX)?;
+                    Some((
+                        name.to_owned(),
+                        (
+                            i.priority()
+                                .and_then(|p| i32::try_from(p).ok())
+                                .unwrap_or(25),
+                            i.minimum_seeders()
+                                .and_then(|s| u32::try_from(s).ok())
+                                .unwrap_or(1),
+                        ),
+                    ))
+                })
+                .collect(),
+        }
+    }
+}
+
+struct Remote {
+    /// A fila do gerenciador; vazia quando ele não responde.
+    queue: Vec<RemoteQueueItem>,
+    /// Espaço livre por pasta raiz, como o gerenciador vê a pasta.
+    free: BTreeMap<String, u64>,
+    rules: Rules,
 }
 
 fn target(
@@ -124,7 +167,7 @@ fn target(
         available: crate::library::is_available(
             movie,
             now.date(),
-            remote.indexer_config["availabilityDelay"]
+            remote.rules.indexer_config["availabilityDelay"]
                 .as_i64()
                 .unwrap_or(0),
         ),
@@ -153,18 +196,16 @@ fn target(
                     }),
             })
             .collect(),
-        free_space: remote
-            .roots
-            .iter()
-            .filter(|root| movie.path.starts_with(&root.path))
-            .max_by_key(|root| root.path.len())
-            .and_then(|root| root.free_space),
+        free_space: std::path::Path::new(&movie.path)
+            .parent()
+            .and_then(|root| remote.free.get(&root.display().to_string()))
+            .copied(),
     })
 }
 
 fn settings(remote: &Remote, definitions: Vec<acervo_store::QualityDefinition>) -> Settings {
-    let indexer = &remote.indexer_config;
-    let media = &remote.media_config;
+    let indexer = &remote.rules.indexer_config;
+    let media = &remote.rules.media_config;
     Settings {
         definitions: definitions
             .into_iter()
@@ -202,24 +243,39 @@ fn indexers(served: &[String], remote: &Remote) -> Vec<Indexer> {
     served
         .iter()
         .map(|name| {
-            let registered = remote
-                .indexers
-                .iter()
-                .find(|i| i.name == format!("{name}{}", crate::sync::SUFFIX));
+            let (priority, minimum_seeders) =
+                remote.rules.indexers.get(name).copied().unwrap_or((25, 1));
             Indexer {
                 name: name.clone(),
-                priority: registered
-                    .and_then(RemoteIndexer::priority)
-                    .and_then(|p| i32::try_from(p).ok())
-                    .unwrap_or(25),
-                minimum_seeders: registered
-                    .and_then(RemoteIndexer::minimum_seeders)
-                    .and_then(|s| u32::try_from(s).ok())
-                    .unwrap_or(1),
+                priority,
+                minimum_seeders,
                 multi_languages: Vec::new(),
             }
         })
         .collect()
+}
+
+/// Espaço livre de cada pasta raiz dos filmes, lido do disco.
+async fn free_space(config: &Config, movies: &[CatalogMovie]) -> BTreeMap<String, u64> {
+    let mut roots: std::collections::BTreeSet<String> =
+        config.movies.root_folders.iter().cloned().collect();
+    for entry in movies {
+        if let Some(root) = std::path::Path::new(&entry.movie.path).parent() {
+            roots.insert(root.display().to_string());
+        }
+    }
+    let map = config.path_map();
+    tokio::task::spawn_blocking(move || {
+        roots
+            .into_iter()
+            .filter_map(|root| {
+                let host = map.to_host(std::path::Path::new(&root)).ok()?;
+                Some((root, acervo_fs::free_space(&host).ok()?))
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 pub(crate) fn movie_client(config: &Config) -> Result<ArrClient> {
@@ -296,20 +352,46 @@ impl Decider {
     ///
     /// Catálogo vazio, gerenciador de filmes inalcançável ou nenhum indexador.
     pub async fn load(config: &Config, store: &Store, catalog: &Catalog) -> Result<Self> {
-        let client = movie_client(config)?;
-        let (queue, roots, indexer_config, media_config, remote_indexers) = tokio::try_join!(
-            client.movie_queue(),
-            client.root_folders(),
-            client.indexer_config(),
-            client.media_management_config(),
-            client.indexers(),
-        )?;
-        let remote = Remote {
-            queue,
-            roots,
-            indexer_config,
-            media_config,
-            indexers: remote_indexers,
+        let live = async {
+            let client = movie_client(config)?;
+            let (queue, indexer_config, media_config, remote_indexers) = tokio::try_join!(
+                client.movie_queue(),
+                client.indexer_config(),
+                client.media_management_config(),
+                client.indexers(),
+            )?;
+            anyhow::Ok((
+                queue,
+                Rules::from_manager(indexer_config, media_config, &remote_indexers),
+            ))
+        }
+        .await;
+        let (queue, rules) = match live {
+            Ok((queue, rules)) => {
+                if let Ok(text) = serde_json::to_string(&rules) {
+                    store
+                        .set_setting(RULES_KEY, Some(&text), &now_rfc3339())
+                        .await?;
+                }
+                (queue, rules)
+            }
+            Err(error) => {
+                if config
+                    .instances
+                    .iter()
+                    .any(|spec| matches!(spec.kind, InstanceKind::Movie))
+                {
+                    tracing::warn!(
+                        "gerenciador de filmes inalcançável, decidindo com as regras guardadas: {error:#}"
+                    );
+                }
+                let rules = store
+                    .setting(RULES_KEY)
+                    .await?
+                    .and_then(|text| serde_json::from_str(&text).ok())
+                    .unwrap_or_default();
+                (Vec::new(), rules)
+            }
         };
         let (movies, stored_profiles, definitions, grabs) = tokio::try_join!(
             store.movies(),
@@ -320,6 +402,11 @@ impl Decider {
         if movies.is_empty() {
             bail!("catálogo vazio: rode `movies import --apply` antes");
         }
+        let remote = Remote {
+            queue,
+            free: free_space(config, &movies).await,
+            rules,
+        };
         let now = time::OffsetDateTime::now_utc();
         let profiles: BTreeMap<String, Profile> = stored_profiles
             .iter()
@@ -377,26 +464,7 @@ impl Decider {
             .search(ALL, &query)
             .await
             .map_err(|error| error.to_string())?;
-        let candidates: Vec<Release> = page
-            .releases
-            .iter()
-            .map(|r| Release {
-                title: r.title.clone(),
-                indexer: r.indexer.clone(),
-                size: r.size,
-                seeders: r.seeders,
-                peers: r.seeders.map(|s| s + r.leechers.unwrap_or(0)),
-                imdb_id: None,
-                tmdb_id: None,
-                languages: Vec::new(),
-                container: None,
-                flags: if r.tags.iter().any(|t| t.eq_ignore_ascii_case("freeleech")) {
-                    FREELEECH
-                } else {
-                    0
-                },
-            })
-            .collect();
+        let candidates = candidates(&page.releases);
         let engine = Engine {
             library: &self.library,
             indexers: &self.indexers,
@@ -408,6 +476,44 @@ impl Decider {
             decisions,
         })
     }
+
+    /// Releases recentes, sem filme buscado: cada um casado com a biblioteca
+    /// inteira, como a sincronização de RSS da referência.
+    pub fn rss(&self, releases: Vec<acervo_indexers::Release>) -> Outcome {
+        let engine = Engine {
+            library: &self.library,
+            indexers: &self.indexers,
+            settings: &self.settings,
+        };
+        let decisions = engine.rss(&candidates(&releases));
+        Outcome {
+            releases,
+            decisions,
+        }
+    }
+}
+
+/// Os releases do indexador no formato que a decisão lê.
+fn candidates(releases: &[acervo_indexers::Release]) -> Vec<Release> {
+    releases
+        .iter()
+        .map(|r| Release {
+            title: r.title.clone(),
+            indexer: r.indexer.clone(),
+            size: r.size,
+            seeders: r.seeders,
+            peers: r.seeders.map(|s| s + r.leechers.unwrap_or(0)),
+            imdb_id: None,
+            tmdb_id: None,
+            languages: Vec::new(),
+            container: None,
+            flags: if r.tags.iter().any(|t| t.eq_ignore_ascii_case("freeleech")) {
+                FREELEECH
+            } else {
+                0
+            },
+        })
+        .collect()
 }
 
 pub(crate) fn label(movie: &Target) -> String {
@@ -431,6 +537,23 @@ pub async fn run(
     catalog: &Catalog,
     limit: usize,
     print: bool,
+) -> Result<Vec<ShadowLine>> {
+    search(config, store, catalog, limit, print, false).await
+}
+
+/// Como [`run`]; com `grab`, o escolhido de cada filme vai ao cliente — é a
+/// busca automática dos filmes que faltam.
+///
+/// # Errors
+///
+/// Catálogo vazio ou nenhum indexador.
+pub async fn search(
+    config: &Config,
+    store: &Store,
+    catalog: &Catalog,
+    limit: usize,
+    print: bool,
+    grab: bool,
 ) -> Result<Vec<ShadowLine>> {
     let (decider, latest) = tokio::try_join!(Decider::load(config, store, catalog), async {
         Ok(store.latest_shadow_runs().await?)
@@ -469,6 +592,20 @@ pub async fn run(
                 },
             ),
             Ok(outcome) => {
+                if grab && let Some((decision, release)) = outcome.pick() {
+                    let quality = decision
+                        .parsed
+                        .as_ref()
+                        .map_or(acervo_parser::Quality::Unknown, |p| p.quality.quality);
+                    if let Err(error) =
+                        crate::grab::send(config, store, catalog, movie.id, release, quality, None)
+                            .await
+                    {
+                        tracing::warn!(filme = label(movie), "grab automático falhou: {error:#}");
+                    } else {
+                        tracing::info!(filme = label(movie), release = release.title, "pegou");
+                    }
+                }
                 let pick = outcome.pick().map(|(decision, release)| ShadowPick {
                     title: release.title.clone(),
                     indexer: release.indexer.clone(),
