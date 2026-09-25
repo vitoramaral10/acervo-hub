@@ -56,6 +56,8 @@ pub struct QualityProfile {
     pub items: Vec<ProfileItem>,
     pub min_format_score: i32,
     pub cutoff_format_score: i32,
+    /// Id do perfil no gerenciador de onde ele veio.
+    pub source_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +72,11 @@ pub struct MovieFile {
     /// Nome do release de onde o arquivo veio.
     pub scene_name: Option<String>,
     pub date_added: Option<String>,
+    /// Id estável do arquivo: o do gerenciador, se veio de lá. Quem guarda
+    /// esse id (o app de legendas guarda) percebe troca de arquivo por ele.
+    pub id: Option<i64>,
+    /// Faixas de áudio, vídeo e legenda, como o gerenciador as leu.
+    pub media_info: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,6 +380,26 @@ const MIGRATIONS: &[&str] = &[
         label TEXT NOT NULL UNIQUE
     );
 ",
+    r"
+    ALTER TABLE quality_profiles ADD COLUMN source_id BIGINT;
+    ALTER TABLE movie_files ADD COLUMN file_id BIGINT, ADD COLUMN media_info JSONB;
+    CREATE SEQUENCE movie_file_ids START 1000000;
+    ALTER TABLE movies DROP CONSTRAINT movies_quality_profile_id_fkey,
+        ADD CONSTRAINT movies_quality_profile_id_fkey FOREIGN KEY (quality_profile_id)
+            REFERENCES quality_profiles(id) ON UPDATE CASCADE;
+    ALTER TABLE movie_files DROP CONSTRAINT movie_files_movie_id_fkey,
+        ADD CONSTRAINT movie_files_movie_id_fkey FOREIGN KEY (movie_id)
+            REFERENCES movies(id) ON DELETE CASCADE ON UPDATE CASCADE;
+    ALTER TABLE movie_titles DROP CONSTRAINT movie_titles_movie_id_fkey,
+        ADD CONSTRAINT movie_titles_movie_id_fkey FOREIGN KEY (movie_id)
+            REFERENCES movies(id) ON DELETE CASCADE ON UPDATE CASCADE;
+    ALTER TABLE shadow_runs DROP CONSTRAINT shadow_runs_movie_id_fkey,
+        ADD CONSTRAINT shadow_runs_movie_id_fkey FOREIGN KEY (movie_id)
+            REFERENCES movies(id) ON DELETE CASCADE ON UPDATE CASCADE;
+    ALTER TABLE grabs DROP CONSTRAINT grabs_movie_id_fkey,
+        ADD CONSTRAINT grabs_movie_id_fkey FOREIGN KEY (movie_id)
+            REFERENCES movies(id) ON DELETE CASCADE ON UPDATE CASCADE;
+",
 ];
 
 /// Chave do lock consultivo que serializa as migrações: o serviço e um
@@ -471,7 +498,7 @@ impl Store {
         let rows = client
             .query(
                 "SELECT name, upgrade_allowed, cutoff, language, items, min_format_score,
-                        cutoff_format_score
+                        cutoff_format_score, source_id
                  FROM quality_profiles ORDER BY name",
                 &[],
             )
@@ -489,8 +516,24 @@ impl Store {
                     items: decode_items(items)?,
                     min_format_score: row.try_get(5)?,
                     cutoff_format_score: row.try_get(6)?,
+                    source_id: row.try_get(7)?,
                 })
             })
+            .collect()
+    }
+
+    /// Os perfis com o id do catálogo, que é o que a API v3 mostra.
+    ///
+    /// # Errors
+    ///
+    /// Falha de leitura ou registro inconsistente.
+    pub async fn profile_ids(&self) -> Result<Vec<(i64, String)>> {
+        let client = self.pool.get().await?;
+        client
+            .query("SELECT id, name FROM quality_profiles ORDER BY id", &[])
+            .await?
+            .iter()
+            .map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
             .collect()
     }
 
@@ -645,19 +688,44 @@ impl Store {
     }
 
     /// O acervo passa a ser dono de todos os filmes: importar do gerenciador
-    /// deixa de mexer neles. Devolve quantos mudaram.
+    /// deixa de mexer neles. Filmes e perfis ganham o id que tinham lá — é
+    /// por ele que os apps de pedidos e de legendas os conhecem —, e o que o
+    /// acervo tinha criado vai para depois do maior. Devolve quantos filmes
+    /// vieram da origem.
     ///
     /// # Errors
     ///
-    /// Falha de escrita.
+    /// Falha de escrita; nada fica pela metade.
     pub async fn adopt_all(&self) -> Result<u64> {
-        let client = self.pool.get().await?;
-        Ok(client
-            .execute(
-                "UPDATE movies SET source = NULL, source_id = NULL WHERE source IS NOT NULL",
-                &[],
-            )
-            .await?)
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let adopted = tx
+            .execute("SELECT 1 FROM movies WHERE source IS NOT NULL", &[])
+            .await?;
+        for (table, sequence_owner) in [
+            ("quality_profiles", "quality_profiles"),
+            ("movies", "movies"),
+        ] {
+            tx.batch_execute(&format!(
+                "UPDATE {table} SET id = -id;
+                 UPDATE {table} SET id = source_id WHERE source_id IS NOT NULL;
+                 UPDATE {table} t SET id = sub.new_id
+                 FROM (SELECT id, (SELECT COALESCE(MAX(id), 0) FROM {table} WHERE id > 0)
+                              + ROW_NUMBER() OVER (ORDER BY id DESC) AS new_id
+                       FROM {table} WHERE id < 0) sub
+                 WHERE t.id = sub.id;
+                 SELECT setval(pg_get_serial_sequence('{sequence_owner}', 'id'),
+                     GREATEST((SELECT COALESCE(MAX(id), 0) FROM {table}), 1));"
+            ))
+            .await?;
+        }
+        tx.batch_execute(
+            "UPDATE movies SET source = NULL, source_id = NULL;
+             UPDATE quality_profiles SET source_id = NULL;",
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(adopted)
     }
 
     /// Tira um filme do catálogo, com o registro do arquivo, títulos, sombra
@@ -1015,12 +1083,13 @@ async fn upsert_profile(client: &impl GenericClient, profile: &QualityProfile) -
     client
         .execute(
             "INSERT INTO quality_profiles (name, upgrade_allowed, cutoff, language, items,
-                 min_format_score, cutoff_format_score)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 min_format_score, cutoff_format_score, source_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (name) DO UPDATE SET upgrade_allowed = excluded.upgrade_allowed,
                  cutoff = excluded.cutoff, language = excluded.language, items = excluded.items,
                  min_format_score = excluded.min_format_score,
-                 cutoff_format_score = excluded.cutoff_format_score",
+                 cutoff_format_score = excluded.cutoff_format_score,
+                 source_id = excluded.source_id",
             &[
                 &profile.name,
                 &profile.upgrade_allowed,
@@ -1029,6 +1098,7 @@ async fn upsert_profile(client: &impl GenericClient, profile: &QualityProfile) -
                 &encode_items(&profile.items),
                 &profile.min_format_score,
                 &profile.cutoff_format_score,
+                &profile.source_id,
             ],
         )
         .await?;
@@ -1142,8 +1212,9 @@ async fn write_children(client: &impl GenericClient, id: i64, movie: &Movie) -> 
             .execute(
                 "INSERT INTO movie_files (movie_id, relative_path, size, quality,
                      revision_version, revision_real, is_repack, languages, release_group,
-                     edition, scene_name, date_added)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                     edition, scene_name, date_added, file_id, media_info)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                     COALESCE($13, nextval('movie_file_ids')), $14)",
                 &[
                     &id,
                     &file.relative_path,
@@ -1157,6 +1228,8 @@ async fn write_children(client: &impl GenericClient, id: i64, movie: &Movie) -> 
                     &file.edition,
                     &file.scene_name,
                     &file.date_added,
+                    &file.id,
+                    &file.media_info,
                 ],
             )
             .await?;
@@ -1228,6 +1301,8 @@ fn read_file(row: &Row) -> Result<Option<MovieFile>> {
         edition: row.try_get(23)?,
         scene_name: row.try_get(24)?,
         date_added: row.try_get(25)?,
+        id: row.try_get(39)?,
+        media_info: row.try_get(40)?,
     }))
 }
 
@@ -1242,7 +1317,8 @@ async fn read_movies(client: &impl GenericClient) -> Result<Vec<CatalogMovie>> {
                     f.date_added,
                     m.runtime, m.secondary_year, m.clean_title, m.available,
                     m.in_cinemas, m.digital_release, m.physical_release, m.overview, m.tags,
-                    m.metadata_title, m.poster, m.fanart, m.metadata_refreshed_at
+                    m.metadata_title, m.poster, m.fanart, m.metadata_refreshed_at,
+                    f.file_id, f.media_info
              FROM movies m
              LEFT JOIN quality_profiles p ON p.id = m.quality_profile_id
              LEFT JOIN movie_files f ON f.movie_id = m.id
@@ -1405,6 +1481,7 @@ mod tests {
             ],
             min_format_score: 0,
             cutoff_format_score: 0,
+            source_id: Some(7),
         }
     }
 
@@ -1434,6 +1511,8 @@ mod tests {
                 edition: None,
                 scene_name: Some(format!("{title}.2020.1080p.WEB-DL-GRUPO")),
                 date_added: Some("2026-01-02T00:00:00Z".into()),
+                id: Some(i64::from(tmdb_id) + 500),
+                media_info: Some(serde_json::json!({ "audioLanguages": "Portuguese/English" })),
             }),
             runtime: 110,
             secondary_year: None,
@@ -1545,7 +1624,7 @@ mod tests {
         };
         let store = &db.store;
         store
-            .import(&import(vec![(1, movie(10, "Um", false))]), true)
+            .import(&import(vec![(50, movie(10, "Um", false))]), true)
             .await
             .unwrap();
         let extras = MovieExtras {
@@ -1560,7 +1639,7 @@ mod tests {
             .unwrap();
         // Reimportar a origem não remove o que o acervo adicionou.
         let again = store
-            .import(&import(vec![(1, movie(10, "Um", false))]), true)
+            .import(&import(vec![(50, movie(10, "Um", false))]), true)
             .await
             .unwrap();
         assert!(again.removed.is_empty());
@@ -1586,16 +1665,24 @@ mod tests {
         );
 
         assert_eq!(store.adopt_all().await.unwrap(), 1);
-        assert!(
-            store
-                .movies()
-                .await
-                .unwrap()
-                .iter()
-                .all(|m| m.origin.is_none())
-        );
-        assert!(store.delete_movie(own).await.unwrap());
-        assert!(!store.delete_movie(own).await.unwrap());
+        let movies = store.movies().await.unwrap();
+        assert!(movies.iter().all(|m| m.origin.is_none()));
+        // O que veio da origem fica com o id de lá; o do acervo vai depois.
+        let um = movies.iter().find(|m| m.movie.tmdb_id == 10).unwrap();
+        let tres = movies.iter().find(|m| m.movie.tmdb_id == 30).unwrap();
+        assert_eq!(um.id, 50);
+        assert_eq!(tres.id, 51);
+        assert_eq!(tres.extras, extras);
+        assert_eq!(store.profile_ids().await.unwrap(), [(7, "Any".to_owned())]);
+        assert_eq!(um.movie.quality_profile.as_deref(), Some("Any"));
+        // O próximo filme novo não colide.
+        let next = store
+            .add_movie(&movie(40, "Quatro", false), &MovieExtras::default())
+            .await
+            .unwrap();
+        assert_eq!(next, 52);
+        assert!(store.delete_movie(tres.id).await.unwrap());
+        assert!(!store.delete_movie(tres.id).await.unwrap());
         db.drop().await;
     }
 

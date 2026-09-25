@@ -55,6 +55,8 @@ tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 deadpool-postgres = "0.14"
 argon2 = { version = "0.5", features = ["std"] }
 sha2 = "0.10"
+# `statvfs` para o espaço livre das pastas raiz, sem libc e sem unsafe aqui.
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 # Infohash de torrent v1: SHA-1 do dicionário `info`.
 sha1 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = [

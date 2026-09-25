@@ -59,6 +59,10 @@ pub struct MoviesConfig {
     /// importar. Zero desliga.
     #[serde(default = "default_import_interval")]
     pub import_interval_minutes: u64,
+    /// Pastas raiz dos filmes, como os gerenciadores as veem. A API v3 as
+    /// oferece aos apps de pedidos.
+    #[serde(default = "default_root_folders")]
+    pub root_folders: Vec<String>,
 }
 
 impl Default for MoviesConfig {
@@ -66,12 +70,17 @@ impl Default for MoviesConfig {
         Self {
             category: default_movie_category(),
             import_interval_minutes: default_import_interval(),
+            root_folders: default_root_folders(),
         }
     }
 }
 
 fn default_movie_category() -> String {
     "acervo".into()
+}
+
+fn default_root_folders() -> Vec<String> {
+    vec!["/media/movies".into()]
 }
 
 fn default_import_interval() -> u64 {

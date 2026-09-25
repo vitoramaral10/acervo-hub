@@ -99,6 +99,16 @@ pub fn facts_for(client_path: &Path, map: &PathMap) -> Result<FileFacts, FsError
     })
 }
 
+/// Bytes livres para quem não é root no sistema de arquivos de `path`.
+///
+/// # Errors
+///
+/// Caminho inexistente ou ilegível.
+pub fn free_space(path: &Path) -> std::io::Result<u64> {
+    let stat = rustix::fs::statvfs(path)?;
+    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
 /// Soma o espaço alocado sob as raízes, contando cada inode uma vez.
 ///
 /// A deduplicação por `(dev, ino)` não é otimização: sem ela, um acervo em que

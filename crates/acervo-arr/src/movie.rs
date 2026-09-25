@@ -122,6 +122,8 @@ pub struct RemoteRootFolder {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteMovieFile {
+    #[serde(default)]
+    pub id: Option<i64>,
     pub relative_path: String,
     #[serde(default)]
     pub size: u64,
@@ -137,6 +139,8 @@ pub struct RemoteMovieFile {
     pub scene_name: Option<String>,
     #[serde(default)]
     pub date_added: Option<String>,
+    #[serde(default)]
+    pub media_info: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

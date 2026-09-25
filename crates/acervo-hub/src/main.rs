@@ -5,6 +5,9 @@
 //! acontece no último passo. `serve` é o outro modo de vida do binário: um
 //! processo longo que responde buscas Torznab.
 
+// O filme da API v3 é um `json!` de ~50 campos, um nível de macro por campo.
+#![recursion_limit = "256"]
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -12,6 +15,7 @@ use acervo_janitor::Mode;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod api_v3;
 mod apply;
 mod collect;
 mod config;

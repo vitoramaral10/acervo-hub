@@ -194,6 +194,7 @@ fn profile(remote: &RemoteQualityProfile) -> QualityProfile {
         items: remote.items.iter().map(item).collect(),
         min_format_score: remote.min_format_score,
         cutoff_format_score: remote.cutoff_format_score,
+        source_id: Some(remote.id),
     }
 }
 
@@ -230,6 +231,8 @@ fn movie(remote: RemoteMovie, profiles: &HashMap<i64, String>) -> Movie {
         edition: blank_is_none(file.edition),
         scene_name: blank_is_none(file.scene_name),
         date_added: file.date_added,
+        id: file.id,
+        media_info: file.media_info,
     });
     Movie {
         tmdb_id: remote.tmdb_id,

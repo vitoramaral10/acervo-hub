@@ -29,7 +29,7 @@ use crate::registry::{self, Added, Registry};
 pub struct Database(Arc<std::sync::OnceLock<acervo_store::Store>>);
 
 impl Database {
-    fn get(&self) -> Result<&acervo_store::Store, String> {
+    pub(crate) fn get(&self) -> Result<&acervo_store::Store, String> {
         self.0
             .get()
             .ok_or_else(|| "banco de dados ainda indisponível; tente de novo em instantes".into())
@@ -251,6 +251,13 @@ pub async fn run(config: Config) -> Result<()> {
             server.shadow_limit,
         ));
     }
+    // A API v3 de filmes, para os apps de pedidos e de legendas.
+    let v3 = Arc::new(crate::api_v3::V3 {
+        config: Arc::clone(&config),
+        database: database.clone(),
+        catalog: catalog.clone(),
+        api_key: api_key.clone(),
+    });
     let admin = HubAdmin::new(config, catalog.clone(), database)?;
     tracing::info!(indexadores = catalog.len(), bind = %bind, "servindo Torznab e a interface web");
 
@@ -259,7 +266,8 @@ pub async fn run(config: Config) -> Result<()> {
         .with_context(|| format!("abrindo `{bind}`"))?;
     axum::serve(
         listener,
-        acervo_api::router_with_admin(catalog, api_key, Some(Arc::new(admin)), accounts),
+        acervo_api::router_with_admin(catalog, api_key, Some(Arc::new(admin)), accounts)
+            .merge(crate::api_v3::router(v3)),
     )
     .with_graceful_shutdown(shutdown())
     .await

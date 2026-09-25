@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 acervo-core.workspace = true
+rustix.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
