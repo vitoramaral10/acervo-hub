@@ -101,6 +101,31 @@ pub struct Movie {
     pub alternate_titles: Vec<String>,
     /// Já passou da disponibilidade mínima.
     pub available: bool,
+    /// Estreia no cinema, `AAAA-MM-DD`.
+    pub in_cinemas: Option<String>,
+    pub digital_release: Option<String>,
+    pub physical_release: Option<String>,
+    pub overview: Option<String>,
+    /// Ids da tabela de tags.
+    pub tags: Vec<i64>,
+}
+
+/// O que só a base de metadados sabe e o gerenciador não expõe.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MovieExtras {
+    /// Título em inglês: o que dá nome à pasta e ao arquivo.
+    pub metadata_title: Option<String>,
+    pub poster: Option<String>,
+    pub fanart: Option<String>,
+    /// Quando os metadados vieram da base pela última vez (RFC 3339).
+    pub refreshed_at: Option<String>,
+}
+
+/// Uma tag, como a API v3 a mostra.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tag {
+    pub id: i64,
+    pub label: String,
 }
 
 /// Um filme do catálogo, com o id local e de onde veio.
@@ -108,8 +133,10 @@ pub struct Movie {
 pub struct CatalogMovie {
     pub id: i64,
     pub movie: Movie,
-    /// Instância de origem e o id do filme lá, se veio de importação.
+    /// Instância de origem e o id do filme lá, se veio de importação. Sem
+    /// origem, o acervo é o dono do filme.
     pub origin: Option<(String, i64)>,
+    pub extras: MovieExtras,
 }
 
 /// Tamanhos por minuto de filme, em megabytes, de uma qualidade.
@@ -205,6 +232,8 @@ pub struct Import {
     pub definitions: Vec<QualityDefinition>,
     /// Id do filme na origem, e o filme.
     pub movies: Vec<(i64, Movie)>,
+    /// Tags da origem, com os ids de lá.
+    pub tags: Vec<Tag>,
 }
 
 /// O que uma importação muda. Nomes como "Título (Ano)".
@@ -326,6 +355,22 @@ const MIGRATIONS: &[&str] = &[
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
         updated_at TEXT NOT NULL
+    );
+",
+    r"
+    ALTER TABLE movies
+        ADD COLUMN in_cinemas TEXT,
+        ADD COLUMN digital_release TEXT,
+        ADD COLUMN physical_release TEXT,
+        ADD COLUMN overview TEXT,
+        ADD COLUMN tags JSONB NOT NULL DEFAULT '[]',
+        ADD COLUMN metadata_title TEXT,
+        ADD COLUMN poster TEXT,
+        ADD COLUMN fanart TEXT,
+        ADD COLUMN metadata_refreshed_at TEXT;
+    CREATE TABLE tags (
+        id BIGSERIAL PRIMARY KEY,
+        label TEXT NOT NULL UNIQUE
     );
 ",
 ];
@@ -554,6 +599,147 @@ impl Store {
         Ok(runs)
     }
 
+    /// Adiciona um filme de que o acervo é dono. Devolve o id.
+    ///
+    /// # Errors
+    ///
+    /// Filme já no catálogo (mesmo TMDB) ou falha de escrita.
+    pub async fn add_movie(&self, movie: &Movie, extras: &MovieExtras) -> Result<i64> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let id = write_movie(&tx, None, movie, None).await?;
+        write_extras(&tx, id, extras).await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    /// Regrava um filme do acervo, mantendo a origem que ele tiver.
+    ///
+    /// # Errors
+    ///
+    /// Filme inexistente ou falha de escrita.
+    pub async fn update_movie(&self, id: i64, movie: &Movie) -> Result<()> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let origin: Option<(Option<String>, Option<i64>)> = tx
+            .query_opt("SELECT source, source_id FROM movies WHERE id = $1", &[&id])
+            .await?
+            .map(|row| Ok::<_, StoreError>((row.try_get(0)?, row.try_get(1)?)))
+            .transpose()?;
+        let Some((source, source_id)) = origin else {
+            return Err(StoreError::Corrupt(format!("filme {id} não existe")));
+        };
+        let origin = source.as_deref().zip(source_id);
+        write_movie(&tx, Some(id), movie, origin).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Grava o que só a base de metadados sabe.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn set_extras(&self, id: i64, extras: &MovieExtras) -> Result<()> {
+        write_extras(&self.pool.get().await?, id, extras).await
+    }
+
+    /// O acervo passa a ser dono de todos os filmes: importar do gerenciador
+    /// deixa de mexer neles. Devolve quantos mudaram.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn adopt_all(&self) -> Result<u64> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .execute(
+                "UPDATE movies SET source = NULL, source_id = NULL WHERE source IS NOT NULL",
+                &[],
+            )
+            .await?)
+    }
+
+    /// Tira um filme do catálogo, com o registro do arquivo, títulos, sombra
+    /// e grabs. O arquivo no disco não é tocado aqui. `false` se não existia.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn delete_movie(&self, id: i64) -> Result<bool> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .execute("DELETE FROM movies WHERE id = $1", &[&id])
+            .await?
+            > 0)
+    }
+
+    /// # Errors
+    ///
+    /// Falha de leitura.
+    pub async fn tags(&self) -> Result<Vec<Tag>> {
+        let client = self.pool.get().await?;
+        client
+            .query("SELECT id, label FROM tags ORDER BY id", &[])
+            .await?
+            .iter()
+            .map(|row| {
+                Ok(Tag {
+                    id: row.try_get(0)?,
+                    label: row.try_get(1)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Cria a tag, ou devolve a que já tem esse rótulo.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn create_tag(&self, label: &str) -> Result<Tag> {
+        let client = self.pool.get().await?;
+        let label = label.trim().to_lowercase();
+        let row = client
+            .query_one(
+                "INSERT INTO tags (label) VALUES ($1)
+                 ON CONFLICT (label) DO UPDATE SET label = excluded.label
+                 RETURNING id",
+                &[&label],
+            )
+            .await?;
+        Ok(Tag {
+            id: row.try_get(0)?,
+            label,
+        })
+    }
+
+    /// # Errors
+    ///
+    /// Rótulo já usado por outra tag ou falha de escrita.
+    pub async fn rename_tag(&self, id: i64, label: &str) -> Result<Option<Tag>> {
+        let client = self.pool.get().await?;
+        let label = label.trim().to_lowercase();
+        let changed = client
+            .execute("UPDATE tags SET label = $2 WHERE id = $1", &[&id, &label])
+            .await?;
+        Ok((changed > 0).then_some(Tag { id, label }))
+    }
+
+    /// Espelha as tags do gerenciador com os mesmos ids: quem guardou o id
+    /// de uma tag (o app de pedidos guarda) continua achando a mesma.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn mirror_tags(&self, tags: &[Tag]) -> Result<()> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        write_tags(&tx, tags).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Uma configuração guardada pela interface.
     ///
     /// # Errors
@@ -705,6 +891,7 @@ impl Store {
         for profile in &import.profiles {
             upsert_profile(&tx, profile).await?;
         }
+        write_tags(&tx, &import.tags).await?;
         for definition in &import.definitions {
             tx.execute(
                 "INSERT INTO quality_definitions (quality, min_size, max_size, preferred_size)
@@ -731,11 +918,17 @@ impl Store {
                     summary.unchanged += 1;
                 }
                 Some(current) => {
-                    write_movie(&tx, Some(current.id), movie, &import.source, *source_id).await?;
+                    write_movie(
+                        &tx,
+                        Some(current.id),
+                        movie,
+                        Some((&import.source, *source_id)),
+                    )
+                    .await?;
                     summary.updated.push(label(movie));
                 }
                 None => {
-                    write_movie(&tx, None, movie, &import.source, *source_id).await?;
+                    write_movie(&tx, None, movie, Some((&import.source, *source_id))).await?;
                     summary.created.push(label(movie));
                 }
             }
@@ -846,9 +1039,8 @@ async fn write_movie(
     client: &impl GenericClient,
     id: Option<i64>,
     movie: &Movie,
-    source: &str,
-    source_id: i64,
-) -> Result<()> {
+    source: Option<(&str, i64)>,
+) -> Result<i64> {
     let profile_id: Option<i64> = match &movie.quality_profile {
         Some(name) => client
             .query_opt("SELECT id FROM quality_profiles WHERE name = $1", &[name])
@@ -861,7 +1053,11 @@ async fn write_movie(
     let year = movie.year.map(i32::from);
     let runtime = i32::try_from(movie.runtime).unwrap_or(i32::MAX);
     let secondary_year = movie.secondary_year.map(i32::from);
-    let values: [&(dyn tokio_postgres::types::ToSql + Sync); 18] = [
+    let source_id = source.map(|(_, id)| id);
+    let source = source.map(|(name, _)| name);
+    let tags =
+        serde_json::to_value(&movie.tags).map_err(|e| StoreError::Corrupt(format!("tags: {e}")))?;
+    let values: [&(dyn tokio_postgres::types::ToSql + Sync); 23] = [
         &tmdb_id,
         &movie.imdb_id,
         &movie.title,
@@ -880,6 +1076,11 @@ async fn write_movie(
         &secondary_year,
         &movie.clean_title,
         &movie.available,
+        &movie.in_cinemas,
+        &movie.digital_release,
+        &movie.physical_release,
+        &movie.overview,
+        &tags,
     ];
     let id: i64 = if let Some(id) = id {
         let mut params = values.to_vec();
@@ -890,8 +1091,9 @@ async fn write_movie(
                      original_language = $5, year = $6, status = $7, minimum_availability = $8,
                      monitored = $9, quality_profile_id = $10, path = $11, added = $12,
                      source = $13, source_id = $14, runtime = $15, secondary_year = $16,
-                     clean_title = $17, available = $18
-                 WHERE id = $19",
+                     clean_title = $17, available = $18, in_cinemas = $19,
+                     digital_release = $20, physical_release = $21, overview = $22, tags = $23
+                 WHERE id = $24",
                 &params,
             )
             .await?;
@@ -901,9 +1103,10 @@ async fn write_movie(
             .query_one(
                 "INSERT INTO movies (tmdb_id, imdb_id, title, original_title, original_language,
                      year, status, minimum_availability, monitored, quality_profile_id, path,
-                     added, source, source_id, runtime, secondary_year, clean_title, available)
+                     added, source, source_id, runtime, secondary_year, clean_title, available,
+                     in_cinemas, digital_release, physical_release, overview, tags)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                     $17, $18)
+                     $17, $18, $19, $20, $21, $22, $23)
                  RETURNING id",
                 &values,
             )
@@ -911,7 +1114,8 @@ async fn write_movie(
             .try_get(0)?
     };
 
-    write_children(client, id, movie).await
+    write_children(client, id, movie).await?;
+    Ok(id)
 }
 
 /// Títulos alternativos e arquivo do filme: apaga os de antes e grava os de
@@ -960,6 +1164,44 @@ async fn write_children(client: &impl GenericClient, id: i64, movie: &Movie) -> 
     Ok(())
 }
 
+async fn write_tags(client: &impl GenericClient, tags: &[Tag]) -> Result<()> {
+    for tag in tags {
+        client
+            .execute(
+                "INSERT INTO tags (id, label) VALUES ($1, $2)
+                 ON CONFLICT (id) DO UPDATE SET label = excluded.label",
+                &[&tag.id, &tag.label.to_lowercase()],
+            )
+            .await?;
+    }
+    client
+        .execute(
+            "SELECT setval(pg_get_serial_sequence('tags', 'id'),
+                 GREATEST((SELECT COALESCE(MAX(id), 0) FROM tags), 1))",
+            &[],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn write_extras(client: &impl GenericClient, id: i64, extras: &MovieExtras) -> Result<()> {
+    client
+        .execute(
+            "UPDATE movies SET metadata_title = $2, poster = $3, fanart = $4,
+                 metadata_refreshed_at = $5
+             WHERE id = $1",
+            &[
+                &id,
+                &extras.metadata_title,
+                &extras.poster,
+                &extras.fanart,
+                &extras.refreshed_at,
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
 fn read_file(row: &Row) -> Result<Option<MovieFile>> {
     let Some(relative_path) = row.try_get::<_, Option<String>>(15)? else {
         return Ok(None);
@@ -998,7 +1240,9 @@ async fn read_movies(client: &impl GenericClient) -> Result<Vec<CatalogMovie>> {
                     f.relative_path, f.size, f.quality, f.revision_version, f.revision_real,
                     f.is_repack, f.languages, f.release_group, f.edition, f.scene_name,
                     f.date_added,
-                    m.runtime, m.secondary_year, m.clean_title, m.available
+                    m.runtime, m.secondary_year, m.clean_title, m.available,
+                    m.in_cinemas, m.digital_release, m.physical_release, m.overview, m.tags,
+                    m.metadata_title, m.poster, m.fanart, m.metadata_refreshed_at
              FROM movies m
              LEFT JOIN quality_profiles p ON p.id = m.quality_profile_id
              LEFT JOIN movie_files f ON f.movie_id = m.id
@@ -1045,6 +1289,18 @@ async fn read_movies(client: &impl GenericClient) -> Result<Vec<CatalogMovie>> {
                 clean_title: row.try_get(28)?,
                 available: row.try_get(29)?,
                 alternate_titles: Vec::new(),
+                in_cinemas: row.try_get(30)?,
+                digital_release: row.try_get(31)?,
+                physical_release: row.try_get(32)?,
+                overview: row.try_get(33)?,
+                tags: serde_json::from_value(row.try_get(34)?)
+                    .map_err(|e| StoreError::Corrupt(format!("tags: {e}")))?,
+            },
+            extras: MovieExtras {
+                metadata_title: row.try_get(35)?,
+                poster: row.try_get(36)?,
+                fanart: row.try_get(37)?,
+                refreshed_at: row.try_get(38)?,
             },
         });
     }
@@ -1184,6 +1440,11 @@ mod tests {
             clean_title: Some(title.to_lowercase()),
             alternate_titles: vec![format!("{title} alternativo"), format!("{title} 2")],
             available: true,
+            in_cinemas: Some("2020-01-10".into()),
+            digital_release: None,
+            physical_release: Some("2020-04-01".into()),
+            overview: Some("Sinopse".into()),
+            tags: vec![1],
         }
     }
 
@@ -1198,6 +1459,7 @@ mod tests {
                 preferred_size: None,
             }],
             movies,
+            tags: Vec::new(),
         }
     }
 
@@ -1273,6 +1535,103 @@ mod tests {
             .unwrap();
         db.store.migrate().await.unwrap();
         assert_eq!(db.store.movies().await.unwrap().len(), 1);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn filme_do_acervo_sobrevive_ao_espelho_e_adotar_solta_os_da_origem() {
+        let Some(db) = TestDb::new("adotar").await else {
+            return;
+        };
+        let store = &db.store;
+        store
+            .import(&import(vec![(1, movie(10, "Um", false))]), true)
+            .await
+            .unwrap();
+        let extras = MovieExtras {
+            metadata_title: Some("One".into()),
+            poster: Some("https://img/p.jpg".into()),
+            fanart: None,
+            refreshed_at: Some("2026-01-01T00:00:00Z".into()),
+        };
+        let own = store
+            .add_movie(&movie(30, "Três", false), &extras)
+            .await
+            .unwrap();
+        // Reimportar a origem não remove o que o acervo adicionou.
+        let again = store
+            .import(&import(vec![(1, movie(10, "Um", false))]), true)
+            .await
+            .unwrap();
+        assert!(again.removed.is_empty());
+        let movies = store.movies().await.unwrap();
+        let tres = movies.iter().find(|m| m.id == own).unwrap();
+        assert_eq!(tres.origin, None);
+        assert_eq!(tres.extras, extras);
+        assert_eq!(tres.movie, movie(30, "Três", false));
+
+        let mut changed = movie(30, "Três", false);
+        changed.monitored = false;
+        store.update_movie(own, &changed).await.unwrap();
+        assert!(
+            !store
+                .movies()
+                .await
+                .unwrap()
+                .iter()
+                .find(|m| m.id == own)
+                .unwrap()
+                .movie
+                .monitored
+        );
+
+        assert_eq!(store.adopt_all().await.unwrap(), 1);
+        assert!(
+            store
+                .movies()
+                .await
+                .unwrap()
+                .iter()
+                .all(|m| m.origin.is_none())
+        );
+        assert!(store.delete_movie(own).await.unwrap());
+        assert!(!store.delete_movie(own).await.unwrap());
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn tags_espelhadas_mantem_o_id_e_as_novas_continuam_depois() {
+        let Some(db) = TestDb::new("tags").await else {
+            return;
+        };
+        let store = &db.store;
+        store
+            .mirror_tags(&[Tag {
+                id: 5,
+                label: "Pedidos".into(),
+            }])
+            .await
+            .unwrap();
+        let new = store.create_tag("Kids").await.unwrap();
+        assert!(new.id > 5);
+        assert_eq!(store.create_tag("kids").await.unwrap().id, new.id);
+        assert_eq!(
+            store.rename_tag(5, "pedido").await.unwrap().unwrap().label,
+            "pedido"
+        );
+        assert_eq!(
+            store.tags().await.unwrap(),
+            [
+                Tag {
+                    id: 5,
+                    label: "pedido".into()
+                },
+                Tag {
+                    id: new.id,
+                    label: "kids".into()
+                }
+            ]
+        );
         db.drop().await;
     }
 

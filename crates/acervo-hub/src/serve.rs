@@ -149,6 +149,36 @@ async fn import_loop(config: Arc<Config>, database: Database, minutes: u64) {
     }
 }
 
+/// Mantém os metadados em dia: a cada seis horas, os filmes conferidos há
+/// mais de um dia. Sem chave do TMDB, espera.
+async fn metadata_loop(config: Arc<Config>, database: Database) {
+    let mut every = tokio::time::interval(Duration::from_secs(6 * 3600));
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        let Ok(store) = database.get() else {
+            continue;
+        };
+        let tmdb = match crate::metadata::tmdb(&config, store).await {
+            Ok(Some(tmdb)) => tmdb,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!("metadados: {error:#}");
+                continue;
+            }
+        };
+        match crate::library::refresh(store, &tmdb, 24).await {
+            Ok(report) => tracing::info!(
+                conferidos = report.conferidos,
+                atualizados = report.atualizados.len(),
+                falhas = report.falhas.len(),
+                "metadados"
+            ),
+            Err(error) => tracing::warn!("metadados: {error:#}"),
+        }
+    }
+}
+
 /// Os downloads do acervo, do mais novo ao mais velho, com o título do filme.
 async fn downloads_json(store: &acervo_store::Store) -> Result<serde_json::Value> {
     let (grabs, movies) = tokio::try_join!(store.grabs(), store.movies())?;
@@ -201,6 +231,9 @@ pub async fn run(config: Config) -> Result<()> {
         tracing::warn!("sem `[database]`: a interface só aceita a chave de API em `X-Api-Key`");
         None
     };
+    if config.database.is_some() {
+        tokio::spawn(metadata_loop(Arc::clone(&config), database.clone()));
+    }
     let import_minutes = config.movies.import_interval_minutes;
     if import_minutes > 0 && config.database.is_some() && config.qbittorrent.is_some() {
         tokio::spawn(import_loop(

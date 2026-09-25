@@ -46,6 +46,23 @@ pub struct RemoteMovie {
     pub is_available: bool,
     #[serde(default)]
     pub alternate_titles: Vec<RemoteTitle>,
+    #[serde(default)]
+    pub in_cinemas: Option<String>,
+    #[serde(default)]
+    pub digital_release: Option<String>,
+    #[serde(default)]
+    pub physical_release: Option<String>,
+    #[serde(default)]
+    pub overview: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<i64>,
+}
+
+/// Uma tag do gerenciador.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteTag {
+    pub id: i64,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -253,6 +270,14 @@ impl ArrClient {
     /// Falha de rede, status não-2xx ou resposta fora do formato.
     pub async fn media_management_config(&self) -> Result<serde_json::Value, ArrError> {
         let path = "api/v3/config/mediamanagement";
+        self.get(self.url(path)?, &[], path).await
+    }
+
+    /// # Errors
+    ///
+    /// Falha de rede, status não-2xx ou resposta fora do formato.
+    pub async fn tags(&self) -> Result<Vec<RemoteTag>, ArrError> {
+        let path = "api/v3/tag";
         self.get(self.url(path)?, &[], path).await
     }
 

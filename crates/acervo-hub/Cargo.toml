@@ -34,7 +34,7 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "signal"] }
 toml.workspace = true
 tracing.workspace = true
-time = { workspace = true, features = ["formatting"] }
+time = { workspace = true, features = ["formatting", "macros"] }
 tracing-subscriber.workspace = true
 url.workspace = true
 

@@ -67,9 +67,24 @@ fn in_format(folder: &str, imdb: &str) -> bool {
     !title.is_empty() && year.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Nome do arquivo, sem extensão.
+/// `{Movie CleanTitle} ({Release Year}) {imdb-{ImdbId}}`: o nome da pasta de
+/// um filme novo, e o do arquivo.
 #[must_use]
-pub fn movie_file_stem(movie: &Movie) -> String {
+pub fn formatted_name(title: &str, year: Option<u16>, imdb: Option<&str>) -> String {
+    let suffix = match (year, imdb) {
+        (Some(year), Some(imdb)) => format!(" ({year}) {{imdb-{imdb}}}"),
+        (Some(year), None) => format!(" ({year})"),
+        (None, Some(imdb)) => format!(" {{imdb-{imdb}}}"),
+        (None, None) => String::new(),
+    };
+    file_safe(&format!("{}{suffix}", clean_title(title)))
+}
+
+/// Nome do arquivo, sem extensão. `metadata_title` é o título em inglês da
+/// base de metadados, quando o acervo o tem: com ele o nome sai exatamente
+/// como o gerenciador daria, sem depender da pasta.
+#[must_use]
+pub fn movie_file_stem(movie: &Movie, metadata_title: Option<&str>) -> String {
     let suffix = match (movie.year, &movie.imdb_id) {
         (Some(year), Some(imdb)) => format!(" ({year}) {{imdb-{imdb}}}"),
         (Some(year), None) => format!(" ({year})"),
@@ -80,6 +95,9 @@ pub fn movie_file_stem(movie: &Movie) -> String {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
+    if let Some(title) = metadata_title {
+        return file_safe(&format!("{}{suffix}", clean_title(title)));
+    }
     // Filme em inglês: o título original é o da base de metadados, e é
     // dele — atual — que o nome sai. Nos outros, o título em inglês só está
     // na pasta.
@@ -128,6 +146,11 @@ mod tests {
             clean_title: None,
             alternate_titles: Vec::new(),
             available: true,
+            in_cinemas: None,
+            digital_release: None,
+            physical_release: None,
+            overview: None,
+            tags: Vec::new(),
         }
     }
 
@@ -155,7 +178,22 @@ mod tests {
             "/media/movies/13 Days 13 Nights (2025) {imdb-tt28291010}",
         );
         assert_eq!(
-            movie_file_stem(&m),
+            movie_file_stem(&m, None),
+            "13 Days 13 Nights (2025) {imdb-tt28291010}"
+        );
+    }
+
+    #[test]
+    fn titulo_da_base_de_metadados_decide_quando_existe() {
+        let m = foreign(
+            "13 Jours, 13 Nuits",
+            "French",
+            Some(2025),
+            Some("tt28291010"),
+            "/media/movies/13 Jours (2025)",
+        );
+        assert_eq!(
+            movie_file_stem(&m, Some("13 Days, 13 Nights")),
             "13 Days 13 Nights (2025) {imdb-tt28291010}"
         );
     }
@@ -169,7 +207,7 @@ mod tests {
             "/media/movies/Now You See Me - Now You Don't (2025)",
         );
         assert_eq!(
-            movie_file_stem(&m),
+            movie_file_stem(&m, None),
             "Now You See Me Now You Don't (2025) {imdb-tt4712810}"
         );
         // Pasta de outro filme com o mesmo formato não conta.
@@ -179,7 +217,10 @@ mod tests {
             Some("tt11762114"),
             "/media/movies/Mean Girls (2004) {imdb-tt0377092}",
         );
-        assert_eq!(movie_file_stem(&m), "Mean Girls (2024) {imdb-tt11762114}");
+        assert_eq!(
+            movie_file_stem(&m, None),
+            "Mean Girls (2024) {imdb-tt11762114}"
+        );
         // Filme em inglês: título e ano atuais, mesmo com a pasta velha.
         let m = movie(
             "Apex",
@@ -187,7 +228,7 @@ mod tests {
             Some("tt16431404"),
             "/media/movies/APEX (2026) {imdb-tt16431404}",
         );
-        assert_eq!(movie_file_stem(&m), "Apex (2025) {imdb-tt16431404}");
+        assert_eq!(movie_file_stem(&m, None), "Apex (2025) {imdb-tt16431404}");
         // Em outra língua, a pasta no formato vale com qualquer ano.
         let m = foreign(
             "Le Film",
@@ -196,7 +237,7 @@ mod tests {
             Some("tt1"),
             "/media/movies/The Film (2026) {imdb-tt1}",
         );
-        assert_eq!(movie_file_stem(&m), "The Film (2026) {imdb-tt1}");
+        assert_eq!(movie_file_stem(&m, None), "The Film (2026) {imdb-tt1}");
     }
 
     /// Contra a lista de filmes de um gerenciador real (`GET /api/v3/movie`),
@@ -224,7 +265,7 @@ mod tests {
                 m["path"].as_str().unwrap_or_default(),
             );
             checked += 1;
-            let got = movie_file_stem(&entry);
+            let got = movie_file_stem(&entry, None);
             let without_year = |s: &str| {
                 s.rsplit_once(" (")
                     .map(|(title, rest)| format!("{title}{}", &rest[rest.find(')').unwrap_or(0)..]))

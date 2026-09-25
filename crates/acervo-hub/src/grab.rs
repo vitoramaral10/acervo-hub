@@ -280,8 +280,10 @@ pub async fn import_downloads(
                 .and_then(|e| e.to_str())
                 .unwrap_or("mkv")
                 .to_ascii_lowercase();
-            let destination =
-                PathBuf::from(&movie.path).join(format!("{}.{extension}", movie_file_stem(movie)));
+            let destination = PathBuf::from(&movie.path).join(format!(
+                "{}.{extension}",
+                movie_file_stem(movie, entry.extras.metadata_title.as_deref())
+            ));
             let source_host = map
                 .to_host(&client_path(&torrent, video))
                 .map_err(|e| e.to_string())?;

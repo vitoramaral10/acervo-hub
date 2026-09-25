@@ -115,10 +115,11 @@ async fn fetch(config: &Config, name: &str, url: &str, api_key: &str) -> Result<
         ArrKind::Movie,
         config.http_timeout(),
     )?;
-    let (profiles, movies, definitions) = tokio::try_join!(
+    let (profiles, movies, definitions, tags) = tokio::try_join!(
         client.quality_profiles(),
         client.movies(),
-        client.quality_definitions()
+        client.quality_definitions(),
+        client.tags(),
     )?;
     let names: HashMap<i64, String> = profiles.iter().map(|p| (p.id, p.name.clone())).collect();
     Ok(Import {
@@ -138,6 +139,13 @@ async fn fetch(config: &Config, name: &str, url: &str, api_key: &str) -> Result<
         movies: movies
             .into_iter()
             .map(|remote| (remote.id, movie(remote, &names)))
+            .collect(),
+        tags: tags
+            .into_iter()
+            .map(|t| acervo_store::Tag {
+                id: t.id,
+                label: t.label,
+            })
             .collect(),
     })
 }
@@ -193,6 +201,11 @@ fn blank_is_none(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.trim().is_empty())
 }
 
+/// `AAAA-MM-DD` de uma data RFC 3339 do gerenciador.
+fn day(date: Option<String>) -> Option<String> {
+    date.and_then(|d| d.get(..10).map(str::to_owned))
+}
+
 fn movie(remote: RemoteMovie, profiles: &HashMap<i64, String>) -> Movie {
     let file = remote.movie_file.map(|file| MovieFile {
         relative_path: file.relative_path,
@@ -243,6 +256,11 @@ fn movie(remote: RemoteMovie, profiles: &HashMap<i64, String>) -> Movie {
             .map(|t| t.title)
             .collect(),
         available: remote.is_available,
+        in_cinemas: day(remote.in_cinemas),
+        digital_release: day(remote.digital_release),
+        physical_release: day(remote.physical_release),
+        overview: blank_is_none(remote.overview),
+        tags: remote.tags,
     }
 }
 

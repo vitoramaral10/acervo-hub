@@ -120,7 +120,14 @@ fn target(
             .unwrap_or(Language::Unknown),
         runtime: movie.runtime,
         monitored: movie.monitored,
-        available: movie.available,
+        // Calculada das datas, como a referência faz, com a carência dela.
+        available: crate::library::is_available(
+            movie,
+            now.date(),
+            remote.indexer_config["availabilityDelay"]
+                .as_i64()
+                .unwrap_or(0),
+        ),
         profile,
         file: movie.file.as_ref().map(|file| ExistingFile {
             quality: file.quality,

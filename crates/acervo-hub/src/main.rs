@@ -20,6 +20,7 @@ mod cycle;
 mod definitions;
 mod grab;
 mod ledger;
+mod library;
 mod metadata;
 mod movies;
 mod naming;
@@ -120,6 +121,36 @@ enum MoviesAction {
         #[arg(long)]
         apply: bool,
     },
+    /// Adiciona um filme ao catálogo a partir do TMDB, com o acervo como dono.
+    Add {
+        /// Id do filme no TMDB.
+        tmdb: u32,
+        /// Perfil de qualidade, pelo nome.
+        #[arg(long)]
+        profile: String,
+        /// Pasta raiz, como o gerenciador a vê.
+        #[arg(long, default_value = "/media/movies")]
+        root: String,
+        /// `announced`, `inCinemas` ou `released`.
+        #[arg(long, default_value = "released")]
+        minimum_availability: String,
+        /// Adiciona sem monitorar.
+        #[arg(long)]
+        unmonitored: bool,
+    },
+    /// Atualiza os metadados pelo TMDB: dos filmes do acervo, tudo; dos que
+    /// vieram do gerenciador, só o que ele não expõe (título em inglês, pôster).
+    Refresh {
+        /// Todos, e não só os conferidos há mais de um dia.
+        #[arg(long)]
+        all: bool,
+    },
+    /// O acervo passa a ser dono de todos os filmes do catálogo: importar do
+    /// gerenciador deixa de mexer neles. É o corte. Sem `--apply`, só conta.
+    Adopt {
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 fn print_grab(report: &grab::GrabReport) {
@@ -204,6 +235,123 @@ async fn users(config: &config::Config, action: UsersAction) -> Result<()> {
     Ok(())
 }
 
+/// Os subcomandos de `movies`. Devolve se algo falhou.
+#[allow(clippy::too_many_lines)] // Um braço por subcomando.
+async fn movies_command(config: &config::Config, action: MoviesAction) -> Result<bool> {
+    let store = config.store().await?;
+    Ok(match action {
+        MoviesAction::Import { apply } => movies::import(config, &store, apply, true)
+            .await?
+            .iter()
+            .any(|instance| instance.erro.is_some()),
+        MoviesAction::Check => movies::check(config, &store).await? > 0,
+        MoviesAction::Shadow { report: true, .. } => shadow::report(config, &store).await? > 0,
+        MoviesAction::Grab { tmdb, apply } => {
+            let movie = store
+                .movies()
+                .await?
+                .into_iter()
+                .find(|m| m.movie.tmdb_id == tmdb)
+                .ok_or_else(|| anyhow::anyhow!("TMDB {tmdb} não está no catálogo"))?;
+            let catalog = acervo_api::Catalog::new(serve::entries(config).await?)?;
+            let report = grab::grab(config, &store, &catalog, movie.id, apply).await?;
+            print_grab(&report);
+            report.escolhido.is_none()
+        }
+        MoviesAction::Downloads { apply } => {
+            let lines = grab::import_downloads(config, &store, apply).await?;
+            if lines.is_empty() {
+                println!("nenhum download do acervo em andamento");
+            }
+            for line in &lines {
+                println!(
+                    "{:<10} {} — {}{}",
+                    line.estado,
+                    line.filme,
+                    line.release,
+                    line.destino
+                        .as_deref()
+                        .or(line.detalhe.as_deref())
+                        .map(|d| format!(" → {d}"))
+                        .unwrap_or_default()
+                );
+            }
+            lines.iter().any(|l| l.estado == "falhou")
+        }
+        MoviesAction::Add {
+            tmdb,
+            profile,
+            root,
+            minimum_availability,
+            unmonitored,
+        } => {
+            let client = metadata::require_tmdb(config, &store).await?;
+            let id = library::add(
+                &store,
+                &client,
+                &library::AddRequest {
+                    tmdb_id: tmdb,
+                    quality_profile: profile,
+                    root_folder: root,
+                    monitored: !unmonitored,
+                    minimum_availability,
+                    tags: Vec::new(),
+                },
+            )
+            .await?;
+            let added = store.movies().await?.into_iter().find(|m| m.id == id);
+            if let Some(added) = added {
+                println!(
+                    "adicionado: {} — {} ({})",
+                    added.movie.title,
+                    added.movie.path,
+                    added.movie.status.as_deref().unwrap_or("?")
+                );
+            }
+            false
+        }
+        MoviesAction::Refresh { all } => {
+            let client = metadata::require_tmdb(config, &store).await?;
+            let report = library::refresh(&store, &client, if all { 0 } else { 24 }).await?;
+            for name in &report.atualizados {
+                println!("atualizado  {name}");
+            }
+            for (name, error) in &report.falhas {
+                println!("falhou      {name} — {error}");
+            }
+            println!(
+                "{} conferidos, {} atualizados, {} falhas",
+                report.conferidos,
+                report.atualizados.len(),
+                report.falhas.len()
+            );
+            !report.falhas.is_empty()
+        }
+        MoviesAction::Adopt { apply } => {
+            let owned = store
+                .movies()
+                .await?
+                .iter()
+                .filter(|m| m.origin.is_some())
+                .count();
+            if apply {
+                let changed = store.adopt_all().await?;
+                println!("{changed} filmes agora são do acervo");
+            } else {
+                println!("{owned} filmes vieram do gerenciador; rode com --apply para adotá-los");
+            }
+            false
+        }
+        MoviesAction::Shadow { limit, .. } => {
+            let catalog = acervo_api::Catalog::new(serve::entries(config).await?)?;
+            shadow::run(config, &store, &catalog, limit, true)
+                .await?
+                .iter()
+                .any(|line| line.erro.is_some())
+        }
+    })
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -251,56 +399,7 @@ async fn run() -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Command::Movies { action } => {
-            let store = config.store().await?;
-            let failed = match action {
-                MoviesAction::Import { apply } => movies::import(&config, &store, apply, true)
-                    .await?
-                    .iter()
-                    .any(|instance| instance.erro.is_some()),
-                MoviesAction::Check => movies::check(&config, &store).await? > 0,
-                MoviesAction::Shadow { report: true, .. } => {
-                    shadow::report(&config, &store).await? > 0
-                }
-                MoviesAction::Grab { tmdb, apply } => {
-                    let movie = store
-                        .movies()
-                        .await?
-                        .into_iter()
-                        .find(|m| m.movie.tmdb_id == tmdb)
-                        .ok_or_else(|| anyhow::anyhow!("TMDB {tmdb} não está no catálogo"))?;
-                    let catalog = acervo_api::Catalog::new(serve::entries(&config).await?)?;
-                    let report = grab::grab(&config, &store, &catalog, movie.id, apply).await?;
-                    print_grab(&report);
-                    report.escolhido.is_none()
-                }
-                MoviesAction::Downloads { apply } => {
-                    let lines = grab::import_downloads(&config, &store, apply).await?;
-                    if lines.is_empty() {
-                        println!("nenhum download do acervo em andamento");
-                    }
-                    for line in &lines {
-                        println!(
-                            "{:<10} {} — {}{}",
-                            line.estado,
-                            line.filme,
-                            line.release,
-                            line.destino
-                                .as_deref()
-                                .or(line.detalhe.as_deref())
-                                .map(|d| format!(" → {d}"))
-                                .unwrap_or_default()
-                        );
-                    }
-                    lines.iter().any(|l| l.estado == "falhou")
-                }
-                MoviesAction::Shadow { limit, .. } => {
-                    let catalog = acervo_api::Catalog::new(serve::entries(&config).await?)?;
-                    shadow::run(&config, &store, &catalog, limit, true)
-                        .await?
-                        .iter()
-                        .any(|line| line.erro.is_some())
-                }
-            };
+            let failed = movies_command(&config, action).await?;
             return Ok(if failed {
                 ExitCode::FAILURE
             } else {

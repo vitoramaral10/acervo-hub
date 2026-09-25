@@ -91,7 +91,6 @@ struct RawReleaseDates {
 
 #[derive(Deserialize)]
 struct RawCountryReleases {
-    iso_3166_1: String,
     release_dates: Vec<RawRelease>,
 }
 
@@ -133,24 +132,22 @@ struct RawTranslationData {
     overview: String,
 }
 
-/// Data de um tipo de lançamento: a dos EUA se houver, senão a mais cedo de
-/// qualquer país.
-fn release(dates: &[RawCountryReleases], kinds: &[u8]) -> Option<String> {
-    let pick = |country: Option<&str>| {
-        dates
-            .iter()
-            .filter(|c| country.is_none_or(|wanted| c.iso_3166_1 == wanted))
-            .flat_map(|c| &c.release_dates)
-            .filter(|r| kinds.contains(&r.kind))
-            .map(|r| {
-                r.release_date
-                    .get(..10)
-                    .unwrap_or(&r.release_date)
-                    .to_owned()
-            })
-            .min()
-    };
-    pick(Some("US")).or_else(|| pick(None))
+/// A data mais cedo de um tipo de lançamento, em qualquer país. É a regra que
+/// reproduz as datas do gerenciador de filmes: contra 293 filmes dele, as de
+/// cinema e física batem em todos, e as digitais em todos menos três que a
+/// base corrigiu depois.
+fn release(dates: &[RawCountryReleases], kind: u8) -> Option<String> {
+    dates
+        .iter()
+        .flat_map(|c| &c.release_dates)
+        .filter(|r| r.kind == kind)
+        .map(|r| {
+            r.release_date
+                .get(..10)
+                .unwrap_or(&r.release_date)
+                .to_owned()
+        })
+        .min()
 }
 
 fn non_empty(text: Option<String>) -> Option<String> {
@@ -187,9 +184,11 @@ impl RawMovie {
                 .and_then(|y| y.parse().ok()),
             runtime: self.runtime.unwrap_or(0),
             status: self.status,
-            in_cinemas: release(dates, &[1, 2, 3]).or(release_date),
-            digital_release: release(dates, &[4]),
-            physical_release: release(dates, &[5]),
+            // Estreia comercial; sem ela, a limitada. Premiere de festival
+            // não conta.
+            in_cinemas: release(dates, 3).or_else(|| release(dates, 2)),
+            digital_release: release(dates, 4),
+            physical_release: release(dates, 5),
             alternate_titles: self
                 .alternative_titles
                 .map(|a| a.titles.into_iter().map(|t| t.title).collect())
@@ -344,7 +343,8 @@ mod tests {
             "status": "Released", "poster_path": "/p.jpg", "backdrop_path": null,
             "release_dates": { "results": [
                 { "iso_3166_1": "BR", "release_dates": [
-                    { "release_date": "2026-04-09T00:00:00.000Z", "type": 4 }] },
+                    { "release_date": "2024-03-20T00:00:00.000Z", "type": 4 },
+                    { "release_date": "2024-01-10T00:00:00.000Z", "type": 1 }] },
                 { "iso_3166_1": "US", "release_dates": [
                     { "release_date": "2024-03-15T00:00:00.000Z", "type": 4 },
                     { "release_date": "2024-03-01T00:00:00.000Z", "type": 3 }] }
