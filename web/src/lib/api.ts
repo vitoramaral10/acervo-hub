@@ -152,6 +152,8 @@ export interface Movie {
   titulo: string
   titulo_original: string | null
   ano: number | null
+  poster: string | null
+  sinopse: string | null
   status: string | null
   monitorado: boolean
   perfil: string | null

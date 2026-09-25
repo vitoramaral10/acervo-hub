@@ -313,6 +313,9 @@ pub struct MovieView {
     pub titulo: String,
     pub titulo_original: Option<String>,
     pub ano: Option<u16>,
+    /// Pôster no tamanho de grade, direto do TMDB.
+    pub poster: Option<String>,
+    pub sinopse: Option<String>,
     pub status: Option<String>,
     pub monitorado: bool,
     pub perfil: Option<String>,
@@ -381,6 +384,11 @@ fn view(
         titulo: movie.title,
         titulo_original: movie.original_title,
         ano: movie.year,
+        poster: entry
+            .extras
+            .poster
+            .map(|url| url.replacen("/t/p/original/", "/t/p/w342/", 1)),
+        sinopse: movie.overview,
         status: movie.status,
         monitorado: movie.monitored,
         perfil: movie.quality_profile,
