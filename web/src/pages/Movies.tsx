@@ -5,14 +5,21 @@ import {
   CircleCheck,
   CircleDashed,
   CloudDownload,
+  ChevronRight,
   ExternalLink,
   Film,
+  ListFilter,
   LoaderCircle,
+  Plus,
   Radar,
   SearchX,
+  Trash2,
 } from 'lucide-react'
 import { type ReactNode, useMemo, useState } from 'react'
 import { toast } from 'sonner'
+import { AVAILABILITIES, AddMovieDialog } from '@/components/AddMovieDialog'
+import { HistoryList } from '@/components/HistoryList'
+import { InteractiveSearch } from '@/components/InteractiveSearch'
 import { PageHeader } from '@/components/PageHeader'
 import { Button } from '@/components/ui/button'
 import {
@@ -24,8 +31,19 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
-import { Badge, Skeleton } from '@/components/ui/misc'
-import { type GrabReport, type Movie, type MovieDownload, type MovieImport, type MovieShadow, api } from '@/lib/api'
+import { Label } from '@/components/ui/label'
+import { Badge, Skeleton, Switch } from '@/components/ui/misc'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import {
+  type GrabReport,
+  type Movie,
+  type MovieChange,
+  type MovieDownload,
+  type MovieImport,
+  type MovieShadow,
+  api,
+  library,
+} from '@/lib/api'
 import { formatAgo, formatCount, formatSize } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
@@ -283,6 +301,7 @@ export function MoviesPage() {
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<Filter>('todos')
   const [selected, setSelected] = useState<number | null>(null)
+  const [adding, setAdding] = useState(false)
 
   const importer = useMutation({
     mutationFn: () => api.importMovies(true),
@@ -360,8 +379,20 @@ export function MoviesPage() {
               {!importer.isPending && <CloudDownload aria-hidden="true" />}
               Importar do Radarr
             </Button>
+            <Button variant="primary" onClick={() => setAdding(true)}>
+              <Plus aria-hidden="true" />
+              Adicionar filme
+            </Button>
           </div>
         }
+      />
+      <AddMovieDialog
+        open={adding}
+        onOpenChange={setAdding}
+        onOpenMovie={(id) => {
+          setAdding(false)
+          setSelected(id)
+        }}
       />
 
       {movies.isPending ? (
@@ -377,11 +408,17 @@ export function MoviesPage() {
           <Film className="size-8 text-content-subtle" aria-hidden="true" />
           <p className="font-medium">A biblioteca está vazia</p>
           <p className="max-w-md text-sm text-content-muted">
-            Importe os filmes do Radarr. Nada muda nele: o acervo-hub só lê a lista, os perfis e os arquivos.
+            Adicione filmes buscando no TMDB, ou importe os que o Radarr já tem.
           </p>
-          <Button variant="primary" onClick={() => importer.mutate()} loading={importer.isPending}>
-            Importar do Radarr
-          </Button>
+          <div className="flex flex-wrap justify-center gap-2">
+            <Button onClick={() => importer.mutate()} loading={importer.isPending}>
+              Importar do Radarr
+            </Button>
+            <Button variant="primary" onClick={() => setAdding(true)}>
+              <Plus aria-hidden="true" />
+              Adicionar filme
+            </Button>
+          </div>
         </div>
       ) : (
         <>
@@ -570,6 +607,144 @@ function Fact({ label, children }: { label: string; children: ReactNode }) {
   )
 }
 
+function RemoveMovieDialog({
+  movie,
+  open,
+  onOpenChange,
+  onRemoved,
+}: {
+  movie: Movie
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onRemoved: () => void
+}) {
+  const queryClient = useQueryClient()
+  const [deleteFiles, setDeleteFiles] = useState(false)
+  const [exclude, setExclude] = useState(false)
+  const remove = useMutation({
+    mutationFn: () => library.remove(movie.id, { apagar_arquivos: deleteFiles, excluir: exclude }),
+    onSuccess: () => {
+      toast.success(`${movie.titulo} removido`)
+      onRemoved()
+    },
+    onError: (error: Error) => toast.error(error.message),
+    onSettled: () => void queryClient.invalidateQueries({ queryKey: ['filmes'] }),
+  })
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Remover {movie.titulo}?</DialogTitle>
+          <DialogDescription>O filme sai da biblioteca{movie.do_radarr ? ' e do Radarr' : ''}.</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <Label htmlFor="remover-arquivos">Apagar a pasta do filme</Label>
+              <p className="font-mono text-xs break-all text-content-subtle">{movie.pasta}</p>
+            </div>
+            <Switch id="remover-arquivos" checked={deleteFiles} onCheckedChange={setDeleteFiles} />
+          </div>
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <Label htmlFor="remover-excluir">Nunca mais adicionar</Label>
+              <p className="text-xs text-content-subtle">Listas de importação não o trazem de volta.</p>
+            </div>
+            <Switch id="remover-excluir" checked={exclude} onCheckedChange={setExclude} />
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={() => onOpenChange(false)}>
+            Cancelar
+          </Button>
+          <Button variant="danger" loading={remove.isPending} onClick={() => remove.mutate()}>
+            <Trash2 aria-hidden="true" />
+            {deleteFiles ? 'Remover e apagar' : 'Remover'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function MovieSettings({ movie }: { movie: Movie }) {
+  const queryClient = useQueryClient()
+  const options = useQuery({ queryKey: ['biblioteca-opcoes'], queryFn: library.options })
+  const edit = useMutation({
+    mutationFn: (change: MovieChange) => library.edit(movie.id, change),
+    onSuccess: () => toast.success('Filme atualizado'),
+    onError: (error: Error) => toast.error(error.message),
+    onSettled: () => void queryClient.invalidateQueries({ queryKey: ['filmes'] }),
+  })
+  return (
+    <div className="grid gap-4 rounded-md border border-border p-4 sm:grid-cols-3">
+      <div className="flex items-center justify-between gap-3 sm:flex-col sm:items-start">
+        <Label htmlFor={`monitorado-${movie.id}`}>Monitorado</Label>
+        <Switch
+          id={`monitorado-${movie.id}`}
+          checked={movie.monitorado}
+          disabled={edit.isPending}
+          onCheckedChange={(on) => edit.mutate({ monitorado: on })}
+        />
+      </div>
+      <div className="grid gap-1.5">
+        <Label htmlFor={`perfil-${movie.id}`}>Perfil</Label>
+        <Select
+          value={movie.perfil ?? undefined}
+          disabled={edit.isPending || !options.data}
+          onValueChange={(perfil) => edit.mutate({ perfil })}
+        >
+          <SelectTrigger id={`perfil-${movie.id}`}>
+            <SelectValue placeholder="Sem perfil" />
+          </SelectTrigger>
+          <SelectContent>
+            {options.data?.perfis.map((p) => (
+              <SelectItem key={p.id} value={p.nome}>
+                {p.nome}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+      <div className="grid gap-1.5">
+        <Label htmlFor={`disponibilidade-${movie.id}`}>Pegar a partir de</Label>
+        <Select
+          value={movie.disponibilidade_minima ?? 'released'}
+          disabled={edit.isPending}
+          onValueChange={(disponibilidade_minima) => edit.mutate({ disponibilidade_minima })}
+        >
+          <SelectTrigger id={`disponibilidade-${movie.id}`}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {AVAILABILITIES.map((a) => (
+              <SelectItem key={a.value} value={a.value}>
+                {a.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+    </div>
+  )
+}
+
+function MovieHistory({ movie }: { movie: Movie }) {
+  const history = useQuery({
+    queryKey: ['historico', 'filme', movie.id],
+    queryFn: () => library.movieHistory(movie.id),
+  })
+  if (history.isPending) return <Skeleton className="h-20" />
+  if (history.isError)
+    return (
+      <p role="alert" className="text-sm text-danger">
+        {history.error.message}
+      </p>
+    )
+  if (history.data.eventos.length === 0) return <p className="text-sm text-content-subtle">Nada registrado ainda.</p>
+  return <HistoryList events={history.data.eventos} showMovie={false} />
+}
+
 function MovieDetails({
   movie,
   open,
@@ -579,11 +754,21 @@ function MovieDetails({
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
+  const queryClient = useQueryClient()
   const [grabbing, setGrabbing] = useState(false)
+  const [interactive, setInteractive] = useState(false)
+  const [removing, setRemoving] = useState(false)
+  const [showHistory, setShowHistory] = useState(false)
   const file = movie.arquivo
   const disk = file ? DISK[file.disco] : null
   const imdb = movie.imdb ? `https://www.imdb.com/title/${movie.imdb}/` : null
-  const canGrab = !file && movie.download?.estado !== 'downloading'
+  const downloading = movie.download?.estado === 'downloading'
+  const deleteFile = useMutation({
+    mutationFn: () => library.deleteFile(movie.id),
+    onSuccess: () => toast.success('Arquivo apagado'),
+    onError: (error: Error) => toast.error(error.message),
+    onSettled: () => void queryClient.invalidateQueries({ queryKey: ['filmes'] }),
+  })
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-3xl gap-0 p-0">
@@ -616,7 +801,6 @@ function MovieDetails({
                 <Fact label="Arquivo">{movie.monitorado ? 'Faltando' : 'Não monitorado'}</Fact>
               )}
               {movie.status && <Fact label="Lançamento">{STATUS[movie.status] ?? movie.status}</Fact>}
-              {movie.perfil && <Fact label="Perfil">{movie.perfil}</Fact>}
               {disk && file && (
                 <Fact label="Disco">
                   <span
@@ -648,24 +832,76 @@ function MovieDetails({
               </div>
             )}
           </div>
+          <div className="grid gap-4 sm:col-span-2">
+            <MovieSettings movie={movie} />
+            <div>
+              <button
+                type="button"
+                aria-expanded={showHistory}
+                onClick={() => setShowHistory((v) => !v)}
+                className="flex items-center gap-1.5 rounded-sm text-sm font-medium text-content-muted hover:text-content focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+              >
+                <ChevronRight
+                  className={cn(
+                    'size-4 transition-transform motion-reduce:transition-none',
+                    showHistory && 'rotate-90',
+                  )}
+                  aria-hidden="true"
+                />
+                Histórico do filme
+              </button>
+              {showHistory && (
+                <div className="mt-2">
+                  <MovieHistory movie={movie} />
+                </div>
+              )}
+            </div>
+          </div>
         </div>
-        <DialogFooter className="border-t border-border px-6 py-4">
-          {imdb && (
-            <Button asChild variant="ghost">
-              <a href={imdb} target="_blank" rel="noreferrer">
-                IMDb
-                <ExternalLink aria-hidden="true" />
-              </a>
+        <DialogFooter className="flex-wrap border-t border-border px-6 py-4 sm:justify-between">
+          <div className="flex flex-wrap gap-2">
+            <Button variant="ghost" onClick={() => setRemoving(true)}>
+              <Trash2 aria-hidden="true" />
+              Remover
             </Button>
-          )}
-          {canGrab && (
-            <Button variant="primary" onClick={() => setGrabbing(true)}>
-              <ArrowDownToLine aria-hidden="true" />
-              Pegar agora
+            {file && (
+              <Button variant="ghost" loading={deleteFile.isPending} onClick={() => deleteFile.mutate()}>
+                Apagar arquivo
+              </Button>
+            )}
+            {imdb && (
+              <Button asChild variant="ghost">
+                <a href={imdb} target="_blank" rel="noreferrer">
+                  IMDb
+                  <ExternalLink aria-hidden="true" />
+                </a>
+              </Button>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={() => setInteractive(true)}>
+              <ListFilter aria-hidden="true" />
+              Busca interativa
             </Button>
-          )}
+            {!downloading && (
+              <Button variant="primary" onClick={() => setGrabbing(true)}>
+                <ArrowDownToLine aria-hidden="true" />
+                {file ? 'Buscar versão melhor' : 'Pegar agora'}
+              </Button>
+            )}
+          </div>
         </DialogFooter>
-        {canGrab && <GrabDialog movie={movie} open={grabbing} onOpenChange={setGrabbing} />}
+        {!downloading && <GrabDialog movie={movie} open={grabbing} onOpenChange={setGrabbing} />}
+        <InteractiveSearch movie={movie} open={interactive} onOpenChange={setInteractive} />
+        <RemoveMovieDialog
+          movie={movie}
+          open={removing}
+          onOpenChange={setRemoving}
+          onRemoved={() => {
+            setRemoving(false)
+            onOpenChange(false)
+          }}
+        />
       </DialogContent>
     </Dialog>
   )

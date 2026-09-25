@@ -3,13 +3,22 @@ import { CircleCheck, CircleDashed, ExternalLink, KeyRound } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
 import { PageHeader } from '@/components/PageHeader'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { ExclusionsSection } from '@/pages/settings/Exclusions'
+import { FormatsSection } from '@/pages/settings/Formats'
+import { ListsSection } from '@/pages/settings/Lists'
+import { MigrationSection } from '@/pages/settings/Migration'
+import { NotificationsSection } from '@/pages/settings/Notifications'
+import { ProfilesSection } from '@/pages/settings/Profiles'
+import { OwnerCard, RulesSection, RulesSkeleton, useRules } from '@/pages/settings/Rules'
+import { SizesSection } from '@/pages/settings/Sizes'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Badge, Skeleton, Switch } from '@/components/ui/misc'
 import { api } from '@/lib/api'
 
-export function SettingsPage() {
+function GeneralSection() {
   const queryClient = useQueryClient()
   const settings = useQuery({ queryKey: ['configuracoes'], queryFn: api.configuration })
   const [key, setKey] = useState('')
@@ -40,15 +49,7 @@ export function SettingsPage() {
 
   return (
     <>
-      <PageHeader
-        title="Configurações"
-        description="O que o acervo-hub guarda no banco e se muda por aqui, sem reiniciar. Endereços, chaves de API dos gerenciadores e do cliente de download continuam no config.toml."
-      />
-
-      <section
-        aria-labelledby="tmdb-titulo"
-        className="max-w-2xl rounded-lg border border-border bg-surface p-6"
-      >
+      <section aria-labelledby="tmdb-titulo" className="max-w-2xl rounded-lg border border-border bg-surface p-6">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <h2 id="tmdb-titulo" className="text-lg font-semibold">
@@ -174,6 +175,103 @@ export function SettingsPage() {
           )}
         </div>
       </section>
+    </>
+  )
+}
+
+const TABS = [
+  { value: 'geral', label: 'Geral' },
+  { value: 'regras', label: 'Regras' },
+  { value: 'perfis', label: 'Perfis' },
+  { value: 'formatos', label: 'Formatos' },
+  { value: 'tamanhos', label: 'Tamanhos' },
+  { value: 'notificacoes', label: 'Notificações' },
+  { value: 'listas', label: 'Listas' },
+  { value: 'exclusoes', label: 'Exclusões' },
+  { value: 'migracao', label: 'Migração' },
+] as const
+
+type Tab = (typeof TABS)[number]['value']
+
+const TAB_KEY = 'acervo.configuracoes.aba'
+
+function storedTab(): Tab {
+  try {
+    const value = localStorage.getItem(TAB_KEY)
+    return TABS.some((t) => t.value === value) ? (value as Tab) : 'geral'
+  } catch {
+    return 'geral'
+  }
+}
+
+export function SettingsPage() {
+  const rules = useRules()
+  const [tab, setTab] = useState<Tab>(storedTab)
+  const editable = rules.data?.dono === 'acervo'
+  const hasRadarr = rules.data?.tem_radarr ?? false
+  const tabs = TABS.filter((t) => t.value !== 'migracao' || hasRadarr)
+  return (
+    <>
+      <PageHeader
+        title="Configurações"
+        description="O que o acervo-hub guarda no banco e se muda por aqui, sem reiniciar. Endereços e chaves do cliente de download e dos gerenciadores continuam no config.toml."
+      />
+      <div className="mb-6">
+        {rules.isPending ? (
+          <Skeleton className="h-28 rounded-lg" />
+        ) : rules.isError ? (
+          <div role="alert" className="flex flex-col items-start gap-3 rounded-lg border border-border bg-surface p-6">
+            <p className="text-sm text-danger">{rules.error.message}</p>
+            <Button onClick={() => void rules.refetch()}>Tentar novamente</Button>
+          </div>
+        ) : (
+          <OwnerCard view={rules.data} />
+        )}
+      </div>
+      <Tabs
+        value={tab}
+        onValueChange={(value) => {
+          setTab(value as Tab)
+          try {
+            localStorage.setItem(TAB_KEY, value)
+          } catch {
+            // Sem armazenamento, a aba só não é lembrada.
+          }
+        }}
+      >
+        <TabsList aria-label="Seções das configurações">
+          {tabs.map((t) => (
+            <TabsTrigger key={t.value} value={t.value}>
+              {t.label}
+            </TabsTrigger>
+          ))}
+        </TabsList>
+        <TabsContent value="geral">
+          <GeneralSection />
+        </TabsContent>
+        <TabsContent value="regras">{rules.data ? <RulesSection view={rules.data} /> : <RulesSkeleton />}</TabsContent>
+        <TabsContent value="perfis">
+          <ProfilesSection editable={editable} />
+        </TabsContent>
+        <TabsContent value="formatos">
+          <FormatsSection editable={editable} />
+        </TabsContent>
+        <TabsContent value="tamanhos">
+          <SizesSection editable={editable} />
+        </TabsContent>
+        <TabsContent value="notificacoes">
+          <NotificationsSection />
+        </TabsContent>
+        <TabsContent value="listas">
+          <ListsSection />
+        </TabsContent>
+        <TabsContent value="exclusoes">
+          <ExclusionsSection />
+        </TabsContent>
+        <TabsContent value="migracao">
+          <MigrationSection hasRadarr={hasRadarr} />
+        </TabsContent>
+      </Tabs>
     </>
   )
 }

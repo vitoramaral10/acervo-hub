@@ -1,11 +1,25 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Blocks, Brush, Film, Library, LogOut, Monitor, Moon, Search, Server, SlidersHorizontal, Sun } from 'lucide-react'
+import {
+  Activity,
+  Blocks,
+  Brush,
+  Film,
+  Library,
+  LogOut,
+  Monitor,
+  Moon,
+  Search,
+  Server,
+  SlidersHorizontal,
+  Sun,
+} from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Tooltip } from '@/components/ui/misc'
 import { api, isUnauthorized } from '@/lib/api'
 import { type Theme, saveTheme, storedTheme } from '@/lib/theme'
 import { cn } from '@/lib/utils'
+import { ActivityPage } from '@/pages/Activity'
 import { AppsPage } from '@/pages/Apps'
 import { CleanupPage } from '@/pages/Cleanup'
 import { IndexersPage } from '@/pages/Indexers'
@@ -14,9 +28,9 @@ import { MoviesPage } from '@/pages/Movies'
 import { SearchPage } from '@/pages/Search'
 import { SettingsPage } from '@/pages/Settings'
 
-type View = 'indexadores' | 'busca' | 'filmes' | 'aplicativos' | 'limpeza' | 'configuracoes'
+type View = 'filmes' | 'atividade' | 'busca' | 'indexadores' | 'aplicativos' | 'limpeza' | 'configuracoes'
 
-const VIEWS: View[] = ['filmes', 'busca', 'indexadores', 'aplicativos', 'limpeza', 'configuracoes']
+const VIEWS: View[] = ['filmes', 'atividade', 'busca', 'indexadores', 'aplicativos', 'limpeza', 'configuracoes']
 
 function viewFromHash(): View {
   const hash = window.location.hash.slice(1) as View
@@ -25,6 +39,7 @@ function viewFromHash(): View {
 
 const NAV: { view: View; label: string; icon: typeof Server }[] = [
   { view: 'filmes', label: 'Filmes', icon: Film },
+  { view: 'atividade', label: 'Atividade', icon: Activity },
   { view: 'busca', label: 'Busca', icon: Search },
   { view: 'indexadores', label: 'Indexadores', icon: Server },
   { view: 'aplicativos', label: 'Aplicativos', icon: Blocks },
@@ -126,6 +141,8 @@ export function App() {
             <SearchPage />
           ) : view === 'filmes' ? (
             <MoviesPage />
+          ) : view === 'atividade' ? (
+            <ActivityPage />
           ) : view === 'aplicativos' ? (
             <AppsPage />
           ) : view === 'limpeza' ? (
@@ -150,7 +167,11 @@ const THEMES: { value: Theme; label: string; icon: typeof Sun }[] = [
 function ThemeSwitcher() {
   const [theme, setTheme] = useState<Theme>(storedTheme)
   return (
-    <div role="radiogroup" aria-label="Tema" className="flex rounded-md border border-border p-0.5 md:mb-1 md:self-start">
+    <div
+      role="radiogroup"
+      aria-label="Tema"
+      className="flex rounded-md border border-border p-0.5 md:mb-1 md:self-start"
+    >
       {THEMES.map(({ value, label, icon: Icon }) => (
         <Tooltip key={value} content={label}>
           <button
