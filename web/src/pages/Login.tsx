@@ -1,5 +1,5 @@
 import { useMutation } from '@tanstack/react-query'
-import { KeyRound } from 'lucide-react'
+import { KeyRound, UserRound } from 'lucide-react'
 import { useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -7,12 +7,16 @@ import { Label } from '@/components/ui/label'
 import { api } from '@/lib/api'
 
 export function LoginPage({ onLoggedIn }: { onLoggedIn: () => void }) {
-  const [key, setKey] = useState('')
+  const [user, setUser] = useState('')
+  const [password, setPassword] = useState('')
   const [shownError, setShownError] = useState<string | null>(null)
   const login = useMutation({
     mutationFn: api.login,
     onSuccess: onLoggedIn,
-    onError: (error: Error) => setShownError(error.message),
+    onError: (error: Error) => {
+      setShownError(error.message)
+      setPassword('')
+    },
   })
 
   return (
@@ -30,39 +34,59 @@ export function LoginPage({ onLoggedIn }: { onLoggedIn: () => void }) {
           className="grid gap-5 rounded-lg border border-border bg-surface p-6 shadow-sm"
           onSubmit={(event) => {
             event.preventDefault()
-            if (!key.trim()) {
-              setShownError('Informe a chave de API.')
+            if (!user.trim() || !password) {
+              setShownError('Informe usuário e senha.')
               return
             }
             setShownError(null)
-            login.mutate(key.trim())
+            login.mutate({ usuario: user.trim(), senha: password })
           }}
         >
           <div className="grid gap-2">
-            <Label htmlFor="chave">Chave de API</Label>
+            <Label htmlFor="usuario">Usuário</Label>
             <div className="relative">
-              <KeyRound className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-content-subtle" aria-hidden="true" />
+              <UserRound
+                className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-content-subtle"
+                aria-hidden="true"
+              />
               <Input
-                id="chave"
-                type="password"
-                autoComplete="current-password"
+                id="usuario"
+                autoComplete="username"
+                autoCapitalize="none"
+                spellCheck={false}
                 autoFocus
-                value={key}
-                onChange={(event) => setKey(event.target.value)}
+                value={user}
+                onChange={(event) => setUser(event.target.value)}
                 aria-invalid={shownError ? true : undefined}
-                aria-describedby="chave-ajuda chave-erro"
+                aria-describedby={shownError ? 'entrada-erro' : undefined}
                 className="pl-9"
               />
             </div>
-            <p id="chave-ajuda" className="text-xs text-content-subtle">
-              A mesma de <code className="font-mono">server.api_key</code> no <code className="font-mono">config.toml</code>.
-            </p>
-            {shownError && (
-              <p id="chave-erro" role="alert" className="text-sm text-danger">
-                {shownError}
-              </p>
-            )}
           </div>
+          <div className="grid gap-2">
+            <Label htmlFor="senha">Senha</Label>
+            <div className="relative">
+              <KeyRound
+                className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-content-subtle"
+                aria-hidden="true"
+              />
+              <Input
+                id="senha"
+                type="password"
+                autoComplete="current-password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                aria-invalid={shownError ? true : undefined}
+                aria-describedby={shownError ? 'entrada-erro' : undefined}
+                className="pl-9"
+              />
+            </div>
+          </div>
+          {shownError && (
+            <p id="entrada-erro" role="alert" className="-mt-1 text-sm text-danger">
+              {shownError}
+            </p>
+          )}
           <Button type="submit" variant="primary" size="lg" loading={login.isPending} className="w-full">
             Entrar
           </Button>

@@ -73,10 +73,16 @@ managed_categories = ["tv-sonarr", "radarr"]
 # Onde os strikes sobrevivem ao reinício do processo. Sem isso, três strikes
 # nunca se completam.
 ledger = "~/.local/state/acervo-hub/strikes.json"
-# Catálogo de filmes (SQLite). Sem valor, `acervo.db` ao lado do ledger.
-# `acervo-hub movies import --apply` o preenche a partir das `[[instances]]`
-# de filmes; `acervo-hub movies check` confere cada arquivo contra o disco.
-# database = "~/.local/state/acervo-hub/acervo.db"
+
+# Postgres do catálogo de filmes e das contas da interface. As tabelas são
+# criadas na primeira conexão. `acervo-hub movies import --apply` preenche o
+# catálogo a partir das `[[instances]]` de filmes; `acervo-hub movies check`
+# confere cada arquivo contra o disco. Contas da interface:
+#   echo 'senha-longa' | acervo-hub users set <nome>
+# Sem esta seção, `serve` sobe e serve os indexadores, mas ninguém entra pela
+# tela — só a chave de API no cabeçalho `X-Api-Key`.
+[database]
+url = "postgres://acervo:TROQUE@localhost:5432/acervo"
 
 # --- Superfície Torznab (`acervo-hub serve`) --------------------------------
 #

@@ -47,9 +47,12 @@ fancy-regex = "0.19"
 unicode-normalization = "0.1"
 futures = "0.3"
 quick-xml = "0.38"
-# SQLite compilado junto (`bundled`): nada de biblioteca do sistema, e o build
-# estático musl segue funcionando com o musl-gcc do estágio de build.
-rusqlite = { version = "0.40", features = ["bundled"] }
+# Postgres em Rust puro, sem libpq: o build estático musl continua. Sem TLS
+# porque o banco fica na rede interna do Docker.
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+deadpool-postgres = "0.14"
+argon2 = { version = "0.5", features = ["std"] }
+sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
@@ -79,6 +82,24 @@ wiremock = "0.6"
 strip = "symbols"
 lto = true
 codegen-units = 1
+
+# Hash sem otimização leva segundos: o argon2 das senhas e o SCRAM de cada
+# conexão com o Postgres deixariam os testes lentos à toa. Só esses pacotes
+# compilam otimizados no perfil de dev.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.hmac]
+opt-level = 3
+
+[profile.dev.package.postgres-protocol]
+opt-level = 3
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

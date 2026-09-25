@@ -2,10 +2,11 @@
 //! manual.
 //!
 //! Uma página estática com JS simples, servida pelo próprio binário, e uma
-//! API JSON por baixo. A autenticação é a mesma chave da superfície Torznab,
-//! guardada num cookie `HttpOnly` + `SameSite=Strict` depois da entrada. Toda
-//! ação que muda estado exige o cabeçalho `X-Acervo`, que um formulário de
-//! outra origem não consegue mandar.
+//! API JSON por baixo. A entrada é por usuário e senha: ela abre uma sessão
+//! cujo token vai num cookie `HttpOnly` + `SameSite=Strict`. Script e
+//! automação podem, em vez disso, mandar a chave da superfície Torznab em
+//! `X-Api-Key`. Toda ação que muda estado exige o cabeçalho `X-Acervo`, que
+//! um formulário de outra origem não consegue mandar.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -139,6 +140,33 @@ pub trait Admin: Send + Sync + std::fmt::Debug {
     ///
     /// Catálogo vazio ou gerenciador de filmes inalcançável.
     async fn shadow(&self, limit: usize) -> Result<serde_json::Value, String>;
+}
+
+/// Contas da interface: confere usuário e senha e guarda as sessões.
+///
+/// Mensagens de erro vão para o log, não para a tela.
+#[async_trait]
+pub trait Accounts: Send + Sync + std::fmt::Debug {
+    /// Token de uma sessão nova, se usuário e senha batem.
+    ///
+    /// # Errors
+    ///
+    /// Banco inalcançável — senha errada é `Ok(None)`.
+    async fn login(&self, user: &str, password: &str) -> Result<Option<String>, String>;
+
+    /// Dono da sessão, se ela existe e não venceu.
+    ///
+    /// # Errors
+    ///
+    /// Banco inalcançável.
+    async fn session_user(&self, token: &str) -> Result<Option<String>, String>;
+
+    /// Encerra a sessão.
+    ///
+    /// # Errors
+    ///
+    /// Banco inalcançável.
+    async fn logout(&self, token: &str) -> Result<(), String>;
 }
 
 /// Uma definição do catálogo, como a tela a lista.
@@ -276,40 +304,61 @@ fn unauthorized() -> UiError {
     )
 }
 
-fn session_key(headers: &HeaderMap) -> Option<String> {
+fn session_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(';'))
         .filter_map(|pair| pair.trim().split_once('='))
-        .find(|(name, _)| *name == COOKIE)
-        .and_then(|(_, value)| {
-            url::form_urlencoded::parse(format!("v={value}").as_bytes())
-                .next()
-                .map(|(_, decoded)| decoded.into_owned())
-        })
-        .or_else(|| {
-            headers
-                .get("x-api-key")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned)
-        })
+        .find(|(name, value)| *name == COOKIE && !value.is_empty())
+        .map(|(_, value)| value)
 }
 
-/// Sessão válida e, se a ação muda estado, o cabeçalho anti-CSRF presente.
-fn guard(server: &Server, headers: &HeaderMap, method: &Method) -> Result<(), UiError> {
-    let presented = session_key(headers).unwrap_or_default();
-    if !constant_time_eq(presented.as_bytes(), server.api_key.as_bytes()) {
-        return Err(unauthorized());
-    }
+fn missing_csrf() -> UiError {
+    UiError(
+        StatusCode::FORBIDDEN,
+        "requisição sem o cabeçalho da interface".into(),
+    )
+}
+
+fn accounts_down(error: &str) -> UiError {
+    tracing::warn!(%error, "contas da interface inalcançáveis");
+    UiError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "o banco de contas não respondeu; tente de novo em instantes".into(),
+    )
+}
+
+/// Quem fez a requisição: o usuário da sessão, ou `None` se veio com a chave
+/// de API. Se a ação muda estado, exige também o cabeçalho anti-CSRF.
+async fn guard(
+    server: &Server,
+    headers: &HeaderMap,
+    method: &Method,
+) -> Result<Option<String>, UiError> {
+    let user = if let Some(key) = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+    {
+        if !constant_time_eq(key.as_bytes(), server.api_key.as_bytes()) {
+            return Err(unauthorized());
+        }
+        None
+    } else {
+        let (Some(token), Some(accounts)) = (session_token(headers), &server.accounts) else {
+            return Err(unauthorized());
+        };
+        match accounts.session_user(token).await {
+            Ok(Some(user)) => Some(user),
+            Ok(None) => return Err(unauthorized()),
+            Err(error) => return Err(accounts_down(&error)),
+        }
+    };
     if method != Method::GET && headers.get(CSRF_HEADER).is_none() {
-        return Err(UiError(
-            StatusCode::FORBIDDEN,
-            "requisição sem o cabeçalho da interface".into(),
-        ));
+        return Err(missing_csrf());
     }
-    Ok(())
+    Ok(user)
 }
 
 fn secure_cookie(headers: &HeaderMap) -> bool {
@@ -321,7 +370,8 @@ fn secure_cookie(headers: &HeaderMap) -> bool {
 
 #[derive(Deserialize)]
 struct LoginBody {
-    chave: String,
+    usuario: String,
+    senha: String,
 }
 
 async fn login(
@@ -330,37 +380,53 @@ async fn login(
     Json(body): Json<LoginBody>,
 ) -> Result<Response, UiError> {
     if headers.get(CSRF_HEADER).is_none() {
+        return Err(missing_csrf());
+    }
+    let Some(accounts) = &server.accounts else {
         return Err(UiError(
-            StatusCode::FORBIDDEN,
-            "requisição sem o cabeçalho da interface".into(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "nenhum banco de contas configurado: defina [database] no config.toml".into(),
         ));
-    }
-    if !constant_time_eq(body.chave.trim().as_bytes(), server.api_key.as_bytes()) {
-        // Atraso fixo: tentativa às cegas fica cara sem precisar de estado.
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        return Err(UiError(StatusCode::UNAUTHORIZED, "chave incorreta".into()));
-    }
-    let value: String = url::form_urlencoded::byte_serialize(server.api_key.as_bytes()).collect();
+    };
+    let token = match accounts.login(body.usuario.trim(), &body.senha).await {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            // Atraso fixo, somado ao custo do argon2: tentativa às cegas fica
+            // cara sem precisar de estado.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            return Err(UiError(
+                StatusCode::UNAUTHORIZED,
+                "usuário ou senha incorretos".into(),
+            ));
+        }
+        Err(error) => return Err(accounts_down(&error)),
+    };
     let secure = if secure_cookie(&headers) {
         "; Secure"
     } else {
         ""
     };
+    let max_age = 60 * 60 * 24 * 30;
     let cookie =
-        format!("{COOKIE}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000{secure}");
-    let mut response = ok(json!({ "ok": true }));
+        format!("{COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}");
+    let mut response = ok(json!({ "ok": true, "usuario": body.usuario.trim() }));
     if let Ok(cookie) = HeaderValue::from_str(&cookie) {
         response.headers_mut().insert(header::SET_COOKIE, cookie);
     }
     Ok(response)
 }
 
-async fn logout(headers: HeaderMap) -> Result<Response, UiError> {
+async fn logout(
+    State(server): State<Arc<Server>>,
+    headers: HeaderMap,
+) -> Result<Response, UiError> {
     if headers.get(CSRF_HEADER).is_none() {
-        return Err(UiError(
-            StatusCode::FORBIDDEN,
-            "requisição sem o cabeçalho da interface".into(),
-        ));
+        return Err(missing_csrf());
+    }
+    if let (Some(token), Some(accounts)) = (session_token(&headers), &server.accounts)
+        && let Err(error) = accounts.logout(token).await
+    {
+        return Err(accounts_down(&error));
     }
     let mut response = ok(json!({ "ok": true }));
     response.headers_mut().insert(
@@ -374,8 +440,8 @@ async fn session(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::GET)?;
-    Ok(ok(json!({ "ok": true })))
+    let user = guard(&server, &headers, &Method::GET).await?;
+    Ok(ok(json!({ "ok": true, "usuario": user })))
 }
 
 fn timestamp(value: Option<time::OffsetDateTime>) -> serde_json::Value {
@@ -416,7 +482,7 @@ async fn indexers(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::GET)?;
+    guard(&server, &headers, &Method::GET).await?;
     let mut list: Vec<_> = server
         .catalog
         .views()
@@ -456,7 +522,7 @@ async fn add_indexer(
     headers: HeaderMap,
     Json(body): Json<AddBody>,
 ) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::POST)?;
+    guard(&server, &headers, &Method::POST).await?;
     let entry = admin(&server)?
         .add(&body.definicao, body.settings)
         .await
@@ -475,7 +541,7 @@ async fn remove_indexer(
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::DELETE)?;
+    guard(&server, &headers, &Method::DELETE).await?;
     admin(&server)?
         .remove(&name)
         .await
@@ -495,7 +561,7 @@ async fn set_enabled(
     headers: HeaderMap,
     Json(body): Json<EnabledBody>,
 ) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::PUT)?;
+    guard(&server, &headers, &Method::PUT).await?;
     let entry = admin(&server)?
         .set_enabled(&name, body.ativo)
         .await
@@ -517,7 +583,7 @@ async fn definitions(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::GET)?;
+    guard(&server, &headers, &Method::GET).await?;
     Ok(ok(json!({ "definicoes": admin(&server)?.definitions() })))
 }
 
@@ -526,7 +592,7 @@ async fn definition_settings(
     Path(definition): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::GET)?;
+    guard(&server, &headers, &Method::GET).await?;
     let views = admin(&server)?
         .definition_settings(&definition)
         .ok_or_else(|| {
@@ -539,7 +605,7 @@ async fn definition_settings(
 }
 
 async fn apps(State(server): State<Arc<Server>>, headers: HeaderMap) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::GET)?;
+    guard(&server, &headers, &Method::GET).await?;
     Ok(ok(json!({ "aplicativos": admin(&server)?.apps() })))
 }
 
@@ -554,7 +620,7 @@ async fn sync(
     headers: HeaderMap,
     Json(body): Json<SyncBody>,
 ) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::POST)?;
+    guard(&server, &headers, &Method::POST).await?;
     let indexers = server
         .catalog
         .views()
@@ -572,7 +638,7 @@ async fn last_cycle(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::GET)?;
+    guard(&server, &headers, &Method::GET).await?;
     Ok(ok(json!({ "ultimo": admin(&server)?.last_cycle() })))
 }
 
@@ -580,7 +646,7 @@ async fn simulate_cycle(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::POST)?;
+    guard(&server, &headers, &Method::POST).await?;
     let report = admin(&server)?
         .simulate_cycle()
         .await
@@ -592,7 +658,7 @@ async fn movies(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::GET)?;
+    guard(&server, &headers, &Method::GET).await?;
     let list = admin(&server)?
         .movies()
         .await
@@ -605,7 +671,7 @@ async fn import_movies(
     headers: HeaderMap,
     Json(body): Json<SyncBody>,
 ) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::POST)?;
+    guard(&server, &headers, &Method::POST).await?;
     let report = admin(&server)?
         .import_movies(body.aplicar)
         .await
@@ -628,7 +694,7 @@ async fn shadow(
     headers: HeaderMap,
     Json(body): Json<ShadowBody>,
 ) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::POST)?;
+    guard(&server, &headers, &Method::POST).await?;
     let report = admin(&server)?
         .shadow(body.limite.clamp(1, 20))
         .await
@@ -648,7 +714,7 @@ async fn test(
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::POST)?;
+    guard(&server, &headers, &Method::POST).await?;
     Ok(ok(test_result(server.catalog.test(&name).await)))
 }
 
@@ -666,7 +732,7 @@ async fn settings(
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::GET)?;
+    guard(&server, &headers, &Method::GET).await?;
     let views = admin(&server)?.settings(&name).ok_or_else(|| {
         UiError(
             StatusCode::NOT_FOUND,
@@ -682,7 +748,7 @@ async fn update_settings(
     headers: HeaderMap,
     Json(values): Json<BTreeMap<String, String>>,
 ) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::PUT)?;
+    guard(&server, &headers, &Method::PUT).await?;
     let entry = admin(&server)?
         .update(&name, values)
         .await
@@ -732,7 +798,7 @@ async fn search(
     headers: HeaderMap,
     Query(params): Query<SearchParams>,
 ) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::GET)?;
+    guard(&server, &headers, &Method::GET).await?;
     let categories: Vec<u32> = params
         .cat
         .as_deref()
@@ -798,7 +864,7 @@ async fn download(
     headers: HeaderMap,
     Query(params): Query<DownloadParams>,
 ) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::GET)?;
+    guard(&server, &headers, &Method::GET).await?;
     let link = url::Url::parse(&params.link)
         .map_err(|_| UiError(StatusCode::BAD_REQUEST, "link inválido".into()))?;
     let torrent = server

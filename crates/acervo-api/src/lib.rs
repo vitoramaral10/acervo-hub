@@ -21,7 +21,7 @@ use axum::routing::get;
 use time::OffsetDateTime;
 
 pub use catalog::{ALL, Catalog, CatalogError, Entry, Health, IndexerView, Page, UI};
-pub use ui::{Admin, DefinitionView, SettingView};
+pub use ui::{Accounts, Admin, DefinitionView, SettingView};
 
 /// Erros do contrato Torznab, com os códigos que os consumidores entendem.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -80,6 +80,7 @@ struct Server {
     catalog: Catalog,
     api_key: String,
     admin: Option<Arc<dyn Admin>>,
+    accounts: Option<Arc<dyn Accounts>>,
 }
 
 impl std::fmt::Debug for Server {
@@ -89,6 +90,7 @@ impl std::fmt::Debug for Server {
             .field("catalog", &self.catalog)
             .field("api_key", &"<redacted>")
             .field("admin", &self.admin)
+            .field("accounts", &self.accounts)
             .finish()
     }
 }
@@ -99,20 +101,23 @@ impl std::fmt::Debug for Server {
 /// A chave vale para todos os indexadores e é aceita em `apikey` ou no
 /// cabeçalho `X-Api-Key`, como os consumidores mandam.
 pub fn router(catalog: Catalog, api_key: impl Into<String>) -> Router {
-    router_with_admin(catalog, api_key, None)
+    router_with_admin(catalog, api_key, None, None)
 }
 
 /// Como [`router`], com a interface podendo reconfigurar indexadores por meio
-/// de `admin`. Sem ele, a interface lista, testa e busca, mas não edita.
+/// de `admin`. Sem ele, a interface lista, testa e busca, mas não edita. Sem
+/// `accounts`, ninguém entra pela tela: só vale a chave em `X-Api-Key`.
 pub fn router_with_admin(
     catalog: Catalog,
     api_key: impl Into<String>,
     admin: Option<Arc<dyn Admin>>,
+    accounts: Option<Arc<dyn Accounts>>,
 ) -> Router {
     let server = Arc::new(Server {
         catalog,
         api_key: api_key.into(),
         admin,
+        accounts,
     });
     Router::new()
         .route("/health", get(|| async { "ok" }))

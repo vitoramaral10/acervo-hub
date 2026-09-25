@@ -12,6 +12,22 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # Os testes do catálogo e das contas rodam contra um Postgres de verdade;
+    # sem `ACERVO_TEST_DATABASE_URL` eles avisam e passam.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: teste
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ACERVO_TEST_DATABASE_URL: postgres://postgres:teste@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v5
 

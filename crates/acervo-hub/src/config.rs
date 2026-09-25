@@ -39,6 +39,25 @@ pub struct Config {
     pub server: Option<ServerConfig>,
     #[serde(default)]
     pub indexers: Vec<IndexerConfig>,
+    /// Banco do catálogo de filmes e das contas da interface.
+    #[serde(default)]
+    pub database: Option<DatabaseConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseConfig {
+    /// `postgres://usuário:senha@host:5432/banco`.
+    pub url: String,
+}
+
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // O endereço carrega a senha do banco.
+        formatter
+            .debug_struct("DatabaseConfig")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,9 +181,6 @@ pub struct StateConfig {
     /// Indexadores adicionados e desativados pela interface web.
     #[serde(default = "default_registry_path")]
     pub registry: PathBuf,
-    /// Catálogo (SQLite). Sem valor, fica ao lado do ledger.
-    #[serde(default)]
-    pub database: Option<PathBuf>,
 }
 
 impl Default for StateConfig {
@@ -173,7 +189,6 @@ impl Default for StateConfig {
             ledger: default_ledger_path(),
             credentials: default_credentials_path(),
             registry: default_registry_path(),
-            database: None,
         }
     }
 }
@@ -183,15 +198,6 @@ impl StateConfig {
     #[must_use]
     pub fn last_cycle(&self) -> PathBuf {
         expand_tilde(&self.ledger).with_file_name("ultimo-ciclo.json")
-    }
-
-    /// Arquivo do catálogo.
-    #[must_use]
-    pub fn database(&self) -> PathBuf {
-        self.database.as_deref().map_or_else(
-            || expand_tilde(&self.ledger).with_file_name("acervo.db"),
-            expand_tilde,
-        )
     }
 }
 
@@ -302,6 +308,21 @@ impl Config {
 
     /// O que `serve` exige.
     ///
+    /// Conecta ao banco do catálogo e das contas, aplicando as migrações.
+    ///
+    /// # Errors
+    ///
+    /// Sem `[database]`, ou banco inalcançável.
+    pub async fn store(&self) -> Result<acervo_store::Store> {
+        let database = self
+            .database
+            .as_ref()
+            .context("seção `[database]` ausente: catálogo e contas precisam do Postgres")?;
+        acervo_store::Store::connect(&database.url)
+            .await
+            .context("conectando ao banco")
+    }
+
     /// # Errors
     ///
     /// Sem `[server]`, chave curta demais ou nenhum indexador.

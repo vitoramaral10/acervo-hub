@@ -62,6 +62,11 @@ enum Command {
         #[command(subcommand)]
         action: MoviesAction,
     },
+    /// Contas da interface web.
+    Users {
+        #[command(subcommand)]
+        action: UsersAction,
+    },
     /// Busca manual nos indexadores configurados.
     Search {
         /// Termo da busca.
@@ -97,6 +102,60 @@ enum MoviesAction {
         #[arg(long)]
         report: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum UsersAction {
+    /// Cria o usuário ou troca a senha dele, lida da entrada padrão (uma
+    /// linha). Trocar a senha encerra as sessões abertas.
+    Set {
+        /// Nome de usuário.
+        name: String,
+    },
+    /// Remove o usuário e as sessões dele.
+    Remove {
+        /// Nome de usuário.
+        name: String,
+    },
+    /// Lista os usuários.
+    List,
+}
+
+/// Senha da entrada padrão, sem o fim de linha. Nunca vem por argumento:
+/// argumento aparece em `ps` e no histórico do shell.
+fn read_password() -> Result<String> {
+    use std::io::{BufRead, IsTerminal};
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        eprint!("Senha (aparece ao digitar): ");
+    }
+    let mut line = String::new();
+    stdin.lock().read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+async fn users(config: &config::Config, action: UsersAction) -> Result<()> {
+    let store = config.store().await?;
+    match action {
+        UsersAction::Set { name } => {
+            let password = read_password()?;
+            store.set_password(&name, &password).await?;
+            println!("senha de `{}` gravada", name.trim());
+        }
+        UsersAction::Remove { name } => {
+            if store.remove_user(&name).await? {
+                println!("`{name}` removido");
+            } else {
+                anyhow::bail!("`{name}` não existe");
+            }
+        }
+        UsersAction::List => {
+            for name in store.users().await? {
+                println!("{name}");
+            }
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -141,17 +200,24 @@ async fn run() -> Result<ExitCode> {
                 ExitCode::SUCCESS
             });
         }
+        Command::Users { action } => {
+            users(&config, action).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
         Command::Movies { action } => {
+            let store = config.store().await?;
             let failed = match action {
-                MoviesAction::Import { apply } => movies::import(&config, apply, true)
+                MoviesAction::Import { apply } => movies::import(&config, &store, apply, true)
                     .await?
                     .iter()
                     .any(|instance| instance.erro.is_some()),
-                MoviesAction::Check => movies::check(&config).await? > 0,
-                MoviesAction::Shadow { report: true, .. } => shadow::report(&config).await? > 0,
+                MoviesAction::Check => movies::check(&config, &store).await? > 0,
+                MoviesAction::Shadow { report: true, .. } => {
+                    shadow::report(&config, &store).await? > 0
+                }
                 MoviesAction::Shadow { limit, .. } => {
                     let catalog = acervo_api::Catalog::new(serve::entries(&config).await?)?;
-                    shadow::run(&config, &catalog, limit, true)
+                    shadow::run(&config, &store, &catalog, limit, true)
                         .await?
                         .iter()
                         .any(|line| line.erro.is_some())

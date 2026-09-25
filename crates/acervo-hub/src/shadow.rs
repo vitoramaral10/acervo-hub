@@ -230,14 +230,6 @@ fn movie_client(config: &Config) -> Result<ArrClient> {
     )?)
 }
 
-fn load_store(config: &Config) -> Result<Store> {
-    let database = config.state.database();
-    if !database.exists() {
-        bail!("catálogo vazio: rode `movies import --apply` antes");
-    }
-    Store::open(&database).with_context(|| format!("abrindo o catálogo `{}`", database.display()))
-}
-
 #[derive(Debug, Serialize)]
 pub struct ShadowLine {
     pub filme: String,
@@ -278,6 +270,7 @@ fn summarize(decisions: &[Decision], movie: i64) -> Vec<(String, usize)> {
 #[allow(clippy::too_many_lines)]
 pub async fn run(
     config: &Config,
+    store: &Store,
     catalog: &Catalog,
     limit: usize,
     print: bool,
@@ -298,19 +291,15 @@ pub async fn run(
         indexers: remote_indexers,
     };
 
-    let database = config.state.database();
-    let (catalog_movies, stored_profiles, definitions, latest) =
-        tokio::task::spawn_blocking(move || -> Result<_> {
-            let store = load_store_at(&database)?;
-            Ok((
-                store.movies()?,
-                store.profiles()?,
-                store.quality_definitions()?,
-                store.latest_shadow_runs()?,
-            ))
-        })
-        .await
-        .context("leitura interrompida")??;
+    let (catalog_movies, stored_profiles, definitions, latest) = tokio::try_join!(
+        store.movies(),
+        store.profiles(),
+        store.quality_definitions(),
+        store.latest_shadow_runs(),
+    )?;
+    if catalog_movies.is_empty() {
+        bail!("catálogo vazio: rode `movies import --apply` antes");
+    }
 
     let now = time::OffsetDateTime::now_utc();
     let profiles: BTreeMap<String, Profile> = stored_profiles
@@ -444,24 +433,10 @@ pub async fn run(
         lines.push(line);
     }
 
-    let database = config.state.database();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut store = load_store_at(&database)?;
-        for run in &runs {
-            store.record_shadow(run)?;
-        }
-        Ok(())
-    })
-    .await
-    .context("gravação interrompida")??;
-    Ok(lines)
-}
-
-fn load_store_at(database: &Path) -> Result<Store> {
-    if !database.exists() {
-        bail!("catálogo vazio: rode `movies import --apply` antes");
+    for run in &runs {
+        store.record_shadow(run).await?;
     }
-    Store::open(database).with_context(|| format!("abrindo o catálogo `{}`", database.display()))
+    Ok(lines)
 }
 
 fn now_rfc3339() -> String {
@@ -509,12 +484,9 @@ pub enum Verdict {
 /// # Errors
 ///
 /// Catálogo vazio ou gerenciador inalcançável.
-pub async fn report(config: &Config) -> Result<usize> {
+pub async fn report(config: &Config, store: &Store) -> Result<usize> {
     let client = movie_client(config)?;
-    let store = load_store(config)?;
-    let movies = store.movies()?;
-    let latest = store.latest_shadow_runs()?;
-    drop(store);
+    let (movies, latest) = tokio::try_join!(store.movies(), store.latest_shadow_runs())?;
 
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     for run in &latest {

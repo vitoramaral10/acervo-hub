@@ -1,32 +1,38 @@
-//! Catálogo persistente: filmes, o arquivo de cada um e os perfis de
-//! qualidade, num arquivo SQLite.
+//! Catálogo persistente: filmes, o arquivo de cada um, os perfis de
+//! qualidade e as contas da interface, num banco Postgres.
 //!
 //! Nesta etapa o catálogo é um espelho do gerenciador de filmes em produção,
 //! importado pela API dele. A importação roda numa transação: a simulação faz
 //! o mesmo trabalho e desfaz no fim, então o que ela relata é exatamente o que
 //! a aplicação faria.
 
+mod accounts;
+
 use std::collections::BTreeSet;
-use std::path::Path;
 
 use acervo_parser::{Quality, QualityModel, Revision};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use deadpool_postgres::{GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod};
 use serde::{Deserialize, Serialize};
+use tokio_postgres::{NoTls, Row};
+
+pub use accounts::SESSION_DAYS;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("banco de dados: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Postgres(#[from] tokio_postgres::Error),
 
-    #[error("criando o diretório de `{path}`: {source}")]
-    Directory {
-        path: String,
-        #[source]
-        source: std::io::Error,
-    },
+    #[error("conexão com o banco: {0}")]
+    Pool(#[from] deadpool_postgres::PoolError),
+
+    #[error("endereço do banco inválido: {0}")]
+    Url(String),
 
     #[error("registro inconsistente no banco: {0}")]
     Corrupt(String),
+
+    #[error("senha: {0}")]
+    Password(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -161,19 +167,21 @@ pub struct ImportSummary {
     pub applied: bool,
 }
 
-const MIGRATIONS: &[&str] = &[
-    r"
+/// Cada migração roda uma vez, na ordem; a posição é a versão.
+const MIGRATIONS: &[&str] = &[r"
     CREATE TABLE quality_profiles (
-        id INTEGER PRIMARY KEY,
+        id BIGSERIAL PRIMARY KEY,
         name TEXT NOT NULL UNIQUE,
-        upgrade_allowed INTEGER NOT NULL,
+        upgrade_allowed BOOLEAN NOT NULL,
         cutoff INTEGER,
         language TEXT,
-        items TEXT NOT NULL
+        items JSONB NOT NULL,
+        min_format_score INTEGER NOT NULL DEFAULT 0,
+        cutoff_format_score INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE movies (
-        id INTEGER PRIMARY KEY,
-        tmdb_id INTEGER NOT NULL UNIQUE,
+        id BIGSERIAL PRIMARY KEY,
+        tmdb_id BIGINT NOT NULL UNIQUE,
         imdb_id TEXT,
         title TEXT NOT NULL,
         original_title TEXT,
@@ -181,106 +189,147 @@ const MIGRATIONS: &[&str] = &[
         year INTEGER,
         status TEXT,
         minimum_availability TEXT,
-        monitored INTEGER NOT NULL,
-        quality_profile_id INTEGER REFERENCES quality_profiles(id),
+        monitored BOOLEAN NOT NULL,
+        quality_profile_id BIGINT REFERENCES quality_profiles(id),
         path TEXT NOT NULL,
         added TEXT,
         source TEXT,
-        source_id INTEGER
+        source_id BIGINT,
+        runtime INTEGER NOT NULL DEFAULT 0,
+        secondary_year INTEGER,
+        clean_title TEXT,
+        available BOOLEAN NOT NULL DEFAULT FALSE
     );
     CREATE TABLE movie_files (
-        movie_id INTEGER PRIMARY KEY REFERENCES movies(id) ON DELETE CASCADE,
+        movie_id BIGINT PRIMARY KEY REFERENCES movies(id) ON DELETE CASCADE,
         relative_path TEXT NOT NULL,
-        size INTEGER NOT NULL,
-        quality INTEGER NOT NULL,
-        revision_version INTEGER NOT NULL,
-        revision_real INTEGER NOT NULL,
-        is_repack INTEGER NOT NULL,
-        languages TEXT NOT NULL,
+        size BIGINT NOT NULL,
+        quality SMALLINT NOT NULL,
+        revision_version SMALLINT NOT NULL,
+        revision_real SMALLINT NOT NULL,
+        is_repack BOOLEAN NOT NULL,
+        languages JSONB NOT NULL,
         release_group TEXT,
         edition TEXT,
         scene_name TEXT,
         date_added TEXT
     );
-",
-    r"
-    ALTER TABLE movies ADD COLUMN runtime INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE movies ADD COLUMN secondary_year INTEGER;
-    ALTER TABLE movies ADD COLUMN clean_title TEXT;
-    ALTER TABLE movies ADD COLUMN available INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE quality_profiles ADD COLUMN min_format_score INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE quality_profiles ADD COLUMN cutoff_format_score INTEGER NOT NULL DEFAULT 0;
     CREATE TABLE movie_titles (
-        movie_id INTEGER NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+        id BIGSERIAL PRIMARY KEY,
+        movie_id BIGINT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
         title TEXT NOT NULL
     );
     CREATE INDEX movie_titles_by_movie ON movie_titles(movie_id);
     CREATE TABLE quality_definitions (
-        quality INTEGER PRIMARY KEY,
-        min_size REAL,
-        max_size REAL,
-        preferred_size REAL
+        quality SMALLINT PRIMARY KEY,
+        min_size DOUBLE PRECISION,
+        max_size DOUBLE PRECISION,
+        preferred_size DOUBLE PRECISION
     );
-",
-    r"
     CREATE TABLE shadow_runs (
-        id INTEGER PRIMARY KEY,
-        movie_id INTEGER NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+        id BIGSERIAL PRIMARY KEY,
+        movie_id BIGINT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
         at TEXT NOT NULL,
-        releases INTEGER NOT NULL,
+        releases BIGINT NOT NULL,
         pick_title TEXT,
         pick_indexer TEXT,
-        pick_quality INTEGER,
-        pick_size INTEGER,
-        rejections TEXT NOT NULL,
+        pick_quality SMALLINT,
+        pick_size BIGINT,
+        rejections JSONB NOT NULL,
         error TEXT
     );
     CREATE INDEX shadow_runs_by_movie ON shadow_runs(movie_id, at);
-",
-];
+    CREATE TABLE users (
+        name TEXT PRIMARY KEY,
+        password_hash TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE sessions (
+        token_hash BYTEA PRIMARY KEY,
+        user_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        expires_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE INDEX sessions_by_expiry ON sessions(expires_at);
+"];
 
-#[derive(Debug)]
+/// Chave do lock consultivo que serializa as migrações: o serviço e um
+/// comando avulso podem subir juntos.
+const MIGRATION_LOCK: i64 = 0x6163_6572_766f; // "acervo"
+
+/// Conexões com o banco. Clonar é barato e divide o mesmo pool.
+#[derive(Clone)]
 pub struct Store {
-    connection: Connection,
+    pool: Pool,
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A configuração do pool carrega a senha do banco.
+        formatter.debug_struct("Store").finish_non_exhaustive()
+    }
 }
 
 impl Store {
-    /// Abre (ou cria) o banco e aplica as migrações pendentes.
+    /// Conecta pelo endereço (`postgres://usuário:senha@host/banco`) e aplica
+    /// as migrações pendentes.
     ///
     /// # Errors
     ///
-    /// Diretório impossível de criar, arquivo que não é SQLite ou migração que
-    /// falha.
-    pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(|source| StoreError::Directory {
-                path: parent.display().to_string(),
-                source,
-            })?;
-        }
-        Self::setup(Connection::open(path)?)
+    /// Endereço inválido, banco inalcançável ou migração que falha.
+    pub async fn connect(url: &str) -> Result<Self> {
+        let config: tokio_postgres::Config = url
+            .parse()
+            .map_err(|e: tokio_postgres::Error| StoreError::Url(e.to_string()))?;
+        Self::with_config(config).await
     }
 
+    /// Como [`Store::connect`], a partir da configuração já montada — é assim
+    /// que os testes isolam cada um no seu schema.
+    ///
     /// # Errors
     ///
-    /// Migração que falha.
-    pub fn open_in_memory() -> Result<Self> {
-        Self::setup(Connection::open_in_memory()?)
+    /// Banco inalcançável ou migração que falha.
+    pub async fn with_config(config: tokio_postgres::Config) -> Result<Self> {
+        let manager = Manager::from_config(
+            config,
+            NoTls,
+            ManagerConfig {
+                recycling_method: RecyclingMethod::Fast,
+            },
+        );
+        let pool = Pool::builder(manager)
+            .max_size(8)
+            .build()
+            .map_err(|e| StoreError::Url(e.to_string()))?;
+        let store = Self { pool };
+        store.migrate().await?;
+        Ok(store)
     }
 
-    fn setup(mut connection: Connection) -> Result<Self> {
-        // WAL: a interface lê enquanto uma importação escreve.
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.pragma_update(None, "foreign_keys", true)?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        let version: i64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        let tx = connection.transaction()?;
-        for (index, migration) in (1_i64..).zip(MIGRATIONS).skip_while(|(i, _)| *i <= version) {
-            tx.execute_batch(migration)?;
-            tx.pragma_update(None, "user_version", index)?;
+    async fn migrate(&self) -> Result<()> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        tx.execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK])
+            .await?;
+        tx.batch_execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+            .await?;
+        let version: i32 = tx
+            .query_opt("SELECT version FROM schema_version", &[])
+            .await?
+            .map_or(Ok(0), |row| row.try_get(0))?;
+        let skip = usize::try_from(version).unwrap_or(0);
+        for (index, migration) in (1_i32..).zip(MIGRATIONS).skip(skip) {
+            tx.batch_execute(migration).await?;
+            tx.execute("DELETE FROM schema_version", &[]).await?;
+            tx.execute(
+                "INSERT INTO schema_version (version) VALUES ($1)",
+                &[&index],
+            )
+            .await?;
         }
-        tx.commit()?;
-        Ok(Self { connection })
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Todos os filmes, por título.
@@ -288,51 +337,39 @@ impl Store {
     /// # Errors
     ///
     /// Falha de leitura ou registro inconsistente.
-    pub fn movies(&self) -> Result<Vec<CatalogMovie>> {
-        read_movies(&self.connection)
+    pub async fn movies(&self) -> Result<Vec<CatalogMovie>> {
+        read_movies(&self.pool.get().await?).await
     }
 
     /// # Errors
     ///
     /// Falha de leitura ou registro inconsistente.
-    pub fn profiles(&self) -> Result<Vec<QualityProfile>> {
-        let mut statement = self.connection.prepare(
-            "SELECT name, upgrade_allowed, cutoff, language, items, min_format_score,
-                    cutoff_format_score
-             FROM quality_profiles ORDER BY name",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, bool>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i32>(5)?,
-                row.get::<_, i32>(6)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (
-                name,
-                upgrade_allowed,
-                cutoff,
-                language,
-                items,
-                min_format_score,
-                cutoff_format_score,
-            ) = row?;
-            Ok(QualityProfile {
-                items: decode_items(&items)?,
-                cutoff: cutoff.and_then(|c| usize::try_from(c).ok()),
-                name,
-                upgrade_allowed,
-                language,
-                min_format_score,
-                cutoff_format_score,
+    pub async fn profiles(&self) -> Result<Vec<QualityProfile>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT name, upgrade_allowed, cutoff, language, items, min_format_score,
+                        cutoff_format_score
+                 FROM quality_profiles ORDER BY name",
+                &[],
+            )
+            .await?;
+        rows.iter()
+            .map(|row| {
+                let items: serde_json::Value = row.try_get(4)?;
+                Ok(QualityProfile {
+                    name: row.try_get(0)?,
+                    upgrade_allowed: row.try_get(1)?,
+                    cutoff: row
+                        .try_get::<_, Option<i32>>(2)?
+                        .and_then(|c| usize::try_from(c).ok()),
+                    language: row.try_get(3)?,
+                    items: decode_items(items)?,
+                    min_format_score: row.try_get(5)?,
+                    cutoff_format_score: row.try_get(6)?,
+                })
             })
-        })
-        .collect()
+            .collect()
     }
 
     /// Tamanhos por qualidade.
@@ -340,23 +377,25 @@ impl Store {
     /// # Errors
     ///
     /// Falha de leitura ou qualidade desconhecida.
-    pub fn quality_definitions(&self) -> Result<Vec<QualityDefinition>> {
-        let mut statement = self.connection.prepare(
-            "SELECT quality, min_size, max_size, preferred_size FROM quality_definitions ORDER BY quality",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, u8>(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?;
-        rows.map(|row| {
-            let (id, min_size, max_size, preferred_size) = row?;
-            Ok(QualityDefinition {
-                quality: quality(id)?,
-                min_size,
-                max_size,
-                preferred_size,
+    pub async fn quality_definitions(&self) -> Result<Vec<QualityDefinition>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT quality, min_size, max_size, preferred_size
+                 FROM quality_definitions ORDER BY quality",
+                &[],
+            )
+            .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(QualityDefinition {
+                    quality: quality(row.try_get(0)?)?,
+                    min_size: row.try_get(1)?,
+                    max_size: row.try_get(2)?,
+                    preferred_size: row.try_get(3)?,
+                })
             })
-        })
-        .collect()
+            .collect()
     }
 
     /// Grava uma busca em sombra.
@@ -364,26 +403,29 @@ impl Store {
     /// # Errors
     ///
     /// Falha de escrita, ou filme que não está no catálogo.
-    pub fn record_shadow(&mut self, run: &ShadowRun) -> Result<()> {
-        let rejections = serde_json::to_string(&run.rejections).unwrap_or_else(|_| "[]".into());
-        self.connection.execute(
-            "INSERT INTO shadow_runs (movie_id, at, releases, pick_title, pick_indexer,
-                 pick_quality, pick_size, rejections, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                run.movie_id,
-                run.at,
-                i64::try_from(run.releases).unwrap_or(i64::MAX),
-                run.pick.as_ref().map(|p| p.title.clone()),
-                run.pick.as_ref().map(|p| p.indexer.clone()),
-                run.pick.as_ref().map(|p| p.quality.id()),
-                run.pick
-                    .as_ref()
-                    .map(|p| i64::try_from(p.size).unwrap_or(i64::MAX)),
-                rejections,
-                run.error,
-            ],
-        )?;
+    pub async fn record_shadow(&self, run: &ShadowRun) -> Result<()> {
+        let client = self.pool.get().await?;
+        let rejections = serde_json::to_value(&run.rejections)
+            .map_err(|e| StoreError::Corrupt(format!("rejeições da sombra: {e}")))?;
+        let pick = run.pick.as_ref();
+        client
+            .execute(
+                "INSERT INTO shadow_runs (movie_id, at, releases, pick_title, pick_indexer,
+                     pick_quality, pick_size, rejections, error)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                &[
+                    &run.movie_id,
+                    &run.at,
+                    &i64::try_from(run.releases).unwrap_or(i64::MAX),
+                    &pick.map(|p| p.title.as_str()),
+                    &pick.map(|p| p.indexer.as_str()),
+                    &pick.map(|p| i16::from(p.quality.id())),
+                    &pick.map(|p| i64::try_from(p.size).unwrap_or(i64::MAX)),
+                    &rejections,
+                    &run.error,
+                ],
+            )
+            .await?;
         Ok(())
     }
 
@@ -392,41 +434,46 @@ impl Store {
     /// # Errors
     ///
     /// Falha de leitura ou registro inconsistente.
-    pub fn latest_shadow_runs(&self) -> Result<Vec<ShadowRun>> {
-        let mut statement = self.connection.prepare(
-            "SELECT movie_id, at, releases, pick_title, pick_indexer, pick_quality, pick_size,
-                    rejections, error
-             FROM shadow_runs r
-             WHERE id = (SELECT id FROM shadow_runs WHERE movie_id = r.movie_id
-                         ORDER BY at DESC, id DESC LIMIT 1)
-             ORDER BY at",
-        )?;
-        let mut rows = statement.query([])?;
-        let mut runs = Vec::new();
-        while let Some(row) = rows.next()? {
-            let pick = match (
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<u8>>(5)?,
-            ) {
-                (Some(title), Some(id)) => Some(ShadowPick {
-                    title,
-                    indexer: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                    quality: quality(id)?,
-                    size: u64::try_from(row.get::<_, Option<i64>>(6)?.unwrap_or(0)).unwrap_or(0),
-                }),
-                _ => None,
-            };
-            let rejections: String = row.get(7)?;
-            runs.push(ShadowRun {
-                movie_id: row.get(0)?,
-                at: row.get(1)?,
-                releases: usize::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
-                pick,
-                rejections: serde_json::from_str(&rejections)
-                    .map_err(|e| StoreError::Corrupt(format!("rejeições da sombra: {e}")))?,
-                error: row.get(8)?,
-            });
-        }
+    pub async fn latest_shadow_runs(&self) -> Result<Vec<ShadowRun>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT DISTINCT ON (movie_id) movie_id, at, releases, pick_title, pick_indexer,
+                        pick_quality, pick_size, rejections, error
+                 FROM shadow_runs
+                 ORDER BY movie_id, at DESC, id DESC",
+                &[],
+            )
+            .await?;
+        let mut runs = rows
+            .iter()
+            .map(|row| {
+                let pick = match (
+                    row.try_get::<_, Option<String>>(3)?,
+                    row.try_get::<_, Option<i16>>(5)?,
+                ) {
+                    (Some(title), Some(id)) => Some(ShadowPick {
+                        title,
+                        indexer: row.try_get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        quality: quality(id)?,
+                        size: u64::try_from(row.try_get::<_, Option<i64>>(6)?.unwrap_or(0))
+                            .unwrap_or(0),
+                    }),
+                    _ => None,
+                };
+                let rejections: serde_json::Value = row.try_get(7)?;
+                Ok(ShadowRun {
+                    movie_id: row.try_get(0)?,
+                    at: row.try_get(1)?,
+                    releases: usize::try_from(row.try_get::<_, i64>(2)?).unwrap_or(0),
+                    pick,
+                    rejections: serde_json::from_value(rejections)
+                        .map_err(|e| StoreError::Corrupt(format!("rejeições da sombra: {e}")))?,
+                    error: row.try_get(8)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        runs.sort_by(|a, b| a.at.cmp(&b.at));
         Ok(runs)
     }
 
@@ -436,32 +483,34 @@ impl Store {
     /// # Errors
     ///
     /// Falha de escrita; nada fica pela metade.
-    pub fn import(&mut self, import: &Import, apply: bool) -> Result<ImportSummary> {
-        let tx = self.connection.transaction()?;
+    pub async fn import(&self, import: &Import, apply: bool) -> Result<ImportSummary> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
         let mut summary = ImportSummary {
             applied: apply,
             profiles: import.profiles.len(),
             ..ImportSummary::default()
         };
         for profile in &import.profiles {
-            upsert_profile(&tx, profile)?;
+            upsert_profile(&tx, profile).await?;
         }
         for definition in &import.definitions {
             tx.execute(
                 "INSERT INTO quality_definitions (quality, min_size, max_size, preferred_size)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(quality) DO UPDATE SET min_size = excluded.min_size,
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (quality) DO UPDATE SET min_size = excluded.min_size,
                      max_size = excluded.max_size, preferred_size = excluded.preferred_size",
-                params![
-                    definition.quality.id(),
-                    definition.min_size,
-                    definition.max_size,
-                    definition.preferred_size
+                &[
+                    &i16::from(definition.quality.id()),
+                    &definition.min_size,
+                    &definition.max_size,
+                    &definition.preferred_size,
                 ],
-            )?;
+            )
+            .await?;
         }
 
-        let existing = read_movies(&tx)?;
+        let existing = read_movies(&tx).await?;
         let seen: BTreeSet<u32> = import.movies.iter().map(|(_, m)| m.tmdb_id).collect();
         for (source_id, movie) in &import.movies {
             let current = existing.iter().find(|c| c.movie.tmdb_id == movie.tmdb_id);
@@ -471,11 +520,11 @@ impl Store {
                     summary.unchanged += 1;
                 }
                 Some(current) => {
-                    write_movie(&tx, Some(current.id), movie, &import.source, *source_id)?;
+                    write_movie(&tx, Some(current.id), movie, &import.source, *source_id).await?;
                     summary.updated.push(label(movie));
                 }
                 None => {
-                    write_movie(&tx, None, movie, &import.source, *source_id)?;
+                    write_movie(&tx, None, movie, &import.source, *source_id).await?;
                     summary.created.push(label(movie));
                 }
             }
@@ -484,14 +533,15 @@ impl Store {
             c.origin.as_ref().is_some_and(|(s, _)| *s == import.source)
                 && !seen.contains(&c.movie.tmdb_id)
         }) {
-            tx.execute("DELETE FROM movies WHERE id = ?1", params![gone.id])?;
+            tx.execute("DELETE FROM movies WHERE id = $1", &[&gone.id])
+                .await?;
             summary.removed.push(label(&gone.movie));
         }
 
         if apply {
-            tx.commit()?;
+            tx.commit().await?;
         } else {
-            tx.rollback()?;
+            tx.rollback().await?;
         }
         Ok(summary)
     }
@@ -511,7 +561,7 @@ struct StoredItem {
     allowed: bool,
 }
 
-fn encode_items(items: &[ProfileItem]) -> String {
+fn encode_items(items: &[ProfileItem]) -> serde_json::Value {
     let stored: Vec<_> = items
         .iter()
         .map(|item| StoredItem {
@@ -520,11 +570,11 @@ fn encode_items(items: &[ProfileItem]) -> String {
             allowed: item.allowed,
         })
         .collect();
-    serde_json::to_string(&stored).unwrap_or_else(|_| "[]".into())
+    serde_json::to_value(stored).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
 }
 
-fn decode_items(text: &str) -> Result<Vec<ProfileItem>> {
-    let stored: Vec<StoredItem> = serde_json::from_str(text)
+fn decode_items(value: serde_json::Value) -> Result<Vec<ProfileItem>> {
+    let stored: Vec<StoredItem> = serde_json::from_value(value)
         .map_err(|e| StoreError::Corrupt(format!("itens de perfil: {e}")))?;
     stored
         .into_iter()
@@ -533,7 +583,7 @@ fn decode_items(text: &str) -> Result<Vec<ProfileItem>> {
                 qualities: item
                     .qualities
                     .into_iter()
-                    .map(quality)
+                    .map(|id| quality(i16::from(id)))
                     .collect::<Result<_>>()?,
                 name: item.name,
                 allowed: item.allowed,
@@ -542,201 +592,256 @@ fn decode_items(text: &str) -> Result<Vec<ProfileItem>> {
         .collect()
 }
 
-fn quality(id: u8) -> Result<Quality> {
-    Quality::from_id(id).ok_or_else(|| StoreError::Corrupt(format!("qualidade {id}")))
+fn quality(id: i16) -> Result<Quality> {
+    u8::try_from(id)
+        .ok()
+        .and_then(Quality::from_id)
+        .ok_or_else(|| StoreError::Corrupt(format!("qualidade {id}")))
 }
 
-fn upsert_profile(tx: &Transaction<'_>, profile: &QualityProfile) -> Result<()> {
-    tx.execute(
-        "INSERT INTO quality_profiles (name, upgrade_allowed, cutoff, language, items,
-             min_format_score, cutoff_format_score)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT(name) DO UPDATE SET upgrade_allowed = excluded.upgrade_allowed,
-             cutoff = excluded.cutoff, language = excluded.language, items = excluded.items,
-             min_format_score = excluded.min_format_score,
-             cutoff_format_score = excluded.cutoff_format_score",
-        params![
-            profile.name,
-            profile.upgrade_allowed,
-            profile.cutoff.and_then(|c| i64::try_from(c).ok()),
-            profile.language,
-            encode_items(&profile.items),
-            profile.min_format_score,
-            profile.cutoff_format_score,
-        ],
-    )?;
+fn small(value: u8) -> i16 {
+    i16::from(value)
+}
+
+fn narrow<T: TryFrom<i32>>(value: i32, what: &str) -> Result<T> {
+    T::try_from(value).map_err(|_| StoreError::Corrupt(format!("{what} {value}")))
+}
+
+async fn upsert_profile(client: &impl GenericClient, profile: &QualityProfile) -> Result<()> {
+    client
+        .execute(
+            "INSERT INTO quality_profiles (name, upgrade_allowed, cutoff, language, items,
+                 min_format_score, cutoff_format_score)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (name) DO UPDATE SET upgrade_allowed = excluded.upgrade_allowed,
+                 cutoff = excluded.cutoff, language = excluded.language, items = excluded.items,
+                 min_format_score = excluded.min_format_score,
+                 cutoff_format_score = excluded.cutoff_format_score",
+            &[
+                &profile.name,
+                &profile.upgrade_allowed,
+                &profile.cutoff.and_then(|c| i32::try_from(c).ok()),
+                &profile.language,
+                &encode_items(&profile.items),
+                &profile.min_format_score,
+                &profile.cutoff_format_score,
+            ],
+        )
+        .await?;
     Ok(())
 }
 
-fn write_movie(
-    tx: &Transaction<'_>,
+async fn write_movie(
+    client: &impl GenericClient,
     id: Option<i64>,
     movie: &Movie,
     source: &str,
     source_id: i64,
 ) -> Result<()> {
     let profile_id: Option<i64> = match &movie.quality_profile {
-        Some(name) => tx
-            .query_row(
-                "SELECT id FROM quality_profiles WHERE name = ?1",
-                params![name],
-                |r| r.get(0),
-            )
-            .optional()?,
+        Some(name) => client
+            .query_opt("SELECT id FROM quality_profiles WHERE name = $1", &[name])
+            .await?
+            .map(|row| row.try_get(0))
+            .transpose()?,
         None => None,
     };
-    let values = params![
-        movie.tmdb_id,
-        movie.imdb_id,
-        movie.title,
-        movie.original_title,
-        movie.original_language,
-        movie.year,
-        movie.status,
-        movie.minimum_availability,
-        movie.monitored,
-        profile_id,
-        movie.path,
-        movie.added,
-        source,
-        source_id,
-        movie.runtime,
-        movie.secondary_year,
-        movie.clean_title,
-        movie.available,
+    let tmdb_id = i64::from(movie.tmdb_id);
+    let year = movie.year.map(i32::from);
+    let runtime = i32::try_from(movie.runtime).unwrap_or(i32::MAX);
+    let secondary_year = movie.secondary_year.map(i32::from);
+    let values: [&(dyn tokio_postgres::types::ToSql + Sync); 18] = [
+        &tmdb_id,
+        &movie.imdb_id,
+        &movie.title,
+        &movie.original_title,
+        &movie.original_language,
+        &year,
+        &movie.status,
+        &movie.minimum_availability,
+        &movie.monitored,
+        &profile_id,
+        &movie.path,
+        &movie.added,
+        &source,
+        &source_id,
+        &runtime,
+        &secondary_year,
+        &movie.clean_title,
+        &movie.available,
     ];
-    let id = if let Some(id) = id {
-        tx.execute(
-            "UPDATE movies SET tmdb_id = ?1, imdb_id = ?2, title = ?3, original_title = ?4,
-                 original_language = ?5, year = ?6, status = ?7, minimum_availability = ?8,
-                 monitored = ?9, quality_profile_id = ?10, path = ?11, added = ?12,
-                 source = ?13, source_id = ?14, runtime = ?15, secondary_year = ?16,
-                 clean_title = ?17, available = ?18
-             WHERE id = ?19",
-            rusqlite::params_from_iter(values.iter().copied().chain([&id as &dyn rusqlite::ToSql])),
-        )?;
+    let id: i64 = if let Some(id) = id {
+        let mut params = values.to_vec();
+        params.push(&id);
+        client
+            .execute(
+                "UPDATE movies SET tmdb_id = $1, imdb_id = $2, title = $3, original_title = $4,
+                     original_language = $5, year = $6, status = $7, minimum_availability = $8,
+                     monitored = $9, quality_profile_id = $10, path = $11, added = $12,
+                     source = $13, source_id = $14, runtime = $15, secondary_year = $16,
+                     clean_title = $17, available = $18
+                 WHERE id = $19",
+                &params,
+            )
+            .await?;
         id
     } else {
-        tx.execute(
-            "INSERT INTO movies (tmdb_id, imdb_id, title, original_title, original_language,
-                 year, status, minimum_availability, monitored, quality_profile_id, path,
-                 added, source, source_id, runtime, secondary_year, clean_title, available)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                 ?17, ?18)",
-            values,
-        )?;
-        tx.last_insert_rowid()
+        client
+            .query_one(
+                "INSERT INTO movies (tmdb_id, imdb_id, title, original_title, original_language,
+                     year, status, minimum_availability, monitored, quality_profile_id, path,
+                     added, source, source_id, runtime, secondary_year, clean_title, available)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                     $17, $18)
+                 RETURNING id",
+                &values,
+            )
+            .await?
+            .try_get(0)?
     };
 
-    tx.execute("DELETE FROM movie_titles WHERE movie_id = ?1", params![id])?;
+    write_children(client, id, movie).await
+}
+
+/// Títulos alternativos e arquivo do filme: apaga os de antes e grava os de
+/// agora.
+async fn write_children(client: &impl GenericClient, id: i64, movie: &Movie) -> Result<()> {
+    client
+        .execute("DELETE FROM movie_titles WHERE movie_id = $1", &[&id])
+        .await?;
     for title in &movie.alternate_titles {
-        tx.execute(
-            "INSERT INTO movie_titles (movie_id, title) VALUES (?1, ?2)",
-            params![id, title],
-        )?;
+        client
+            .execute(
+                "INSERT INTO movie_titles (movie_id, title) VALUES ($1, $2)",
+                &[&id, title],
+            )
+            .await?;
     }
-    tx.execute("DELETE FROM movie_files WHERE movie_id = ?1", params![id])?;
+    client
+        .execute("DELETE FROM movie_files WHERE movie_id = $1", &[&id])
+        .await?;
     if let Some(file) = &movie.file {
-        tx.execute(
-            "INSERT INTO movie_files (movie_id, relative_path, size, quality, revision_version,
-                 revision_real, is_repack, languages, release_group, edition, scene_name, date_added)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                id,
-                file.relative_path,
-                i64::try_from(file.size).unwrap_or(i64::MAX),
-                file.quality.quality.id(),
-                file.quality.revision.version,
-                file.quality.revision.real,
-                file.quality.revision.is_repack,
-                serde_json::to_string(&file.languages).unwrap_or_else(|_| "[]".into()),
-                file.release_group,
-                file.edition,
-                file.scene_name,
-                file.date_added,
-            ],
-        )?;
+        let languages = serde_json::to_value(&file.languages)
+            .map_err(|e| StoreError::Corrupt(format!("idiomas: {e}")))?;
+        client
+            .execute(
+                "INSERT INTO movie_files (movie_id, relative_path, size, quality,
+                     revision_version, revision_real, is_repack, languages, release_group,
+                     edition, scene_name, date_added)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                &[
+                    &id,
+                    &file.relative_path,
+                    &i64::try_from(file.size).unwrap_or(i64::MAX),
+                    &small(file.quality.quality.id()),
+                    &small(file.quality.revision.version),
+                    &small(file.quality.revision.real),
+                    &file.quality.revision.is_repack,
+                    &languages,
+                    &file.release_group,
+                    &file.edition,
+                    &file.scene_name,
+                    &file.date_added,
+                ],
+            )
+            .await?;
     }
     Ok(())
 }
 
-fn read_movies(connection: &Connection) -> Result<Vec<CatalogMovie>> {
-    let mut statement = connection.prepare(
-        "SELECT m.id, m.tmdb_id, m.imdb_id, m.title, m.original_title, m.original_language,
-                m.year, m.status, m.minimum_availability, m.monitored, p.name, m.path, m.added,
-                m.source, m.source_id,
-                f.relative_path, f.size, f.quality, f.revision_version, f.revision_real,
-                f.is_repack, f.languages, f.release_group, f.edition, f.scene_name, f.date_added,
-                m.runtime, m.secondary_year, m.clean_title, m.available
-         FROM movies m
-         LEFT JOIN quality_profiles p ON p.id = m.quality_profile_id
-         LEFT JOIN movie_files f ON f.movie_id = m.id
-         ORDER BY m.title COLLATE NOCASE, m.year",
-    )?;
-    let mut rows = statement.query([])?;
-    let mut movies = Vec::new();
-    while let Some(row) = rows.next()? {
-        let file = match row.get::<_, Option<String>>(15)? {
-            Some(relative_path) => {
-                let languages: String = row.get(21)?;
-                Some(MovieFile {
-                    relative_path,
-                    size: u64::try_from(row.get::<_, i64>(16)?).unwrap_or(0),
-                    quality: QualityModel {
-                        quality: quality(row.get(17)?)?,
-                        revision: Revision {
-                            version: row.get(18)?,
-                            real: row.get(19)?,
-                            is_repack: row.get(20)?,
-                        },
-                    },
-                    languages: serde_json::from_str(&languages)
-                        .map_err(|e| StoreError::Corrupt(format!("idiomas: {e}")))?,
-                    release_group: row.get(22)?,
-                    edition: row.get(23)?,
-                    scene_name: row.get(24)?,
-                    date_added: row.get(25)?,
-                })
-            }
-            None => None,
-        };
+fn read_file(row: &Row) -> Result<Option<MovieFile>> {
+    let Some(relative_path) = row.try_get::<_, Option<String>>(15)? else {
+        return Ok(None);
+    };
+    let languages: serde_json::Value = row.try_get(21)?;
+    let revision = |index: usize| -> Result<u8> {
+        u8::try_from(row.try_get::<_, i16>(index)?)
+            .map_err(|_| StoreError::Corrupt("revisão".into()))
+    };
+    Ok(Some(MovieFile {
+        relative_path,
+        size: u64::try_from(row.try_get::<_, i64>(16)?).unwrap_or(0),
+        quality: QualityModel {
+            quality: quality(row.try_get(17)?)?,
+            revision: Revision {
+                version: revision(18)?,
+                real: revision(19)?,
+                is_repack: row.try_get(20)?,
+            },
+        },
+        languages: serde_json::from_value(languages)
+            .map_err(|e| StoreError::Corrupt(format!("idiomas: {e}")))?,
+        release_group: row.try_get(22)?,
+        edition: row.try_get(23)?,
+        scene_name: row.try_get(24)?,
+        date_added: row.try_get(25)?,
+    }))
+}
+
+async fn read_movies(client: &impl GenericClient) -> Result<Vec<CatalogMovie>> {
+    let rows = client
+        .query(
+            "SELECT m.id, m.tmdb_id, m.imdb_id, m.title, m.original_title, m.original_language,
+                    m.year, m.status, m.minimum_availability, m.monitored, p.name, m.path,
+                    m.added, m.source, m.source_id,
+                    f.relative_path, f.size, f.quality, f.revision_version, f.revision_real,
+                    f.is_repack, f.languages, f.release_group, f.edition, f.scene_name,
+                    f.date_added,
+                    m.runtime, m.secondary_year, m.clean_title, m.available
+             FROM movies m
+             LEFT JOIN quality_profiles p ON p.id = m.quality_profile_id
+             LEFT JOIN movie_files f ON f.movie_id = m.id
+             ORDER BY lower(m.title), m.year",
+            &[],
+        )
+        .await?;
+    let mut movies = Vec::with_capacity(rows.len());
+    for row in &rows {
         let origin = match (
-            row.get::<_, Option<String>>(13)?,
-            row.get::<_, Option<i64>>(14)?,
+            row.try_get::<_, Option<String>>(13)?,
+            row.try_get::<_, Option<i64>>(14)?,
         ) {
             (Some(source), Some(id)) => Some((source, id)),
             _ => None,
         };
+        let tmdb_id: i64 = row.try_get(1)?;
         movies.push(CatalogMovie {
-            id: row.get(0)?,
+            id: row.try_get(0)?,
             origin,
             movie: Movie {
-                tmdb_id: row.get(1)?,
-                imdb_id: row.get(2)?,
-                title: row.get(3)?,
-                original_title: row.get(4)?,
-                original_language: row.get(5)?,
-                year: row.get(6)?,
-                status: row.get(7)?,
-                minimum_availability: row.get(8)?,
-                monitored: row.get(9)?,
-                quality_profile: row.get(10)?,
-                path: row.get(11)?,
-                added: row.get(12)?,
-                file,
-                runtime: row.get(26)?,
-                secondary_year: row.get(27)?,
-                clean_title: row.get(28)?,
-                available: row.get(29)?,
+                tmdb_id: u32::try_from(tmdb_id)
+                    .map_err(|_| StoreError::Corrupt(format!("tmdb {tmdb_id}")))?,
+                imdb_id: row.try_get(2)?,
+                title: row.try_get(3)?,
+                original_title: row.try_get(4)?,
+                original_language: row.try_get(5)?,
+                year: row
+                    .try_get::<_, Option<i32>>(6)?
+                    .map(|y| narrow(y, "ano"))
+                    .transpose()?,
+                status: row.try_get(7)?,
+                minimum_availability: row.try_get(8)?,
+                monitored: row.try_get(9)?,
+                quality_profile: row.try_get(10)?,
+                path: row.try_get(11)?,
+                added: row.try_get(12)?,
+                file: read_file(row)?,
+                runtime: narrow(row.try_get(26)?, "duração")?,
+                secondary_year: row
+                    .try_get::<_, Option<i32>>(27)?
+                    .map(|y| narrow(y, "ano"))
+                    .transpose()?,
+                clean_title: row.try_get(28)?,
+                available: row.try_get(29)?,
                 alternate_titles: Vec::new(),
             },
         });
     }
-    let mut titles =
-        connection.prepare("SELECT movie_id, title FROM movie_titles ORDER BY rowid")?;
-    let mut rows = titles.query([])?;
-    while let Some(row) = rows.next()? {
-        let (id, title): (i64, String) = (row.get(0)?, row.get(1)?);
+    let titles = client
+        .query("SELECT movie_id, title FROM movie_titles ORDER BY id", &[])
+        .await?;
+    for row in &titles {
+        let (id, title): (i64, String) = (row.try_get(0)?, row.try_get(1)?);
         if let Some(entry) = movies.iter_mut().find(|m| m.id == id) {
             entry.movie.alternate_titles.push(title);
         }
@@ -744,8 +849,73 @@ fn read_movies(connection: &Connection) -> Result<Vec<CatalogMovie>> {
     Ok(movies)
 }
 
+/// Banco de teste: cada teste ganha um schema próprio, apagado no fim.
+///
+/// Os testes que precisam de banco leem `ACERVO_TEST_DATABASE_URL`; sem ela,
+/// avisam e passam — o CI a define com um Postgres de serviço.
+#[doc(hidden)]
+pub mod testing {
+    use super::{Store, StoreError};
+
+    #[derive(Debug)]
+    pub struct TestDb {
+        pub store: Store,
+        schema: String,
+        url: String,
+    }
+
+    impl TestDb {
+        /// `None` quando não há banco de teste configurado.
+        ///
+        /// # Panics
+        ///
+        /// Banco configurado mas inalcançável.
+        pub async fn new(name: &str) -> Option<Self> {
+            let Ok(url) = std::env::var("ACERVO_TEST_DATABASE_URL") else {
+                eprintln!("ACERVO_TEST_DATABASE_URL ausente: teste de banco pulado");
+                return None;
+            };
+            let schema = format!("teste_{name}_{}", std::process::id());
+            let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+                .await
+                .expect("conectando ao banco de teste");
+            tokio::spawn(connection);
+            client
+                .batch_execute(&format!(
+                    "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}"
+                ))
+                .await
+                .expect("criando o schema de teste");
+            let mut config: tokio_postgres::Config = url
+                .parse()
+                .map_err(|e: tokio_postgres::Error| StoreError::Url(e.to_string()))
+                .expect("endereço de teste");
+            config.options(format!("-c search_path={schema}"));
+            let store = Store::with_config(config).await.expect("migrando");
+            Some(Self { store, schema, url })
+        }
+
+        /// Apaga o schema. Chamar no fim do teste.
+        ///
+        /// # Panics
+        ///
+        /// Banco inalcançável.
+        pub async fn drop(self) {
+            let (client, connection) = tokio_postgres::connect(&self.url, tokio_postgres::NoTls)
+                .await
+                .expect("conectando ao banco de teste");
+            tokio::spawn(connection);
+            client
+                .batch_execute(&format!("DROP SCHEMA {} CASCADE", self.schema))
+                .await
+                .expect("apagando o schema de teste");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testing::TestDb;
     use super::*;
 
     fn profile() -> QualityProfile {
@@ -801,7 +971,7 @@ mod tests {
             runtime: 110,
             secondary_year: None,
             clean_title: Some(title.to_lowercase()),
-            alternate_titles: vec![format!("{title} alternativo")],
+            alternate_titles: vec![format!("{title} alternativo"), format!("{title} 2")],
             available: true,
         }
     }
@@ -820,32 +990,39 @@ mod tests {
         }
     }
 
-    #[test]
-    fn simulacao_nao_grava_e_relata_o_mesmo_que_a_aplicacao() {
-        let mut store = Store::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn simulacao_nao_grava_e_relata_o_mesmo_que_a_aplicacao() {
+        let Some(db) = TestDb::new("simulacao").await else {
+            return;
+        };
+        let store = &db.store;
         let first = import(vec![
             (1, movie(10, "Um", true)),
             (2, movie(20, "Dois", false)),
         ]);
 
-        let simulated = store.import(&first, false).unwrap();
-        assert!(store.movies().unwrap().is_empty());
-        let applied = store.import(&first, true).unwrap();
+        let simulated = store.import(&first, false).await.unwrap();
+        assert!(store.movies().await.unwrap().is_empty());
+        let applied = store.import(&first, true).await.unwrap();
         assert_eq!(simulated.created, applied.created);
         assert_eq!(applied.created, ["Um (2020)", "Dois (2020)"]);
 
-        let movies = store.movies().unwrap();
+        let movies = store.movies().await.unwrap();
         assert_eq!(movies.len(), 2);
         let um = movies.iter().find(|m| m.movie.tmdb_id == 10).unwrap();
         assert_eq!(um.movie, movie(10, "Um", true));
         assert_eq!(um.origin, Some(("radarr:filmes".into(), 1)));
-        assert_eq!(store.profiles().unwrap(), [profile()]);
-        assert_eq!(store.quality_definitions().unwrap().len(), 1);
+        assert_eq!(store.profiles().await.unwrap(), [profile()]);
+        assert_eq!(store.quality_definitions().await.unwrap().len(), 1);
+        db.drop().await;
     }
 
-    #[test]
-    fn reimportar_atualiza_mantem_e_remove_so_o_que_veio_da_origem() {
-        let mut store = Store::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn reimportar_atualiza_mantem_e_remove_so_o_que_veio_da_origem() {
+        let Some(db) = TestDb::new("reimportar").await else {
+            return;
+        };
+        let store = &db.store;
         store
             .import(
                 &import(vec![
@@ -854,10 +1031,12 @@ mod tests {
                 ]),
                 true,
             )
+            .await
             .unwrap();
 
         let again = store
             .import(&import(vec![(1, movie(10, "Um", true))]), true)
+            .await
             .unwrap();
         assert_eq!(again.updated, ["Um (2020)"]);
         assert_eq!(again.removed, ["Dois (2020)"]);
@@ -865,41 +1044,38 @@ mod tests {
 
         let same = store
             .import(&import(vec![(1, movie(10, "Um", true))]), true)
+            .await
             .unwrap();
         assert_eq!(same.unchanged, 1);
         assert!(same.updated.is_empty() && same.removed.is_empty());
+        db.drop().await;
     }
 
-    #[test]
-    fn banco_da_versao_1_migra_sem_perder_filme() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection.execute_batch(MIGRATIONS[0]).unwrap();
-        connection.pragma_update(None, "user_version", 1).unwrap();
-        connection
-            .execute(
-                "INSERT INTO movies (tmdb_id, title, monitored, path) VALUES (10, 'Um', 1, '/f/Um')",
-                [],
-            )
+    #[tokio::test]
+    async fn migrar_de_novo_nao_refaz_nada() {
+        let Some(db) = TestDb::new("migrar").await else {
+            return;
+        };
+        db.store
+            .import(&import(vec![(1, movie(10, "Um", true))]), true)
+            .await
             .unwrap();
-        let store = Store::setup(connection).unwrap();
-        let movies = store.movies().unwrap();
-        assert_eq!(movies.len(), 1);
-        assert_eq!(movies[0].movie.runtime, 0);
-        assert!(!movies[0].movie.available);
-        let version: i64 = store
-            .connection
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, i64::try_from(MIGRATIONS.len()).unwrap());
+        db.store.migrate().await.unwrap();
+        assert_eq!(db.store.movies().await.unwrap().len(), 1);
+        db.drop().await;
     }
 
-    #[test]
-    fn sombra_guarda_a_ultima_de_cada_filme() {
-        let mut store = Store::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn sombra_guarda_a_ultima_de_cada_filme() {
+        let Some(db) = TestDb::new("sombra").await else {
+            return;
+        };
+        let store = &db.store;
         store
             .import(&import(vec![(1, movie(10, "Um", false))]), true)
+            .await
             .unwrap();
-        let id = store.movies().unwrap()[0].id;
+        let id = store.movies().await.unwrap()[0].id;
         let run = |at: &str, pick: bool| ShadowRun {
             movie_id: id,
             at: at.into(),
@@ -915,28 +1091,16 @@ mod tests {
         };
         store
             .record_shadow(&run("2026-01-01T00:00:00Z", false))
+            .await
             .unwrap();
         store
             .record_shadow(&run("2026-01-02T00:00:00Z", true))
+            .await
             .unwrap();
         assert_eq!(
-            store.latest_shadow_runs().unwrap(),
+            store.latest_shadow_runs().await.unwrap(),
             [run("2026-01-02T00:00:00Z", true)]
         );
-    }
-
-    #[test]
-    fn arquivo_em_disco_sobrevive_a_reabertura() {
-        let dir = std::env::temp_dir().join(format!("acervo-store-{}", std::process::id()));
-        let path = dir.join("sub").join("acervo.db");
-        {
-            let mut store = Store::open(&path).unwrap();
-            store
-                .import(&import(vec![(1, movie(10, "Um", true))]), true)
-                .unwrap();
-        }
-        let store = Store::open(&path).unwrap();
-        assert_eq!(store.movies().unwrap().len(), 1);
-        std::fs::remove_dir_all(dir).unwrap();
+        db.drop().await;
     }
 }

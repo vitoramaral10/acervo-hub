@@ -34,8 +34,13 @@ pub struct InstanceImport {
 ///
 /// # Errors
 ///
-/// Catálogo impossível de abrir.
-pub async fn import(config: &Config, apply: bool, print: bool) -> Result<Vec<InstanceImport>> {
+/// Falha de escrita no catálogo.
+pub async fn import(
+    config: &Config,
+    store: &Store,
+    apply: bool,
+    print: bool,
+) -> Result<Vec<InstanceImport>> {
     let mut report = Vec::new();
     for spec in config
         .instances
@@ -50,14 +55,10 @@ pub async fn import(config: &Config, apply: bool, print: bool) -> Result<Vec<Ins
                 resumo: None,
             },
             Ok(import) => {
-                let database = config.state.database();
-                let summary = tokio::task::spawn_blocking(move || -> Result<ImportSummary> {
-                    let mut store = Store::open(&database)
-                        .with_context(|| format!("abrindo o catálogo `{}`", database.display()))?;
-                    Ok(store.import(&import, apply)?)
-                })
-                .await
-                .context("importação interrompida")??;
+                let summary = store
+                    .import(&import, apply)
+                    .await
+                    .context("gravando no catálogo")?;
                 InstanceImport {
                     nome: spec.name.clone(),
                     erro: None,
@@ -369,23 +370,19 @@ fn view(
 ///
 /// # Errors
 ///
-/// Catálogo impossível de abrir ou ler.
-pub async fn list(config: &Config) -> Result<Vec<MovieView>> {
-    let database = config.state.database();
+/// Catálogo ilegível.
+pub async fn list(config: &Config, store: &Store) -> Result<Vec<MovieView>> {
     let map = config.path_map();
+    let mut shadows: HashMap<i64, acervo_store::ShadowRun> = store
+        .latest_shadow_runs()
+        .await?
+        .into_iter()
+        .map(|run| (run.movie_id, run))
+        .collect();
+    let movies = store.movies().await?;
+    // O `stat` de cada arquivo é disco: fora do executor assíncrono.
     tokio::task::spawn_blocking(move || -> Result<Vec<MovieView>> {
-        if !database.exists() {
-            return Ok(Vec::new());
-        }
-        let store = Store::open(&database)
-            .with_context(|| format!("abrindo o catálogo `{}`", database.display()))?;
-        let mut shadows: std::collections::HashMap<i64, acervo_store::ShadowRun> = store
-            .latest_shadow_runs()?
-            .into_iter()
-            .map(|run| (run.movie_id, run))
-            .collect();
-        Ok(store
-            .movies()?
+        Ok(movies
             .into_iter()
             .map(|entry| {
                 let shadow = shadows.remove(&entry.id);
@@ -401,9 +398,9 @@ pub async fn list(config: &Config) -> Result<Vec<MovieView>> {
 ///
 /// # Errors
 ///
-/// Catálogo impossível de abrir ou ler.
-pub async fn check(config: &Config) -> Result<usize> {
-    let movies = list(config).await?;
+/// Catálogo ilegível.
+pub async fn check(config: &Config, store: &Store) -> Result<usize> {
+    let movies = list(config, store).await?;
     let with_file = movies.iter().filter(|m| m.arquivo.is_some()).count();
     let mut problems = 0;
     for movie in &movies {

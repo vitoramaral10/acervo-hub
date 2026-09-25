@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use acervo_api::{Admin, Catalog, DefinitionView, Entry, SettingView};
+use acervo_api::{Accounts, Admin, Catalog, DefinitionView, Entry, SettingView};
 use acervo_indexers::{
     Capabilities, CardigannClient, CardigannDefinition, SettingInfo, SettingInfoKind, TorznabClient,
 };
@@ -20,10 +20,72 @@ use crate::credentials::{self, Overrides};
 use crate::definitions::Definitions;
 use crate::registry::{self, Added, Registry};
 
+/// O banco do catálogo e das contas, quando alcançável.
+///
+/// A conexão sobe em segundo plano: Postgres fora do ar não pode derrubar os
+/// indexadores, que os gerenciadores consultam sem precisar dele. Enquanto
+/// ele não responde, só a entrada pela tela e o catálogo de filmes falham.
+#[derive(Debug, Clone, Default)]
+pub struct Database(Arc<std::sync::OnceLock<acervo_store::Store>>);
+
+impl Database {
+    fn get(&self) -> Result<&acervo_store::Store, String> {
+        self.0
+            .get()
+            .ok_or_else(|| "banco de dados ainda indisponível; tente de novo em instantes".into())
+    }
+
+    /// Tenta conectar até conseguir.
+    async fn connect(self, config: Arc<Config>) {
+        loop {
+            match config.store().await {
+                Ok(store) => {
+                    let _ = self.0.set(store);
+                    tracing::info!("banco de dados conectado");
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "banco de dados indisponível, nova tentativa em 30 s: {error:#}"
+                    );
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Accounts for Database {
+    async fn login(&self, user: &str, password: &str) -> Result<Option<String>, String> {
+        self.get()?
+            .login(user, password)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn session_user(&self, token: &str) -> Result<Option<String>, String> {
+        self.get()?
+            .session_user(token)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn logout(&self, token: &str) -> Result<(), String> {
+        self.get()?.logout(token).await.map_err(|e| e.to_string())
+    }
+}
+
 /// Reimporta o catálogo de filmes e roda a sombra de tempos em tempos, com o
 /// catálogo de indexadores servido. Erro numa rodada fica no log e a próxima
 /// tenta de novo.
-async fn shadow_loop(config: Arc<Config>, catalog: Catalog, minutes: u64, limit: usize) {
+async fn shadow_loop(
+    config: Arc<Config>,
+    database: Database,
+    catalog: Catalog,
+    minutes: u64,
+    limit: usize,
+) {
     let mut every = tokio::time::interval(Duration::from_secs(minutes * 60));
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // A primeira batida é imediata; espera um ciclo para não somar a sombra
@@ -31,7 +93,14 @@ async fn shadow_loop(config: Arc<Config>, catalog: Catalog, minutes: u64, limit:
     every.tick().await;
     loop {
         every.tick().await;
-        match crate::movies::import(&config, true, false).await {
+        let store = match database.get() {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!("sombra adiada: {error}");
+                continue;
+            }
+        };
+        match crate::movies::import(&config, store, true, false).await {
             Ok(report) => {
                 for instance in report.iter().filter(|i| i.erro.is_some()) {
                     tracing::warn!(
@@ -43,7 +112,7 @@ async fn shadow_loop(config: Arc<Config>, catalog: Catalog, minutes: u64, limit:
             }
             Err(error) => tracing::warn!("importação de filmes falhou: {error:#}"),
         }
-        match crate::shadow::run(&config, &catalog, limit, false).await {
+        match crate::shadow::run(&config, store, &catalog, limit, false).await {
             Ok(lines) => tracing::info!(
                 filmes = lines.len(),
                 pegaria = lines.iter().filter(|l| l.pegaria.is_some()).count(),
@@ -68,15 +137,24 @@ pub async fn run(config: Config) -> Result<()> {
     let bind = server.bind.clone();
     let api_key = server.api_key.clone();
     let catalog = Catalog::new(entries(&config).await?)?;
+    let database = Database::default();
+    let accounts: Option<Arc<dyn Accounts>> = if config.database.is_some() {
+        tokio::spawn(database.clone().connect(Arc::clone(&config)));
+        Some(Arc::new(database.clone()))
+    } else {
+        tracing::warn!("sem `[database]`: a interface só aceita a chave de API em `X-Api-Key`");
+        None
+    };
     if let Some(minutes) = server.shadow_interval_minutes.filter(|m| *m > 0) {
         tokio::spawn(shadow_loop(
             Arc::clone(&config),
+            database.clone(),
             catalog.clone(),
             minutes,
             server.shadow_limit,
         ));
     }
-    let admin = HubAdmin::new(config, catalog.clone())?;
+    let admin = HubAdmin::new(config, catalog.clone(), database)?;
     tracing::info!(indexadores = catalog.len(), bind = %bind, "servindo Torznab e a interface web");
 
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -84,7 +162,7 @@ pub async fn run(config: Config) -> Result<()> {
         .with_context(|| format!("abrindo `{bind}`"))?;
     axum::serve(
         listener,
-        acervo_api::router_with_admin(catalog, api_key, Some(Arc::new(admin))),
+        acervo_api::router_with_admin(catalog, api_key, Some(Arc::new(admin)), accounts),
     )
     .with_graceful_shutdown(shutdown())
     .await
@@ -249,6 +327,7 @@ struct HubAdmin {
     /// O catálogo servido: a sombra busca por ele e divide as consultas com
     /// os gerenciadores.
     catalog: Catalog,
+    database: Database,
     definitions: Definitions,
     /// Indexadores Cardigann da config, pelo id da definição.
     config_cardigann: BTreeMap<String, CardigannIndexer>,
@@ -260,7 +339,7 @@ struct HubAdmin {
 }
 
 impl HubAdmin {
-    fn new(config: Arc<Config>, catalog: Catalog) -> Result<Self> {
+    fn new(config: Arc<Config>, catalog: Catalog, database: Database) -> Result<Self> {
         let catalogs: Vec<PathBuf> = config
             .server
             .as_ref()
@@ -292,6 +371,7 @@ impl HubAdmin {
             registry: expand_tilde(&config.state.registry),
             config,
             catalog,
+            database,
             definitions,
             config_cardigann,
             config_torznab,
@@ -736,22 +816,28 @@ impl Admin for HubAdmin {
     }
 
     async fn movies(&self) -> Result<serde_json::Value, String> {
-        let list = crate::movies::list(&self.config)
+        let list = crate::movies::list(&self.config, self.database.get()?)
             .await
             .map_err(|e| format!("{e:#}"))?;
         serde_json::to_value(list).map_err(|e| e.to_string())
     }
 
     async fn shadow(&self, limit: usize) -> Result<serde_json::Value, String> {
-        let lines = crate::shadow::run(&self.config, &self.catalog, limit, false)
-            .await
-            .map_err(|e| format!("{e:#}"))?;
+        let lines = crate::shadow::run(
+            &self.config,
+            self.database.get()?,
+            &self.catalog,
+            limit,
+            false,
+        )
+        .await
+        .map_err(|e| format!("{e:#}"))?;
         serde_json::to_value(lines).map_err(|e| e.to_string())
     }
 
     async fn import_movies(&self, apply: bool) -> Result<serde_json::Value, String> {
         let _guard = self.write.lock().await;
-        let report = crate::movies::import(&self.config, apply, false)
+        let report = crate::movies::import(&self.config, self.database.get()?, apply, false)
             .await
             .map_err(|e| format!("{e:#}"))?;
         serde_json::to_value(report).map_err(|e| e.to_string())
@@ -830,8 +916,12 @@ mod tests {
              settings = {{ cookie = \"do-arquivo\" }}\n"
         );
         let config = load_config(&dir.0, &indexers);
-        let admin =
-            HubAdmin::new(Arc::new(load_config(&dir.0, &indexers)), Catalog::default()).unwrap();
+        let admin = HubAdmin::new(
+            Arc::new(load_config(&dir.0, &indexers)),
+            Catalog::default(),
+            Database::default(),
+        )
+        .unwrap();
         assert_eq!(admin.origin("cookie-privado"), Some("config"));
 
         admin.remove("cookie-privado").await.unwrap();
@@ -881,8 +971,12 @@ mod tests {
             velho.uri()
         );
         let config = load_config(&dir.0, &indexers);
-        let admin =
-            HubAdmin::new(Arc::new(load_config(&dir.0, &indexers)), Catalog::default()).unwrap();
+        let admin = HubAdmin::new(
+            Arc::new(load_config(&dir.0, &indexers)),
+            Catalog::default(),
+            Database::default(),
+        )
+        .unwrap();
         let settings = admin
             .settings("outro")
             .expect("Torznab do config é editável");

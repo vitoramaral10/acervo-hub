@@ -184,8 +184,9 @@ export interface MovieImport {
 }
 
 export const api = {
-  session: () => request<{ ok: boolean }>('GET', '/ui/api/sessao'),
-  login: (chave: string) => request<{ ok: boolean }>('POST', '/ui/api/entrar', { chave }),
+  session: () => request<{ ok: boolean; usuario: string | null }>('GET', '/ui/api/sessao'),
+  login: (credentials: { usuario: string; senha: string }) =>
+    request<{ ok: boolean; usuario: string }>('POST', '/ui/api/entrar', credentials),
   logout: () => request<{ ok: boolean }>('POST', '/ui/api/sair'),
   indexers: () => request<{ indexadores: Indexer[] }>('GET', '/ui/api/indexadores'),
   test: (name: string) =>

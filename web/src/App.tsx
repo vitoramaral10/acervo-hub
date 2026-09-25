@@ -106,6 +106,11 @@ export function App() {
           <div className="hidden md:block">
             <ThemeSwitcher />
           </div>
+          {session.data.usuario && (
+            <p className="hidden truncate px-3 pt-2 text-xs text-content-subtle md:block">
+              Conectado como <span className="font-medium text-content-muted">{session.data.usuario}</span>
+            </p>
+          )}
           <Button variant="ghost" size="sm" onClick={logout} className="md:justify-start">
             <LogOut aria-hidden="true" />
             <span className="hidden md:inline">Sair</span>

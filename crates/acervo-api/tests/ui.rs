@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use acervo_api::{Admin, Catalog, DefinitionView, Entry, SettingView, router_with_admin};
+use acervo_api::{Accounts, Admin, Catalog, DefinitionView, Entry, SettingView, router_with_admin};
 use acervo_indexers::{
     Capabilities, Category, Indexer, IndexerError, Release, SearchQuery, SearchSupport,
 };
@@ -228,12 +228,47 @@ impl Admin for FakeAdmin {
     }
 }
 
+/// Contas falsas: uma usuária, sessões num conjunto em memória.
+#[derive(Debug, Default)]
+struct FakeAccounts {
+    sessions: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl Accounts for FakeAccounts {
+    async fn login(&self, user: &str, password: &str) -> Result<Option<String>, String> {
+        if user != "ana" || password != "senha-certa" {
+            return Ok(None);
+        }
+        let mut sessions = self.sessions.lock().unwrap();
+        let token = format!("token{}", sessions.len());
+        sessions.push(token.clone());
+        Ok(Some(token))
+    }
+
+    async fn session_user(&self, token: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|t| t == token)
+            .then(|| "ana".to_owned()))
+    }
+
+    async fn logout(&self, token: &str) -> Result<(), String> {
+        self.sessions.lock().unwrap().retain(|t| t != token);
+        Ok(())
+    }
+}
+
 async fn serve() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let catalog = Catalog::new([entry("vencido")]).unwrap();
     let admin: Arc<dyn Admin> = Arc::new(FakeAdmin::default());
-    let app = router_with_admin(catalog, KEY, Some(admin));
+    let accounts: Arc<dyn Accounts> = Arc::new(FakeAccounts::default());
+    let app = router_with_admin(catalog, KEY, Some(admin), Some(accounts));
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     format!("http://{address}")
 }
@@ -246,7 +281,7 @@ async fn login(base: &str) -> String {
     let response = http()
         .post(format!("{base}/ui/api/entrar"))
         .header("X-Acervo", "1")
-        .json(&json!({ "chave": KEY }))
+        .json(&json!({ "usuario": "ana", "senha": "senha-certa" }))
         .send()
         .await
         .unwrap();
@@ -296,28 +331,64 @@ async fn pagina_carrega_com_csp_e_api_exige_sessao() {
 }
 
 #[tokio::test]
-async fn entrar_exige_a_chave_certa_e_o_cabecalho_da_interface() {
+async fn entrar_exige_usuario_e_senha_certos_e_o_cabecalho_da_interface() {
     let base = serve().await;
     let without_header = http()
         .post(format!("{base}/ui/api/entrar"))
-        .json(&json!({ "chave": KEY }))
+        .json(&json!({ "usuario": "ana", "senha": "senha-certa" }))
         .send()
         .await
         .unwrap();
     assert_eq!(without_header.status().as_u16(), 403);
-    let wrong = http()
-        .post(format!("{base}/ui/api/entrar"))
+    for (user, password) in [("ana", "errada"), ("bia", "senha-certa")] {
+        let wrong = http()
+            .post(format!("{base}/ui/api/entrar"))
+            .header("X-Acervo", "1")
+            .json(&json!({ "usuario": user, "senha": password }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status().as_u16(), 401);
+        assert!(wrong.headers().get(SET_COOKIE).is_none());
+    }
+
+    let cookie = login(&base).await;
+    let (status, body) = get(&base, "/ui/api/sessao", &cookie).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["usuario"], "ana");
+}
+
+#[tokio::test]
+async fn sair_encerra_a_sessao_no_servidor() {
+    let base = serve().await;
+    let cookie = login(&base).await;
+    let response = http()
+        .post(format!("{base}/ui/api/sair"))
         .header("X-Acervo", "1")
-        .json(&json!({ "chave": "errada" }))
+        .header(COOKIE, &cookie)
         .send()
         .await
         .unwrap();
-    assert_eq!(wrong.status().as_u16(), 401);
-    assert!(wrong.headers().get(SET_COOKIE).is_none());
-
-    let cookie = login(&base).await;
+    assert_eq!(response.status().as_u16(), 200);
+    // Mesmo quem guardou o cookie antigo não entra mais.
     let (status, _) = get(&base, "/ui/api/sessao", &cookie).await;
-    assert_eq!(status, 200);
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn chave_de_api_no_cabecalho_substitui_a_sessao() {
+    let base = serve().await;
+    let with_key = |key: &str| {
+        http()
+            .get(format!("{base}/ui/api/sessao"))
+            .header("X-Api-Key", key)
+            .send()
+    };
+    assert_eq!(with_key(KEY).await.unwrap().status().as_u16(), 200);
+    assert_eq!(with_key("errada").await.unwrap().status().as_u16(), 401);
+    // A chave não serve mais de cookie.
+    let (status, _) = get(&base, "/ui/api/sessao", &format!("acervo_sessao={KEY}")).await;
+    assert_eq!(status, 401);
 }
 
 #[tokio::test]

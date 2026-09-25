@@ -93,14 +93,26 @@ cargo run --bin acervo-hub -- -c config.toml search "termo" [-i indexador] [-k 5
 - **Aplicativos** — o `sync` na tela: mostra o que mudaria no Sonarr e no Radarr e aplica.
 - **Limpeza** — o último ciclo (gravado ao lado do ledger) e uma simulação na hora.
 
-Entra-se com a mesma chave de `server.api_key`.
+Entra-se com usuário e senha, cadastrados por linha de comando — a senha vem da entrada
+padrão, nunca de argumento:
+
+```sh
+echo 'senha-longa' | acervo-hub users set admin   # cria ou troca a senha
+acervo-hub users list
+acervo-hub users remove admin
+```
+
+Scripts e automação podem, em vez disso, mandar a chave de `server.api_key` no cabeçalho
+`X-Api-Key`.
 
 - **A tela não reescreve o `config.toml`**, que pode ficar somente leitura. Indexadores
   adicionados e desativados vão para `[state] registry`; credenciais, para
   `[state] credentials` (gravação atômica, permissão 600). Os dois valem por cima da config.
   Indexador do arquivo não se remove pela tela — desativa-se. Segredo nunca volta para a tela: campo em branco
   mantém o valor atual.
-- **Sessão em cookie `HttpOnly` e `SameSite=Strict`**, e toda ação que muda estado exige
+- **Senha em argon2id, sessão em cookie `HttpOnly` e `SameSite=Strict`.** O banco guarda
+  só o SHA-256 do token da sessão, que vale 30 dias; sair apaga a sessão no servidor, e
+  trocar a senha derruba todas as abertas. Toda ação que muda estado exige
   um cabeçalho que formulário de outra origem não consegue mandar. A CSP só aceita script
   servido pelo próprio binário.
 - O front é React + TypeScript + Tailwind, em `web/`. O build é versionado em
@@ -233,7 +245,7 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
         todos os campos de todos os títulos, esquisitices incluídas. O corpus fica fora do
         repositório (tem nome de tracker privado); o teste `corpus`, ignorado por padrão,
         refaz a conta.
-  - [x] **Catálogo de filmes** (`acervo-store`, SQLite). `movies import` espelha filmes,
+  - [x] **Catálogo de filmes** (`acervo-store`, Postgres). `movies import` espelha filmes,
         arquivos e perfis de qualidade do gerenciador pela API v3 — sem `--apply`, numa
         transação que é desfeita, então a simulação relata exatamente o que a aplicação
         faria. Filme que some da origem sai do catálogo só se tiver vindo dela.
