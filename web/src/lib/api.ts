@@ -159,6 +159,22 @@ export interface Movie {
   adicionado: string | null
   arquivo: MovieFile | null
   sombra: MovieShadow | null
+  download: MovieDownload | null
+}
+
+export interface MovieDownload {
+  estado: 'downloading' | 'imported' | 'failed'
+  release: string
+  mensagem: string | null
+  pego_em: string
+}
+
+export interface GrabReport {
+  filme: string
+  releases: number
+  escolhido: { titulo: string; indexador: string; qualidade: string; tamanho: number } | null
+  motivos: [string, number][]
+  aplicado: boolean
 }
 
 export interface MovieShadow {
@@ -217,6 +233,9 @@ export const api = {
   simulateCycle: () => request<CycleReport>('POST', '/ui/api/limpeza/simular'),
   movies: () => request<{ filmes: Movie[] }>('GET', '/ui/api/filmes'),
   shadow: (limite: number) => request<{ filmes: unknown[] }>('POST', '/ui/api/filmes/sombra', { limite }),
+  grab: (id: number, aplicar: boolean) =>
+    request<GrabReport>('POST', `/ui/api/filmes/${id}/pegar`, { aplicar }),
+  importDownloads: () => request<{ downloads: unknown[] }>('POST', '/ui/api/downloads/importar'),
   importMovies: (aplicar: boolean) =>
     request<{ instancias: MovieImport[] }>('POST', '/ui/api/filmes/importar', { aplicar }),
   search: (params: { q: string; indexador: string; cat: string }) => {

@@ -144,6 +144,57 @@ pub struct ShadowRun {
     pub error: Option<String>,
 }
 
+/// Em que pé está um download que o acervo mandou ao cliente.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrabState {
+    /// No cliente, ainda sem importar.
+    Downloading,
+    /// Arquivo ligado na pasta do filme.
+    Imported,
+    /// Desistiu-se dele; `message` diz por quê.
+    Failed,
+}
+
+impl GrabState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Downloading => "downloading",
+            Self::Imported => "imported",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn parse(text: &str) -> Result<Self> {
+        match text {
+            "downloading" => Ok(Self::Downloading),
+            "imported" => Ok(Self::Imported),
+            "failed" => Ok(Self::Failed),
+            other => Err(StoreError::Corrupt(format!("estado de grab `{other}`"))),
+        }
+    }
+}
+
+/// Um release mandado ao cliente de download.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grab {
+    pub id: i64,
+    pub movie_id: i64,
+    /// Infohash, em hex minúsculo: é por ele que o torrent é achado no cliente.
+    pub hash: String,
+    pub title: String,
+    pub indexer: String,
+    pub quality: Quality,
+    pub size: u64,
+    /// RFC 3339, em UTC.
+    pub grabbed_at: String,
+    pub state: GrabState,
+    pub message: Option<String>,
+    /// Onde o arquivo foi ligado, como o gerenciador vê.
+    pub imported_path: Option<String>,
+    pub finished_at: Option<String>,
+}
+
 /// Tudo o que uma instância tem, para espelhar.
 #[derive(Debug, Clone)]
 pub struct Import {
@@ -168,7 +219,8 @@ pub struct ImportSummary {
 }
 
 /// Cada migração roda uma vez, na ordem; a posição é a versão.
-const MIGRATIONS: &[&str] = &[r"
+const MIGRATIONS: &[&str] = &[
+    r"
     CREATE TABLE quality_profiles (
         id BIGSERIAL PRIMARY KEY,
         name TEXT NOT NULL UNIQUE,
@@ -251,7 +303,25 @@ const MIGRATIONS: &[&str] = &[r"
         expires_at TIMESTAMPTZ NOT NULL
     );
     CREATE INDEX sessions_by_expiry ON sessions(expires_at);
-"];
+",
+    r"
+    CREATE TABLE grabs (
+        id BIGSERIAL PRIMARY KEY,
+        movie_id BIGINT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+        hash TEXT NOT NULL UNIQUE,
+        title TEXT NOT NULL,
+        indexer TEXT NOT NULL,
+        quality SMALLINT NOT NULL,
+        size BIGINT NOT NULL,
+        grabbed_at TEXT NOT NULL,
+        state TEXT NOT NULL,
+        message TEXT,
+        imported_path TEXT,
+        finished_at TEXT
+    );
+    CREATE INDEX grabs_by_movie ON grabs(movie_id, grabbed_at);
+",
+];
 
 /// Chave do lock consultivo que serializa as migrações: o serviço e um
 /// comando avulso podem subir juntos.
@@ -475,6 +545,99 @@ impl Store {
             .collect::<Result<Vec<_>>>()?;
         runs.sort_by(|a, b| a.at.cmp(&b.at));
         Ok(runs)
+    }
+
+    /// Registra um release mandado ao cliente. Devolve o id.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita, filme fora do catálogo ou hash já registrado.
+    pub async fn record_grab(&self, grab: &Grab) -> Result<i64> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one(
+                "INSERT INTO grabs (movie_id, hash, title, indexer, quality, size, grabbed_at,
+                     state, message)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 RETURNING id",
+                &[
+                    &grab.movie_id,
+                    &grab.hash,
+                    &grab.title,
+                    &grab.indexer,
+                    &i16::from(grab.quality.id()),
+                    &i64::try_from(grab.size).unwrap_or(i64::MAX),
+                    &grab.grabbed_at,
+                    &grab.state.as_str(),
+                    &grab.message,
+                ],
+            )
+            .await?;
+        Ok(row.try_get(0)?)
+    }
+
+    /// Todos os grabs, do mais novo ao mais velho.
+    ///
+    /// # Errors
+    ///
+    /// Falha de leitura ou registro inconsistente.
+    pub async fn grabs(&self) -> Result<Vec<Grab>> {
+        let client = self.pool.get().await?;
+        client
+            .query(
+                "SELECT id, movie_id, hash, title, indexer, quality, size, grabbed_at, state,
+                        message, imported_path, finished_at
+                 FROM grabs ORDER BY grabbed_at DESC, id DESC",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|row| {
+                Ok(Grab {
+                    id: row.try_get(0)?,
+                    movie_id: row.try_get(1)?,
+                    hash: row.try_get(2)?,
+                    title: row.try_get(3)?,
+                    indexer: row.try_get(4)?,
+                    quality: quality(row.try_get(5)?)?,
+                    size: u64::try_from(row.try_get::<_, i64>(6)?).unwrap_or(0),
+                    grabbed_at: row.try_get(7)?,
+                    state: GrabState::parse(row.try_get(8)?)?,
+                    message: row.try_get(9)?,
+                    imported_path: row.try_get(10)?,
+                    finished_at: row.try_get(11)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Encerra um grab: importado (com o caminho) ou desistido (com o
+    /// motivo). `message` sem mudar o estado serve de anotação ("ainda
+    /// baixando: 40%").
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn update_grab(
+        &self,
+        id: i64,
+        state: GrabState,
+        message: Option<&str>,
+        imported_path: Option<&str>,
+        at: &str,
+    ) -> Result<()> {
+        let client = self.pool.get().await?;
+        let finished = (state != GrabState::Downloading).then_some(at);
+        client
+            .execute(
+                "UPDATE grabs SET state = $2, message = $3,
+                     imported_path = COALESCE($4, imported_path),
+                     finished_at = COALESCE($5, finished_at)
+                 WHERE id = $1",
+                &[&id, &state.as_str(), &message, &imported_path, &finished],
+            )
+            .await?;
+        Ok(())
     }
 
     /// Espelha a origem: cria, atualiza e remove o que for preciso. Com
@@ -1062,6 +1225,56 @@ mod tests {
             .unwrap();
         db.store.migrate().await.unwrap();
         assert_eq!(db.store.movies().await.unwrap().len(), 1);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn grab_nasce_baixando_e_termina_importado() {
+        let Some(db) = TestDb::new("grabs").await else {
+            return;
+        };
+        let store = &db.store;
+        store
+            .import(&import(vec![(1, movie(10, "Um", false))]), true)
+            .await
+            .unwrap();
+        let movie_id = store.movies().await.unwrap()[0].id;
+        let mut grab = Grab {
+            id: 0,
+            movie_id,
+            hash: "c12fe1c06bba254a9dc9f519b335aa7c1367a88a".into(),
+            title: "Um.2020.1080p.WEB-DL-GRUPO".into(),
+            indexer: "tracker".into(),
+            quality: Quality::WebDl1080p,
+            size: 4_000_000_000,
+            grabbed_at: "2026-01-01T00:00:00Z".into(),
+            state: GrabState::Downloading,
+            message: None,
+            imported_path: None,
+            finished_at: None,
+        };
+        grab.id = store.record_grab(&grab).await.unwrap();
+        assert_eq!(store.grabs().await.unwrap(), [grab.clone()]);
+        // O mesmo torrent duas vezes é recusado.
+        assert!(store.record_grab(&grab).await.is_err());
+
+        store
+            .update_grab(
+                grab.id,
+                GrabState::Imported,
+                None,
+                Some("/filmes/Um (2020)/Um (2020).mkv"),
+                "2026-01-01T02:00:00Z",
+            )
+            .await
+            .unwrap();
+        let done = &store.grabs().await.unwrap()[0];
+        assert_eq!(done.state, GrabState::Imported);
+        assert_eq!(
+            done.imported_path.as_deref(),
+            Some("/filmes/Um (2020)/Um (2020).mkv")
+        );
+        assert_eq!(done.finished_at.as_deref(), Some("2026-01-01T02:00:00Z"));
         db.drop().await;
     }
 

@@ -18,8 +18,10 @@ mod config;
 mod credentials;
 mod cycle;
 mod definitions;
+mod grab;
 mod ledger;
 mod movies;
+mod naming;
 mod registry;
 mod report;
 mod search;
@@ -102,6 +104,49 @@ enum MoviesAction {
         #[arg(long)]
         report: bool,
     },
+    /// Busca um filme que falta, decide e, com `--apply`, manda o escolhido
+    /// ao qBittorrent.
+    Grab {
+        /// Id do filme no TMDB.
+        tmdb: u32,
+        /// Pega de verdade em vez de só mostrar a escolha.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Importa os downloads do acervo que terminaram: hardlink na pasta do
+    /// filme, com o nome que o gerenciador daria. Sem `--apply`, só mostra.
+    Downloads {
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+fn print_grab(report: &grab::GrabReport) {
+    match &report.escolhido {
+        Some(pick) => println!(
+            "{}: {} {} — {} ({}, {:.1} GiB)",
+            report.filme,
+            if report.aplicado { "pegou" } else { "pegaria" },
+            pick.titulo,
+            pick.indexador,
+            pick.qualidade,
+            f64::from(u32::try_from(pick.tamanho / 1_048_576).unwrap_or(u32::MAX)) / 1024.0,
+        ),
+        None => println!(
+            "{}: nada entre {} releases — {}",
+            report.filme,
+            report.releases,
+            report
+                .motivos
+                .iter()
+                .map(|(reason, n)| format!("{reason} {n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+    if report.escolhido.is_some() && !report.aplicado {
+        println!("  simulação: rode com --apply para pegar");
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -214,6 +259,38 @@ async fn run() -> Result<ExitCode> {
                 MoviesAction::Check => movies::check(&config, &store).await? > 0,
                 MoviesAction::Shadow { report: true, .. } => {
                     shadow::report(&config, &store).await? > 0
+                }
+                MoviesAction::Grab { tmdb, apply } => {
+                    let movie = store
+                        .movies()
+                        .await?
+                        .into_iter()
+                        .find(|m| m.movie.tmdb_id == tmdb)
+                        .ok_or_else(|| anyhow::anyhow!("TMDB {tmdb} não está no catálogo"))?;
+                    let catalog = acervo_api::Catalog::new(serve::entries(&config).await?)?;
+                    let report = grab::grab(&config, &store, &catalog, movie.id, apply).await?;
+                    print_grab(&report);
+                    report.escolhido.is_none()
+                }
+                MoviesAction::Downloads { apply } => {
+                    let lines = grab::import_downloads(&config, &store, apply).await?;
+                    if lines.is_empty() {
+                        println!("nenhum download do acervo em andamento");
+                    }
+                    for line in &lines {
+                        println!(
+                            "{:<10} {} — {}{}",
+                            line.estado,
+                            line.filme,
+                            line.release,
+                            line.destino
+                                .as_deref()
+                                .or(line.detalhe.as_deref())
+                                .map(|d| format!(" → {d}"))
+                                .unwrap_or_default()
+                        );
+                    }
+                    lines.iter().any(|l| l.estado == "falhou")
                 }
                 MoviesAction::Shadow { limit, .. } => {
                     let catalog = acervo_api::Catalog::new(serve::entries(&config).await?)?;

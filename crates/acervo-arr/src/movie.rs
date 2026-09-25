@@ -256,6 +256,24 @@ impl ArrClient {
         self.get(self.url(path)?, &[], path).await
     }
 
+    /// Pede para reler a pasta do filme: um arquivo posto lá por fora passa
+    /// a ser o arquivo do filme.
+    ///
+    /// # Errors
+    ///
+    /// Falha de rede ou status não-2xx.
+    pub async fn rescan_movie(&self, movie_id: i64) -> Result<(), ArrError> {
+        let path = "api/v3/command";
+        let response = self
+            .http
+            .post(self.url(path)?)
+            .json(&serde_json::json!({ "name": "RescanMovie", "movieId": movie_id }))
+            .send()
+            .await
+            .map_err(|source| self.transport(source))?;
+        self.check_status(response, path).map(|_| ())
+    }
+
     /// Filmes pegos (enviados ao cliente) de um filme, do mais novo ao mais
     /// velho.
     ///

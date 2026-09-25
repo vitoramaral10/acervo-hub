@@ -42,6 +42,40 @@ pub struct Config {
     /// Banco do catálogo de filmes e das contas da interface.
     #[serde(default)]
     pub database: Option<DatabaseConfig>,
+    /// Grab e importação de filmes pelo próprio acervo.
+    #[serde(default)]
+    pub movies: MoviesConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MoviesConfig {
+    /// Categoria do cliente de download para o que o acervo pega. Separada da
+    /// do gerenciador, para ele não tentar importar o que não pegou; entra em
+    /// `policy.managed_categories` para a limpeza cuidar do seed depois.
+    #[serde(default = "default_movie_category")]
+    pub category: String,
+    /// De quanto em quanto tempo o serviço procura download concluído para
+    /// importar. Zero desliga.
+    #[serde(default = "default_import_interval")]
+    pub import_interval_minutes: u64,
+}
+
+impl Default for MoviesConfig {
+    fn default() -> Self {
+        Self {
+            category: default_movie_category(),
+            import_interval_minutes: default_import_interval(),
+        }
+    }
+}
+
+fn default_movie_category() -> String {
+    "acervo".into()
+}
+
+fn default_import_interval() -> u64 {
+    5
 }
 
 #[derive(Deserialize)]

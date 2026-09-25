@@ -1,12 +1,31 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { CircleAlert, CircleCheck, CircleDashed, CloudDownload, Film, HardDrive, Radar, SearchX } from 'lucide-react'
+import {
+  ArrowDownToLine,
+  CircleAlert,
+  CircleCheck,
+  CircleDashed,
+  CloudDownload,
+  Film,
+  HardDrive,
+  LoaderCircle,
+  Radar,
+  SearchX,
+} from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { PageHeader } from '@/components/PageHeader'
 import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Badge, Skeleton, Tooltip } from '@/components/ui/misc'
-import { type Movie, type MovieImport, type MovieShadow, api } from '@/lib/api'
+import { type GrabReport, type Movie, type MovieDownload, type MovieImport, type MovieShadow, api } from '@/lib/api'
 import { formatAgo, formatCount, formatSize } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
@@ -79,6 +98,146 @@ function ShadowLine({ shadow }: { shadow: MovieShadow }) {
         Sombra {when}: nada entre {formatCount(shadow.releases)} — {reasons}
       </span>
     </p>
+  )
+}
+
+function DownloadLine({ download }: { download: MovieDownload }) {
+  const when = formatAgo(download.pego_em)
+  if (download.estado === 'failed') {
+    return (
+      <p className="mt-1 flex items-center gap-1.5 text-xs text-danger" title={download.release}>
+        <CircleAlert className="size-3.5 shrink-0" aria-hidden="true" />
+        <span className="truncate">
+          Download {when} falhou{download.mensagem ? ` — ${download.mensagem}` : ''}
+        </span>
+      </p>
+    )
+  }
+  if (download.estado === 'imported') {
+    return (
+      <p className="mt-1 flex items-center gap-1.5 text-xs text-success" title={download.release}>
+        <CircleCheck className="size-3.5 shrink-0" aria-hidden="true" />
+        <span className="truncate">Importado — o Radarr adota o arquivo ao reler a pasta</span>
+      </p>
+    )
+  }
+  return (
+    <p className="mt-1 flex items-center gap-1.5 text-xs text-accent" title={download.release}>
+      <LoaderCircle className="size-3.5 shrink-0 animate-spin motion-reduce:animate-none" aria-hidden="true" />
+      <span className="truncate">
+        Baixando{download.mensagem ? ` (${download.mensagem})` : ''}:{' '}
+        <span className="font-mono">{download.release}</span>
+      </span>
+    </p>
+  )
+}
+
+/** Busca, mostra a escolha e só pega depois de confirmar. */
+function GrabDialog({
+  movie,
+  open,
+  onOpenChange,
+}: {
+  movie: Movie
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  const queryClient = useQueryClient()
+  const [plan, setPlan] = useState<GrabReport | null>(null)
+  const search = useMutation({
+    mutationFn: () => api.grab(movie.id, false),
+    onSuccess: setPlan,
+  })
+  const take = useMutation({
+    mutationFn: () => api.grab(movie.id, true),
+    onSuccess: (report) => {
+      if (report.aplicado && report.escolhido) {
+        toast.success(`${report.filme}: mandado ao qBittorrent`)
+        onOpenChange(false)
+      } else {
+        // A escolha mudou entre a busca e a confirmação.
+        setPlan(report)
+      }
+    },
+    onError: (error: Error) => toast.error(error.message),
+    onSettled: () => void queryClient.invalidateQueries({ queryKey: ['filmes'] }),
+  })
+  const pick = plan?.escolhido
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        onOpenChange(next)
+        if (next) {
+          setPlan(null)
+          search.mutate()
+        }
+      }}
+    >
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>
+            Pegar {movie.titulo}
+            {movie.ano ? ` (${movie.ano})` : ''}
+          </DialogTitle>
+          <DialogDescription>
+            Busca em todos os indexadores e escolhe com as regras do Radarr. Nada é baixado antes de você confirmar.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="min-h-24" aria-live="polite">
+          {search.isPending ? (
+            <div className="grid gap-2" aria-busy="true">
+              <Skeleton className="h-4 w-3/4" />
+              <Skeleton className="h-4 w-1/2" />
+              <p className="text-xs text-content-subtle">Buscando nos indexadores…</p>
+            </div>
+          ) : search.isError ? (
+            <p role="alert" className="text-sm text-danger">
+              {search.error.message}
+            </p>
+          ) : pick && plan ? (
+            <dl className="grid gap-3 rounded-md border border-border p-4 text-sm">
+              <div>
+                <dt className="text-xs text-content-subtle">Release</dt>
+                <dd className="font-mono text-xs break-all">{pick.titulo}</dd>
+              </div>
+              <div className="flex flex-wrap gap-x-6 gap-y-2">
+                <div>
+                  <dt className="text-xs text-content-subtle">Indexador</dt>
+                  <dd>{pick.indexador}</dd>
+                </div>
+                <div>
+                  <dt className="text-xs text-content-subtle">Qualidade</dt>
+                  <dd>{pick.qualidade}</dd>
+                </div>
+                <div>
+                  <dt className="text-xs text-content-subtle">Tamanho</dt>
+                  <dd className="tabular-nums">{formatSize(pick.tamanho)}</dd>
+                </div>
+              </div>
+              <p className="text-xs text-content-subtle">Melhor de {formatCount(plan.releases)} releases.</p>
+            </dl>
+          ) : plan ? (
+            <p className="text-sm text-content-muted">
+              Nenhum release serve entre {formatCount(plan.releases)}
+              {plan.motivos.length > 0 &&
+                ` — ${plan.motivos.map(([reason, count]) => `${REASONS[reason] ?? reason} (${count})`).join(', ')}`}
+              .
+            </p>
+          ) : null}
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={() => onOpenChange(false)}>
+            Cancelar
+          </Button>
+          <Button variant="primary" disabled={!pick} loading={take.isPending} onClick={() => take.mutate()}>
+            {!take.isPending && <ArrowDownToLine aria-hidden="true" />}
+            Pegar este
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -167,7 +326,7 @@ export function MoviesPage() {
     <>
       <PageHeader
         title="Filmes"
-        description="O catálogo do acervo-hub, espelhado do Radarr. Nesta fase o Radarr continua decidindo e baixando; a sombra busca nos indexadores daqui e mostra o que o acervo-hub pegaria, sem pegar nada."
+        description="O catálogo do acervo-hub, espelhado do Radarr. O Radarr continua decidindo e baixando sozinho; a sombra mostra o que o acervo-hub pegaria, e “Pegar agora” faz o acervo-hub buscar, baixar e importar um filme que falta."
         action={
           <div className="flex flex-wrap gap-2">
             <Button onClick={() => shadow.mutate()} loading={shadow.isPending} disabled={counts.total === 0}>
@@ -305,6 +464,7 @@ function Stat({ label, value, tone }: { label: string; value: string; tone?: 'da
 }
 
 function MovieRow({ movie }: { movie: Movie }) {
+  const [grabbing, setGrabbing] = useState(false)
   const file = movie.arquivo
   const disk = file ? DISK[file.disco] : null
   const imdb = movie.imdb ? `https://www.imdb.com/title/${movie.imdb}/` : undefined
@@ -330,7 +490,20 @@ function MovieRow({ movie }: { movie: Movie }) {
             {file.release}
           </p>
         )}
-        {!file && movie.sombra && <ShadowLine shadow={movie.sombra} />}
+        {!file && movie.download ? (
+          <DownloadLine download={movie.download} />
+        ) : (
+          !file && movie.sombra && <ShadowLine shadow={movie.sombra} />
+        )}
+        {!file && movie.download?.estado !== 'downloading' && (
+          <>
+            <Button variant="ghost" size="sm" className="mt-2 -ml-2" onClick={() => setGrabbing(true)}>
+              <ArrowDownToLine aria-hidden="true" />
+              Pegar agora
+            </Button>
+            <GrabDialog movie={movie} open={grabbing} onOpenChange={setGrabbing} />
+          </>
+        )}
         {file && (
           <p className="mt-1 flex flex-wrap gap-1.5 md:hidden">
             <Badge>{file.qualidade}</Badge>

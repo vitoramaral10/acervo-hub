@@ -265,7 +265,13 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
         daqui e grava o que o acervo-hub pegaria, sem pegar nada; `movies shadow --report`
         compara cada escolha com o primeiro grab do gerenciador depois dela. A tela de filmes
         mostra a última sombra de cada um. Falta acumular dias de comparação antes do corte.
-  - [ ] **Grab e import**: envio ao cliente, hardlink e renomeação na biblioteca.
+  - [x] **Grab e import**. `movies grab <tmdb>` (ou "Pegar agora" na tela) busca, decide
+        e manda o escolhido ao qBittorrent numa categoria própria (`[movies] category`), que o
+        gerenciador não importa. O serviço confere a cada `import_interval_minutes` os
+        downloads que terminaram e liga o maior vídeo na pasta do filme por hardlink, com o
+        nome que o gerenciador daria — a regra confere com os 134 arquivos de um gerenciador
+        real —, e pede a ele que releia a pasta. Só cria: filme que já tem arquivo fica de
+        fora, e upgrade continua com o gerenciador.
   - [ ] **API v3 de filmes** para os clientes que dependem dela (pedidos e legendas), e o
         corte.
 - [ ] **Fase 4 — séries.** Só depois de o parser passar no corpus real.

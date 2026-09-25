@@ -215,7 +215,7 @@ fn indexers(served: &[String], remote: &Remote) -> Vec<Indexer> {
         .collect()
 }
 
-fn movie_client(config: &Config) -> Result<ArrClient> {
+pub(crate) fn movie_client(config: &Config) -> Result<ArrClient> {
     let spec = config
         .instances
         .iter()
@@ -239,7 +239,7 @@ pub struct ShadowLine {
     pub erro: Option<String>,
 }
 
-fn summarize(decisions: &[Decision], movie: i64) -> Vec<(String, usize)> {
+pub(crate) fn summarize(decisions: &[Decision], movie: i64) -> Vec<(String, usize)> {
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     for decision in decisions.iter().filter(|d| !d.approved()) {
         // O motivo que pesa: o do filme buscado, ou "outro filme".
@@ -259,87 +259,103 @@ fn summarize(decisions: &[Decision], movie: i64) -> Vec<(String, usize)> {
     counts
 }
 
-/// Busca em sombra até `limit` filmes que faltam, começando pelos que estão
-/// há mais tempo sem sombra. `catalog` é o dos indexadores servidos: dentro
-/// do serviço, a sombra divide sessão e consultas guardadas com os
-/// gerenciadores.
-///
-/// # Errors
-///
-/// Catálogo vazio, gerenciador de filmes inalcançável ou nenhum indexador.
-#[allow(clippy::too_many_lines)]
-pub async fn run(
-    config: &Config,
-    store: &Store,
-    catalog: &Catalog,
-    limit: usize,
-    print: bool,
-) -> Result<Vec<ShadowLine>> {
-    let client = movie_client(config)?;
-    let (queue, roots, indexer_config, media_config, remote_indexers) = tokio::try_join!(
-        client.movie_queue(),
-        client.root_folders(),
-        client.indexer_config(),
-        client.media_management_config(),
-        client.indexers(),
-    )?;
-    let remote = Remote {
-        queue,
-        roots,
-        indexer_config,
-        media_config,
-        indexers: remote_indexers,
-    };
+/// Tudo o que a decisão precisa, lido uma vez: a biblioteca como alvos, os
+/// indexadores servidos e a configuração do gerenciador.
+pub(crate) struct Decider {
+    pub library: Vec<Target>,
+    indexers: Vec<Indexer>,
+    settings: Settings,
+}
 
-    let (catalog_movies, stored_profiles, definitions, latest) = tokio::try_join!(
-        store.movies(),
-        store.profiles(),
-        store.quality_definitions(),
-        store.latest_shadow_runs(),
-    )?;
-    if catalog_movies.is_empty() {
-        bail!("catálogo vazio: rode `movies import --apply` antes");
+/// Uma busca decidida: os releases como vieram do indexador e a decisão de
+/// cada um, na ordem de preferência.
+pub(crate) struct Outcome {
+    pub releases: Vec<acervo_indexers::Release>,
+    pub decisions: Vec<Decision>,
+}
+
+impl Outcome {
+    /// O release que seria pego, com a decisão dele.
+    pub fn pick(&self) -> Option<(&Decision, &acervo_indexers::Release)> {
+        self.decisions
+            .iter()
+            .find(|d| d.approved())
+            .map(|d| (d, &self.releases[d.release]))
     }
+}
 
-    let now = time::OffsetDateTime::now_utc();
-    let profiles: BTreeMap<String, Profile> = stored_profiles
-        .iter()
-        .map(|p| (p.name.clone(), profile(p)))
-        .collect();
-    let library: Vec<Target> = catalog_movies
-        .iter()
-        .filter_map(|entry| target(entry, &profiles, &remote, now))
-        .collect();
-    let settings = settings(&remote, definitions);
-
-    let served: Vec<String> = catalog.views().into_iter().map(|view| view.name).collect();
-    if served.is_empty() {
-        bail!("nenhum indexador ativo para buscar");
-    }
-    let indexers = indexers(&served, &remote);
-    let engine = Engine {
-        library: &library,
-        indexers: &indexers,
-        settings: &settings,
-    };
-
-    let last_run: BTreeMap<i64, &str> =
-        latest.iter().map(|r| (r.movie_id, r.at.as_str())).collect();
-    let mut wanted: Vec<&Target> = library
-        .iter()
-        .filter(|t| t.monitored && t.available && t.file.is_none())
-        .collect();
-    // Nunca buscados primeiro; depois, o que está há mais tempo sem busca.
-    wanted.sort_by_key(|t| last_run.get(&t.id).copied().unwrap_or(""));
-    wanted.truncate(limit);
-
-    let mut lines = Vec::new();
-    let mut runs = Vec::new();
-    for movie in wanted {
-        let label = match movie.year {
-            Some(year) => format!("{} ({year})", movie.title),
-            None => movie.title.clone(),
+impl Decider {
+    /// # Errors
+    ///
+    /// Catálogo vazio, gerenciador de filmes inalcançável ou nenhum indexador.
+    pub async fn load(config: &Config, store: &Store, catalog: &Catalog) -> Result<Self> {
+        let client = movie_client(config)?;
+        let (queue, roots, indexer_config, media_config, remote_indexers) = tokio::try_join!(
+            client.movie_queue(),
+            client.root_folders(),
+            client.indexer_config(),
+            client.media_management_config(),
+            client.indexers(),
+        )?;
+        let remote = Remote {
+            queue,
+            roots,
+            indexer_config,
+            media_config,
+            indexers: remote_indexers,
         };
+        let (movies, stored_profiles, definitions, grabs) = tokio::try_join!(
+            store.movies(),
+            store.profiles(),
+            store.quality_definitions(),
+            store.grabs(),
+        )?;
+        if movies.is_empty() {
+            bail!("catálogo vazio: rode `movies import --apply` antes");
+        }
+        let now = time::OffsetDateTime::now_utc();
+        let profiles: BTreeMap<String, Profile> = stored_profiles
+            .iter()
+            .map(|p| (p.name.clone(), profile(p)))
+            .collect();
+        let mut library: Vec<Target> = movies
+            .iter()
+            .filter_map(|entry| target(entry, &profiles, &remote, now))
+            .collect();
+        // O que o acervo mesmo mandou ao cliente conta como fila: sem isso,
+        // pegaria o mesmo filme de novo enquanto o primeiro baixa.
+        for grab in grabs
+            .iter()
+            .filter(|g| g.state == acervo_store::GrabState::Downloading)
+        {
+            if let Some(target) = library.iter_mut().find(|t| t.id == grab.movie_id) {
+                target.queued.push(QualityModel {
+                    quality: grab.quality,
+                    revision: Revision::default(),
+                });
+            }
+        }
+        let served: Vec<String> = catalog.views().into_iter().map(|view| view.name).collect();
+        if served.is_empty() {
+            bail!("nenhum indexador ativo para buscar");
+        }
+        Ok(Self {
+            indexers: indexers(&served, &remote),
+            settings: settings(&remote, definitions),
+            library,
+        })
+    }
+
+    pub fn target(&self, movie_id: i64) -> Option<&Target> {
+        self.library.iter().find(|t| t.id == movie_id)
+    }
+
+    /// Busca o filme em todos os indexadores e decide cada release.
+    ///
+    /// # Errors
+    ///
+    /// A busca falhou em todos os indexadores.
+    pub async fn decide(&self, catalog: &Catalog, movie: &Target) -> Result<Outcome, String> {
         let mut query = SearchQuery::movie(movie.title.clone()).with_categories([MOVIES]);
         if let Some(year) = movie.year {
             query = query.with_year(year);
@@ -350,75 +366,124 @@ pub async fn run(
         if movie.tmdb_id != 0 {
             query = query.with_tmdb_id(u64::from(movie.tmdb_id));
         }
+        let page = catalog
+            .search(ALL, &query)
+            .await
+            .map_err(|error| error.to_string())?;
+        let candidates: Vec<Release> = page
+            .releases
+            .iter()
+            .map(|r| Release {
+                title: r.title.clone(),
+                indexer: r.indexer.clone(),
+                size: r.size,
+                seeders: r.seeders,
+                peers: r.seeders.map(|s| s + r.leechers.unwrap_or(0)),
+                imdb_id: None,
+                tmdb_id: None,
+                languages: Vec::new(),
+                container: None,
+                flags: if r.tags.iter().any(|t| t.eq_ignore_ascii_case("freeleech")) {
+                    FREELEECH
+                } else {
+                    0
+                },
+            })
+            .collect();
+        let engine = Engine {
+            library: &self.library,
+            indexers: &self.indexers,
+            settings: &self.settings,
+        };
+        let decisions = engine.search(movie.id, &candidates, Mode::Automatic);
+        Ok(Outcome {
+            releases: page.releases,
+            decisions,
+        })
+    }
+}
+
+pub(crate) fn label(movie: &Target) -> String {
+    match movie.year {
+        Some(year) => format!("{} ({year})", movie.title),
+        None => movie.title.clone(),
+    }
+}
+
+/// Busca em sombra até `limit` filmes que faltam, começando pelos que estão
+/// há mais tempo sem sombra. `catalog` é o dos indexadores servidos: dentro
+/// do serviço, a sombra divide sessão e consultas guardadas com os
+/// gerenciadores.
+///
+/// # Errors
+///
+/// Catálogo vazio, gerenciador de filmes inalcançável ou nenhum indexador.
+pub async fn run(
+    config: &Config,
+    store: &Store,
+    catalog: &Catalog,
+    limit: usize,
+    print: bool,
+) -> Result<Vec<ShadowLine>> {
+    let (decider, latest) = tokio::try_join!(Decider::load(config, store, catalog), async {
+        Ok(store.latest_shadow_runs().await?)
+    },)?;
+    let last_run: BTreeMap<i64, &str> =
+        latest.iter().map(|r| (r.movie_id, r.at.as_str())).collect();
+    let mut wanted: Vec<&Target> = decider
+        .library
+        .iter()
+        .filter(|t| t.monitored && t.available && t.file.is_none())
+        .collect();
+    // Nunca buscados primeiro; depois, o que está há mais tempo sem busca.
+    wanted.sort_by_key(|t| last_run.get(&t.id).copied().unwrap_or(""));
+    wanted.truncate(limit);
+
+    let mut lines = Vec::new();
+    let mut runs = Vec::new();
+    for movie in wanted {
         let at = now_rfc3339();
-        let (run, line) = match catalog.search(ALL, &query).await {
-            Err(error) => {
-                let error = error.to_string();
-                (
-                    ShadowRun {
-                        movie_id: movie.id,
-                        at,
-                        releases: 0,
-                        pick: None,
-                        rejections: Vec::new(),
-                        error: Some(error.clone()),
-                    },
-                    ShadowLine {
-                        filme: label,
-                        releases: 0,
-                        pegaria: None,
-                        motivos: Vec::new(),
-                        erro: Some(error),
-                    },
-                )
-            }
-            Ok(page) => {
-                let releases: Vec<Release> = page
-                    .releases
-                    .iter()
-                    .map(|r| Release {
-                        title: r.title.clone(),
-                        indexer: r.indexer.clone(),
-                        size: r.size,
-                        seeders: r.seeders,
-                        peers: r.seeders.map(|s| s + r.leechers.unwrap_or(0)),
-                        imdb_id: None,
-                        tmdb_id: None,
-                        languages: Vec::new(),
-                        container: None,
-                        flags: if r.tags.iter().any(|t| t.eq_ignore_ascii_case("freeleech")) {
-                            FREELEECH
-                        } else {
-                            0
-                        },
-                    })
-                    .collect();
-                let decisions = engine.search(movie.id, &releases, Mode::Automatic);
-                let pick = decisions.iter().find(|d| d.approved()).map(|d| {
-                    let release = &releases[d.release];
-                    ShadowPick {
-                        title: release.title.clone(),
-                        indexer: release.indexer.clone(),
-                        quality: d
-                            .parsed
-                            .as_ref()
-                            .map_or(acervo_parser::Quality::Unknown, |p| p.quality.quality),
-                        size: release.size,
-                    }
+        let (run, line) = match decider.decide(catalog, movie).await {
+            Err(error) => (
+                ShadowRun {
+                    movie_id: movie.id,
+                    at,
+                    releases: 0,
+                    pick: None,
+                    rejections: Vec::new(),
+                    error: Some(error.clone()),
+                },
+                ShadowLine {
+                    filme: label(movie),
+                    releases: 0,
+                    pegaria: None,
+                    motivos: Vec::new(),
+                    erro: Some(error),
+                },
+            ),
+            Ok(outcome) => {
+                let pick = outcome.pick().map(|(decision, release)| ShadowPick {
+                    title: release.title.clone(),
+                    indexer: release.indexer.clone(),
+                    quality: decision
+                        .parsed
+                        .as_ref()
+                        .map_or(acervo_parser::Quality::Unknown, |p| p.quality.quality),
+                    size: release.size,
                 });
-                let reasons = summarize(&decisions, movie.id);
+                let reasons = summarize(&outcome.decisions, movie.id);
                 (
                     ShadowRun {
                         movie_id: movie.id,
                         at,
-                        releases: releases.len(),
+                        releases: outcome.releases.len(),
                         pick: pick.clone(),
                         rejections: reasons.clone(),
                         error: None,
                     },
                     ShadowLine {
-                        filme: label,
-                        releases: releases.len(),
+                        filme: label(movie),
+                        releases: outcome.releases.len(),
                         pegaria: pick.map(|p| p.title),
                         motivos: reasons,
                         erro: None,
@@ -439,7 +504,7 @@ pub async fn run(
     Ok(lines)
 }
 
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default()

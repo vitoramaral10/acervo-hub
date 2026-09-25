@@ -232,7 +232,7 @@ impl ArrClient {
         self.check_status(response, &path).map(|_| ())
     }
 
-    fn transport(&self, source: reqwest::Error) -> ArrError {
+    pub(crate) fn transport(&self, source: reqwest::Error) -> ArrError {
         ArrError::Transport {
             instance: self.name.clone(),
             source,

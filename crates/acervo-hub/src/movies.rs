@@ -299,6 +299,16 @@ pub struct MovieView {
     pub adicionado: Option<String>,
     pub arquivo: Option<FileView>,
     pub sombra: Option<ShadowView>,
+    /// O download mais recente que o acervo pegou para o filme.
+    pub download: Option<DownloadView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DownloadView {
+    pub estado: acervo_store::GrabState,
+    pub release: String,
+    pub mensagem: Option<String>,
+    pub pego_em: String,
 }
 
 fn disk(path: &Path, expected: u64, map: &acervo_fs::PathMap) -> (Disk, Option<String>) {
@@ -324,6 +334,7 @@ fn view(
     entry: CatalogMovie,
     map: &acervo_fs::PathMap,
     shadow: Option<acervo_store::ShadowRun>,
+    download: Option<DownloadView>,
 ) -> MovieView {
     let movie = entry.movie;
     let arquivo = movie.file.map(|file| {
@@ -363,6 +374,7 @@ fn view(
             motivos: run.rejections,
             erro: run.error,
         }),
+        download,
     }
 }
 
@@ -380,13 +392,24 @@ pub async fn list(config: &Config, store: &Store) -> Result<Vec<MovieView>> {
         .map(|run| (run.movie_id, run))
         .collect();
     let movies = store.movies().await?;
+    let mut downloads: HashMap<i64, DownloadView> = HashMap::new();
+    // Do mais novo ao mais velho: o primeiro de cada filme fica.
+    for grab in store.grabs().await? {
+        downloads.entry(grab.movie_id).or_insert(DownloadView {
+            estado: grab.state,
+            release: grab.title,
+            mensagem: grab.message,
+            pego_em: grab.grabbed_at,
+        });
+    }
     // O `stat` de cada arquivo é disco: fora do executor assíncrono.
     tokio::task::spawn_blocking(move || -> Result<Vec<MovieView>> {
         Ok(movies
             .into_iter()
             .map(|entry| {
                 let shadow = shadows.remove(&entry.id);
-                view(entry, &map, shadow)
+                let download = downloads.remove(&entry.id);
+                view(entry, &map, shadow, download)
             })
             .collect())
     })

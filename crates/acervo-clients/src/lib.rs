@@ -7,8 +7,10 @@ use acervo_core::{DownloadHash, DownloadState};
 use url::Url;
 
 mod dto;
+mod torrent;
 
 pub use dto::{TorrentFile, TorrentInfo};
+pub use torrent::{info_hash, magnet_hash};
 
 #[derive(Debug, thiserror::Error)]
 pub enum QbitError {
@@ -26,6 +28,24 @@ pub enum QbitError {
 
     #[error("login recusado: usuário ou senha do qBittorrent incorretos")]
     LoginRefused,
+
+    #[error("o qBittorrent recusou o torrent (já existe ou arquivo inválido)")]
+    AddRefused,
+}
+
+/// O que mandar ao cliente: o arquivo `.torrent` ou um link magnet.
+#[derive(Debug, Clone)]
+pub enum NewTorrent {
+    File(Vec<u8>),
+    Magnet(String),
+}
+
+/// Onde e como o torrent novo entra.
+#[derive(Debug, Clone)]
+pub struct AddOptions {
+    pub category: String,
+    /// Pasta de download como o cliente a vê; sem ela, a da categoria.
+    pub save_path: Option<String>,
 }
 
 /// Sessão autenticada no qBittorrent.
@@ -101,6 +121,88 @@ impl QbitClient {
     /// Falha de transporte ou status não-2xx.
     pub async fn torrents(&self) -> Result<Vec<TorrentInfo>, QbitError> {
         self.get("api/v2/torrents/info", &[]).await
+    }
+
+    /// Um torrent pelo hash, se o cliente o tem.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status não-2xx.
+    pub async fn torrent(&self, hash: &str) -> Result<Option<TorrentInfo>, QbitError> {
+        let found: Vec<TorrentInfo> = self
+            .get("api/v2/torrents/info", &[("hashes", hash)])
+            .await?;
+        Ok(found.into_iter().next())
+    }
+
+    /// Cria a categoria; já existir não é erro.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status inesperado.
+    pub async fn ensure_category(&self, name: &str) -> Result<(), QbitError> {
+        let path = "api/v2/torrents/createCategory";
+        let response = self
+            .http
+            .post(self.base.join(path)?)
+            .header(reqwest::header::REFERER, self.base.as_str())
+            .form(&[("category", name), ("savePath", "")])
+            .send()
+            .await?;
+        // 409: a categoria já existe.
+        match response.status() {
+            status if status.is_success() => Ok(()),
+            reqwest::StatusCode::CONFLICT => Ok(()),
+            status => Err(QbitError::Status {
+                status,
+                path: path.into(),
+            }),
+        }
+    }
+
+    /// Adiciona um torrent. O cliente não devolve o hash: quem chama o tira
+    /// de [`info_hash`] ou [`magnet_hash`] antes.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte, status não-2xx ou torrent recusado.
+    pub async fn add(&self, torrent: NewTorrent, options: &AddOptions) -> Result<(), QbitError> {
+        let path = "api/v2/torrents/add";
+        let mut form = reqwest::multipart::Form::new().text("category", options.category.clone());
+        if let Some(save_path) = &options.save_path {
+            form = form.text("savepath", save_path.clone());
+        }
+        form = match torrent {
+            NewTorrent::File(bytes) => form.part(
+                "torrents",
+                reqwest::multipart::Part::bytes(bytes)
+                    .file_name("acervo.torrent")
+                    .mime_str("application/x-bittorrent")?,
+            ),
+            NewTorrent::Magnet(link) => form.text("urls", link),
+        };
+        let response = self
+            .http
+            .post(self.base.join(path)?)
+            .header(reqwest::header::REFERER, self.base.as_str())
+            .multipart(form)
+            .send()
+            .await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::CONFLICT {
+            return Err(QbitError::AddRefused);
+        }
+        if !status.is_success() {
+            return Err(QbitError::Status {
+                status,
+                path: path.into(),
+            });
+        }
+        // Até a 5.0, recusa é 200 com "Fails.".
+        if response.text().await?.trim() == "Fails." {
+            return Err(QbitError::AddRefused);
+        }
+        Ok(())
     }
 
     /// Lista os arquivos de um torrent, com caminho relativo ao `save_path`.

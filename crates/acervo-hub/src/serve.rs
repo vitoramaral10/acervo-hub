@@ -123,6 +123,62 @@ async fn shadow_loop(
     }
 }
 
+/// Importa de tempos em tempos os downloads do acervo que terminaram.
+async fn import_loop(config: Arc<Config>, database: Database, minutes: u64) {
+    let mut every = tokio::time::interval(Duration::from_secs(minutes * 60));
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        let Ok(store) = database.get() else {
+            continue;
+        };
+        match crate::grab::import_downloads(&config, store, true).await {
+            Ok(lines) => {
+                for line in lines.iter().filter(|l| l.estado != "baixando") {
+                    tracing::info!(
+                        filme = line.filme,
+                        estado = line.estado,
+                        destino = line.destino,
+                        detalhe = line.detalhe,
+                        "importação de download"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!("importação de downloads falhou: {error:#}"),
+        }
+    }
+}
+
+/// Os downloads do acervo, do mais novo ao mais velho, com o título do filme.
+async fn downloads_json(store: &acervo_store::Store) -> Result<serde_json::Value> {
+    let (grabs, movies) = tokio::try_join!(store.grabs(), store.movies())?;
+    Ok(serde_json::Value::Array(
+        grabs
+            .iter()
+            .map(|grab| {
+                let movie = movies.iter().find(|m| m.id == grab.movie_id);
+                json!({
+                    "id": grab.id,
+                    "filme_id": grab.movie_id,
+                    "filme": movie.map(|m| match m.movie.year {
+                        Some(year) => format!("{} ({year})", m.movie.title),
+                        None => m.movie.title.clone(),
+                    }),
+                    "release": grab.title,
+                    "indexador": grab.indexer,
+                    "qualidade": grab.quality.name(),
+                    "tamanho": grab.size,
+                    "estado": grab.state,
+                    "mensagem": grab.message,
+                    "destino": grab.imported_path,
+                    "pego_em": grab.grabbed_at,
+                    "concluido_em": grab.finished_at,
+                })
+            })
+            .collect(),
+    ))
+}
+
 /// Nome da "definição" que adiciona um endpoint Torznab qualquer.
 const TORZNAB: &str = "torznab";
 
@@ -145,6 +201,14 @@ pub async fn run(config: Config) -> Result<()> {
         tracing::warn!("sem `[database]`: a interface só aceita a chave de API em `X-Api-Key`");
         None
     };
+    let import_minutes = config.movies.import_interval_minutes;
+    if import_minutes > 0 && config.database.is_some() && config.qbittorrent.is_some() {
+        tokio::spawn(import_loop(
+            Arc::clone(&config),
+            database.clone(),
+            import_minutes,
+        ));
+    }
     if let Some(minutes) = server.shadow_interval_minutes.filter(|m| *m > 0) {
         tokio::spawn(shadow_loop(
             Arc::clone(&config),
@@ -833,6 +897,35 @@ impl Admin for HubAdmin {
         .await
         .map_err(|e| format!("{e:#}"))?;
         serde_json::to_value(lines).map_err(|e| e.to_string())
+    }
+
+    async fn grab_movie(&self, movie_id: i64, apply: bool) -> Result<serde_json::Value, String> {
+        let report = crate::grab::grab(
+            &self.config,
+            self.database.get()?,
+            &self.catalog,
+            movie_id,
+            apply,
+        )
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+        serde_json::to_value(report).map_err(|e| e.to_string())
+    }
+
+    async fn downloads(&self, import: bool) -> Result<serde_json::Value, String> {
+        let store = self.database.get()?;
+        let imported = if import {
+            let _guard = self.write.lock().await;
+            Some(
+                crate::grab::import_downloads(&self.config, store, true)
+                    .await
+                    .map_err(|e| format!("{e:#}"))?,
+            )
+        } else {
+            None
+        };
+        let list = downloads_json(store).await.map_err(|e| format!("{e:#}"))?;
+        Ok(json!({ "downloads": list, "importacao": imported }))
     }
 
     async fn import_movies(&self, apply: bool) -> Result<serde_json::Value, String> {

@@ -297,3 +297,72 @@ async fn sessao_expirada_no_meio_do_ciclo_vira_erro() {
 
     assert!(erro.to_string().contains("403"), "erro inesperado: {erro}");
 }
+
+#[tokio::test]
+async fn adicionar_manda_arquivo_e_categoria_e_reconhece_recusa() {
+    use acervo_clients::{AddOptions, NewTorrent};
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/add"))
+        .and(body_string_contains("name=\"category\""))
+        .and(body_string_contains("acervo"))
+        .and(body_string_contains("filename=\"acervo.torrent\""))
+        .and(body_string_contains("d4:info"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/add"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("Fails."))
+        .mount(&server)
+        .await;
+    let options = AddOptions {
+        category: "acervo".into(),
+        save_path: None,
+    };
+
+    cliente
+        .add(NewTorrent::File(b"d4:infod4:name1:xee".to_vec()), &options)
+        .await
+        .expect("aceito");
+    // O mesmo torrent de novo: o 4.x responde 200 com "Fails.".
+    let erro = cliente
+        .add(NewTorrent::File(b"d4:infod4:name1:xee".to_vec()), &options)
+        .await
+        .unwrap_err();
+    assert!(matches!(erro, acervo_clients::QbitError::AddRefused));
+}
+
+#[tokio::test]
+async fn categoria_existente_nao_e_erro_e_torrent_por_hash() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/createCategory"))
+        .respond_with(ResponseTemplate::new(409))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrents/info"))
+        .and(query_param("hashes", "a1b2c3d4e5f6"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([torrent(
+            "a1b2c3d4e5f6",
+            "uploading",
+            "/media/downloads/acervo"
+        )])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrents/info"))
+        .and(query_param("hashes", "ausente"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+
+    cliente.ensure_category("acervo").await.expect("já existe");
+    let achado = cliente.torrent("a1b2c3d4e5f6").await.unwrap().unwrap();
+    assert_eq!(achado.save_path, "/media/downloads/acervo");
+    assert!(cliente.torrent("ausente").await.unwrap().is_none());
+}

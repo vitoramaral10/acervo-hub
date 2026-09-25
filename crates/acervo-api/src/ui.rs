@@ -140,6 +140,22 @@ pub trait Admin: Send + Sync + std::fmt::Debug {
     ///
     /// Catálogo vazio ou gerenciador de filmes inalcançável.
     async fn shadow(&self, limit: usize) -> Result<serde_json::Value, String>;
+
+    /// Busca e decide um filme do catálogo; com `apply`, manda o escolhido
+    /// ao cliente de download.
+    ///
+    /// # Errors
+    ///
+    /// Filme desconhecido ou que já tem arquivo, busca que falhou, cliente
+    /// inalcançável.
+    async fn grab_movie(&self, movie_id: i64, apply: bool) -> Result<serde_json::Value, String>;
+
+    /// Os downloads do acervo; com `import`, importa agora os que terminaram.
+    ///
+    /// # Errors
+    ///
+    /// Banco ou cliente de download inalcançável.
+    async fn downloads(&self, import: bool) -> Result<serde_json::Value, String>;
 }
 
 /// Contas da interface: confere usuário e senha e guarda as sessões.
@@ -240,6 +256,9 @@ pub(crate) fn routes() -> Router<Arc<Server>> {
         .route("/ui/api/filmes", get(movies))
         .route("/ui/api/filmes/importar", post(import_movies))
         .route("/ui/api/filmes/sombra", post(shadow))
+        .route("/ui/api/filmes/{id}/pegar", post(grab_movie))
+        .route("/ui/api/downloads", get(downloads))
+        .route("/ui/api/downloads/importar", post(import_downloads))
         .route("/ui/api/indexadores/{nome}/testar", post(test))
         .route(
             "/ui/api/indexadores/{nome}/settings",
@@ -700,6 +719,44 @@ async fn shadow(
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     Ok(ok(json!({ "filmes": report })))
+}
+
+async fn grab_movie(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Json(body): Json<SyncBody>,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::POST).await?;
+    let report = admin(&server)?
+        .grab_movie(id, body.aplicar)
+        .await
+        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    Ok(ok(report))
+}
+
+async fn downloads(
+    State(server): State<Arc<Server>>,
+    headers: HeaderMap,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::GET).await?;
+    let list = admin(&server)?
+        .downloads(false)
+        .await
+        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    Ok(ok(list))
+}
+
+async fn import_downloads(
+    State(server): State<Arc<Server>>,
+    headers: HeaderMap,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::POST).await?;
+    let list = admin(&server)?
+        .downloads(true)
+        .await
+        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    Ok(ok(list))
 }
 
 fn test_result(outcome: Result<usize, String>) -> serde_json::Value {

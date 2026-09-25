@@ -226,6 +226,17 @@ impl Admin for FakeAdmin {
     async fn shadow(&self, limit: usize) -> Result<Value, String> {
         Ok(json!([{ "filme": "Filme (2020)", "limite": limit }]))
     }
+
+    async fn grab_movie(&self, movie_id: i64, apply: bool) -> Result<Value, String> {
+        if movie_id != 7 {
+            return Err("filme fora do catálogo".into());
+        }
+        Ok(json!({ "filme": "Filme (2020)", "aplicado": apply }))
+    }
+
+    async fn downloads(&self, import: bool) -> Result<Value, String> {
+        Ok(json!({ "downloads": [], "importados": if import { 0 } else { -1 } }))
+    }
 }
 
 /// Contas falsas: uma usuária, sessões num conjunto em memória.
@@ -674,6 +685,41 @@ async fn filmes_lista_e_importa() {
     assert_eq!(status, 200);
     // O limite tem teto: cada filme é uma busca nos trackers.
     assert_eq!(body["filmes"][0]["limite"], 20);
+
+    let (status, body) = send(
+        &base,
+        reqwest::Method::POST,
+        "/ui/api/filmes/7/pegar",
+        &cookie,
+        json!({ "aplicar": false }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["aplicado"], false);
+    let (status, body) = send(
+        &base,
+        reqwest::Method::POST,
+        "/ui/api/filmes/8/pegar",
+        &cookie,
+        json!({ "aplicar": true }),
+    )
+    .await;
+    assert_eq!(status, 422);
+    assert_eq!(body["erro"], "filme fora do catálogo");
+
+    let (status, body) = get(&base, "/ui/api/downloads", &cookie).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["importados"], -1);
+    let (status, body) = send(
+        &base,
+        reqwest::Method::POST,
+        "/ui/api/downloads/importar",
+        &cookie,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["importados"], 0);
 
     // Sem sessão, nada.
     let (status, _) = get(&base, "/ui/api/filmes", "").await;

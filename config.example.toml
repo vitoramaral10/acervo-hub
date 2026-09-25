@@ -84,6 +84,17 @@ ledger = "~/.local/state/acervo-hub/strikes.json"
 [database]
 url = "postgres://acervo:TROQUE@localhost:5432/acervo"
 
+# Grab e importação de filmes pelo acervo-hub (`movies grab`, "Pegar agora").
+# O torrent vai ao `[qbittorrent]` nesta categoria, separada da do gerenciador
+# para ele não tentar importar o que não pegou — ponha-a também em
+# `policy.managed_categories`, para a limpeza cuidar do seed depois. `serve`
+# importa os downloads concluídos a cada `import_interval_minutes` (0 desliga):
+# hardlink na pasta do filme, então download e biblioteca precisam estar no
+# mesmo disco, e o serviço precisa de escrita na biblioteca.
+[movies]
+category = "acervo"
+import_interval_minutes = 5
+
 # --- Superfície Torznab (`acervo-hub serve`) --------------------------------
 #
 # Nada abaixo é lido por `plan`/`apply`, e nada acima é exigido por `serve`:
