@@ -16,17 +16,17 @@ import { SettingsPage } from '@/pages/Settings'
 
 type View = 'indexadores' | 'busca' | 'filmes' | 'aplicativos' | 'limpeza' | 'configuracoes'
 
-const VIEWS: View[] = ['indexadores', 'busca', 'filmes', 'aplicativos', 'limpeza', 'configuracoes']
+const VIEWS: View[] = ['filmes', 'busca', 'indexadores', 'aplicativos', 'limpeza', 'configuracoes']
 
 function viewFromHash(): View {
   const hash = window.location.hash.slice(1) as View
-  return VIEWS.includes(hash) ? hash : 'indexadores'
+  return VIEWS.includes(hash) ? hash : 'filmes'
 }
 
 const NAV: { view: View; label: string; icon: typeof Server }[] = [
-  { view: 'indexadores', label: 'Indexadores', icon: Server },
-  { view: 'busca', label: 'Busca', icon: Search },
   { view: 'filmes', label: 'Filmes', icon: Film },
+  { view: 'busca', label: 'Busca', icon: Search },
+  { view: 'indexadores', label: 'Indexadores', icon: Server },
   { view: 'aplicativos', label: 'Aplicativos', icon: Blocks },
   { view: 'limpeza', label: 'Limpeza', icon: Brush },
   { view: 'configuracoes', label: 'Configurações', icon: SlidersHorizontal },
