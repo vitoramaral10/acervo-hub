@@ -539,7 +539,7 @@ export function MoviesPage() {
 }
 
 const GRID =
-  "grid grid-cols-[repeat(auto-fill,minmax(8.5rem,1fr))] gap-x-4 gap-y-6 sm:grid-cols-[repeat(auto-fill,minmax(10rem,1fr))]";
+  "grid grid-cols-[repeat(auto-fill,minmax(6.5rem,1fr))] gap-x-3 gap-y-5 sm:gap-x-4 sm:gap-y-6 sm:grid-cols-[repeat(auto-fill,minmax(10rem,1fr))]";
 
 /** Ordem de estante: sem artigo inicial. */
 function sortKey(movie: Movie) {
