@@ -17,8 +17,8 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use acervo_decision::{
-    Engine, ExistingFile, Indexer, Mode, Profile, ProfileItem, Propers, QualityDefinition, Release,
-    Settings, Target, compare,
+    Delay, Engine, ExistingFile, Indexer, Mode, Profile, ProfileItem, Propers, QualityDefinition,
+    Queued, Release, Settings, Target, compare,
 };
 use acervo_parser::{Language, Quality, QualityModel, Revision, clean_movie_title};
 use serde_json::Value;
@@ -95,6 +95,7 @@ fn profile(value: &Value) -> Profile {
         min_format_score: i32::try_from(value["minFormatScore"].as_i64().unwrap_or(0)).unwrap_or(0),
         cutoff_format_score: i32::try_from(value["cutoffFormatScore"].as_i64().unwrap_or(0))
             .unwrap_or(0),
+        format_scores: Vec::new(),
     }
 }
 
@@ -126,6 +127,7 @@ fn target(movie: &Value, profiles: &BTreeMap<i64, Profile>, library: &Value) -> 
         quality: quality_model(&movie["movieFile"]["quality"]),
         release_group: text(&movie["movieFile"]["releaseGroup"]),
         age_days: 30,
+        format_score: 0,
     });
     Target {
         id: movie["id"].as_i64().unwrap_or_default(),
@@ -149,7 +151,10 @@ fn target(movie: &Value, profiles: &BTreeMap<i64, Profile>, library: &Value) -> 
             .into_iter()
             .flatten()
             .filter(|q| q["movieId"] == movie["id"] && q["status"] != "failedPending")
-            .map(|q| quality_model(&q["quality"]))
+            .map(|q| Queued {
+                quality: quality_model(&q["quality"]),
+                format_score: 0,
+            })
             .collect(),
         free_space: library["raiz"]
             .as_array()
@@ -209,6 +214,7 @@ fn release(value: &Value) -> Release {
         languages: Vec::new(),
         container: None,
         flags: flags(&value["indexerFlags"]),
+        age_hours: None,
     }
 }
 
@@ -367,6 +373,9 @@ fn corpus() {
         library: &library,
         indexers: &indexers,
         settings: &settings,
+        formats: &[],
+        blocklist: &[],
+        delay: Delay::default(),
     };
 
     let mut releases_total = 0usize;

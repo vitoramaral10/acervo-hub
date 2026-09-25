@@ -1,7 +1,7 @@
 //! Ordem de preferência entre releases do mesmo filme.
 //!
 //! Critérios em cascata, como na referência: qualidade (posição no perfil,
-//! depois revisão), prioridade do indexador, seeders e peers em ordem de
+//! depois revisão), nota de formatos, prioridade do indexador, seeders e peers em ordem de
 //! grandeza, e tamanho mais perto do preferido. Flags do indexador contam só
 //! se preferidas. Protocolo e idade não separam nada: é tudo torrent.
 
@@ -96,6 +96,7 @@ pub fn compare(engine: &Engine<'_>, releases: &[Release], a: &Decision, b: &Deci
         Ordering::Equal
     };
     quality
+        .then(a.format_score.cmp(&b.format_score))
         .then(priority(rb).cmp(&priority(ra)))
         .then(flags)
         .then(magnitude(ra.seeders).cmp(&magnitude(rb.seeders)))

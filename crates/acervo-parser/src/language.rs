@@ -299,6 +299,64 @@ impl Language {
         }
     }
 
+    /// Pelo código ISO 639-2 das faixas de um arquivo (`por`, `eng`). Os
+    /// códigos bibliográficos e os terminológicos valem os dois.
+    #[must_use]
+    pub fn from_iso639_2(code: &str) -> Self {
+        let code = code.to_ascii_lowercase();
+        let two = match code.as_str() {
+            "eng" => "en",
+            "fre" | "fra" => "fr",
+            "spa" => "es",
+            "ger" | "deu" => "de",
+            "ita" => "it",
+            "dan" => "da",
+            "dut" | "nld" => "nl",
+            "jpn" => "ja",
+            "ice" | "isl" => "is",
+            "chi" | "zho" | "cmn" | "yue" => "zh",
+            "rus" => "ru",
+            "pol" => "pl",
+            "vie" => "vi",
+            "swe" => "sv",
+            "nor" | "nob" | "nno" => "no",
+            "fin" => "fi",
+            "tur" => "tr",
+            "por" => "pt",
+            "gre" | "ell" => "el",
+            "kor" => "ko",
+            "hun" => "hu",
+            "heb" => "he",
+            "lit" => "lt",
+            "cze" | "ces" => "cs",
+            "hin" => "hi",
+            "rum" | "ron" => "ro",
+            "tha" => "th",
+            "bul" => "bg",
+            "ara" => "ar",
+            "ukr" => "uk",
+            "per" | "fas" => "fa",
+            "ben" => "bn",
+            "slo" | "slk" => "sk",
+            "lav" => "lv",
+            "cat" => "ca",
+            "tam" => "ta",
+            "tel" => "te",
+            "mal" => "ml",
+            "kan" => "kn",
+            "alb" | "sqi" => "sq",
+            "afr" => "af",
+            "mar" => "mr",
+            "tgl" | "fil" => "tl",
+            "urd" => "ur",
+            "roh" => "rm",
+            "mon" => "mn",
+            "geo" | "kat" => "ka",
+            other => other,
+        };
+        Self::from_iso639_1(two)
+    }
+
     /// Pelo nome que a API v3 usa ("Portuguese (Brazil)").
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {

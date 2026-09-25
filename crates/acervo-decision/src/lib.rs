@@ -7,17 +7,20 @@
 //! os perfis e os releases prontos, e é conferida contra a do gerenciador num
 //! corpus de buscas reais (teste `corpus`, ignorado por padrão).
 //!
-//! Fica de fora, por depender do estado do gerenciador e não do release:
-//! fila, histórico, lista de bloqueio e espaço livre. Custom formats também:
-//! nenhum perfil em uso lhes dá nota, e nota zero não muda decisão.
+//! Fila, lista de bloqueio e espaço livre chegam prontos no alvo e no motor:
+//! quem chama lê o estado, a decisão só o aplica.
 
 use acervo_parser::{Language, ParsedMovie, Quality, QualityModel, parse_movie_title};
 
+mod formats;
 mod languages;
 mod mapping;
 mod rank;
 mod specs;
 
+pub use formats::{
+    CustomFormat, FormatInput, FormatSpec, Rule, matching, modifier_name, source_name,
+};
 pub use rank::compare;
 
 /// Tamanhos por minuto de filme, em megabytes, de uma qualidade.
@@ -93,9 +96,21 @@ pub struct Profile {
     pub language: Language,
     pub min_format_score: i32,
     pub cutoff_format_score: i32,
+    /// Nota de cada formato, pelo id; formato ausente vale zero.
+    pub format_scores: Vec<(i64, i32)>,
 }
 
 impl Profile {
+    /// Soma das notas dos formatos.
+    #[must_use]
+    pub fn score(&self, formats: &[i64]) -> i32 {
+        formats
+            .iter()
+            .filter_map(|id| self.format_scores.iter().find(|(f, _)| f == id))
+            .map(|(_, score)| score)
+            .sum()
+    }
+
     /// Posição da qualidade no perfil; fora dele é -1, abaixo de tudo.
     fn index(&self, quality: Quality) -> i64 {
         self.items
@@ -140,6 +155,15 @@ pub struct ExistingFile {
     pub release_group: Option<String>,
     /// Dias desde que entrou na biblioteca.
     pub age_days: u32,
+    /// Nota dos formatos do arquivo no perfil do filme.
+    pub format_score: i32,
+}
+
+/// Um download do filme já na fila.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Queued {
+    pub quality: QualityModel,
+    pub format_score: i32,
 }
 
 /// Um filme da biblioteca, com o que a decisão precisa dele.
@@ -162,8 +186,8 @@ pub struct Target {
     pub available: bool,
     pub profile: Profile,
     pub file: Option<ExistingFile>,
-    /// Qualidade de cada download deste filme já na fila.
-    pub queued: Vec<QualityModel>,
+    /// Cada download deste filme já na fila.
+    pub queued: Vec<Queued>,
     /// Espaço livre onde o filme mora, em bytes; `None` pula a verificação.
     pub free_space: Option<u64>,
 }
@@ -180,7 +204,7 @@ pub struct Indexer {
 }
 
 /// Um resultado de busca, como o indexador o descreve.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Release {
     pub title: String,
     pub indexer: String,
@@ -196,6 +220,8 @@ pub struct Release {
     /// Bits de flag do indexador (freeleech, internal...), no formato da
     /// referência.
     pub flags: u32,
+    /// Horas desde a publicação; `None` é desconhecido.
+    pub age_hours: Option<f64>,
 }
 
 /// Por que um release não serve. O nome de cada variante é o motivo da
@@ -252,6 +278,12 @@ pub enum Rejection {
     MinimumFreeSpace {
         remaining: i64,
     },
+    Blocklisted,
+    /// Esperando o atraso do perfil de espera.
+    Delayed {
+        /// Idade do release, em minutos.
+        minutes: u32,
+    },
 }
 
 impl Rejection {
@@ -292,6 +324,8 @@ impl Rejection {
             Self::QueueUpgradesNotAllowed => "QueueUpgradesNotAllowed",
             Self::QueuePropersDisabled => "QueuePropersDisabled",
             Self::MinimumFreeSpace { .. } => "MinimumFreeSpace",
+            Self::Blocklisted => "Blocklisted",
+            Self::Delayed { .. } => "Delayed",
         }
     }
 }
@@ -368,6 +402,10 @@ impl std::fmt::Display for Rejection {
                     "sobrariam {remaining} bytes no disco, abaixo da folga mínima"
                 )
             }
+            Self::Blocklisted => write!(f, "está na lista de bloqueio"),
+            Self::Delayed { minutes } => {
+                write!(f, "esperando o atraso: publicado há {minutes} min")
+            }
         }
     }
 }
@@ -390,6 +428,10 @@ pub struct Decision {
     pub movie: Option<i64>,
     /// Idiomas depois da agregação.
     pub languages: Vec<Language>,
+    /// Formatos personalizados que casaram, pelos ids.
+    pub formats: Vec<i64>,
+    /// Nota dos formatos no perfil do filme.
+    pub format_score: i32,
     pub rejections: Vec<Rejection>,
 }
 
@@ -400,12 +442,33 @@ impl Decision {
     }
 }
 
+/// Atraso antes de pegar automaticamente: espera o release amadurecer,
+/// a não ser que já seja a melhor qualidade do perfil.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Delay {
+    pub minutes: u32,
+    pub bypass_if_highest_quality: bool,
+    /// Pula a espera se a nota de formatos chega a este valor.
+    pub bypass_if_above_score: Option<i32>,
+}
+
+/// Um release bloqueado: não se pega de novo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedRelease {
+    pub movie: Option<i64>,
+    pub title: String,
+    pub indexer: Option<String>,
+}
+
 /// O motor: a biblioteca, os indexadores e as configurações.
 #[derive(Debug, Clone, Copy)]
 pub struct Engine<'a> {
     pub library: &'a [Target],
     pub indexers: &'a [Indexer],
     pub settings: &'a Settings,
+    pub formats: &'a [CustomFormat],
+    pub blocklist: &'a [BlockedRelease],
+    pub delay: Delay,
 }
 
 impl Engine<'_> {
@@ -458,6 +521,8 @@ impl Engine<'_> {
                 languages: acervo_parser::parse_languages(&release.title),
                 parsed: None,
                 movie: None,
+                formats: Vec::new(),
+                format_score: 0,
                 rejections: vec![Rejection::UnableToParse],
             };
         };
@@ -468,18 +533,46 @@ impl Engine<'_> {
                 languages: parsed.languages.clone(),
                 parsed: Some(parsed),
                 movie: None,
+                formats: Vec::new(),
+                format_score: 0,
                 rejections: vec![Rejection::UnknownMovie],
             };
         };
         let languages =
             languages::aggregate(&parsed, release, target, self.indexer(&release.indexer));
-        let rejections =
-            specs::evaluate(self, release, &parsed, &languages, target, searched, mode);
+        let formats = formats::matching(
+            self.formats,
+            &FormatInput {
+                title: &release.title,
+                release_group: parsed.release_group.as_deref(),
+                edition: parsed.edition.as_deref(),
+                languages: &languages,
+                original_language: target.original_language,
+                quality: parsed.quality.quality,
+                size: release.size,
+                flags: release.flags,
+            },
+        );
+        let format_score = target.profile.score(&formats);
+        let rejections = specs::evaluate(
+            self,
+            &specs::Candidate {
+                release,
+                parsed: &parsed,
+                languages: &languages,
+                format_score,
+            },
+            target,
+            searched,
+            mode,
+        );
         Decision {
             release: index,
             movie: Some(target.id),
             parsed: Some(parsed),
             languages,
+            formats,
+            format_score,
             rejections,
         }
     }
@@ -508,6 +601,7 @@ mod tests {
             language: Language::Original,
             min_format_score: 0,
             cutoff_format_score: 0,
+            format_scores: Vec::new(),
         }
     }
 
@@ -543,6 +637,7 @@ mod tests {
             languages: Vec::new(),
             container: None,
             flags: 0,
+            age_hours: None,
         }
     }
 
@@ -558,6 +653,9 @@ mod tests {
             library,
             indexers: &indexers,
             settings: &settings,
+            formats: &[],
+            blocklist: &[],
+            delay: Delay::default(),
         }
         .search(library[0].id, releases, Mode::UserInvoked)
     }
@@ -617,6 +715,7 @@ mod tests {
             },
             release_group: Some("GRP".into()),
             age_days: 30,
+            format_score: 0,
         });
         let decisions = decide(&[target], &[release("The Housemaid 2025 2160p WEB-DL-GRP")]);
         assert_eq!(

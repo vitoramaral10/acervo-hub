@@ -57,14 +57,22 @@ fn quality_cutoff_not_met(profile: &Profile, current: QualityModel, new: Quality
     profile.index(current.quality) < profile.effective_cutoff() || is_revision_upgrade(current, new)
 }
 
-/// Custom format não entra: nota zero dos dois lados, sempre.
-fn cutoff_not_met(profile: &Profile, current: QualityModel, new: QualityModel) -> bool {
+/// O corte ainda não foi atingido, pela qualidade ou pela nota de formatos
+/// do que já existe.
+fn cutoff_not_met(profile: &Profile, current: Scored, new: QualityModel) -> bool {
     let format_cutoff = if profile.upgrade_allowed {
         profile.cutoff_format_score
     } else {
         profile.min_format_score
     };
-    quality_cutoff_not_met(profile, current, new) || 0 < format_cutoff
+    quality_cutoff_not_met(profile, current.quality, new) || current.score < format_cutoff
+}
+
+/// Uma qualidade com a nota de formatos dela.
+#[derive(Clone, Copy)]
+struct Scored {
+    quality: QualityModel,
+    score: i32,
 }
 
 enum NotUpgradable {
@@ -78,9 +86,10 @@ enum NotUpgradable {
 fn is_upgradable(
     profile: &Profile,
     propers: Propers,
-    current: QualityModel,
-    new: QualityModel,
+    current_scored: Scored,
+    new_scored: Scored,
 ) -> Result<(), NotUpgradable> {
+    let (current, new) = (current_scored.quality, new_scored.quality);
     let quality = profile
         .index(new.quality)
         .cmp(&profile.index(current.quality));
@@ -103,8 +112,15 @@ fn is_upgradable(
     if quality.is_gt() {
         return Err(NotUpgradable::QualityCutoff);
     }
-    // Nota nova (zero) nunca supera a atual (zero).
-    Err(NotUpgradable::CustomFormatScore)
+    // Mesma qualidade: só a nota de formatos decide. Corte de nota zero
+    // cai direto na comparação, como na referência.
+    if profile.cutoff_format_score > 0 && current_scored.score >= profile.cutoff_format_score {
+        return Err(NotUpgradable::QualityCutoff);
+    }
+    if new_scored.score <= current_scored.score {
+        return Err(NotUpgradable::CustomFormatScore);
+    }
+    Ok(())
 }
 
 fn is_upgrade_allowed(profile: &Profile, current: QualityModel, new: QualityModel) -> bool {
@@ -163,21 +179,30 @@ fn size_checks(
 
 fn file_checks(
     engine: &Engine<'_>,
-    parsed: &ParsedMovie,
+    candidate: &Candidate<'_>,
     profile: &Profile,
     file: &ExistingFile,
     rss: bool,
     out: &mut Vec<Rejection>,
 ) {
+    let parsed = candidate.parsed;
     let current = file.quality;
     let new = parsed.quality;
     let propers = engine.settings.propers;
+    let current_scored = Scored {
+        quality: current,
+        score: file.format_score,
+    };
+    let new_scored = Scored {
+        quality: new,
+        score: candidate.format_score,
+    };
 
     if !is_upgrade_allowed(profile, current, new) {
         out.push(Rejection::QualityUpgradesDisabled);
     }
-    if cutoff_not_met(profile, current, new) {
-        match is_upgradable(profile, propers, current, new) {
+    if cutoff_not_met(profile, current_scored, new) {
+        match is_upgradable(profile, propers, current_scored, new_scored) {
             Ok(()) => {}
             Err(NotUpgradable::BetterQuality) => out.push(Rejection::DiskHigherPreference),
             Err(NotUpgradable::BetterRevision) => out.push(Rejection::DiskHigherRevision),
@@ -222,15 +247,22 @@ fn file_checks(
     }
 }
 
+/// O release em avaliação, com o que já se calculou dele.
+pub(crate) struct Candidate<'a> {
+    pub release: &'a Release,
+    pub parsed: &'a ParsedMovie,
+    pub languages: &'a [Language],
+    pub format_score: i32,
+}
+
 pub(crate) fn evaluate(
     engine: &Engine<'_>,
-    release: &Release,
-    parsed: &ParsedMovie,
-    languages: &[Language],
+    candidate: &Candidate<'_>,
     movie: &Target,
     searched: Option<i64>,
     mode: Mode,
 ) -> Vec<Rejection> {
+    let (release, parsed, languages) = (candidate.release, candidate.parsed, candidate.languages);
     let mut out = Vec::new();
     let profile = &movie.profile;
 
@@ -292,19 +324,37 @@ pub(crate) fn evaluate(
         });
     }
 
-    if 0 < profile.min_format_score {
+    if candidate.format_score < profile.min_format_score {
         out.push(Rejection::CustomFormatMinimumScore);
     }
 
     if let Some(file) = &movie.file {
-        file_checks(engine, parsed, profile, file, searched.is_none(), &mut out);
+        file_checks(
+            engine,
+            candidate,
+            profile,
+            file,
+            searched.is_none(),
+            &mut out,
+        );
+    }
+
+    if engine.blocklist.iter().any(|blocked| {
+        blocked.movie.is_none_or(|m| m == movie.id)
+            && blocked.title.eq_ignore_ascii_case(&release.title)
+            && blocked
+                .indexer
+                .as_deref()
+                .is_none_or(|i| i.eq_ignore_ascii_case(&release.indexer))
+    }) {
+        out.push(Rejection::Blocklisted);
     }
 
     if searched.is_some_and(|id| id != movie.id) {
         out.push(Rejection::WrongMovie);
     }
 
-    queue_check(engine, parsed, movie, &mut out);
+    queue_check(engine, candidate, movie, &mut out);
 
     if mode == Mode::Automatic {
         if !movie.available {
@@ -313,6 +363,7 @@ pub(crate) fn evaluate(
         if !movie.monitored {
             out.push(Rejection::MovieNotMonitored);
         }
+        delay_check(engine, candidate, movie, &mut out);
     }
 
     // Prioridade "disco": só roda quando todo o resto aprovou.
@@ -324,32 +375,79 @@ pub(crate) fn evaluate(
 
 /// Download já na fila que atinge o corte, ou que é igual ou melhor, barra o
 /// release — como no arquivo em disco.
+/// Busca automática espera o release ter a idade do atraso, a não ser que
+/// ele já seja o melhor do perfil ou passe da nota de formatos pedida.
+fn delay_check(
+    engine: &Engine<'_>,
+    candidate: &Candidate<'_>,
+    movie: &Target,
+    out: &mut Vec<Rejection>,
+) {
+    let delay = engine.delay;
+    if delay.minutes == 0 {
+        return;
+    }
+    let Some(age) = candidate.release.age_hours else {
+        return;
+    };
+    let profile = &movie.profile;
+    if delay.bypass_if_highest_quality
+        && profile.index(candidate.parsed.quality.quality) == profile.last_allowed()
+    {
+        return;
+    }
+    if delay
+        .bypass_if_above_score
+        .is_some_and(|minimum| candidate.format_score >= minimum)
+    {
+        return;
+    }
+    let minutes = age * 60.0;
+    if minutes < f64::from(delay.minutes) {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        out.push(Rejection::Delayed {
+            minutes: minutes.max(0.0) as u32,
+        });
+    }
+}
+
 fn queue_check(
     engine: &Engine<'_>,
-    parsed: &ParsedMovie,
+    candidate: &Candidate<'_>,
     movie: &Target,
     out: &mut Vec<Rejection>,
 ) {
     let profile = &movie.profile;
-    let new = parsed.quality;
-    for &queued in &movie.queued {
-        if !cutoff_not_met(profile, queued, new) {
+    let new = candidate.parsed.quality;
+    let new_scored = Scored {
+        quality: new,
+        score: candidate.format_score,
+    };
+    for queued in &movie.queued {
+        let queued_scored = Scored {
+            quality: queued.quality,
+            score: queued.format_score,
+        };
+        if !cutoff_not_met(profile, queued_scored, new) {
             out.push(Rejection::QueueCutoffMet);
             return;
         }
-        let rejection = match is_upgradable(profile, engine.settings.propers, queued, new) {
-            Ok(()) => None,
-            Err(NotUpgradable::BetterQuality) => Some(Rejection::QueueHigherPreference),
-            Err(NotUpgradable::BetterRevision) => Some(Rejection::QueueHigherRevision),
-            Err(NotUpgradable::QualityCutoff) => Some(Rejection::QueueCutoffMet),
-            Err(NotUpgradable::CustomFormatScore) => Some(Rejection::QueueCustomFormatScore),
-            Err(NotUpgradable::UpgradesNotAllowed) => Some(Rejection::QueueUpgradesNotAllowed),
-        };
+        let rejection =
+            match is_upgradable(profile, engine.settings.propers, queued_scored, new_scored) {
+                Ok(()) => None,
+                Err(NotUpgradable::BetterQuality) => Some(Rejection::QueueHigherPreference),
+                Err(NotUpgradable::BetterRevision) => Some(Rejection::QueueHigherRevision),
+                Err(NotUpgradable::QualityCutoff) => Some(Rejection::QueueCutoffMet),
+                Err(NotUpgradable::CustomFormatScore) => Some(Rejection::QueueCustomFormatScore),
+                Err(NotUpgradable::UpgradesNotAllowed) => Some(Rejection::QueueUpgradesNotAllowed),
+            };
         if let Some(rejection) = rejection {
             out.push(rejection);
             return;
         }
-        if is_revision_upgrade(queued, new) && engine.settings.propers == Propers::DoNotUpgrade {
+        if is_revision_upgrade(queued.quality, new)
+            && engine.settings.propers == Propers::DoNotUpgrade
+        {
             out.push(Rejection::QueuePropersDisabled);
             return;
         }
