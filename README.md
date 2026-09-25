@@ -88,10 +88,19 @@ cargo run --bin acervo-hub -- -c config.toml search "termo" [-i indexador] [-k 5
   definições (`server.catalogs`) ou de qualquer endpoint Torznab. As definições que o
   executor ainda não roda aparecem com o motivo, em vez de sumirem.
 - **Busca** manual em todos os indexadores, com download do `.torrent` pela sessão.
-- **Filmes** — o catálogo de filmes, espelhado do gerenciador de filmes, com cada arquivo
-  conferido contra o disco. Busca e filtro por arquivo ausente ou divergente.
+- **Filmes** — a biblioteca em pôsteres. Adicionar pelo TMDB; editar monitoramento, perfil
+  e disponibilidade; busca automática ou interativa (cada release com qualidade,
+  formatos, nota e o motivo de cada recusa); apagar o arquivo ou remover o filme (com a
+  pasta, e com exclusão para listas); histórico do filme; cada arquivo conferido contra o
+  disco.
+- **Atividade** — a fila com o progresso do qBittorrent (tirar da fila, bloquear, buscar
+  outro), o histórico de tudo e a lista de bloqueio.
 - **Aplicativos** — o `sync` na tela: mostra o que mudaria no Sonarr e no Radarr e aplica.
 - **Limpeza** — o último ciclo (gravado ao lado do ledger) e uma simulação na hora.
+- **Configurações** — quem decide (o Radarr ou o acervo), TMDB e busca automática, regras
+  de decisão, perfis de qualidade, formatos personalizados (com testador de nome de
+  release), tamanhos por qualidade, notificações (Gotify), listas de importação do TMDB,
+  exclusões e a migração do que só o Radarr sabe.
 
 Entra-se com usuário e senha, cadastrados por linha de comando — a senha vem da entrada
 padrão, nunca de argumento:
@@ -156,9 +165,10 @@ quebrou".
 docker build -t acervo-hub .
 ```
 
-Imagem final de **~9 MB**: multi-stage com alvo musl, distroless `static` como base,
-o binário estático e nada mais. Sem shell, sem gerenciador de pacotes, sem `curl` —
-o que não está lá não precisa ser corrigido nem serve a quem entrar.
+Multi-stage com alvo musl e distroless `static` como base: o binário estático e um
+`ffprobe` estático (≈135 MB, a maior parte da imagem), que lê as faixas de áudio e legenda
+do que o acervo importa. Sem shell, sem gerenciador de pacotes, sem `curl` — o que não está
+lá não precisa ser corrigido nem serve a quem entrar.
 
 `deploy/` traz o serviço para um stack Compose existente e as unidades systemd que agendam
 o ciclo. Três pontos do desenho que valem atenção:
@@ -259,8 +269,9 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
         seeders, disco bruto, legenda embutida, upgrade e corte, repack, fila, espaço livre —
         e a ordem de preferência. Contra 40 buscas interativas reais (470 releases), com a
         decisão da referência como gabarito: nenhuma divergência em casamento, motivos,
-        ordem ou escolha. Ficam de fora histórico e lista de bloqueio, que são estado do
-        gerenciador.
+        ordem ou escolha. Depois vieram formatos personalizados (as especificações da
+        referência, com nota por perfil, nota mínima e de corte, upgrade por nota), lista de
+        bloqueio e espera antes de pegar — com tudo zerado, a conta acima continua exata.
   - [ ] **Decisão em sombra**. `movies shadow` busca os filmes que faltam nos indexadores
         daqui e grava o que o acervo-hub pegaria, sem pegar nada; `movies shadow --report`
         compara cada escolha com o primeiro grab do gerenciador depois dela. A tela de filmes
@@ -285,9 +296,17 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
         rotativa dos filmes que faltam. A importação troca o arquivo antigo no upgrade e grava o
         novo no catálogo. As regras de decisão do gerenciador ficam guardadas no banco, e o
         espaço livre é lido do disco: o acervo decide igual depois que ele sair.
-  - [ ] **O corte**: `movies adopt` (filmes e perfis ganham os ids do gerenciador, que os apps
-        de pedidos e de legendas guardam), apontar esses apps para cá, ligar a busca automática
-        e desligar o gerenciador.
+  - [x] **Gerenciador completo**. Adicionar, editar e remover pela tela (enquanto o
+        gerenciador decide, a mudança vai para ele primeiro); busca interativa; fila,
+        histórico e lista de bloqueio — download que o cliente perde é bloqueado e o filme,
+        buscado de novo; perfis, formatos, tamanhos e regras editáveis; notificações pelo
+        Gotify; `ffprobe` no import (o `mediaInfo` da API v3); listas de importação do TMDB
+        (pessoa, coleção, lista) com exclusões; e `movies migrate` (ou a aba Migração), que
+        traz do gerenciador histórico, bloqueados, exclusões, notificação e listas.
+  - [ ] **O corte**: `movies take-over` (ou "Assumir" nas Configurações) copia uma última vez
+        filmes, perfis, formatos e regras, adota os filmes (com os ids do gerenciador, que os
+        apps de pedidos e de legendas guardam) e para de importar. Depois: apontar esses apps
+        para cá, ligar a busca automática e desligar o gerenciador.
 - [ ] **Fase 4 — séries.** Só depois de o parser passar no corpus real.
 
 ## Licença
