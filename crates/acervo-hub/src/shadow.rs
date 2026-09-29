@@ -10,8 +10,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use acervo_api::{ALL, Catalog};
-use acervo_arr::{ArrClient, ArrKind, RemoteQueueItem};
-use acervo_core::InstanceName;
 use acervo_decision::{
     BlockedRelease, CustomFormat, Decision, Delay, Engine, ExistingFile, FormatInput, Indexer,
     Mode, Profile, Queued, Release, Settings, Target,
@@ -19,10 +17,10 @@ use acervo_decision::{
 use acervo_indexers::SearchQuery;
 use acervo_parser::{Language, QualityModel, Revision, clean_movie_title, parse_movie_title};
 use acervo_store::{CatalogMovie, ShadowPick, ShadowRun, Store};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde::Serialize;
 
-use crate::config::{Config, InstanceKind};
+use crate::config::Config;
 use crate::rules::DecisionRules;
 
 /// Categoria Newznab de filmes.
@@ -98,8 +96,6 @@ fn age_days(date: Option<&str>, now: time::OffsetDateTime) -> u32 {
 }
 
 struct Remote {
-    /// A fila do gerenciador; vazia quando ele não responde.
-    queue: Vec<RemoteQueueItem>,
     rules: DecisionRules,
 }
 
@@ -120,7 +116,6 @@ fn target(
     {
         clean_titles.push(clean_movie_title(title));
     }
-    let source_id = entry.origin.as_ref().map(|(_, id)| *id);
     let original_language = movie
         .original_language
         .as_deref()
@@ -160,28 +155,8 @@ fn target(
             }
         }),
         profile,
-        queued: remote
-            .queue
-            .iter()
-            .filter(|item| item.movie_id.is_some() && item.movie_id == source_id)
-            .filter(|item| item.tracked_download_state.as_deref() != Some("failedPending"))
-            .filter_map(|item| item.quality.as_ref())
-            .map(|q| Queued {
-                quality: QualityModel {
-                    quality: acervo_parser::Quality::from_id(q.quality.id)
-                        .unwrap_or(acervo_parser::Quality::Unknown),
-                    revision: q
-                        .revision
-                        .as_ref()
-                        .map_or_else(Revision::default, |r| Revision {
-                            version: r.version,
-                            real: r.real,
-                            is_repack: r.is_repack,
-                        }),
-                },
-                format_score: 0,
-            })
-            .collect(),
+        // A fila é a dos grabs do acervo, somada em `Decider::load`.
+        queued: Vec::new(),
         // Espaço não trava o grab: com o disco cheio, o qBittorrent pausa o
         // download e a limpeza libera espaço; recusar deixaria o filme sem
         // nada na fila.
@@ -204,21 +179,6 @@ fn indexers(served: &[String], remote: &Remote) -> Vec<Indexer> {
             }
         })
         .collect()
-}
-
-pub(crate) fn movie_client(config: &Config) -> Result<ArrClient> {
-    let spec = config
-        .instances
-        .iter()
-        .find(|spec| matches!(spec.kind, InstanceKind::Movie))
-        .context("nenhum gerenciador de filmes em [[instances]]")?;
-    Ok(ArrClient::new(
-        InstanceName::new(spec.name.clone()),
-        &spec.url,
-        &spec.api_key,
-        ArrKind::Movie,
-        config.http_timeout(),
-    )?)
 }
 
 #[derive(Debug, Serialize)]
@@ -281,41 +241,10 @@ impl Outcome {
 impl Decider {
     /// # Errors
     ///
-    /// Catálogo vazio, gerenciador de filmes inalcançável ou nenhum indexador.
+    /// Catálogo vazio, banco inalcançável ou nenhum indexador.
     #[allow(clippy::too_many_lines)] // Leitura em sequência; dividir só espalharia.
-    pub async fn load(config: &Config, store: &Store, catalog: &Catalog) -> Result<Self> {
-        let owner = crate::rules::owner(config, store).await?;
-        let has_manager = config
-            .instances
-            .iter()
-            .any(|spec| matches!(spec.kind, InstanceKind::Movie));
-        let live = async {
-            let client = movie_client(config)?;
-            if owner != "radarr" {
-                return anyhow::Ok((client.movie_queue().await?, None));
-            }
-            let (queue, rules) = tokio::try_join!(
-                async { Ok(client.movie_queue().await?) },
-                crate::rules::from_manager(&client),
-            )?;
-            anyhow::Ok((queue, Some(rules)))
-        }
-        .await;
-        let (queue, rules) = match live {
-            Ok((queue, Some(rules))) => {
-                crate::rules::save(store, &rules).await?;
-                (queue, rules)
-            }
-            Ok((queue, None)) => (queue, crate::rules::stored(store).await?),
-            Err(error) => {
-                if has_manager {
-                    tracing::warn!(
-                        "gerenciador de filmes inalcançável, decidindo com as regras guardadas: {error:#}"
-                    );
-                }
-                (Vec::new(), crate::rules::stored(store).await?)
-            }
-        };
+    pub async fn load(store: &Store, catalog: &Catalog) -> Result<Self> {
+        let rules = crate::rules::stored(store).await?;
         let (movies, definitions, grabs, stored_formats, blocked) = tokio::try_join!(
             store.movies(),
             store.quality_definitions(),
@@ -324,10 +253,10 @@ impl Decider {
             store.blocklist(),
         )?;
         if movies.is_empty() {
-            bail!("catálogo vazio: adicione filmes ou importe do gerenciador antes");
+            bail!("catálogo vazio: adicione filmes antes");
         }
         let formats = crate::rules::compiled_formats(&stored_formats);
-        let remote = Remote { queue, rules };
+        let remote = Remote { rules };
         let now = time::OffsetDateTime::now_utc();
         let mut library: Vec<Target> = movies
             .iter()
@@ -528,7 +457,7 @@ pub async fn search(
     print: bool,
     grab: bool,
 ) -> Result<Vec<ShadowLine>> {
-    let (decider, latest) = tokio::try_join!(Decider::load(config, store, catalog), async {
+    let (decider, latest) = tokio::try_join!(Decider::load(store, catalog), async {
         Ok(store.latest_shadow_runs().await?)
     },)?;
     let last_run: BTreeMap<i64, &str> =
@@ -642,75 +571,4 @@ fn print_line(line: &ShadowLine) {
                 .join(", ")
         ),
     }
-}
-
-/// Como a escolha em sombra se compara com o que o gerenciador pegou depois.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Verdict {
-    /// Os dois pegaram o mesmo release.
-    Same,
-    /// Os dois pegaram, releases diferentes.
-    Different,
-    /// A sombra pegaria; o gerenciador ainda não pegou nada.
-    Pending,
-    /// O gerenciador pegou algo que a sombra não pegaria.
-    OnlyReference,
-    /// Nenhum dos dois.
-    Neither,
-}
-
-/// `movies shadow --report`: a última sombra de cada filme contra o primeiro
-/// grab do gerenciador depois dela. Devolve quantas divergem.
-///
-/// # Errors
-///
-/// Catálogo vazio ou gerenciador inalcançável.
-pub async fn report(config: &Config, store: &Store) -> Result<usize> {
-    let client = movie_client(config)?;
-    let (movies, latest) = tokio::try_join!(store.movies(), store.latest_shadow_runs())?;
-
-    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
-    for run in &latest {
-        let Some(entry) = movies.iter().find(|m| m.id == run.movie_id) else {
-            continue;
-        };
-        let Some((_, source_id)) = &entry.origin else {
-            continue;
-        };
-        let grabs = client.movie_grabs(*source_id).await?;
-        // O primeiro grab depois da sombra (RFC 3339 em UTC compara como texto).
-        let after = grabs
-            .iter()
-            .rev()
-            .find(|g| g.date.as_str() >= run.at.as_str());
-        let verdict = match (&run.pick, after) {
-            (Some(pick), Some(grab)) if pick.title == grab.source_title => Verdict::Same,
-            (Some(_), Some(_)) => Verdict::Different,
-            (Some(_), None) => Verdict::Pending,
-            (None, Some(_)) => Verdict::OnlyReference,
-            (None, None) => Verdict::Neither,
-        };
-        let key = match verdict {
-            Verdict::Same => "igual",
-            Verdict::Different => "diferente",
-            Verdict::Pending => "só a sombra (o gerenciador ainda não pegou)",
-            Verdict::OnlyReference => "só o gerenciador",
-            Verdict::Neither => "nenhum dos dois",
-        };
-        *counts.entry(key).or_default() += 1;
-        if matches!(verdict, Verdict::Different | Verdict::OnlyReference) {
-            println!(
-                "{} — sombra: {} | gerenciador: {}",
-                entry.movie.title,
-                run.pick.as_ref().map_or("nada", |p| p.title.as_str()),
-                after.map_or("nada", |g| g.source_title.as_str())
-            );
-        }
-    }
-    for (key, n) in &counts {
-        println!("{n:>4}  {key}");
-    }
-    Ok(counts.get("diferente").copied().unwrap_or(0)
-        + counts.get("só o gerenciador").copied().unwrap_or(0))
 }

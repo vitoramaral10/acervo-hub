@@ -100,18 +100,6 @@ async fn shadow_loop(
                 continue;
             }
         };
-        match crate::movies::import(&config, store, true, false).await {
-            Ok(report) => {
-                for instance in report.iter().filter(|i| i.erro.is_some()) {
-                    tracing::warn!(
-                        instancia = instance.nome,
-                        erro = instance.erro,
-                        "importação de filmes falhou"
-                    );
-                }
-            }
-            Err(error) => tracing::warn!("importação de filmes falhou: {error:#}"),
-        }
         // Com a busca automática ligada, a sombra pega o que escolher.
         let grab = crate::automatic::enabled(store).await.unwrap_or(false);
         match crate::shadow::search(&config, store, &catalog, limit, false, grab).await {
@@ -264,11 +252,6 @@ pub async fn run(config: Config) -> Result<()> {
     };
     if config.database.is_some() {
         tokio::spawn(metadata_loop(Arc::clone(&config), database.clone()));
-        tokio::spawn(crate::lists::sync_loop(
-            Arc::clone(&config),
-            database.clone(),
-            catalog.clone(),
-        ));
     }
     if config.database.is_some() && config.qbittorrent.is_some() {
         tokio::spawn(rss_loop(
@@ -1079,14 +1062,6 @@ impl Admin for HubAdmin {
             }
         }
         self.configuration().await
-    }
-
-    async fn import_movies(&self, apply: bool) -> Result<serde_json::Value, String> {
-        let _guard = self.write.lock().await;
-        let report = crate::movies::import(&self.config, self.database.get()?, apply, false)
-            .await
-            .map_err(|e| format!("{e:#}"))?;
-        serde_json::to_value(report).map_err(|e| e.to_string())
     }
 }
 

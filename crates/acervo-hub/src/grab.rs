@@ -22,7 +22,7 @@ use serde::Serialize;
 use crate::config::Config;
 use crate::events::{self, Event, Kind};
 use crate::naming::movie_file_stem;
-use crate::shadow::{Decider, label, movie_client, now_rfc3339, summarize};
+use crate::shadow::{Decider, label, now_rfc3339, summarize};
 
 /// Extensões de vídeo que a importação aceita.
 const VIDEO: &[&str] = &[
@@ -183,7 +183,7 @@ pub async fn grab(
     movie_id: i64,
     apply: bool,
 ) -> Result<GrabReport> {
-    let decider = Decider::load(config, store, catalog).await?;
+    let decider = Decider::load(store, catalog).await?;
     let movie = decider.target(movie_id).context("filme fora do catálogo")?;
     let outcome = decider
         .decide(catalog, movie)
@@ -648,20 +648,6 @@ pub async fn import_downloads(
                     },
                 )
                 .await;
-                // O gerenciador adota o arquivo e para de procurar o filme.
-                if let Some((_, source_id)) = &entry.origin
-                    && let Err(error) = async {
-                        movie_client(config)?
-                            .rescan_movie(*source_id)
-                            .await
-                            .map_err(anyhow::Error::from)
-                    }
-                    .await
-                {
-                    line.detalhe = Some(format!(
-                        "importado, mas o gerenciador não releu a pasta: {error:#}"
-                    ));
-                }
             }
             Err(Failure::Download(error)) => {
                 line.estado = "falhou";

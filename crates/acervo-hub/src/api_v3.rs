@@ -575,12 +575,7 @@ async fn add_movie(
         .add_options
         .as_ref()
         .is_some_and(|o| o.search_for_movie);
-    let manager_decides = crate::rules::owner(&v3.config, store)
-        .await
-        .map_err(internal)?
-        == "radarr";
-    let id = crate::library::add_anywhere(
-        &v3.config,
+    let id = crate::library::add(
         store,
         &tmdb,
         &crate::library::AddRequest {
@@ -596,7 +591,6 @@ async fn add_movie(
                 .unwrap_or_else(|| "released".into()),
             tags: body.tags,
         },
-        search,
     )
     .await
     .map_err(|e| {
@@ -610,7 +604,7 @@ async fn add_movie(
             ApiError(StatusCode::BAD_REQUEST, message)
         }
     })?;
-    if search && !manager_decides {
+    if search {
         search_later(&v3, vec![id]);
     }
     let movies = store.movies().await.map_err(internal)?;
@@ -668,7 +662,7 @@ async fn update_movie(
         minimum_availability: body.minimum_availability,
         tags: body.tags,
     };
-    let updated = crate::library::edit(&v3.config, store, id, &change)
+    let updated = crate::library::edit(store, id, &change)
         .await
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     if body.add_options.is_some_and(|o| o.search_for_movie) {
@@ -705,15 +699,10 @@ async fn delete_movie(
             .get(name)
             .is_some_and(|v| v.eq_ignore_ascii_case("true"))
     };
-    crate::library::remove(
-        &v3.config,
-        store,
-        id,
-        flag("deleteFiles"),
-        flag("addImportExclusion"),
-    )
-    .await
-    .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    // `addImportExclusion` não tem efeito: o acervo não tem listas.
+    crate::library::remove(&v3.config, store, id, flag("deleteFiles"))
+        .await
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     ok(json!({}))
 }
 

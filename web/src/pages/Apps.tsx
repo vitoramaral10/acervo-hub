@@ -24,7 +24,7 @@ export function AppsPage() {
     onSuccess: (report) => {
       queryClient.setQueryData(['sincronizacao'], { ...report, aplicado: false })
       if (report.falhas > 0) toast.error(`Sincronização com ${report.falhas} falha(s) — veja abaixo`)
-      else toast.success('Sonarr e Radarr sincronizados')
+      else toast.success('Sonarr sincronizado')
       void queryClient.invalidateQueries({ queryKey: ['sincronizacao'] })
     },
     onError: (error: Error) => toast.error(error.message),
@@ -92,7 +92,7 @@ export function AppsPage() {
           <Unplug className="size-8 text-content-subtle" aria-hidden="true" />
           <p className="font-medium">Nenhum gerenciador configurado</p>
           <p className="max-w-md text-sm text-content-muted">
-            Liste o Sonarr e o Radarr em <code className="font-mono">[[instances]]</code> no{' '}
+            Liste o Sonarr em <code className="font-mono">[[instances]]</code> no{' '}
             <code className="font-mono">config.toml</code>.
           </p>
         </div>

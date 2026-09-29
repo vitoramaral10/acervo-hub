@@ -27,10 +27,8 @@ mod events;
 mod grab;
 mod ledger;
 mod library;
-mod lists;
 mod mediainfo;
 mod metadata;
-mod migrate;
 mod movies;
 mod naming;
 mod registry;
@@ -97,13 +95,6 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum MoviesAction {
-    /// Espelha os gerenciadores de filmes no catálogo. Sem `--apply`, só
-    /// mostra o que mudaria.
-    Import {
-        /// Grava em vez de só mostrar.
-        #[arg(long)]
-        apply: bool,
-    },
     /// Confere cada arquivo do catálogo contra o disco.
     Check,
     /// Busca os filmes que faltam nos indexadores daqui e decide o que
@@ -112,10 +103,6 @@ enum MoviesAction {
         /// Quantos filmes buscar nesta rodada.
         #[arg(long, default_value_t = 5)]
         limit: usize,
-        /// Em vez de buscar, compara a última sombra de cada filme com o que o
-        /// gerenciador pegou depois.
-        #[arg(long)]
-        report: bool,
     },
     /// Busca um filme que falta, decide e, com `--apply`, manda o escolhido
     /// ao qBittorrent.
@@ -163,21 +150,6 @@ enum MoviesAction {
         #[arg(long)]
         apply: bool,
     },
-    /// O acervo passa a ser dono de todos os filmes do catálogo: importar do
-    /// gerenciador deixa de mexer neles. Sem `--apply`, só conta. Para o
-    /// corte completo (regras também), use `movies take-over`.
-    Adopt {
-        #[arg(long)]
-        apply: bool,
-    },
-    /// O corte: o acervo assume filmes, perfis, formatos e regras, e para de
-    /// importar do gerenciador.
-    TakeOver,
-    /// Traz do gerenciador histórico, bloqueados, exclusões, notificação e
-    /// listas de importação. Pode rodar de novo sem duplicar.
-    Migrate,
-    /// Sincroniza as listas de importação agora.
-    Lists,
 }
 
 fn print_grab(report: &grab::GrabReport) {
@@ -267,12 +239,7 @@ async fn users(config: &config::Config, action: UsersAction) -> Result<()> {
 async fn movies_command(config: &config::Config, action: MoviesAction) -> Result<bool> {
     let store = config.store().await?;
     Ok(match action {
-        MoviesAction::Import { apply } => movies::import(config, &store, apply, true)
-            .await?
-            .iter()
-            .any(|instance| instance.erro.is_some()),
         MoviesAction::Check => movies::check(config, &store).await? > 0,
-        MoviesAction::Shadow { report: true, .. } => shadow::report(config, &store).await? > 0,
         MoviesAction::Grab { tmdb, apply } => {
             let movie = store
                 .movies()
@@ -374,50 +341,7 @@ async fn movies_command(config: &config::Config, action: MoviesAction) -> Result
             }
             grabs.iter().any(|g| g.erro.is_some())
         }
-        MoviesAction::Adopt { apply } => {
-            let owned = store
-                .movies()
-                .await?
-                .iter()
-                .filter(|m| m.origin.is_some())
-                .count();
-            if apply {
-                let changed = store.adopt_all().await?;
-                println!("{changed} filmes agora são do acervo");
-            } else {
-                println!("{owned} filmes vieram do gerenciador; rode com --apply para adotá-los");
-            }
-            false
-        }
-        MoviesAction::TakeOver => {
-            rules::take_over(config, &store).await?;
-            println!("o acervo decide: filmes adotados, regras assumidas, importação desligada");
-            false
-        }
-        MoviesAction::Migrate => {
-            let report = migrate::run(config, &store).await?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-            !report.avisos.is_empty()
-        }
-        MoviesAction::Lists => {
-            let catalog = acervo_api::Catalog::new(serve::entries(config).await?)?;
-            let reports = lists::sync_all(config, &store, Some(&catalog)).await?;
-            for report in &reports {
-                println!(
-                    "{}: {} encontrados, {} adicionados, {} já no catálogo, {} excluídos",
-                    report.lista,
-                    report.encontrados,
-                    report.adicionados.len(),
-                    report.ja_no_catalogo,
-                    report.excluidos
-                );
-                for (movie, error) in &report.falhas {
-                    println!("  falhou {movie}: {error}");
-                }
-            }
-            reports.iter().any(|r| !r.falhas.is_empty())
-        }
-        MoviesAction::Shadow { limit, .. } => {
+        MoviesAction::Shadow { limit } => {
             let catalog = acervo_api::Catalog::new(serve::entries(config).await?)?;
             shadow::run(config, &store, &catalog, limit, true)
                 .await?

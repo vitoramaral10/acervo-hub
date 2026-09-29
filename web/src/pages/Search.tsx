@@ -91,7 +91,7 @@ export function SearchPage() {
     <>
       <PageHeader
         title="Busca"
-        description="A mesma consulta que o Sonarr e o Radarr fazem. Sem termo, traz o mais recente de cada indexador."
+        description="A mesma consulta que o Sonarr e a busca de filmes fazem. Sem termo, traz o mais recente de cada indexador."
       />
 
       <form

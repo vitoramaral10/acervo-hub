@@ -16,13 +16,12 @@ use acervo_parser::{Language, clean_movie_title};
 use acervo_store::{CatalogMovie, Movie, MovieExtras, Store};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use time::{Date, Duration, OffsetDateTime};
 
 use crate::config::Config;
 use crate::events::{self, Event, Kind};
 use crate::naming::formatted_name;
-use crate::shadow::{movie_client, now_rfc3339};
+use crate::shadow::now_rfc3339;
 
 fn date(text: Option<&str>) -> Option<Date> {
     let format = time::macros::format_description!("[year]-[month]-[day]");
@@ -154,13 +153,11 @@ pub async fn refresh(store: &Store, tmdb: &Tmdb, stale_hours: i64) -> Result<Ref
                 continue;
             }
         };
-        if entry.origin.is_none() {
-            let mut movie = entry.movie.clone();
-            apply(&mut movie, &meta);
-            if movie != entry.movie {
-                store.update_movie(entry.id, &movie).await?;
-                report.atualizados.push(label);
-            }
+        let mut movie = entry.movie.clone();
+        apply(&mut movie, &meta);
+        if movie != entry.movie {
+            store.update_movie(entry.id, &movie).await?;
+            report.atualizados.push(label);
         }
         store.set_extras(entry.id, &extras(&meta)).await?;
     }
@@ -267,90 +264,6 @@ pub async fn add(store: &Store, tmdb: &Tmdb, request: &AddRequest) -> Result<i64
     Ok(id)
 }
 
-/// Adiciona onde as decisões estão sendo tomadas: no gerenciador, enquanto
-/// ele for o dono das regras (e aí a importação traz o filme para cá), ou
-/// direto no catálogo. Devolve o id no catálogo.
-///
-/// # Errors
-///
-/// Filme já no catálogo ou excluído, perfil desconhecido, TMDB ou
-/// gerenciador inalcançável.
-pub async fn add_anywhere(
-    config: &Config,
-    store: &Store,
-    tmdb: &Tmdb,
-    request: &AddRequest,
-    search: bool,
-) -> Result<i64> {
-    if crate::rules::owner(config, store).await? != "radarr" {
-        return add(store, tmdb, request).await;
-    }
-    if store
-        .movies()
-        .await?
-        .iter()
-        .any(|m| m.movie.tmdb_id == request.tmdb_id)
-    {
-        bail!("o filme {} já está no catálogo", request.tmdb_id);
-    }
-    // O Radarr exige um perfil: o pedido, ou o primeiro que veio de lá.
-    let profile = store
-        .profiles()
-        .await?
-        .into_iter()
-        .filter(|p| p.source_id.is_some())
-        .find(|p| {
-            request
-                .quality_profile
-                .as_ref()
-                .is_none_or(|name| p.name == *name)
-        })
-        .context("nenhum perfil de qualidade do Radarr para o filme novo")?;
-    let source_profile = profile.source_id.context(
-        "o perfil não existe no Radarr; perfis novos só valem depois que o acervo assume",
-    )?;
-    let (movie, _) = lookup(tmdb, request.tmdb_id).await?;
-    let client = movie_client(config)?;
-    client
-        .post_json(
-            "api/v3/movie",
-            &json!({
-                "tmdbId": request.tmdb_id,
-                "title": movie.title,
-                "year": movie.year,
-                "qualityProfileId": source_profile,
-                "rootFolderPath": request.root_folder,
-                "monitored": request.monitored,
-                "minimumAvailability": request.minimum_availability,
-                "tags": request.tags,
-                "addOptions": { "searchForMovie": search },
-            }),
-        )
-        .await
-        .context("adicionando o filme no gerenciador")?;
-    crate::movies::import(config, store, true, false).await?;
-    let entry = store
-        .movies()
-        .await?
-        .into_iter()
-        .find(|m| m.movie.tmdb_id == request.tmdb_id)
-        .context("o gerenciador aceitou o filme, mas a importação não o trouxe")?;
-    events::record(
-        store,
-        Event {
-            poster: entry.extras.poster.clone(),
-            message: Some("adicionado no gerenciador".into()),
-            ..Event::new(
-                Kind::MovieAdded,
-                Some(entry.id),
-                events::label(&entry.movie.title, entry.movie.year),
-            )
-        },
-    )
-    .await;
-    Ok(entry.id)
-}
-
 /// O que se muda num filme. Campo ausente fica como está.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MovieEdit {
@@ -372,14 +285,9 @@ const AVAILABILITIES: &[&str] = &["announced", "inCinemas", "released"];
 ///
 /// # Errors
 ///
-/// Filme ou perfil desconhecido, disponibilidade inválida, gerenciador que
-/// recusa ou falha de escrita.
-pub async fn edit(
-    config: &Config,
-    store: &Store,
-    id: i64,
-    change: &MovieEdit,
-) -> Result<CatalogMovie> {
+/// Filme ou perfil desconhecido, disponibilidade inválida ou falha de
+/// escrita.
+pub async fn edit(store: &Store, id: i64, change: &MovieEdit) -> Result<CatalogMovie> {
     let entry = store
         .movies()
         .await?
@@ -407,31 +315,6 @@ pub async fn edit(
         movie.tags.clone_from(tags);
     }
     movie.available = is_available(&movie, today(), 0);
-    if let Some((_, source_id)) = &entry.origin {
-        let client = movie_client(config)?;
-        let path = format!("api/v3/movie/{source_id}");
-        let mut remote = client
-            .get_json(&path, &[])
-            .await
-            .context("lendo o filme no gerenciador")?;
-        remote["monitored"] = json!(movie.monitored);
-        if let Some(minimum) = &movie.minimum_availability {
-            remote["minimumAvailability"] = json!(minimum);
-        }
-        remote["tags"] = json!(movie.tags);
-        if let Some(profile) = movie
-            .quality_profile
-            .as_ref()
-            .and_then(|name| profiles.iter().find(|p| p.name == *name))
-            .and_then(|p| p.source_id)
-        {
-            remote["qualityProfileId"] = json!(profile);
-        }
-        client
-            .put_json(&path, &[], &remote)
-            .await
-            .context("mudando o filme no gerenciador")?;
-    }
     store.update_movie(id, &movie).await?;
     Ok(CatalogMovie { movie, ..entry })
 }
@@ -575,20 +458,13 @@ pub async fn delete_file(config: &Config, store: &Store, id: i64) -> Result<()> 
         .file
         .clone()
         .context("o filme não tem arquivo")?;
-    if let (Some(_), Some(file_id)) = (&entry.origin, file.id) {
-        movie_client(config)?
-            .delete_path(&format!("api/v3/moviefile/{file_id}"), &[])
-            .await
-            .context("apagando o arquivo no gerenciador")?;
-    } else {
-        let path = Path::new(&entry.movie.path).join(&file.relative_path);
-        let host = config.path_map().to_host(&path)?;
-        tokio::task::spawn_blocking(move || match std::fs::remove_file(&host) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-            _ => Ok(()),
-        })
-        .await??;
-    }
+    let path = Path::new(&entry.movie.path).join(&file.relative_path);
+    let host = config.path_map().to_host(&path)?;
+    tokio::task::spawn_blocking(move || match std::fs::remove_file(&host) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    })
+    .await??;
     store.set_movie_file(id, None).await?;
     events::record(
         store,
@@ -608,8 +484,7 @@ pub async fn delete_file(config: &Config, store: &Store, id: i64) -> Result<()> 
     Ok(())
 }
 
-/// Tira o filme do catálogo; com `exclude`, nenhuma lista o traz de volta.
-/// Filme do gerenciador sai de lá também (e é ele quem apaga a pasta).
+/// Tira o filme do catálogo.
 ///
 /// Com `delete_files`, apaga a pasta **e** o download no qBittorrent, com os
 /// dados, na hora — privado ou não, por escolha do usuário. Sem isso, o
@@ -618,15 +493,8 @@ pub async fn delete_file(config: &Config, store: &Store, id: i64) -> Result<()> 
 ///
 /// # Errors
 ///
-/// Filme desconhecido, pasta fora das raízes, gerenciador que recusa ou
-/// falha de escrita.
-pub async fn remove(
-    config: &Config,
-    store: &Store,
-    id: i64,
-    delete_files: bool,
-    exclude: bool,
-) -> Result<()> {
+/// Filme desconhecido, pasta fora das raízes ou falha de escrita.
+pub async fn remove(config: &Config, store: &Store, id: i64, delete_files: bool) -> Result<()> {
     let entry = store
         .movies()
         .await?
@@ -641,28 +509,8 @@ pub async fn remove(
     } else {
         Ok(Vec::new())
     };
-    if let Some((_, source_id)) = &entry.origin {
-        movie_client(config)?
-            .delete_path(
-                &format!("api/v3/movie/{source_id}"),
-                &[
-                    ("deleteFiles", if delete_files { "true" } else { "false" }),
-                    ("addImportExclusion", if exclude { "true" } else { "false" }),
-                ],
-            )
-            .await
-            .context("removendo o filme do gerenciador")?;
-    } else if delete_files {
+    if delete_files {
         delete_folder(config, &entry.movie.path).await?;
-    }
-    if exclude {
-        store
-            .add_exclusions(&[acervo_store::Exclusion {
-                tmdb_id: entry.movie.tmdb_id,
-                title: entry.movie.title.clone(),
-                year: entry.movie.year,
-            }])
-            .await?;
     }
     store.delete_movie(id).await?;
     let removed = match downloads {

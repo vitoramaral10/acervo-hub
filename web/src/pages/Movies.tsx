@@ -4,7 +4,6 @@ import {
   CircleAlert,
   CircleCheck,
   CircleDashed,
-  CloudDownload,
   ChevronRight,
   ExternalLink,
   Film,
@@ -39,7 +38,6 @@ import {
   type Movie,
   type MovieChange,
   type MovieDownload,
-  type MovieImport,
   type MovieShadow,
   api,
   library,
@@ -94,7 +92,7 @@ function ShadowLine({ shadow }: { shadow: MovieShadow }) {
       <p className="mt-1 flex items-center gap-1.5 text-xs text-danger">
         <Radar className="size-3.5 shrink-0" aria-hidden="true" />
         <span className="truncate">
-          Sombra {when}: a busca falhou — {shadow.erro}
+          Última busca {when}: falhou — {shadow.erro}
         </span>
       </p>
     )
@@ -104,7 +102,7 @@ function ShadowLine({ shadow }: { shadow: MovieShadow }) {
       <p className="mt-1 flex items-center gap-1.5 text-xs text-accent" title={shadow.pegaria}>
         <Radar className="size-3.5 shrink-0" aria-hidden="true" />
         <span className="truncate">
-          Sombra {when}: pegaria <span className="font-mono">{shadow.pegaria}</span>
+          Última busca {when}: pegaria <span className="font-mono">{shadow.pegaria}</span>
         </span>
       </p>
     )
@@ -117,7 +115,7 @@ function ShadowLine({ shadow }: { shadow: MovieShadow }) {
     <p className="mt-1 flex items-center gap-1.5 text-xs text-content-subtle">
       <Radar className="size-3.5 shrink-0" aria-hidden="true" />
       <span className="truncate">
-        Sombra {when}: nada entre {formatCount(shadow.releases)} — {reasons}
+        Última busca {when}: nada entre {formatCount(shadow.releases)} — {reasons}
       </span>
     </p>
   )
@@ -140,7 +138,7 @@ function DownloadLine({ download }: { download: MovieDownload }) {
     return (
       <p className="mt-1 flex items-center gap-1.5 text-xs text-success" title={download.release}>
         <CircleCheck className="size-3.5 shrink-0" aria-hidden="true" />
-        <span className="truncate">Importado — o Radarr adota o arquivo ao reler a pasta</span>
+        <span className="truncate">Importado</span>
       </p>
     )
   }
@@ -205,7 +203,7 @@ function GrabDialog({
             {movie.ano ? ` (${movie.ano})` : ''}
           </DialogTitle>
           <DialogDescription>
-            Busca em todos os indexadores e escolhe com as regras do Radarr. Nada é baixado antes de você confirmar.
+            Busca em todos os indexadores e escolhe o melhor release. Nada é baixado antes de você confirmar.
           </DialogDescription>
         </DialogHeader>
         <div className="min-h-24" aria-live="polite">
@@ -273,28 +271,6 @@ function normalize(text: string) {
     .toLowerCase()
 }
 
-function summarize(instances: MovieImport[]) {
-  const failed = instances.find((instance) => instance.erro)
-  if (failed) return { ok: false, text: `${failed.nome}: ${failed.erro}` }
-  const total = instances.reduce(
-    (sum, instance) => {
-      const r = instance.resumo
-      if (!r) return sum
-      return {
-        created: sum.created + r.created.length,
-        updated: sum.updated + r.updated.length,
-        removed: sum.removed + r.removed.length,
-      }
-    },
-    { created: 0, updated: 0, removed: 0 },
-  )
-  if (total.created + total.updated + total.removed === 0) return { ok: true, text: 'Catálogo já estava em dia' }
-  return {
-    ok: true,
-    text: `${total.created} novos, ${total.updated} atualizados, ${total.removed} removidos`,
-  }
-}
-
 export function MoviesPage() {
   const queryClient = useQueryClient()
   const movies = useQuery({ queryKey: ['filmes'], queryFn: api.movies })
@@ -303,24 +279,9 @@ export function MoviesPage() {
   const [selected, setSelected] = useState<number | null>(null)
   const [adding, setAdding] = useState(false)
 
-  const importer = useMutation({
-    mutationFn: () => api.importMovies(true),
-    onSuccess: ({ instancias }) => {
-      if (instancias.length === 0) {
-        toast.error('Nenhum gerenciador de filmes configurado em [[instances]]')
-        return
-      }
-      const result = summarize(instancias)
-      if (result.ok) toast.success(result.text)
-      else toast.error(result.text)
-    },
-    onError: (error: Error) => toast.error(error.message),
-    onSettled: () => void queryClient.invalidateQueries({ queryKey: ['filmes'] }),
-  })
-
   const shadow = useMutation({
     mutationFn: () => api.shadow(5),
-    onSuccess: ({ filmes }) => toast.success(`Sombra: ${filmes.length} filmes buscados`),
+    onSuccess: ({ filmes }) => toast.success(`${filmes.length} filmes buscados`),
     onError: (error: Error) => toast.error(error.message),
     onSettled: () => void queryClient.invalidateQueries({ queryKey: ['filmes'] }),
   })
@@ -373,11 +334,7 @@ export function MoviesPage() {
               disabled={counts.total === 0}
             >
               {!shadow.isPending && <Radar aria-hidden="true" />}
-              Sombra
-            </Button>
-            <Button variant="ghost" onClick={() => importer.mutate()} loading={importer.isPending}>
-              {!importer.isPending && <CloudDownload aria-hidden="true" />}
-              Importar do Radarr
+              Buscar os que faltam
             </Button>
             <Button variant="primary" onClick={() => setAdding(true)}>
               <Plus aria-hidden="true" />
@@ -408,12 +365,9 @@ export function MoviesPage() {
           <Film className="size-8 text-content-subtle" aria-hidden="true" />
           <p className="font-medium">A biblioteca está vazia</p>
           <p className="max-w-md text-sm text-content-muted">
-            Adicione filmes buscando no TMDB, ou importe os que o Radarr já tem.
+            Adicione filmes buscando no TMDB.
           </p>
           <div className="flex flex-wrap justify-center gap-2">
-            <Button onClick={() => importer.mutate()} loading={importer.isPending}>
-              Importar do Radarr
-            </Button>
             <Button variant="primary" onClick={() => setAdding(true)}>
               <Plus aria-hidden="true" />
               Adicionar filme
@@ -620,9 +574,8 @@ function RemoveMovieDialog({
 }) {
   const queryClient = useQueryClient()
   const [deleteFiles, setDeleteFiles] = useState(true)
-  const [exclude, setExclude] = useState(false)
   const remove = useMutation({
-    mutationFn: () => library.remove(movie.id, { apagar_arquivos: deleteFiles, excluir: exclude }),
+    mutationFn: () => library.remove(movie.id, { apagar_arquivos: deleteFiles }),
     onSuccess: () => {
       toast.success(`${movie.titulo} removido`)
       onRemoved()
@@ -635,7 +588,7 @@ function RemoveMovieDialog({
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Remover {movie.titulo}?</DialogTitle>
-          <DialogDescription>O filme sai da biblioteca{movie.do_radarr ? ' e do Radarr' : ''}.</DialogDescription>
+          <DialogDescription>O filme sai da biblioteca.</DialogDescription>
         </DialogHeader>
         <div className="grid gap-4">
           <div className="flex items-start justify-between gap-4">
@@ -647,13 +600,6 @@ function RemoveMovieDialog({
               <p className="font-mono text-xs break-all text-content-subtle">{movie.pasta}</p>
             </div>
             <Switch id="remover-arquivos" checked={deleteFiles} onCheckedChange={setDeleteFiles} />
-          </div>
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <Label htmlFor="remover-excluir">Nunca mais adicionar</Label>
-              <p className="text-xs text-content-subtle">Listas de importação não o trazem de volta.</p>
-            </div>
-            <Switch id="remover-excluir" checked={exclude} onCheckedChange={setExclude} />
           </div>
         </div>
         <DialogFooter>

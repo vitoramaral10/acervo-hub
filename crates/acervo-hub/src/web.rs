@@ -10,21 +10,19 @@
 // aqui só custaria alocação em todo erro.
 #![allow(clippy::result_large_err, clippy::unnecessary_wraps)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use acervo_api::{Accounts, Catalog, authorize_ui, ui_json};
 use acervo_decision::Mode;
 use acervo_parser::Quality;
-use acervo_store::{
-    CustomFormat, ImportList, ProfileItem, QualityDefinition, QualityProfile, Store,
-};
+use acervo_store::Store;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::Response;
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -90,22 +88,6 @@ async fn enter<'a>(
         .map_err(|e| fail(WebError(StatusCode::SERVICE_UNAVAILABLE, e)))
 }
 
-/// As regras só mudam pela tela depois que o acervo as assume.
-async fn require_owner(web: &Web, store: &Store) -> Result<(), Response> {
-    let owner = crate::rules::owner(&web.config, store)
-        .await
-        .map_err(|e| fail(anyhow_bad(&e)))?;
-    if owner == "acervo" {
-        Ok(())
-    } else {
-        Err(fail(WebError(
-            StatusCode::CONFLICT,
-            "quem decide ainda é o Radarr: assuma em Configurações → Regras para editar aqui"
-                .into(),
-        )))
-    }
-}
-
 pub fn router(web: Arc<Web>) -> Router {
     Router::new()
         .route("/ui/api/biblioteca/opcoes", get(options))
@@ -139,38 +121,7 @@ pub fn router(web: Arc<Web>) -> Router {
             "/ui/api/biblioteca/bloqueados/{id}",
             axum::routing::delete(unblock),
         )
-        .route(
-            "/ui/api/biblioteca/exclusoes",
-            get(exclusions).post(add_exclusion),
-        )
-        .route(
-            "/ui/api/biblioteca/exclusoes/{tmdb}",
-            axum::routing::delete(remove_exclusion),
-        )
         .route("/ui/api/biblioteca/regras", get(rules).put(save_rules))
-        .route("/ui/api/biblioteca/regras/assumir", post(take_over))
-        .route("/ui/api/biblioteca/regras/devolver", post(give_back))
-        .route(
-            "/ui/api/biblioteca/perfis",
-            get(profiles).post(create_profile),
-        )
-        .route(
-            "/ui/api/biblioteca/perfis/{id}",
-            put(update_profile).delete(delete_profile),
-        )
-        .route(
-            "/ui/api/biblioteca/formatos",
-            get(formats).post(create_format),
-        )
-        .route(
-            "/ui/api/biblioteca/formatos/{id}",
-            put(update_format).delete(delete_format),
-        )
-        .route("/ui/api/biblioteca/formatos/testar", post(test_formats))
-        .route(
-            "/ui/api/biblioteca/tamanhos",
-            get(definitions).put(save_definitions),
-        )
         .route(
             "/ui/api/biblioteca/notificacoes",
             get(notifications).put(save_notifications),
@@ -179,17 +130,6 @@ pub fn router(web: Arc<Web>) -> Router {
             "/ui/api/biblioteca/notificacoes/testar",
             post(test_notification),
         )
-        .route("/ui/api/biblioteca/listas", get(lists).post(create_list))
-        .route(
-            "/ui/api/biblioteca/listas/{id}",
-            put(update_list).delete(delete_list),
-        )
-        .route(
-            "/ui/api/biblioteca/listas/{id}/sincronizar",
-            post(sync_list),
-        )
-        .route("/ui/api/biblioteca/listas/{id}/previa", get(preview_list))
-        .route("/ui/api/biblioteca/migrar", post(migrate))
         .with_state(web)
 }
 
@@ -197,12 +137,7 @@ pub fn router(web: Arc<Web>) -> Router {
 
 async fn options(State(web): Shared, headers: HeaderMap) -> WebResult {
     let store = enter(&web, &headers, &Method::GET).await?;
-    let (profiles, tags, owner) = tokio::try_join!(
-        async { store.profile_ids().await.map_err(anyhow::Error::from) },
-        async { store.tags().await.map_err(anyhow::Error::from) },
-        crate::rules::owner(&web.config, store),
-    )
-    .map_err(|e| fail(anyhow_bad(&e)))?;
+    let tags = store.tags().await.map_err(|e| fail(bad(e)))?;
     let map = web.config.path_map();
     let roots = web.config.movies.root_folders.clone();
     let folders = tokio::task::spawn_blocking(move || {
@@ -220,10 +155,8 @@ async fn options(State(web): Shared, headers: HeaderMap) -> WebResult {
     .await
     .unwrap_or_default();
     ok(&json!({
-        "perfis": profiles.iter().map(|(id, name)| json!({ "id": id, "nome": name })).collect::<Vec<_>>(),
         "pastas": folders,
         "tags": tags.iter().map(|t| json!({ "id": t.id, "nome": t.label })).collect::<Vec<_>>(),
-        "dono_das_regras": owner,
         "qualidades": Quality::ALL.iter().filter(|q| **q != Quality::Unknown)
             .map(|q| json!({ "id": q.id(), "nome": q.name() })).collect::<Vec<_>>(),
         "indexadores": web.catalog.views().into_iter().map(|v| v.name).collect::<Vec<_>>(),
@@ -306,8 +239,7 @@ async fn tmdb_search(
         };
         tmdb.search(title, year).await.map_err(|e| fail(bad(e)))?
     };
-    let (movies, exclusions) =
-        tokio::try_join!(store.movies(), store.exclusions()).map_err(|e| fail(bad(e)))?;
+    let movies = store.movies().await.map_err(|e| fail(bad(e)))?;
     let list: Vec<Value> = results
         .into_iter()
         .map(|r| {
@@ -324,7 +256,6 @@ async fn tmdb_search(
                 "poster": r.poster,
                 "nota": r.vote_average,
                 "no_catalogo": existing,
-                "excluido": exclusions.iter().any(|e| e.tmdb_id == r.tmdb_id),
             })
         })
         .collect();
@@ -334,8 +265,6 @@ async fn tmdb_search(
 #[derive(Deserialize)]
 struct AddBody {
     tmdb: u32,
-    #[serde(default)]
-    perfil: Option<String>,
     pasta: String,
     #[serde(default = "yes")]
     monitorado: bool,
@@ -372,19 +301,16 @@ async fn add_movie(
         .map_err(|e| fail(anyhow_bad(&e)))?;
     let request = crate::library::AddRequest {
         tmdb_id: body.tmdb,
-        quality_profile: body.perfil,
+        quality_profile: None,
         root_folder: body.pasta,
         monitored: body.monitorado,
         minimum_availability: body.disponibilidade_minima,
         tags: body.tags,
     };
-    let id = crate::library::add_anywhere(&web.config, store, &tmdb, &request, body.buscar)
+    let id = crate::library::add(store, &tmdb, &request)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
-    // Adicionado por engano como excluído: a pessoa quis, a exclusão sai.
-    let _ = store.remove_exclusion(body.tmdb).await;
-    let manager_decides = crate::rules::owner(&web.config, store).await.ok() == Some("radarr");
-    if body.buscar && !manager_decides {
+    if body.buscar {
         let web = Arc::clone(&web);
         tokio::spawn(async move {
             if let Ok(store) = web.database.get()
@@ -405,7 +331,7 @@ async fn edit_movie(
     axum::Json(change): axum::Json<crate::library::MovieEdit>,
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::PATCH).await?;
-    crate::library::edit(&web.config, store, id, &change)
+    crate::library::edit(store, id, &change)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     ok(&json!({ "ok": true }))
@@ -415,8 +341,6 @@ async fn edit_movie(
 struct RemoveQuery {
     #[serde(default)]
     apagar_arquivos: bool,
-    #[serde(default)]
-    excluir: bool,
 }
 
 async fn remove_movie(
@@ -426,7 +350,7 @@ async fn remove_movie(
     Query(q): Query<RemoveQuery>,
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::DELETE).await?;
-    crate::library::remove(&web.config, store, id, q.apagar_arquivos, q.excluir)
+    crate::library::remove(&web.config, store, id, q.apagar_arquivos)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     ok(&json!({ "ok": true }))
@@ -455,7 +379,7 @@ async fn interactive_search(
     headers: HeaderMap,
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::POST).await?;
-    let decider = Decider::load(&web.config, store, &web.catalog)
+    let decider = Decider::load(store, &web.catalog)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     let target = decider
@@ -687,68 +611,14 @@ async fn unblock(State(web): Shared, Path(id): Path<i64>, headers: HeaderMap) ->
     ok(&json!({ "ok": true }))
 }
 
-async fn exclusions(State(web): Shared, headers: HeaderMap) -> WebResult {
-    let store = enter(&web, &headers, &Method::GET).await?;
-    let list = store.exclusions().await.map_err(|e| fail(bad(e)))?;
-    ok(&json!({ "exclusoes": list }))
-}
-
-#[derive(Deserialize)]
-struct ExclusionBody {
-    tmdb: u32,
-    titulo: String,
-    #[serde(default)]
-    ano: Option<u16>,
-}
-
-async fn add_exclusion(
-    State(web): Shared,
-    headers: HeaderMap,
-    axum::Json(body): axum::Json<ExclusionBody>,
-) -> WebResult {
-    let store = enter(&web, &headers, &Method::POST).await?;
-    store
-        .add_exclusions(&[acervo_store::Exclusion {
-            tmdb_id: body.tmdb,
-            title: body.titulo,
-            year: body.ano,
-        }])
-        .await
-        .map_err(|e| fail(bad(e)))?;
-    ok(&json!({ "ok": true }))
-}
-
-async fn remove_exclusion(
-    State(web): Shared,
-    Path(tmdb): Path<u32>,
-    headers: HeaderMap,
-) -> WebResult {
-    let store = enter(&web, &headers, &Method::DELETE).await?;
-    store
-        .remove_exclusion(tmdb)
-        .await
-        .map_err(|e| fail(bad(e)))?;
-    ok(&json!({ "ok": true }))
-}
-
 // ---------------------------------------------------------------- regras
 
 async fn rules(State(web): Shared, headers: HeaderMap) -> WebResult {
     let store = enter(&web, &headers, &Method::GET).await?;
-    let owner = crate::rules::owner(&web.config, store)
-        .await
-        .map_err(|e| fail(anyhow_bad(&e)))?;
     let rules = crate::rules::stored(store)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
-    let has_manager = web
-        .config
-        .instances
-        .iter()
-        .any(|spec| matches!(spec.kind, crate::config::InstanceKind::Movie));
     ok(&json!({
-        "dono": owner,
-        "tem_radarr": has_manager,
         "regras": rules,
         "indexadores": web.catalog.views().into_iter().map(|v| v.name).collect::<Vec<_>>(),
     }))
@@ -760,7 +630,6 @@ async fn save_rules(
     axum::Json(rules): axum::Json<crate::rules::DecisionRules>,
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::PUT).await?;
-    require_owner(&web, store).await?;
     if !["preferir_e_atualizar", "nao_atualizar", "nao_preferir"].contains(&rules.propers.as_str())
     {
         return Err(fail(bad("valor de propers inválido")));
@@ -768,367 +637,6 @@ async fn save_rules(
     crate::rules::save(store, &rules)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
-    ok(&json!({ "ok": true }))
-}
-
-async fn take_over(State(web): Shared, headers: HeaderMap) -> WebResult {
-    let store = enter(&web, &headers, &Method::POST).await?;
-    crate::rules::take_over(&web.config, store)
-        .await
-        .map_err(|e| fail(anyhow_bad(&e)))?;
-    ok(&json!({ "dono": "acervo" }))
-}
-
-async fn give_back(State(web): Shared, headers: HeaderMap) -> WebResult {
-    let store = enter(&web, &headers, &Method::POST).await?;
-    crate::rules::give_back(store)
-        .await
-        .map_err(|e| fail(anyhow_bad(&e)))?;
-    ok(&json!({ "dono": "radarr" }))
-}
-
-fn profile_json(id: i64, profile: &QualityProfile, used: usize) -> Value {
-    json!({
-        "id": id,
-        "nome": profile.name,
-        "upgrade": profile.upgrade_allowed,
-        "corte": profile.cutoff,
-        "idioma": profile.language,
-        "itens": profile.items.iter().map(|item| json!({
-            "nome": item.name,
-            "qualidades": item.qualities.iter().map(|q| q.id()).collect::<Vec<_>>(),
-            "permitido": item.allowed,
-        })).collect::<Vec<_>>(),
-        "nota_minima": profile.min_format_score,
-        "nota_corte": profile.cutoff_format_score,
-        "notas": profile.format_scores.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<_, _>>(),
-        "em_uso": used,
-        "do_radarr": profile.source_id.is_some(),
-    })
-}
-
-async fn profiles(State(web): Shared, headers: HeaderMap) -> WebResult {
-    let store = enter(&web, &headers, &Method::GET).await?;
-    let (profiles, movies) =
-        tokio::try_join!(store.profiles_by_id(), store.movies()).map_err(|e| fail(bad(e)))?;
-    let list: Vec<Value> = profiles
-        .iter()
-        .map(|(id, p)| {
-            let used = movies
-                .iter()
-                .filter(|m| m.movie.quality_profile.as_deref() == Some(&p.name))
-                .count();
-            profile_json(*id, p, used)
-        })
-        .collect();
-    ok(&json!({ "perfis": list }))
-}
-
-#[derive(Deserialize)]
-struct ProfileBody {
-    nome: String,
-    upgrade: bool,
-    corte: Option<usize>,
-    idioma: Option<String>,
-    itens: Vec<ItemBody>,
-    #[serde(default)]
-    nota_minima: i32,
-    #[serde(default)]
-    nota_corte: i32,
-    #[serde(default)]
-    notas: BTreeMap<String, i32>,
-}
-
-#[derive(Deserialize)]
-struct ItemBody {
-    nome: String,
-    qualidades: Vec<u8>,
-    permitido: bool,
-}
-
-fn profile_from(body: ProfileBody, source_id: Option<i64>) -> Result<QualityProfile, WebError> {
-    let name = body.nome.trim().to_owned();
-    if name.is_empty() {
-        return Err(bad("o perfil precisa de nome"));
-    }
-    let items: Vec<ProfileItem> = body
-        .itens
-        .into_iter()
-        .map(|item| {
-            Ok(ProfileItem {
-                name: item.nome,
-                qualities: item
-                    .qualidades
-                    .into_iter()
-                    .map(|id| {
-                        Quality::from_id(id)
-                            .ok_or_else(|| bad(format!("qualidade {id} desconhecida")))
-                    })
-                    .collect::<Result<_, _>>()?,
-                allowed: item.permitido,
-            })
-        })
-        .collect::<Result<_, WebError>>()?;
-    if !items.iter().any(|i| i.allowed) {
-        return Err(bad("o perfil precisa aceitar ao menos uma qualidade"));
-    }
-    if let Some(cutoff) = body.corte
-        && !items.get(cutoff).is_some_and(|i| i.allowed)
-    {
-        return Err(bad("o corte tem de ser uma qualidade aceita"));
-    }
-    if let Some(language) = &body.idioma
-        && !matches!(language.as_str(), "Any" | "Original")
-        && acervo_parser::Language::from_name(language).is_none()
-    {
-        return Err(bad(format!("idioma `{language}` desconhecido")));
-    }
-    Ok(QualityProfile {
-        name,
-        upgrade_allowed: body.upgrade,
-        cutoff: body.corte,
-        language: body.idioma,
-        items,
-        min_format_score: body.nota_minima,
-        cutoff_format_score: body.nota_corte,
-        source_id,
-        format_scores: body
-            .notas
-            .into_iter()
-            .filter(|(_, score)| *score != 0)
-            .filter_map(|(id, score)| Some((id.parse().ok()?, score)))
-            .collect(),
-    })
-}
-
-async fn create_profile(
-    State(web): Shared,
-    headers: HeaderMap,
-    axum::Json(body): axum::Json<ProfileBody>,
-) -> WebResult {
-    let store = enter(&web, &headers, &Method::POST).await?;
-    require_owner(&web, store).await?;
-    let profile = profile_from(body, None).map_err(fail)?;
-    let id = store
-        .save_profile(None, &profile)
-        .await
-        .map_err(|e| fail(bad(e)))?;
-    ok(&json!({ "id": id }))
-}
-
-async fn update_profile(
-    State(web): Shared,
-    Path(id): Path<i64>,
-    headers: HeaderMap,
-    axum::Json(body): axum::Json<ProfileBody>,
-) -> WebResult {
-    let store = enter(&web, &headers, &Method::PUT).await?;
-    require_owner(&web, store).await?;
-    let current = store
-        .profiles_by_id()
-        .await
-        .map_err(|e| fail(bad(e)))?
-        .into_iter()
-        .find(|(pid, _)| *pid == id)
-        .ok_or_else(|| {
-            fail(WebError(
-                StatusCode::NOT_FOUND,
-                "perfil desconhecido".into(),
-            ))
-        })?;
-    let profile = profile_from(body, current.1.source_id).map_err(fail)?;
-    store
-        .save_profile(Some(id), &profile)
-        .await
-        .map_err(|e| fail(bad(e)))?;
-    ok(&json!({ "id": id }))
-}
-
-async fn delete_profile(State(web): Shared, Path(id): Path<i64>, headers: HeaderMap) -> WebResult {
-    let store = enter(&web, &headers, &Method::DELETE).await?;
-    require_owner(&web, store).await?;
-    store.delete_profile(id).await.map_err(|e| fail(bad(e)))?;
-    ok(&json!({ "ok": true }))
-}
-
-async fn formats(State(web): Shared, headers: HeaderMap) -> WebResult {
-    let store = enter(&web, &headers, &Method::GET).await?;
-    let list = store.custom_formats().await.map_err(|e| fail(bad(e)))?;
-    ok(&json!({ "formatos": list.iter().map(|f| json!({
-        "id": f.id,
-        "nome": f.name,
-        "especificacoes": f.specifications,
-        "no_nome_do_arquivo": f.include_when_renaming,
-    })).collect::<Vec<_>>() }))
-}
-
-#[derive(Deserialize)]
-struct FormatBody {
-    nome: String,
-    especificacoes: Value,
-    #[serde(default)]
-    no_nome_do_arquivo: bool,
-}
-
-fn format_from(id: i64, body: FormatBody) -> Result<CustomFormat, WebError> {
-    let name = body.nome.trim().to_owned();
-    if name.is_empty() {
-        return Err(bad("o formato precisa de nome"));
-    }
-    let specs: Vec<acervo_decision::FormatSpec> =
-        serde_json::from_value(body.especificacoes.clone())
-            .map_err(|e| bad(format!("especificações: {e}")))?;
-    if specs.is_empty() {
-        return Err(bad("o formato precisa de ao menos uma especificação"));
-    }
-    acervo_decision::CustomFormat::new(id, name.clone(), specs).map_err(bad)?;
-    Ok(CustomFormat {
-        id,
-        name,
-        specifications: body.especificacoes,
-        include_when_renaming: body.no_nome_do_arquivo,
-    })
-}
-
-async fn create_format(
-    State(web): Shared,
-    headers: HeaderMap,
-    axum::Json(body): axum::Json<FormatBody>,
-) -> WebResult {
-    let store = enter(&web, &headers, &Method::POST).await?;
-    require_owner(&web, store).await?;
-    let format = format_from(0, body).map_err(fail)?;
-    let id = store
-        .save_custom_format(&format)
-        .await
-        .map_err(|e| fail(bad(e)))?;
-    ok(&json!({ "id": id }))
-}
-
-async fn update_format(
-    State(web): Shared,
-    Path(id): Path<i64>,
-    headers: HeaderMap,
-    axum::Json(body): axum::Json<FormatBody>,
-) -> WebResult {
-    let store = enter(&web, &headers, &Method::PUT).await?;
-    require_owner(&web, store).await?;
-    let format = format_from(id, body).map_err(fail)?;
-    store
-        .save_custom_format(&format)
-        .await
-        .map_err(|e| fail(bad(e)))?;
-    ok(&json!({ "id": id }))
-}
-
-async fn delete_format(State(web): Shared, Path(id): Path<i64>, headers: HeaderMap) -> WebResult {
-    let store = enter(&web, &headers, &Method::DELETE).await?;
-    require_owner(&web, store).await?;
-    store
-        .delete_custom_format(id)
-        .await
-        .map_err(|e| fail(bad(e)))?;
-    ok(&json!({ "ok": true }))
-}
-
-#[derive(Deserialize)]
-struct TestBody {
-    titulo: String,
-}
-
-/// Que formatos casam com um nome de release — para montar formato sem
-/// esperar um release de verdade.
-async fn test_formats(
-    State(web): Shared,
-    headers: HeaderMap,
-    axum::Json(body): axum::Json<TestBody>,
-) -> WebResult {
-    let store = enter(&web, &headers, &Method::POST).await?;
-    let stored = store.custom_formats().await.map_err(|e| fail(bad(e)))?;
-    let formats = crate::rules::compiled_formats(&stored);
-    let parsed = acervo_parser::parse_movie_title(&body.titulo);
-    let languages = parsed
-        .as_ref()
-        .map(|p| p.languages.clone())
-        .unwrap_or_default();
-    let quality = parsed.as_ref().map_or_else(
-        || acervo_parser::parse_quality(&body.titulo).quality,
-        |p| p.quality.quality,
-    );
-    let input = acervo_decision::FormatInput {
-        title: &body.titulo,
-        release_group: parsed.as_ref().and_then(|p| p.release_group.as_deref()),
-        edition: parsed.as_ref().and_then(|p| p.edition.as_deref()),
-        languages: &languages,
-        original_language: acervo_parser::Language::English,
-        quality,
-        size: 0,
-        flags: 0,
-    };
-    let matched = acervo_decision::matching(&formats, &input);
-    ok(&json!({
-        "qualidade": quality.name(),
-        "idiomas": languages.iter().map(|l| l.name()).collect::<Vec<_>>(),
-        "grupo": input.release_group,
-        "formatos": formats.iter().filter(|f| matched.contains(&f.id))
-            .map(|f| json!({ "id": f.id, "nome": f.name })).collect::<Vec<_>>(),
-    }))
-}
-
-async fn definitions(State(web): Shared, headers: HeaderMap) -> WebResult {
-    let store = enter(&web, &headers, &Method::GET).await?;
-    let list = store
-        .quality_definitions()
-        .await
-        .map_err(|e| fail(bad(e)))?;
-    ok(&json!({ "tamanhos": list.iter().map(|d| json!({
-        "qualidade": d.quality.id(),
-        "nome": d.quality.name(),
-        "minimo": d.min_size,
-        "maximo": d.max_size,
-        "preferido": d.preferred_size,
-    })).collect::<Vec<_>>() }))
-}
-
-#[derive(Deserialize)]
-struct DefinitionBody {
-    qualidade: u8,
-    minimo: Option<f64>,
-    maximo: Option<f64>,
-    preferido: Option<f64>,
-}
-
-async fn save_definitions(
-    State(web): Shared,
-    headers: HeaderMap,
-    axum::Json(body): axum::Json<Vec<DefinitionBody>>,
-) -> WebResult {
-    let store = enter(&web, &headers, &Method::PUT).await?;
-    require_owner(&web, store).await?;
-    let list: Vec<QualityDefinition> = body
-        .into_iter()
-        .map(|d| {
-            let quality = Quality::from_id(d.qualidade)
-                .ok_or_else(|| bad(format!("qualidade {} desconhecida", d.qualidade)))?;
-            if let (Some(min), Some(max)) = (d.minimo, d.maximo)
-                && max != 0.0
-                && min > max
-            {
-                return Err(bad(format!("{}: mínimo acima do máximo", quality.name())));
-            }
-            Ok(QualityDefinition {
-                quality,
-                min_size: d.minimo,
-                max_size: d.maximo,
-                preferred_size: d.preferido,
-            })
-        })
-        .collect::<Result<_, WebError>>()
-        .map_err(fail)?;
-    store
-        .set_quality_definitions(&list)
-        .await
-        .map_err(|e| fail(bad(e)))?;
     ok(&json!({ "ok": true }))
 }
 
@@ -1223,141 +731,3 @@ async fn test_notification(
 }
 
 // ---------------------------------------------------------------- listas
-
-async fn lists(State(web): Shared, headers: HeaderMap) -> WebResult {
-    let store = enter(&web, &headers, &Method::GET).await?;
-    let list = store.import_lists().await.map_err(|e| fail(bad(e)))?;
-    ok(&json!({ "listas": list }))
-}
-
-#[derive(Deserialize)]
-struct ListBody {
-    nome: String,
-    tipo: String,
-    configuracao: Value,
-    #[serde(default = "yes")]
-    ligada: bool,
-    #[serde(default = "yes")]
-    monitorar: bool,
-    #[serde(default)]
-    buscar_ao_adicionar: bool,
-    perfil: i64,
-    pasta: String,
-    #[serde(default = "released")]
-    disponibilidade_minima: String,
-    #[serde(default)]
-    tags: Vec<i64>,
-}
-
-fn list_from(web: &Web, id: i64, body: ListBody) -> Result<ImportList, WebError> {
-    if !["tmdb_person", "tmdb_collection", "tmdb_list"].contains(&body.tipo.as_str()) {
-        return Err(bad(format!("tipo de lista `{}` desconhecido", body.tipo)));
-    }
-    if !web.config.movies.root_folders.contains(&body.pasta) {
-        return Err(bad(format!("pasta raiz `{}` não configurada", body.pasta)));
-    }
-    if body.nome.trim().is_empty() {
-        return Err(bad("a lista precisa de nome"));
-    }
-    Ok(ImportList {
-        id,
-        name: body.nome.trim().to_owned(),
-        kind: body.tipo,
-        settings: body.configuracao,
-        enabled: body.ligada,
-        monitor: body.monitorar,
-        search_on_add: body.buscar_ao_adicionar,
-        quality_profile_id: Some(body.perfil),
-        root_folder: body.pasta,
-        minimum_availability: body.disponibilidade_minima,
-        tags: body.tags,
-        last_sync: None,
-        last_error: None,
-    })
-}
-
-async fn create_list(
-    State(web): Shared,
-    headers: HeaderMap,
-    axum::Json(body): axum::Json<ListBody>,
-) -> WebResult {
-    let store = enter(&web, &headers, &Method::POST).await?;
-    let list = list_from(&web, 0, body).map_err(fail)?;
-    let id = store
-        .save_import_list(&list)
-        .await
-        .map_err(|e| fail(bad(e)))?;
-    ok(&json!({ "id": id }))
-}
-
-async fn update_list(
-    State(web): Shared,
-    Path(id): Path<i64>,
-    headers: HeaderMap,
-    axum::Json(body): axum::Json<ListBody>,
-) -> WebResult {
-    let store = enter(&web, &headers, &Method::PUT).await?;
-    let list = list_from(&web, id, body).map_err(fail)?;
-    store
-        .save_import_list(&list)
-        .await
-        .map_err(|e| fail(bad(e)))?;
-    ok(&json!({ "id": id }))
-}
-
-async fn delete_list(State(web): Shared, Path(id): Path<i64>, headers: HeaderMap) -> WebResult {
-    let store = enter(&web, &headers, &Method::DELETE).await?;
-    store
-        .delete_import_list(id)
-        .await
-        .map_err(|e| fail(bad(e)))?;
-    ok(&json!({ "ok": true }))
-}
-
-async fn find_list(store: &Store, id: i64) -> Result<ImportList, Response> {
-    store
-        .import_lists()
-        .await
-        .map_err(|e| fail(bad(e)))?
-        .into_iter()
-        .find(|l| l.id == id)
-        .ok_or_else(|| fail(WebError(StatusCode::NOT_FOUND, "lista desconhecida".into())))
-}
-
-async fn sync_list(State(web): Shared, Path(id): Path<i64>, headers: HeaderMap) -> WebResult {
-    let store = enter(&web, &headers, &Method::POST).await?;
-    let list = find_list(store, id).await?;
-    let report = crate::lists::sync(&web.config, store, Some(&web.catalog), &list)
-        .await
-        .map_err(|e| fail(anyhow_bad(&e)))?;
-    ok(&serde_json::to_value(report).unwrap_or_default())
-}
-
-async fn preview_list(State(web): Shared, Path(id): Path<i64>, headers: HeaderMap) -> WebResult {
-    let store = enter(&web, &headers, &Method::GET).await?;
-    let list = find_list(store, id).await?;
-    let tmdb = crate::metadata::require_tmdb(&web.config, store)
-        .await
-        .map_err(|e| fail(anyhow_bad(&e)))?;
-    let found = crate::lists::movies(&tmdb, &list)
-        .await
-        .map_err(|e| fail(anyhow_bad(&e)))?;
-    let (movies, exclusions) =
-        tokio::try_join!(store.movies(), store.exclusions()).map_err(|e| fail(bad(e)))?;
-    ok(&json!({ "filmes": found.iter().map(|m| json!({
-        "tmdb": m.tmdb_id,
-        "titulo": m.title,
-        "ano": m.year,
-        "poster": m.poster,
-        "no_catalogo": movies.iter().any(|c| c.movie.tmdb_id == m.tmdb_id),
-        "excluido": exclusions.iter().any(|e| e.tmdb_id == m.tmdb_id),
-    })).collect::<Vec<_>>() }))
-}
-
-async fn migrate(State(web): Shared, headers: HeaderMap) -> WebResult {
-    let store = enter(&web, &headers, &Method::POST).await?;
-    let report = crate::migrate::run(&web.config, store)
-        .await
-        .map_err(|e| fail(anyhow_bad(&e)))?;
-    ok(&serde_json::to_value(report).unwrap_or_default())
-}

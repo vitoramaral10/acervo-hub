@@ -125,14 +125,6 @@ pub trait Admin: Send + Sync + std::fmt::Debug {
     /// Catálogo ilegível.
     async fn movies(&self) -> Result<serde_json::Value, String>;
 
-    /// Espelha os gerenciadores de filmes no catálogo; sem `apply`, só
-    /// relata o que mudaria.
-    ///
-    /// # Errors
-    ///
-    /// Catálogo impossível de abrir.
-    async fn import_movies(&self, apply: bool) -> Result<serde_json::Value, String>;
-
     /// Uma rodada de decisão em sombra: busca até `limit` filmes que faltam e
     /// grava o que pegaria, sem pegar nada.
     ///
@@ -273,7 +265,6 @@ pub(crate) fn routes() -> Router<Arc<Server>> {
         .route("/ui/api/limpeza", get(last_cycle))
         .route("/ui/api/limpeza/simular", post(simulate_cycle))
         .route("/ui/api/filmes", get(movies))
-        .route("/ui/api/filmes/importar", post(import_movies))
         .route("/ui/api/filmes/sombra", post(shadow))
         .route("/ui/api/filmes/{id}/pegar", post(grab_movie))
         .route("/ui/api/downloads", get(downloads))
@@ -741,19 +732,6 @@ async fn movies(
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     Ok(ok(json!({ "filmes": list })))
-}
-
-async fn import_movies(
-    State(server): State<Arc<Server>>,
-    headers: HeaderMap,
-    Json(body): Json<SyncBody>,
-) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::POST).await?;
-    let report = admin(&server)?
-        .import_movies(body.aplicar)
-        .await
-        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
-    Ok(ok(json!({ "instancias": report })))
 }
 
 #[derive(Deserialize)]

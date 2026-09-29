@@ -219,10 +219,6 @@ impl Admin for FakeAdmin {
         Ok(json!([{ "titulo": "Filme", "ano": 2020 }]))
     }
 
-    async fn import_movies(&self, apply: bool) -> Result<Value, String> {
-        Ok(json!([{ "nome": "filmes", "resumo": { "applied": apply } }]))
-    }
-
     async fn shadow(&self, limit: usize) -> Result<Value, String> {
         Ok(json!([{ "filme": "Filme (2020)", "limite": limit }]))
     }
@@ -680,23 +676,12 @@ async fn credencial_de_indexador_desativado_e_salva_sem_erro() {
 }
 
 #[tokio::test]
-async fn filmes_lista_e_importa() {
+async fn filmes_lista_e_busca() {
     let base = serve().await;
     let cookie = login(&base).await;
     let (status, body) = get(&base, "/ui/api/filmes", &cookie).await;
     assert_eq!(status, 200);
     assert_eq!(body["filmes"][0]["titulo"], "Filme");
-
-    let (status, body) = send(
-        &base,
-        reqwest::Method::POST,
-        "/ui/api/filmes/importar",
-        &cookie,
-        json!({ "aplicar": true }),
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert_eq!(body["instancias"][0]["resumo"]["applied"], true);
 
     let (status, body) = send(
         &base,

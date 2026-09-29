@@ -54,8 +54,6 @@ function Choose({ result, onBack, onDone }: { result: TmdbResult; onBack: () => 
     },
   })
 
-  const radarr = options.data?.dono_das_regras === 'radarr'
-
   return (
     <>
       <div className="flex gap-4">
@@ -125,11 +123,6 @@ function Choose({ result, onBack, onDone }: { result: TmdbResult; onBack: () => 
             <Label htmlFor="novo-buscar">Buscar agora</Label>
             <Switch id="novo-buscar" checked={search && monitored} disabled={!monitored} onCheckedChange={setSearch} />
           </div>
-          {radarr && (
-            <p className="text-xs text-content-subtle sm:col-span-2">
-              As regras ainda são do Radarr: o filme é adicionado lá, e ele busca e baixa.
-            </p>
-          )}
         </div>
       )}
       {add.isError && (
@@ -272,8 +265,6 @@ export function AddMovieDialog({
                               <Check aria-hidden="true" />
                               Na biblioteca
                             </Badge>
-                          ) : result.excluido ? (
-                            <Badge tone="warning">Excluído</Badge>
                           ) : null}
                         </div>
                       </button>

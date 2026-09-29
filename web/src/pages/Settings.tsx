@@ -4,11 +4,8 @@ import { useState } from 'react'
 import { toast } from 'sonner'
 import { PageHeader } from '@/components/PageHeader'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { ExclusionsSection } from '@/pages/settings/Exclusions'
-import { ListsSection } from '@/pages/settings/Lists'
-import { MigrationSection } from '@/pages/settings/Migration'
 import { NotificationsSection } from '@/pages/settings/Notifications'
-import { OwnerCard, RulesSection, RulesSkeleton, useRules } from '@/pages/settings/Rules'
+import { RulesSection, RulesSkeleton, useRules } from '@/pages/settings/Rules'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -154,8 +151,7 @@ function GeneralSection() {
             </h2>
             <p id="automatica-ajuda" className="mt-1 max-w-[60ch] text-sm text-content-muted">
               O acervo-hub lê os releases recentes a cada meia hora e busca os filmes que faltam, e pega sozinho o
-              melhor de cada um — upgrades incluídos —, com as regras do Radarr. Ligue só no corte: com o Radarr também
-              pegando, cada filme seria baixado duas vezes.
+              melhor de cada um. Desligada, ele só busca e mostra o que pegaria.
             </p>
           </div>
           {settings.isPending ? (
@@ -180,9 +176,6 @@ const TABS = [
   { value: 'geral', label: 'Geral' },
   { value: 'regras', label: 'Regras' },
   { value: 'notificacoes', label: 'Notificações' },
-  { value: 'listas', label: 'Listas' },
-  { value: 'exclusoes', label: 'Exclusões' },
-  { value: 'migracao', label: 'Migração' },
 ] as const
 
 type Tab = (typeof TABS)[number]['value']
@@ -201,26 +194,12 @@ function storedTab(): Tab {
 export function SettingsPage() {
   const rules = useRules()
   const [tab, setTab] = useState<Tab>(storedTab)
-  const hasRadarr = rules.data?.tem_radarr ?? false
-  const tabs = TABS.filter((t) => t.value !== 'migracao' || hasRadarr)
   return (
     <>
       <PageHeader
         title="Configurações"
         description="O que o acervo-hub guarda no banco e se muda por aqui, sem reiniciar. Endereços e chaves do cliente de download e dos gerenciadores continuam no config.toml."
       />
-      <div className="mb-6">
-        {rules.isPending ? (
-          <Skeleton className="h-28 rounded-lg" />
-        ) : rules.isError ? (
-          <div role="alert" className="flex flex-col items-start gap-3 rounded-lg border border-border bg-surface p-6">
-            <p className="text-sm text-danger">{rules.error.message}</p>
-            <Button onClick={() => void rules.refetch()}>Tentar novamente</Button>
-          </div>
-        ) : (
-          <OwnerCard view={rules.data} />
-        )}
-      </div>
       <Tabs
         value={tab}
         onValueChange={(value) => {
@@ -233,7 +212,7 @@ export function SettingsPage() {
         }}
       >
         <TabsList aria-label="Seções das configurações">
-          {tabs.map((t) => (
+          {TABS.map((t) => (
             <TabsTrigger key={t.value} value={t.value}>
               {t.label}
             </TabsTrigger>
@@ -242,18 +221,20 @@ export function SettingsPage() {
         <TabsContent value="geral">
           <GeneralSection />
         </TabsContent>
-        <TabsContent value="regras">{rules.data ? <RulesSection view={rules.data} /> : <RulesSkeleton />}</TabsContent>
+        <TabsContent value="regras">
+          {rules.isError ? (
+            <div role="alert" className="flex flex-col items-start gap-3 rounded-lg border border-border bg-surface p-6">
+              <p className="text-sm text-danger">{rules.error.message}</p>
+              <Button onClick={() => void rules.refetch()}>Tentar novamente</Button>
+            </div>
+          ) : rules.data ? (
+            <RulesSection view={rules.data} />
+          ) : (
+            <RulesSkeleton />
+          )}
+        </TabsContent>
         <TabsContent value="notificacoes">
           <NotificationsSection />
-        </TabsContent>
-        <TabsContent value="listas">
-          <ListsSection />
-        </TabsContent>
-        <TabsContent value="exclusoes">
-          <ExclusionsSection />
-        </TabsContent>
-        <TabsContent value="migracao">
-          <MigrationSection hasRadarr={hasRadarr} />
         </TabsContent>
       </Tabs>
     </>

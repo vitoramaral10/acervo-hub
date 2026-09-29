@@ -53,7 +53,7 @@ pub async fn rss(
     catalog: &Catalog,
     apply: bool,
 ) -> Result<Vec<RssGrab>> {
-    let decider = Decider::load(config, store, catalog).await?;
+    let decider = Decider::load(store, catalog).await?;
     let page = catalog
         .search(ALL, &SearchQuery::general("").with_categories([MOVIES]))
         .await

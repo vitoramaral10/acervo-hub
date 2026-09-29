@@ -63,7 +63,7 @@ export function IndexersPage() {
     <>
       <PageHeader
         title="Indexadores"
-        description="Estado desde que o serviço subiu. Cada busca — do Sonarr, do Radarr ou daqui — atualiza esta tela."
+        description="Estado desde que o serviço subiu. Cada busca — do Sonarr ou daqui — atualiza esta tela."
         action={
           <div className="flex gap-2">
             <Button onClick={() => void indexers.refetch()} loading={indexers.isFetching && !indexers.isPending}>
@@ -239,7 +239,7 @@ function IndexerCard({ indexer, onEdit }: { indexer: Indexer; onEdit: () => void
 
       {!indexer.ativo ? (
         <p className="border-t border-border pt-4 text-sm text-content-muted">
-          Desativado: não é servido ao Sonarr e ao Radarr nem entra na busca. Ative para voltar.
+          Desativado: não é servido ao Sonarr nem entra na busca. Ative para voltar.
         </p>
       ) : (
       <dl className="grid grid-cols-3 gap-3 border-t border-border pt-4 text-sm">
@@ -300,7 +300,7 @@ function IndexerCard({ indexer, onEdit }: { indexer: Indexer; onEdit: () => void
           <DialogHeader>
             <DialogTitle>Remover {indexer.nome}?</DialogTitle>
             <DialogDescription>
-              Sai do acervo-hub junto com as credenciais guardadas pela tela. O cadastro dele no Sonarr e no Radarr só
+              Sai do acervo-hub junto com as credenciais guardadas pela tela. O cadastro dele no Sonarr só
               some na próxima sincronização.
               {indexer.origem === 'config' &&
                 ' Ele veio do config.toml: o arquivo não muda, e dá para trazê-lo de volta pelo catálogo.'}

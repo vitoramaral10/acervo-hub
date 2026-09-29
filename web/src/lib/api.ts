@@ -196,19 +196,6 @@ export interface MovieShadow {
   erro: string | null
 }
 
-export interface MovieImport {
-  nome: string
-  erro: string | null
-  resumo: {
-    created: string[]
-    updated: string[]
-    removed: string[]
-    unchanged: number
-    profiles: number
-    applied: boolean
-  } | null
-}
-
 export const api = {
   session: () => request<{ ok: boolean; usuario: string | null }>('GET', '/ui/api/sessao'),
   login: (credentials: { usuario: string; senha: string }) =>
@@ -249,8 +236,6 @@ export const api = {
   configuration: () => request<Configuration>('GET', '/ui/api/configuracoes'),
   saveConfiguration: (values: Record<string, string | null>) =>
     request<Configuration>('PUT', '/ui/api/configuracoes', values),
-  importMovies: (aplicar: boolean) =>
-    request<{ instancias: MovieImport[] }>('POST', '/ui/api/filmes/importar', { aplicar }),
   search: (params: { q: string; indexador: string; cat: string }) => {
     const query = new URLSearchParams()
     query.set('q', params.q)
@@ -263,10 +248,8 @@ export const api = {
 // ---------------------------------------------------------------- biblioteca
 
 export interface LibraryOptions {
-  perfis: { id: number; nome: string }[]
   pastas: { caminho: string; livre: number | null }[]
   tags: { id: number; nome: string }[]
-  dono_das_regras: 'radarr' | 'acervo'
   qualidades: { id: number; nome: string }[]
   indexadores: string[]
 }
@@ -280,7 +263,6 @@ export interface TmdbResult {
   poster: string | null
   nota: number
   no_catalogo: number | null
-  excluido: boolean
 }
 
 export interface NewMovie {
@@ -372,12 +354,6 @@ export interface BlockedRelease {
   message: string | null
 }
 
-export interface Exclusion {
-  tmdb_id: number
-  title: string
-  year: number | null
-}
-
 export interface IndexerRules {
   prioridade: number
   seeders_minimos: number
@@ -397,72 +373,8 @@ export interface DecisionRules {
 }
 
 export interface RulesView {
-  dono: 'radarr' | 'acervo'
-  tem_radarr: boolean
   regras: DecisionRules
   indexadores: string[]
-}
-
-export interface ProfileItem {
-  nome: string
-  qualidades: number[]
-  permitido: boolean
-}
-
-export interface Profile {
-  id: number
-  nome: string
-  upgrade: boolean
-  /** Posição em `itens` do corte. */
-  corte: number | null
-  idioma: string | null
-  /** Do pior ao melhor. */
-  itens: ProfileItem[]
-  nota_minima: number
-  nota_corte: number
-  /** Nota por id de formato. */
-  notas: Record<string, number>
-  em_uso: number
-  do_radarr: boolean
-}
-
-export type ProfileInput = Omit<Profile, 'id' | 'em_uso' | 'do_radarr'>
-
-export type FormatRule =
-  | { tipo: 'titulo'; valor: string }
-  | { tipo: 'grupo'; valor: string }
-  | { tipo: 'edicao'; valor: string }
-  | { tipo: 'idioma'; valor: string }
-  | { tipo: 'fonte'; valor: string }
-  | { tipo: 'resolucao'; valor: number }
-  | { tipo: 'modificador'; valor: string }
-  | { tipo: 'tamanho'; minimo: number; maximo: number }
-  | { tipo: 'flag'; valor: number }
-
-export type FormatSpec = FormatRule & { nome: string; negar?: boolean; obrigatoria?: boolean }
-
-export interface CustomFormat {
-  id: number
-  nome: string
-  especificacoes: FormatSpec[]
-  no_nome_do_arquivo: boolean
-}
-
-export type CustomFormatInput = Omit<CustomFormat, 'id'>
-
-export interface FormatTest {
-  qualidade: string
-  idiomas: string[]
-  grupo: string | null
-  formatos: { id: number; nome: string }[]
-}
-
-export interface SizeDefinition {
-  qualidade: number
-  nome: string
-  minimo: number | null
-  maximo: number | null
-  preferido: number | null
 }
 
 export interface NotifyOn {
@@ -490,67 +402,6 @@ export interface GotifyInput {
   ligado: boolean
 }
 
-export type ImportListKind = 'tmdb_person' | 'tmdb_collection' | 'tmdb_list'
-
-export interface ImportList {
-  id: number
-  name: string
-  kind: ImportListKind
-  /** tmdb_person: {pessoa, elenco, departamentos}; tmdb_collection: {colecao}; tmdb_list: {lista}. */
-  settings: Record<string, unknown>
-  enabled: boolean
-  monitor: boolean
-  search_on_add: boolean
-  quality_profile_id: number | null
-  root_folder: string
-  minimum_availability: string
-  tags: number[]
-  last_sync: string | null
-  last_error: string | null
-}
-
-export interface ImportListInput {
-  nome: string
-  tipo: ImportListKind
-  configuracao: Record<string, unknown>
-  ligada: boolean
-  monitorar: boolean
-  buscar_ao_adicionar: boolean
-  perfil: number
-  pasta: string
-  disponibilidade_minima: string
-  tags: number[]
-}
-
-export interface ListSyncReport {
-  lista: string
-  encontrados: number
-  adicionados: string[]
-  ja_no_catalogo: number
-  excluidos: number
-  sem_data: number
-  falhas: [string, string][]
-}
-
-export interface ListPreviewMovie {
-  tmdb: number
-  titulo: string
-  ano: number | null
-  poster: string | null
-  no_catalogo: boolean
-  excluido: boolean
-}
-
-export interface MigrationReport {
-  historico: number
-  historico_ja_migrado: boolean
-  bloqueados: number
-  exclusoes: number
-  notificacao: boolean
-  listas: string[]
-  avisos: string[]
-}
-
 const LIB = '/ui/api/biblioteca'
 
 export const library = {
@@ -559,12 +410,11 @@ export const library = {
     request<{ resultados: TmdbResult[] }>('GET', `${LIB}/tmdb?${new URLSearchParams({ termo })}`),
   add: (movie: NewMovie) => request<{ id: number }>('POST', `${LIB}/filmes`, movie),
   edit: (id: number, change: MovieChange) => request<{ ok: boolean }>('PATCH', `${LIB}/filmes/${id}`, change),
-  remove: (id: number, options: { apagar_arquivos: boolean; excluir: boolean }) =>
+  remove: (id: number, options: { apagar_arquivos: boolean }) =>
     request<{ ok: boolean }>(
       'DELETE',
       `${LIB}/filmes/${id}?${new URLSearchParams({
         apagar_arquivos: String(options.apagar_arquivos),
-        excluir: String(options.excluir),
       })}`,
     ),
   deleteFile: (id: number) => request<{ ok: boolean }>('DELETE', `${LIB}/filmes/${id}/arquivo`),
@@ -590,36 +440,10 @@ export const library = {
   },
   blocklist: () => request<{ bloqueados: BlockedRelease[] }>('GET', `${LIB}/bloqueados`),
   unblock: (id: number) => request<{ ok: boolean }>('DELETE', `${LIB}/bloqueados/${id}`),
-  exclusions: () => request<{ exclusoes: Exclusion[] }>('GET', `${LIB}/exclusoes`),
-  addExclusion: (exclusion: { tmdb: number; titulo: string; ano: number | null }) =>
-    request<{ ok: boolean }>('POST', `${LIB}/exclusoes`, exclusion),
-  removeExclusion: (tmdb: number) => request<{ ok: boolean }>('DELETE', `${LIB}/exclusoes/${tmdb}`),
   rules: () => request<RulesView>('GET', `${LIB}/regras`),
   saveRules: (rules: DecisionRules) => request<{ ok: boolean }>('PUT', `${LIB}/regras`, rules),
-  takeOver: () => request<{ dono: string }>('POST', `${LIB}/regras/assumir`),
-  giveBack: () => request<{ dono: string }>('POST', `${LIB}/regras/devolver`),
-  profiles: () => request<{ perfis: Profile[] }>('GET', `${LIB}/perfis`),
-  createProfile: (profile: ProfileInput) => request<{ id: number }>('POST', `${LIB}/perfis`, profile),
-  updateProfile: (id: number, profile: ProfileInput) => request<{ id: number }>('PUT', `${LIB}/perfis/${id}`, profile),
-  deleteProfile: (id: number) => request<{ ok: boolean }>('DELETE', `${LIB}/perfis/${id}`),
-  formats: () => request<{ formatos: CustomFormat[] }>('GET', `${LIB}/formatos`),
-  createFormat: (format: CustomFormatInput) => request<{ id: number }>('POST', `${LIB}/formatos`, format),
-  updateFormat: (id: number, format: CustomFormatInput) =>
-    request<{ id: number }>('PUT', `${LIB}/formatos/${id}`, format),
-  deleteFormat: (id: number) => request<{ ok: boolean }>('DELETE', `${LIB}/formatos/${id}`),
-  testFormats: (titulo: string) => request<FormatTest>('POST', `${LIB}/formatos/testar`, { titulo }),
-  sizes: () => request<{ tamanhos: SizeDefinition[] }>('GET', `${LIB}/tamanhos`),
-  saveSizes: (sizes: Pick<SizeDefinition, 'qualidade' | 'minimo' | 'maximo' | 'preferido'>[]) =>
-    request<{ ok: boolean }>('PUT', `${LIB}/tamanhos`, sizes),
   notifications: () => request<{ gotify: GotifyView | null }>('GET', `${LIB}/notificacoes`),
   saveNotifications: (gotify: GotifyInput | null) =>
     request<{ gotify: GotifyView | null }>('PUT', `${LIB}/notificacoes`, gotify),
   testNotification: (gotify: GotifyInput) => request<{ ok: boolean }>('POST', `${LIB}/notificacoes/testar`, gotify),
-  lists: () => request<{ listas: ImportList[] }>('GET', `${LIB}/listas`),
-  createList: (list: ImportListInput) => request<{ id: number }>('POST', `${LIB}/listas`, list),
-  updateList: (id: number, list: ImportListInput) => request<{ id: number }>('PUT', `${LIB}/listas/${id}`, list),
-  deleteList: (id: number) => request<{ ok: boolean }>('DELETE', `${LIB}/listas/${id}`),
-  syncList: (id: number) => request<ListSyncReport>('POST', `${LIB}/listas/${id}/sincronizar`),
-  previewList: (id: number) => request<{ filmes: ListPreviewMovie[] }>('GET', `${LIB}/listas/${id}/previa`),
-  migrate: () => request<MigrationReport>('POST', `${LIB}/migrar`),
 }

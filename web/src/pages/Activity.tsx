@@ -279,7 +279,7 @@ function HistoryTab() {
           title={event === 'todos' ? 'Histórico vazio' : 'Nenhum evento desse tipo'}
           text={
             event === 'todos'
-              ? 'Cada grab, importação, falha e remoção fica registrada aqui. Para trazer o histórico do Radarr, use Configurações → Migração.'
+              ? 'Cada grab, importação, falha e remoção fica registrada aqui.'
               : 'Troque o filtro para ver os outros eventos.'
           }
         />
