@@ -136,9 +136,9 @@ enum MoviesAction {
     Add {
         /// Id do filme no TMDB.
         tmdb: u32,
-        /// Perfil de qualidade, pelo nome.
+        /// Perfil guardado, pelo nome; a decisão usa sempre o automático.
         #[arg(long)]
-        profile: String,
+        profile: Option<String>,
         /// Pasta raiz, como o gerenciador a vê.
         #[arg(long, default_value = "/media/movies")]
         root: String,

@@ -285,7 +285,6 @@ export interface TmdbResult {
 
 export interface NewMovie {
   tmdb: number
-  perfil: string
   pasta: string
   monitorado: boolean
   disponibilidade_minima: string
@@ -295,7 +294,6 @@ export interface NewMovie {
 
 export interface MovieChange {
   monitorado?: boolean
-  perfil?: string
   disponibilidade_minima?: string
   tags?: number[]
 }

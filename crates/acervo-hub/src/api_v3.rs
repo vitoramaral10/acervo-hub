@@ -585,7 +585,7 @@ async fn add_movie(
         &tmdb,
         &crate::library::AddRequest {
             tmdb_id: body.tmdb_id,
-            quality_profile: profile,
+            quality_profile: Some(profile),
             root_folder: body
                 .root_folder_path
                 .or_else(|| v3.config.movies.root_folders.first().cloned())

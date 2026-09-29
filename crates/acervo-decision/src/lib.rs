@@ -98,6 +98,10 @@ pub struct Profile {
     pub cutoff_format_score: i32,
     /// Nota de cada formato, pelo id; formato ausente vale zero.
     pub format_scores: Vec<(i64, i32)>,
+    /// Com valor, a saúde do torrent pesa antes da qualidade: release com
+    /// pelo menos esse tanto de seeders vence qualquer um abaixo, e sem
+    /// seeder nenhum fica por último. `None` é a ordem da referência.
+    pub healthy_seeders: Option<u32>,
 }
 
 impl Profile {
@@ -144,6 +148,65 @@ impl Profile {
                 .unwrap_or_else(|| self.last_allowed())
         } else {
             self.first_allowed()
+        }
+    }
+}
+
+/// Nome do perfil único do acervo.
+pub const AUTOMATIC: &str = "Automático";
+
+/// Seeders a partir dos quais o torrent baixa bem, no perfil automático.
+pub const HEALTHY_SEEDERS: u32 = 5;
+
+impl Profile {
+    /// O perfil único: aceita qualquer qualidade de um arquivo de filme e
+    /// fica com a melhor que achar, sem trocar depois (sem upgrade). A
+    /// saúde vem antes: um release bem semeado vence um de qualidade maior
+    /// que mal baixaria (ver [`HEALTHY_SEEDERS`]).
+    ///
+    /// Fica de fora o que não é arquivo de filme (BR-DISK é o disco inteiro,
+    /// Raw-HD é gravação crua) e as cópias de cinema (CAM, TELESYNC e afins):
+    /// sem upgrade, uma delas ficaria para sempre. `WEB-DL` e `WEBRip` da mesma
+    /// resolução valem o mesmo, como na referência.
+    #[must_use]
+    pub fn automatic(language: Language) -> Self {
+        use Quality as Q;
+        let rungs: [(&str, &[Quality]); 17] = [
+            ("SDTV", &[Q::Sdtv]),
+            ("DVD", &[Q::Dvd]),
+            ("DVD-R", &[Q::DvdR]),
+            ("WEB 480p", &[Q::WebDl480p, Q::WebRip480p]),
+            ("Bluray-480p", &[Q::Bluray480p]),
+            ("Bluray-576p", &[Q::Bluray576p]),
+            ("HDTV-720p", &[Q::Hdtv720p]),
+            ("WEB 720p", &[Q::WebDl720p, Q::WebRip720p]),
+            ("Bluray-720p", &[Q::Bluray720p]),
+            ("HDTV-1080p", &[Q::Hdtv1080p]),
+            ("WEB 1080p", &[Q::WebDl1080p, Q::WebRip1080p]),
+            ("Bluray-1080p", &[Q::Bluray1080p]),
+            ("Remux-1080p", &[Q::Remux1080p]),
+            ("HDTV-2160p", &[Q::Hdtv2160p]),
+            ("WEB 2160p", &[Q::WebDl2160p, Q::WebRip2160p]),
+            ("Bluray-2160p", &[Q::Bluray2160p]),
+            ("Remux-2160p", &[Q::Remux2160p]),
+        ];
+        Self {
+            name: AUTOMATIC.into(),
+            items: rungs
+                .iter()
+                .map(|(name, qualities)| ProfileItem {
+                    name: (*name).into(),
+                    qualities: qualities.to_vec(),
+                    allowed: true,
+                })
+                .collect(),
+            cutoff: None,
+            upgrade_allowed: false,
+            language,
+            min_format_score: 0,
+            cutoff_format_score: 0,
+            format_scores: Vec::new(),
+            healthy_seeders: Some(HEALTHY_SEEDERS),
         }
     }
 }
@@ -581,6 +644,38 @@ impl Engine<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatico_vai_da_melhor_para_a_pior_sem_upgrade() {
+        use Quality as Q;
+        let profile = Profile::automatic(Language::Original);
+        let order = [
+            Q::Sdtv,
+            Q::Dvd,
+            Q::WebDl720p,
+            Q::WebDl1080p,
+            Q::Bluray1080p,
+            Q::Remux1080p,
+            Q::WebDl2160p,
+            Q::Remux2160p,
+        ];
+        for pair in order.windows(2) {
+            assert!(profile.index(pair[0]) < profile.index(pair[1]), "{pair:?}");
+        }
+        assert_eq!(profile.index(Q::WebDl1080p), profile.index(Q::WebRip1080p));
+        for fora in [
+            Q::Unknown,
+            Q::Cam,
+            Q::Telesync,
+            Q::Workprint,
+            Q::BrDisk,
+            Q::RawHd,
+        ] {
+            assert_eq!(profile.index(fora), -1, "{fora:?}");
+        }
+        assert!(!profile.upgrade_allowed);
+        assert_eq!(profile.effective_cutoff(), 0);
+    }
     use acervo_parser::Revision;
 
     fn profile() -> Profile {
@@ -602,6 +697,7 @@ mod tests {
             min_format_score: 0,
             cutoff_format_score: 0,
             format_scores: Vec::new(),
+            healthy_seeders: None,
         }
     }
 
@@ -721,6 +817,47 @@ mod tests {
         assert_eq!(
             reasons(&decisions[0]),
             ["QualityUpgradesDisabled", "DiskCutoffMet"]
+        );
+    }
+
+    #[test]
+    fn automatico_troca_qualidade_por_saude() {
+        let mut target = movie(1, "The Housemaid", "tt0000001");
+        target.profile = Profile::automatic(Language::Original);
+        let library = [target];
+        let seeded = |title: &str, seeders: u32| {
+            let mut r = release(title);
+            r.seeders = Some(seeders);
+            r
+        };
+        let first = |releases: &[Release]| {
+            let decisions = decide(&library, releases);
+            assert!(decisions[0].approved(), "{:?}", decisions[0].rejections);
+            decisions[0].release
+        };
+        // 2160p fraco perde para 1080p saudável.
+        assert_eq!(
+            first(&[
+                seeded("The Housemaid 2025 2160p WEB-DL", 4),
+                seeded("The Housemaid 2025 1080p WEB-DL", 10),
+            ]),
+            1
+        );
+        // Os dois saudáveis: vale a qualidade.
+        assert_eq!(
+            first(&[
+                seeded("The Housemaid 2025 2160p WEB-DL", 6),
+                seeded("The Housemaid 2025 1080p WEB-DL", 100),
+            ]),
+            0
+        );
+        // Os dois fracos: vale a qualidade; morto fica por último.
+        assert_eq!(
+            first(&[
+                seeded("The Housemaid 2025 720p WEB-DL", 1),
+                seeded("The Housemaid 2025 1080p WEB-DL", 3),
+            ]),
+            1
         );
     }
 

@@ -334,7 +334,8 @@ async fn tmdb_search(
 #[derive(Deserialize)]
 struct AddBody {
     tmdb: u32,
-    perfil: String,
+    #[serde(default)]
+    perfil: Option<String>,
     pasta: String,
     #[serde(default = "yes")]
     monitorado: bool,
@@ -459,7 +460,7 @@ async fn interactive_search(
         .map_err(|e| fail(anyhow_bad(&e)))?;
     let target = decider
         .target(id)
-        .ok_or_else(|| fail(bad("filme fora do catálogo ou sem perfil de qualidade")))?;
+        .ok_or_else(|| fail(bad("filme fora do catálogo")))?;
     let releases = Decider::fetch(&web.catalog, target)
         .await
         .map_err(|e| fail(bad(format!("busca falhou: {e}"))))?;

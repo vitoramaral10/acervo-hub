@@ -96,6 +96,7 @@ fn profile(value: &Value) -> Profile {
         cutoff_format_score: i32::try_from(value["cutoffFormatScore"].as_i64().unwrap_or(0))
             .unwrap_or(0),
         format_scores: Vec::new(),
+        healthy_seeders: None,
     }
 }
 

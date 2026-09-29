@@ -1,6 +1,8 @@
 //! Ordem de preferência entre releases do mesmo filme.
 //!
-//! Critérios em cascata, como na referência: qualidade (posição no perfil,
+//! Com `healthy_seeders` no perfil, a saúde do torrent vem antes de tudo:
+//! bem semeado, fraco, morto. Depois, critérios em cascata, como na
+//! referência: qualidade (posição no perfil,
 //! depois revisão), nota de formatos, prioridade do indexador, seeders e peers em ordem de
 //! grandeza, e tamanho mais perto do preferido. Flags do indexador contam só
 //! se preferidas. Protocolo e idade não separam nada: é tudo torrent.
@@ -61,6 +63,16 @@ fn size_score(engine: &Engine<'_>, decision: &Decision, release: &Release) -> i6
     }
 }
 
+/// Faixa de saúde: 2 com seeders suficientes, 1 com algum (ou sem contagem),
+/// 0 sem nenhum.
+fn health(seeders: Option<u32>, healthy: u32) -> u8 {
+    match seeders {
+        Some(0) => 0,
+        Some(count) if count >= healthy => 2,
+        _ => 1,
+    }
+}
+
 /// Compara dois releases do mesmo filme: `Greater` é o preferido.
 #[must_use]
 pub fn compare(engine: &Engine<'_>, releases: &[Release], a: &Decision, b: &Decision) -> Ordering {
@@ -95,7 +107,11 @@ pub fn compare(engine: &Engine<'_>, releases: &[Release], a: &Decision, b: &Deci
     } else {
         Ordering::Equal
     };
-    quality
+    let health = profile.healthy_seeders.map_or(Ordering::Equal, |healthy| {
+        health(ra.seeders, healthy).cmp(&health(rb.seeders, healthy))
+    });
+    health
+        .then(quality)
         .then(a.format_score.cmp(&b.format_score))
         .then(priority(rb).cmp(&priority(ra)))
         .then(flags)
@@ -152,5 +168,15 @@ mod tests {
         assert_eq!(magnitude(Some(40)), 2);
         assert_eq!(truncate_to(450, 200), 400);
         assert_eq!(truncate_to(-450, 200), -400);
+    }
+
+    #[test]
+    fn faixas_de_saude() {
+        assert_eq!(health(Some(0), 5), 0);
+        assert_eq!(health(Some(1), 5), 1);
+        assert_eq!(health(Some(4), 5), 1);
+        assert_eq!(health(None, 5), 1);
+        assert_eq!(health(Some(5), 5), 2);
+        assert_eq!(health(Some(500), 5), 2);
     }
 }

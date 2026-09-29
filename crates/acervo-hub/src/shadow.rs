@@ -14,11 +14,11 @@ use acervo_arr::{ArrClient, ArrKind, RemoteQueueItem};
 use acervo_core::InstanceName;
 use acervo_decision::{
     BlockedRelease, CustomFormat, Decision, Delay, Engine, ExistingFile, FormatInput, Indexer,
-    Mode, Profile, ProfileItem, Queued, Release, Settings, Target,
+    Mode, Profile, Queued, Release, Settings, Target,
 };
 use acervo_indexers::SearchQuery;
 use acervo_parser::{Language, QualityModel, Revision, clean_movie_title, parse_movie_title};
-use acervo_store::{CatalogMovie, QualityProfile, ShadowPick, ShadowRun, Store};
+use acervo_store::{CatalogMovie, ShadowPick, ShadowRun, Store};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
@@ -45,33 +45,12 @@ fn metadata_title(movie: &acervo_store::Movie) -> String {
     }
 }
 
-fn profile(stored: &QualityProfile) -> Profile {
-    Profile {
-        name: stored.name.clone(),
-        items: stored
-            .items
-            .iter()
-            .map(|item| ProfileItem {
-                name: item.name.clone(),
-                qualities: item.qualities.clone(),
-                allowed: item.allowed,
-            })
-            .collect(),
-        cutoff: stored.cutoff,
-        upgrade_allowed: stored.upgrade_allowed,
-        language: stored
-            .language
-            .as_deref()
-            .and_then(Language::from_name)
-            .unwrap_or(Language::Any),
-        min_format_score: stored.min_format_score,
-        cutoff_format_score: stored.cutoff_format_score,
-        format_scores: stored
-            .format_scores
-            .iter()
-            .map(|(id, score)| (*id, *score))
-            .collect(),
-    }
+/// Todo filme decide pelo perfil automático: da melhor qualidade para a
+/// pior, sem upgrade. O idioma é o original do filme, como era em todos os
+/// perfis vindos do gerenciador — dual-audio com o original passa, só
+/// dublado não.
+fn automatic_profile() -> Profile {
+    Profile::automatic(Language::Original)
 }
 
 /// Nota de formatos de um nome de release ou de arquivo no perfil.
@@ -121,20 +100,17 @@ fn age_days(date: Option<&str>, now: time::OffsetDateTime) -> u32 {
 struct Remote {
     /// A fila do gerenciador; vazia quando ele não responde.
     queue: Vec<RemoteQueueItem>,
-    /// Espaço livre por pasta raiz, como o gerenciador vê a pasta.
-    free: BTreeMap<String, u64>,
     rules: DecisionRules,
 }
 
 fn target(
     entry: &CatalogMovie,
-    profiles: &BTreeMap<String, Profile>,
     remote: &Remote,
     formats: &[CustomFormat],
     now: time::OffsetDateTime,
-) -> Option<Target> {
+) -> Target {
     let movie = &entry.movie;
-    let profile = profiles.get(movie.quality_profile.as_deref()?)?.clone();
+    let profile = automatic_profile();
     let mut clean_titles: Vec<String> = movie.clean_title.iter().cloned().collect();
     for title in movie
         .original_title
@@ -150,7 +126,7 @@ fn target(
         .as_deref()
         .and_then(Language::from_name)
         .unwrap_or(Language::Unknown);
-    Some(Target {
+    Target {
         id: entry.id,
         title: metadata_title(movie),
         clean_titles,
@@ -206,11 +182,11 @@ fn target(
                 format_score: 0,
             })
             .collect(),
-        free_space: std::path::Path::new(&movie.path)
-            .parent()
-            .and_then(|root| remote.free.get(&root.display().to_string()))
-            .copied(),
-    })
+        // Espaço não trava o grab: com o disco cheio, o qBittorrent pausa o
+        // download e a limpeza libera espaço; recusar deixaria o filme sem
+        // nada na fila.
+        free_space: None,
+    }
 }
 
 /// Os indexadores daqui, com prioridade e seeders mínimos do cadastro deles
@@ -228,29 +204,6 @@ fn indexers(served: &[String], remote: &Remote) -> Vec<Indexer> {
             }
         })
         .collect()
-}
-
-/// Espaço livre de cada pasta raiz dos filmes, lido do disco.
-async fn free_space(config: &Config, movies: &[CatalogMovie]) -> BTreeMap<String, u64> {
-    let mut roots: std::collections::BTreeSet<String> =
-        config.movies.root_folders.iter().cloned().collect();
-    for entry in movies {
-        if let Some(root) = std::path::Path::new(&entry.movie.path).parent() {
-            roots.insert(root.display().to_string());
-        }
-    }
-    let map = config.path_map();
-    tokio::task::spawn_blocking(move || {
-        roots
-            .into_iter()
-            .filter_map(|root| {
-                let host = map.to_host(std::path::Path::new(&root)).ok()?;
-                Some((root, acervo_fs::free_space(&host).ok()?))
-            })
-            .collect()
-    })
-    .await
-    .unwrap_or_default()
 }
 
 pub(crate) fn movie_client(config: &Config) -> Result<ArrClient> {
@@ -363,9 +316,8 @@ impl Decider {
                 (Vec::new(), crate::rules::stored(store).await?)
             }
         };
-        let (movies, stored_profiles, definitions, grabs, stored_formats, blocked) = tokio::try_join!(
+        let (movies, definitions, grabs, stored_formats, blocked) = tokio::try_join!(
             store.movies(),
-            store.profiles(),
             store.quality_definitions(),
             store.grabs(),
             store.custom_formats(),
@@ -375,19 +327,11 @@ impl Decider {
             bail!("catálogo vazio: adicione filmes ou importe do gerenciador antes");
         }
         let formats = crate::rules::compiled_formats(&stored_formats);
-        let remote = Remote {
-            queue,
-            free: free_space(config, &movies).await,
-            rules,
-        };
+        let remote = Remote { queue, rules };
         let now = time::OffsetDateTime::now_utc();
-        let profiles: BTreeMap<String, Profile> = stored_profiles
-            .iter()
-            .map(|p| (p.name.clone(), profile(p)))
-            .collect();
         let mut library: Vec<Target> = movies
             .iter()
-            .filter_map(|entry| target(entry, &profiles, &remote, &formats, now))
+            .map(|entry| target(entry, &remote, &formats, now))
             .collect();
         // O que o acervo mesmo mandou ao cliente conta como fila: sem isso,
         // pegaria o mesmo filme de novo enquanto o primeiro baixa.

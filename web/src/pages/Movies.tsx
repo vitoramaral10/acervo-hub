@@ -672,7 +672,6 @@ function RemoveMovieDialog({
 
 function MovieSettings({ movie }: { movie: Movie }) {
   const queryClient = useQueryClient()
-  const options = useQuery({ queryKey: ['biblioteca-opcoes'], queryFn: library.options })
   const edit = useMutation({
     mutationFn: (change: MovieChange) => library.edit(movie.id, change),
     onSuccess: () => toast.success('Filme atualizado'),
@@ -680,7 +679,10 @@ function MovieSettings({ movie }: { movie: Movie }) {
     onSettled: () => void queryClient.invalidateQueries({ queryKey: ['filmes'] }),
   })
   return (
-    <div className="grid gap-4 rounded-md border border-border p-4 sm:grid-cols-3">
+    <div className="grid gap-4 rounded-md border border-border p-4 sm:grid-cols-2">
+      <p className="text-xs text-content-subtle sm:col-span-2">
+        Qualidade automática: pega a melhor entre as que têm 5 ou mais seeders (do Remux 2160p ao SD), e não troca depois.
+      </p>
       <div className="flex items-center justify-between gap-3 sm:flex-col sm:items-start">
         <Label htmlFor={`monitorado-${movie.id}`}>Monitorado</Label>
         <Switch
@@ -689,25 +691,6 @@ function MovieSettings({ movie }: { movie: Movie }) {
           disabled={edit.isPending}
           onCheckedChange={(on) => edit.mutate({ monitorado: on })}
         />
-      </div>
-      <div className="grid gap-1.5">
-        <Label htmlFor={`perfil-${movie.id}`}>Perfil</Label>
-        <Select
-          value={movie.perfil ?? undefined}
-          disabled={edit.isPending || !options.data}
-          onValueChange={(perfil) => edit.mutate({ perfil })}
-        >
-          <SelectTrigger id={`perfil-${movie.id}`}>
-            <SelectValue placeholder="Sem perfil" />
-          </SelectTrigger>
-          <SelectContent>
-            {options.data?.perfis.map((p) => (
-              <SelectItem key={p.id} value={p.nome}>
-                {p.nome}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
       </div>
       <div className="grid gap-1.5">
         <Label htmlFor={`disponibilidade-${movie.id}`}>Pegar a partir de</Label>

@@ -5,13 +5,10 @@ import { toast } from 'sonner'
 import { PageHeader } from '@/components/PageHeader'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { ExclusionsSection } from '@/pages/settings/Exclusions'
-import { FormatsSection } from '@/pages/settings/Formats'
 import { ListsSection } from '@/pages/settings/Lists'
 import { MigrationSection } from '@/pages/settings/Migration'
 import { NotificationsSection } from '@/pages/settings/Notifications'
-import { ProfilesSection } from '@/pages/settings/Profiles'
 import { OwnerCard, RulesSection, RulesSkeleton, useRules } from '@/pages/settings/Rules'
-import { SizesSection } from '@/pages/settings/Sizes'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -182,9 +179,6 @@ function GeneralSection() {
 const TABS = [
   { value: 'geral', label: 'Geral' },
   { value: 'regras', label: 'Regras' },
-  { value: 'perfis', label: 'Perfis' },
-  { value: 'formatos', label: 'Formatos' },
-  { value: 'tamanhos', label: 'Tamanhos' },
   { value: 'notificacoes', label: 'Notificações' },
   { value: 'listas', label: 'Listas' },
   { value: 'exclusoes', label: 'Exclusões' },
@@ -207,7 +201,6 @@ function storedTab(): Tab {
 export function SettingsPage() {
   const rules = useRules()
   const [tab, setTab] = useState<Tab>(storedTab)
-  const editable = rules.data?.dono === 'acervo'
   const hasRadarr = rules.data?.tem_radarr ?? false
   const tabs = TABS.filter((t) => t.value !== 'migracao' || hasRadarr)
   return (
@@ -250,15 +243,6 @@ export function SettingsPage() {
           <GeneralSection />
         </TabsContent>
         <TabsContent value="regras">{rules.data ? <RulesSection view={rules.data} /> : <RulesSkeleton />}</TabsContent>
-        <TabsContent value="perfis">
-          <ProfilesSection editable={editable} />
-        </TabsContent>
-        <TabsContent value="formatos">
-          <FormatsSection editable={editable} />
-        </TabsContent>
-        <TabsContent value="tamanhos">
-          <SizesSection editable={editable} />
-        </TabsContent>
         <TabsContent value="notificacoes">
           <NotificationsSection />
         </TabsContent>

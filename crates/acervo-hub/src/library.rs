@@ -171,8 +171,9 @@ pub async fn refresh(store: &Store, tmdb: &Tmdb, stale_hours: i64) -> Result<Ref
 #[derive(Debug, Clone)]
 pub struct AddRequest {
     pub tmdb_id: u32,
-    /// Nome do perfil de qualidade.
-    pub quality_profile: String,
+    /// Nome de um perfil guardado; só serve à API v3 e ao Radarr. A decisão
+    /// do acervo usa sempre o perfil automático.
+    pub quality_profile: Option<String>,
     /// Pasta raiz, como o gerenciador a vê (`/media/movies`).
     pub root_folder: String,
     pub monitored: bool,
@@ -223,8 +224,7 @@ pub async fn lookup(tmdb: &Tmdb, tmdb_id: u32) -> Result<(Movie, MovieExtras)> {
 ///
 /// # Errors
 ///
-/// Filme já no catálogo, perfil desconhecido, TMDB inalcançável ou falha de
-/// escrita.
+/// Filme já no catálogo, TMDB inalcançável ou falha de escrita.
 pub async fn add(store: &Store, tmdb: &Tmdb, request: &AddRequest) -> Result<i64> {
     if store
         .movies()
@@ -234,17 +234,7 @@ pub async fn add(store: &Store, tmdb: &Tmdb, request: &AddRequest) -> Result<i64
     {
         bail!("o filme {} já está no catálogo", request.tmdb_id);
     }
-    if !store
-        .profiles()
-        .await?
-        .iter()
-        .any(|p| p.name == request.quality_profile)
-    {
-        bail!(
-            "perfil de qualidade `{}` não existe",
-            request.quality_profile
-        );
-    }
+    let profiles = store.profiles().await?;
     let (mut movie, extras) = lookup(tmdb, request.tmdb_id).await?;
     let folder = formatted_name(
         extras.metadata_title.as_deref().unwrap_or(&movie.title),
@@ -252,7 +242,10 @@ pub async fn add(store: &Store, tmdb: &Tmdb, request: &AddRequest) -> Result<i64
         movie.imdb_id.as_deref(),
     );
     movie.path = format!("{}/{folder}", request.root_folder.trim_end_matches('/'));
-    movie.quality_profile = Some(request.quality_profile.clone());
+    movie.quality_profile = request
+        .quality_profile
+        .clone()
+        .filter(|name| profiles.iter().any(|p| p.name == *name));
     movie.monitored = request.monitored;
     movie.minimum_availability = Some(request.minimum_availability.clone());
     movie.tags.clone_from(&request.tags);
@@ -300,17 +293,19 @@ pub async fn add_anywhere(
     {
         bail!("o filme {} já está no catálogo", request.tmdb_id);
     }
+    // O Radarr exige um perfil: o pedido, ou o primeiro que veio de lá.
     let profile = store
         .profiles()
         .await?
         .into_iter()
-        .find(|p| p.name == request.quality_profile)
-        .with_context(|| {
-            format!(
-                "perfil de qualidade `{}` não existe",
-                request.quality_profile
-            )
-        })?;
+        .filter(|p| p.source_id.is_some())
+        .find(|p| {
+            request
+                .quality_profile
+                .as_ref()
+                .is_none_or(|name| p.name == *name)
+        })
+        .context("nenhum perfil de qualidade do Radarr para o filme novo")?;
     let source_profile = profile.source_id.context(
         "o perfil não existe no Radarr; perfis novos só valem depois que o acervo assume",
     )?;

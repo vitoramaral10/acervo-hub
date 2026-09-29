@@ -129,7 +129,7 @@ async fn sync_with(
         let label = crate::events::label(&movie.title, movie.year);
         let request = AddRequest {
             tmdb_id: movie.tmdb_id,
-            quality_profile: profile.clone(),
+            quality_profile: Some(profile.clone()),
             root_folder: list.root_folder.clone(),
             monitored: list.monitor,
             minimum_availability: list.minimum_availability.clone(),

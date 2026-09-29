@@ -184,9 +184,7 @@ pub async fn grab(
     apply: bool,
 ) -> Result<GrabReport> {
     let decider = Decider::load(config, store, catalog).await?;
-    let movie = decider
-        .target(movie_id)
-        .context("filme fora do catálogo ou sem perfil de qualidade")?;
+    let movie = decider.target(movie_id).context("filme fora do catálogo")?;
     let outcome = decider
         .decide(catalog, movie)
         .await

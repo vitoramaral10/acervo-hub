@@ -27,7 +27,6 @@ export const AVAILABILITIES = [
 function Choose({ result, onBack, onDone }: { result: TmdbResult; onBack: () => void; onDone: (id: number) => void }) {
   const queryClient = useQueryClient()
   const options = useQuery({ queryKey: ['biblioteca-opcoes'], queryFn: library.options })
-  const [profile, setProfile] = useState('')
   const [folder, setFolder] = useState('')
   const [availability, setAvailability] = useState('released')
   const [monitored, setMonitored] = useState(true)
@@ -35,7 +34,6 @@ function Choose({ result, onBack, onDone }: { result: TmdbResult; onBack: () => 
 
   useEffect(() => {
     if (!options.data) return
-    setProfile((current) => current || options.data.perfis[0]?.nome || '')
     setFolder((current) => current || options.data.pastas[0]?.caminho || '')
   }, [options.data])
 
@@ -43,7 +41,6 @@ function Choose({ result, onBack, onDone }: { result: TmdbResult; onBack: () => 
     mutationFn: () =>
       library.add({
         tmdb: result.tmdb,
-        perfil: profile,
         pasta: folder,
         monitorado: monitored,
         disponibilidade_minima: availability,
@@ -89,21 +86,6 @@ function Choose({ result, onBack, onDone }: { result: TmdbResult; onBack: () => 
         </p>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2">
-          <div className="grid gap-2">
-            <Label htmlFor="novo-perfil">Perfil de qualidade</Label>
-            <Select value={profile} onValueChange={setProfile}>
-              <SelectTrigger id="novo-perfil">
-                <SelectValue placeholder="Escolha" />
-              </SelectTrigger>
-              <SelectContent>
-                {options.data.perfis.map((p) => (
-                  <SelectItem key={p.id} value={p.nome}>
-                    {p.nome}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
           <div className="grid gap-2">
             <Label htmlFor="novo-disponibilidade">Pegar a partir de</Label>
             <Select value={availability} onValueChange={setAvailability}>
@@ -160,7 +142,7 @@ function Choose({ result, onBack, onDone }: { result: TmdbResult; onBack: () => 
           <ArrowLeft aria-hidden="true" />
           Voltar
         </Button>
-        <Button variant="primary" disabled={!profile || !folder} loading={add.isPending} onClick={() => add.mutate()}>
+        <Button variant="primary" disabled={!folder} loading={add.isPending} onClick={() => add.mutate()}>
           Adicionar filme
         </Button>
       </DialogFooter>
