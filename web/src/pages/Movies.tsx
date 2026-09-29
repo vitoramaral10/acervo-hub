@@ -619,7 +619,7 @@ function RemoveMovieDialog({
   onRemoved: () => void
 }) {
   const queryClient = useQueryClient()
-  const [deleteFiles, setDeleteFiles] = useState(false)
+  const [deleteFiles, setDeleteFiles] = useState(true)
   const [exclude, setExclude] = useState(false)
   const remove = useMutation({
     mutationFn: () => library.remove(movie.id, { apagar_arquivos: deleteFiles, excluir: exclude }),
@@ -640,7 +640,10 @@ function RemoveMovieDialog({
         <div className="grid gap-4">
           <div className="flex items-start justify-between gap-4">
             <div>
-              <Label htmlFor="remover-arquivos">Apagar a pasta do filme</Label>
+              <Label htmlFor="remover-arquivos">Apagar os arquivos e o download</Label>
+              <p className="text-xs text-content-subtle">
+                A pasta do filme e o torrent no qBittorrent, com os dados, na hora.
+              </p>
               <p className="font-mono text-xs break-all text-content-subtle">{movie.pasta}</p>
             </div>
             <Switch id="remover-arquivos" checked={deleteFiles} onCheckedChange={setDeleteFiles} />

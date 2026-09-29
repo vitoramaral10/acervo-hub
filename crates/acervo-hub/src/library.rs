@@ -6,8 +6,11 @@
 //! origem — adicionado aqui ou adotado no corte — tem título, datas e status
 //! mantidos a partir do TMDB.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 
+use acervo_core::DownloadHash;
 use acervo_metadata::{MovieMetadata, Tmdb};
 use acervo_parser::{Language, clean_movie_title};
 use acervo_store::{CatalogMovie, Movie, MovieExtras, Store};
@@ -463,6 +466,102 @@ pub async fn delete_folder(config: &Config, movie_path: &str) -> Result<()> {
     Ok(())
 }
 
+fn removal_message(folder: &str, removed: &Result<Vec<String>, String>) -> String {
+    match removed {
+        Ok(names) if names.is_empty() => {
+            format!("pasta apagada: {folder}; nenhum download no cliente")
+        }
+        Ok(names) => format!(
+            "pasta apagada: {folder}; download apagado com os dados: {}",
+            names.join(", ")
+        ),
+        Err(error) => format!(
+            "pasta apagada: {folder}; download não apagado ({error}), fica para o ciclo de limpeza"
+        ),
+    }
+}
+
+/// Torrents que semeiam os arquivos da pasta do filme. O arquivo da
+/// biblioteca é hardlink do download, então o mesmo inode aparece nos dois
+/// lados — vale para o que o Radarr baixou e para o que o acervo baixou, e
+/// não depende de nome nem de histórico.
+async fn downloads_of(config: &Config, movie_path: &str) -> Result<Vec<(DownloadHash, String)>> {
+    let map = config.path_map();
+    let folder = map.to_host(Path::new(movie_path))?;
+    let inodes = tokio::task::spawn_blocking(move || linked_inodes(&folder)).await??;
+    if inodes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let qbit = crate::grab::qbit(config).await?;
+    let mut candidates: Vec<(DownloadHash, String, Vec<PathBuf>)> = Vec::new();
+    for torrent in qbit.torrents().await.context("listando os torrents")? {
+        let hash = DownloadHash::new(&torrent.hash);
+        let files = qbit
+            .files(&hash)
+            .await
+            .context("listando os arquivos de um torrent")?;
+        // Caminho fora do mapa não é deste acervo: não pode ser o filme.
+        let paths = files
+            .iter()
+            .filter_map(|file| {
+                map.to_host(&acervo_clients::client_path(&torrent, file))
+                    .ok()
+            })
+            .collect();
+        candidates.push((hash, torrent.name, paths));
+    }
+    Ok(tokio::task::spawn_blocking(move || {
+        candidates
+            .into_iter()
+            .filter(|(_, _, paths)| {
+                paths.iter().any(|path| {
+                    std::fs::metadata(path)
+                        .is_ok_and(|meta| inodes.contains(&(meta.dev(), meta.ino())))
+                })
+            })
+            .map(|(hash, name, _)| (hash, name))
+            .collect()
+    })
+    .await?)
+}
+
+/// Inodes dos arquivos da pasta que têm outro link — só esses podem ser de
+/// um download. Pasta inexistente não tem nenhum.
+fn linked_inodes(folder: &Path) -> std::io::Result<HashSet<(u64, u64)>> {
+    let mut inodes = HashSet::new();
+    let mut pending = vec![folder.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            other => other?,
+        };
+        for entry in entries {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            if meta.is_dir() {
+                pending.push(entry.path());
+            } else if meta.is_file() && meta.nlink() > 1 {
+                inodes.insert((meta.dev(), meta.ino()));
+            }
+        }
+    }
+    Ok(inodes)
+}
+
+async fn delete_downloads(
+    config: &Config,
+    found: Vec<(DownloadHash, String)>,
+) -> Result<Vec<String>, String> {
+    let (hashes, names): (Vec<_>, Vec<_>) = found.into_iter().unzip();
+    let qbit = crate::grab::qbit(config)
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    qbit.delete(&hashes, true)
+        .await
+        .map_err(|error| format!("apagando no qBittorrent: {error}"))?;
+    Ok(names)
+}
+
 /// Apaga só o arquivo do filme; o filme fica no catálogo, sem arquivo (e,
 /// monitorado, volta a ser procurado). Filme do gerenciador apaga por lá.
 ///
@@ -514,9 +613,13 @@ pub async fn delete_file(config: &Config, store: &Store, id: i64) -> Result<()> 
     Ok(())
 }
 
-/// Tira o filme do catálogo; com `delete_files`, apaga a pasta; com
-/// `exclude`, nenhuma lista o traz de volta. Filme do gerenciador sai de lá
-/// também (e é ele quem apaga os arquivos).
+/// Tira o filme do catálogo; com `exclude`, nenhuma lista o traz de volta.
+/// Filme do gerenciador sai de lá também (e é ele quem apaga a pasta).
+///
+/// Com `delete_files`, apaga a pasta **e** o download no qBittorrent, com os
+/// dados, na hora — privado ou não, por escolha do usuário. Sem isso, o
+/// torrent seguiria semeando até o ciclo de limpeza vencer a carência. Se o
+/// cliente falhar, o filme sai mesmo assim e o ciclo limpa depois.
 ///
 /// # Errors
 ///
@@ -535,6 +638,14 @@ pub async fn remove(
         .into_iter()
         .find(|m| m.id == id)
         .context("filme fora do catálogo")?;
+    // Antes de apagar a pasta: depois dela, não há mais inode para casar.
+    let downloads = if delete_files {
+        downloads_of(config, &entry.movie.path)
+            .await
+            .map_err(|error| format!("{error:#}"))
+    } else {
+        Ok(Vec::new())
+    };
     if let Some((_, source_id)) = &entry.origin {
         movie_client(config)?
             .delete_path(
@@ -559,15 +670,28 @@ pub async fn remove(
             .await?;
     }
     store.delete_movie(id).await?;
+    let removed = match downloads {
+        Ok(found) if found.is_empty() => Ok(Vec::new()),
+        Ok(found) => delete_downloads(config, found).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = &removed {
+        tracing::warn!(
+            filme = entry.movie.title,
+            %error,
+            "download não apagado; fica para o ciclo de limpeza"
+        );
+    }
     tracing::info!(
         filme = entry.movie.title,
         arquivos = delete_files,
+        downloads = removed.as_ref().map_or(0, Vec::len),
         "filme removido"
     );
     events::record(
         store,
         Event {
-            message: delete_files.then(|| format!("pasta apagada: {}", entry.movie.path)),
+            message: delete_files.then(|| removal_message(&entry.movie.path, &removed)),
             poster: entry.extras.poster.clone(),
             ..Event::new(
                 Kind::MovieDeleted,
@@ -583,6 +707,24 @@ pub async fn remove(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn so_arquivo_com_outro_link_conta_como_download() {
+        let root = std::env::temp_dir().join(format!("acervo-inodes-{}", std::process::id()));
+        let movie = root.join("filme");
+        let download = root.join("download");
+        std::fs::create_dir_all(movie.join("extras")).unwrap();
+        std::fs::create_dir_all(&download).unwrap();
+        std::fs::write(download.join("filme.mkv"), b"video").unwrap();
+        std::fs::hard_link(download.join("filme.mkv"), movie.join("filme.mkv")).unwrap();
+        std::fs::write(movie.join("extras/poster.jpg"), b"sozinho").unwrap();
+
+        let inodes = linked_inodes(&movie).unwrap();
+        let meta = std::fs::metadata(download.join("filme.mkv")).unwrap();
+        assert_eq!(inodes, HashSet::from([(meta.dev(), meta.ino())]));
+        assert!(linked_inodes(&root.join("nao-existe")).unwrap().is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     fn movie(
         minimum: &str,
