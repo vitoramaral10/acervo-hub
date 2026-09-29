@@ -15,7 +15,7 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::config::Config;
-use crate::shadow::Decider;
+use crate::decide::Decider;
 
 /// Onde a chave liga-desliga fica na tabela de configurações.
 pub const KEY: &str = "busca.automatica";

@@ -22,12 +22,6 @@ kind = "series"
 url = "http://localhost:8989"
 api_key = "CHAVE_DA_API"
 
-[[instances]]
-name = "filmes"
-kind = "movie"
-url = "http://localhost:7878"
-api_key = "CHAVE_DA_API"
-
 # Caminho como o CLIENTE DE DOWNLOAD o vê → caminho no host onde o acervo-hub
 # roda. Sem isso, o `stat` cairia no lugar errado da árvore do host. Omitir a
 # seção inteira só funciona se ambos enxergam a mesma árvore.
@@ -64,10 +58,10 @@ recent_change_grace_hours = 24
 max_batch_gib = 300
 max_batch_fraction = 0.30
 
-# Categorias do cliente que os gerenciadores usam. Só seed nelas pode ser
-# apagado por ter perdido o hardlink; o resto é download manual e nunca é
-# tocado. Vazia, essa regra não apaga nada.
-managed_categories = ["tv-sonarr", "radarr"]
+# Categorias do cliente que o gerenciador de séries e o acervo usam. Só seed
+# nelas pode ser apagado por ter perdido o hardlink; o resto é download manual e
+# nunca é tocado. Vazia, essa regra não apaga nada.
+managed_categories = ["tv-sonarr", "acervo"]
 
 [state]
 # Onde os strikes sobrevivem ao reinício do processo. Sem isso, três strikes
@@ -75,9 +69,9 @@ managed_categories = ["tv-sonarr", "radarr"]
 ledger = "~/.local/state/acervo-hub/strikes.json"
 
 # Postgres do catálogo de filmes e das contas da interface. As tabelas são
-# criadas na primeira conexão. `acervo-hub movies import --apply` preenche o
-# catálogo a partir das `[[instances]]` de filmes; `acervo-hub movies check`
-# confere cada arquivo contra o disco. Contas da interface:
+# criadas na primeira conexão; filmes entram pela tela (ou `acervo-hub movies
+# add`), e `acervo-hub movies check` confere cada arquivo contra o disco.
+# Contas da interface:
 #   echo 'senha-longa' | acervo-hub users set <nome>
 # Sem esta seção, `serve` sobe e serve os indexadores, mas ninguém entra pela
 # tela — só a chave de API no cabeçalho `X-Api-Key`.
@@ -122,12 +116,13 @@ public_url = "http://acervo-hub-indexadores:9797"
 # indexador" — por exemplo, o Definitions do agregador atual. As que o
 # executor ainda não roda aparecem com o motivo.
 catalogs = ["/etc/acervo-hub/definicoes", "/etc/acervo-hub/catalogo"]
-# Decisão em sombra dentro do serviço: a cada tantos minutos, reimporta o
-# catálogo de filmes e busca `shadow_limit` filmes que faltam. Roda aqui, e não
-# num processo à parte, para dividir com os gerenciadores a sessão e as
-# consultas guardadas (cada tracker vê uma requisição por consulta).
-# shadow_interval_minutes = 120
-# shadow_limit = 5
+# Busca dos filmes que faltam: a cada tantos minutos, busca `search_limit`
+# filmes sem arquivo (os há mais tempo sem busca primeiro). Com a busca
+# automática ligada na tela, pega o escolhido; desligada, só registra. Roda
+# aqui, e não num processo à parte, para dividir com o gerenciador de séries a
+# sessão e as consultas guardadas (cada tracker vê uma requisição por consulta).
+# search_interval_minutes = 120
+# search_limit = 5
 
 # Endpoint Torznab existente — por exemplo, o feed de um indexador no agregador
 # atual. As capacidades são lidas no início; se ele não responder, fica fora do

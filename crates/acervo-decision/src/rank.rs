@@ -2,10 +2,10 @@
 //!
 //! Com `healthy_seeders` no perfil, a saúde do torrent vem antes de tudo:
 //! bem semeado, fraco, morto. Depois, critérios em cascata, como na
-//! referência: qualidade (posição no perfil,
-//! depois revisão), nota de formatos, prioridade do indexador, seeders e peers em ordem de
-//! grandeza, e tamanho mais perto do preferido. Flags do indexador contam só
-//! se preferidas. Protocolo e idade não separam nada: é tudo torrent.
+//! referência: qualidade (posição no perfil, depois revisão), prioridade do
+//! indexador, seeders e peers em ordem de grandeza, e tamanho mais perto do
+//! preferido. Flags do indexador contam só se preferidas. Protocolo e idade
+//! não separam nada: é tudo torrent.
 
 use std::cmp::Ordering;
 
@@ -112,7 +112,6 @@ pub fn compare(engine: &Engine<'_>, releases: &[Release], a: &Decision, b: &Deci
     });
     health
         .then(quality)
-        .then(a.format_score.cmp(&b.format_score))
         .then(priority(rb).cmp(&priority(ra)))
         .then(flags)
         .then(magnitude(ra.seeders).cmp(&magnitude(rb.seeders)))

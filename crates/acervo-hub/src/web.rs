@@ -1,7 +1,6 @@
 //! A parte da interface que faz do acervo um gerenciador: adicionar, editar
 //! e remover filmes, busca interativa, fila e histórico, lista de bloqueio,
-//! exclusões, perfis, formatos, tamanhos, regras, notificações, listas de
-//! importação e a migração.
+//! regras e notificações.
 //!
 //! Tudo sob `/ui/api/biblioteca/`, com a mesma entrada da tela (sessão ou
 //! chave, e o cabeçalho anti-CSRF em ação que muda estado).
@@ -27,8 +26,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::Config;
+use crate::decide::{Decider, now_rfc3339};
 use crate::serve::Database;
-use crate::shadow::{Decider, now_rfc3339};
 
 /// Por quanto tempo uma busca interativa fica guardada para o grab.
 const SEARCH_TTL: Duration = Duration::from_secs(30 * 60);
@@ -405,9 +404,6 @@ async fn interactive_search(
                 "idade_horas": age_hours(release),
                 "qualidade": decision.parsed.as_ref().map(|p| p.quality.quality.name()),
                 "idiomas": decision.languages.iter().map(|l| l.name()).collect::<Vec<_>>(),
-                "formatos": decision.formats.iter()
-                    .filter_map(|f| decider.format_name(*f)).collect::<Vec<_>>(),
-                "nota": decision.format_score,
                 "aprovado": decision.approved(),
                 "outro_filme": other_movie,
                 "motivos": decision.rejections.iter().map(ToString::to_string).collect::<Vec<_>>(),

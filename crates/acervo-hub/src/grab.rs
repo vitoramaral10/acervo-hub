@@ -20,9 +20,9 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::config::Config;
+use crate::decide::{Decider, label, now_rfc3339, summarize};
 use crate::events::{self, Event, Kind};
 use crate::naming::movie_file_stem;
-use crate::shadow::{Decider, label, now_rfc3339, summarize};
 
 /// Extensões de vídeo que a importação aceita.
 const VIDEO: &[&str] = &[

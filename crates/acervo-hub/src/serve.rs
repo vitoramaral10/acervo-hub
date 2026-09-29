@@ -76,10 +76,10 @@ impl Accounts for Database {
     }
 }
 
-/// Reimporta o catálogo de filmes e roda a sombra de tempos em tempos, com o
+/// Busca os filmes que faltam de tempos em tempos, com o
 /// catálogo de indexadores servido. Erro numa rodada fica no log e a próxima
 /// tenta de novo.
-async fn shadow_loop(
+async fn missing_loop(
     config: Arc<Config>,
     database: Database,
     catalog: Catalog,
@@ -88,7 +88,7 @@ async fn shadow_loop(
 ) {
     let mut every = tokio::time::interval(Duration::from_secs(minutes * 60));
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // A primeira batida é imediata; espera um ciclo para não somar a sombra
+    // A primeira batida é imediata; espera um ciclo para não somar a busca
     // à subida do serviço.
     every.tick().await;
     loop {
@@ -96,20 +96,20 @@ async fn shadow_loop(
         let store = match database.get() {
             Ok(store) => store,
             Err(error) => {
-                tracing::warn!("sombra adiada: {error}");
+                tracing::warn!("busca dos que faltam adiada: {error}");
                 continue;
             }
         };
-        // Com a busca automática ligada, a sombra pega o que escolher.
+        // Com a busca automática ligada, pega o que escolher.
         let grab = crate::automatic::enabled(store).await.unwrap_or(false);
-        match crate::shadow::search(&config, store, &catalog, limit, false, grab).await {
+        match crate::decide::search(&config, store, &catalog, limit, false, grab).await {
             Ok(lines) => tracing::info!(
                 filmes = lines.len(),
                 pegaria = lines.iter().filter(|l| l.pegaria.is_some()).count(),
                 pegando = grab,
-                "sombra"
+                "busca dos que faltam"
             ),
-            Err(error) => tracing::warn!("sombra falhou: {error:#}"),
+            Err(error) => tracing::warn!("busca dos que faltam falhou: {error:#}"),
         }
     }
 }
@@ -270,13 +270,13 @@ pub async fn run(config: Config) -> Result<()> {
             import_minutes,
         ));
     }
-    if let Some(minutes) = server.shadow_interval_minutes.filter(|m| *m > 0) {
-        tokio::spawn(shadow_loop(
+    if let Some(minutes) = server.search_interval_minutes.filter(|m| *m > 0) {
+        tokio::spawn(missing_loop(
             Arc::clone(&config),
             database.clone(),
             catalog.clone(),
             minutes,
-            server.shadow_limit,
+            server.search_limit,
         ));
     }
     // A API v3 de filmes, para os apps de pedidos e de legendas.
@@ -466,7 +466,7 @@ enum Source {
 #[derive(Debug)]
 struct HubAdmin {
     config: Arc<Config>,
-    /// O catálogo servido: a sombra busca por ele e divide as consultas com
+    /// O catálogo servido: a busca dos que faltam passa por ele e divide as consultas com
     /// os gerenciadores.
     catalog: Catalog,
     database: Database,
@@ -964,8 +964,8 @@ impl Admin for HubAdmin {
         serde_json::to_value(list).map_err(|e| e.to_string())
     }
 
-    async fn shadow(&self, limit: usize) -> Result<serde_json::Value, String> {
-        let lines = crate::shadow::run(
+    async fn search_missing(&self, limit: usize) -> Result<serde_json::Value, String> {
+        let lines = crate::decide::run(
             &self.config,
             self.database.get()?,
             &self.catalog,
@@ -1026,7 +1026,7 @@ impl Admin for HubAdmin {
         values: BTreeMap<String, Option<String>>,
     ) -> Result<serde_json::Value, String> {
         let store = self.database.get()?;
-        let at = crate::shadow::now_rfc3339();
+        let at = crate::decide::now_rfc3339();
         for (name, value) in values {
             match name.as_str() {
                 "tmdb_chave" => {

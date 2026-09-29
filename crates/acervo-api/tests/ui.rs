@@ -219,7 +219,7 @@ impl Admin for FakeAdmin {
         Ok(json!([{ "titulo": "Filme", "ano": 2020 }]))
     }
 
-    async fn shadow(&self, limit: usize) -> Result<Value, String> {
+    async fn search_missing(&self, limit: usize) -> Result<Value, String> {
         Ok(json!([{ "filme": "Filme (2020)", "limite": limit }]))
     }
 
@@ -686,7 +686,7 @@ async fn filmes_lista_e_busca() {
     let (status, body) = send(
         &base,
         reqwest::Method::POST,
-        "/ui/api/filmes/sombra",
+        "/ui/api/filmes/buscar",
         &cookie,
         json!({ "limite": 500 }),
     )

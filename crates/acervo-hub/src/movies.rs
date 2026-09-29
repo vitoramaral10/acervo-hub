@@ -37,9 +37,9 @@ pub struct FileView {
     pub disco_detalhe: Option<String>,
 }
 
-/// A última decisão em sombra do filme.
+/// A última busca do filme.
 #[derive(Debug, Serialize)]
-pub struct ShadowView {
+pub struct LastSearchView {
     pub quando: String,
     pub releases: usize,
     pub pegaria: Option<String>,
@@ -69,7 +69,7 @@ pub struct MovieView {
     pub pasta: String,
     pub adicionado: Option<String>,
     pub arquivo: Option<FileView>,
-    pub sombra: Option<ShadowView>,
+    pub ultima_busca: Option<LastSearchView>,
     /// O download mais recente que o acervo pegou para o filme.
     pub download: Option<DownloadView>,
 }
@@ -145,7 +145,7 @@ fn view(
         pasta: movie.path,
         adicionado: movie.added,
         arquivo,
-        sombra: shadow.map(|run| ShadowView {
+        ultima_busca: shadow.map(|run| LastSearchView {
             quando: run.at,
             releases: run.releases,
             qualidade: run.pick.as_ref().map(|p| p.quality.name()),

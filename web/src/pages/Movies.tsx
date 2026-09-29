@@ -38,7 +38,7 @@ import {
   type Movie,
   type MovieChange,
   type MovieDownload,
-  type MovieShadow,
+  type LastSearch,
   api,
   library,
 } from '@/lib/api'
@@ -85,37 +85,37 @@ const REASONS: Record<string, string> = {
   QueueUpgradesNotAllowed: 'já baixando',
 }
 
-function ShadowLine({ shadow }: { shadow: MovieShadow }) {
-  const when = formatAgo(shadow.quando)
-  if (shadow.erro) {
+function LastSearchLine({ search }: { search: LastSearch }) {
+  const when = formatAgo(search.quando)
+  if (search.erro) {
     return (
       <p className="mt-1 flex items-center gap-1.5 text-xs text-danger">
         <Radar className="size-3.5 shrink-0" aria-hidden="true" />
         <span className="truncate">
-          Última busca {when}: falhou — {shadow.erro}
+          Última busca {when}: falhou — {search.erro}
         </span>
       </p>
     )
   }
-  if (shadow.pegaria) {
+  if (search.pegaria) {
     return (
-      <p className="mt-1 flex items-center gap-1.5 text-xs text-accent" title={shadow.pegaria}>
+      <p className="mt-1 flex items-center gap-1.5 text-xs text-accent" title={search.pegaria}>
         <Radar className="size-3.5 shrink-0" aria-hidden="true" />
         <span className="truncate">
-          Última busca {when}: pegaria <span className="font-mono">{shadow.pegaria}</span>
+          Última busca {when}: pegaria <span className="font-mono">{search.pegaria}</span>
         </span>
       </p>
     )
   }
   const reasons =
-    shadow.releases === 0
+    search.releases === 0
       ? 'nenhum resultado'
-      : shadow.motivos.map(([reason, count]) => `${REASONS[reason] ?? reason} (${count})`).join(', ')
+      : search.motivos.map(([reason, count]) => `${REASONS[reason] ?? reason} (${count})`).join(', ')
   return (
     <p className="mt-1 flex items-center gap-1.5 text-xs text-content-subtle">
       <Radar className="size-3.5 shrink-0" aria-hidden="true" />
       <span className="truncate">
-        Última busca {when}: nada entre {formatCount(shadow.releases)} — {reasons}
+        Última busca {when}: nada entre {formatCount(search.releases)} — {reasons}
       </span>
     </p>
   )
@@ -279,8 +279,8 @@ export function MoviesPage() {
   const [selected, setSelected] = useState<number | null>(null)
   const [adding, setAdding] = useState(false)
 
-  const shadow = useMutation({
-    mutationFn: () => api.shadow(5),
+  const missing = useMutation({
+    mutationFn: () => api.searchMissing(5),
     onSuccess: ({ filmes }) => toast.success(`${filmes.length} filmes buscados`),
     onError: (error: Error) => toast.error(error.message),
     onSettled: () => void queryClient.invalidateQueries({ queryKey: ['filmes'] }),
@@ -329,11 +329,11 @@ export function MoviesPage() {
           <div className="flex flex-wrap gap-2">
             <Button
               variant="ghost"
-              onClick={() => shadow.mutate()}
-              loading={shadow.isPending}
+              onClick={() => missing.mutate()}
+              loading={missing.isPending}
               disabled={counts.total === 0}
             >
-              {!shadow.isPending && <Radar aria-hidden="true" />}
+              {!missing.isPending && <Radar aria-hidden="true" />}
               Buscar os que faltam
             </Button>
             <Button variant="primary" onClick={() => setAdding(true)}>
@@ -752,14 +752,14 @@ function MovieDetails({
               )}
             </dl>
 
-            {(file?.release || movie.download || movie.sombra) && (
+            {(file?.release || movie.download || movie.ultima_busca) && (
               <div className="border-t border-border pt-3">
                 {file?.release && <p className="font-mono text-xs break-all text-content-subtle">{file.release}</p>}
                 {file?.disco_detalhe && <p className="mt-1 text-xs text-warning">{file.disco_detalhe}</p>}
                 {!file && movie.download ? (
                   <DownloadLine download={movie.download} />
                 ) : (
-                  !file && movie.sombra && <ShadowLine shadow={movie.sombra} />
+                  !file && movie.ultima_busca && <LastSearchLine search={movie.ultima_busca} />
                 )}
               </div>
             )}

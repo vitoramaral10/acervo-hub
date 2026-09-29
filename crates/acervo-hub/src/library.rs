@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 use time::{Date, Duration, OffsetDateTime};
 
 use crate::config::Config;
+use crate::decide::now_rfc3339;
 use crate::events::{self, Event, Kind};
 use crate::naming::formatted_name;
-use crate::shadow::now_rfc3339;
 
 fn date(text: Option<&str>) -> Option<Date> {
     let format = time::macros::format_description!("[year]-[month]-[day]");

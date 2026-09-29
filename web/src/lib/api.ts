@@ -163,7 +163,7 @@ export interface Movie {
   pasta: string
   adicionado: string | null
   arquivo: MovieFile | null
-  sombra: MovieShadow | null
+  ultima_busca: LastSearch | null
   download: MovieDownload | null
 }
 
@@ -187,7 +187,7 @@ export interface GrabReport {
   aplicado: boolean
 }
 
-export interface MovieShadow {
+export interface LastSearch {
   quando: string
   releases: number
   pegaria: string | null
@@ -229,7 +229,7 @@ export const api = {
   lastCycle: () => request<{ ultimo: CycleReport | null }>('GET', '/ui/api/limpeza'),
   simulateCycle: () => request<CycleReport>('POST', '/ui/api/limpeza/simular'),
   movies: () => request<{ filmes: Movie[] }>('GET', '/ui/api/filmes'),
-  shadow: (limite: number) => request<{ filmes: unknown[] }>('POST', '/ui/api/filmes/sombra', { limite }),
+  searchMissing: (limite: number) => request<{ filmes: unknown[] }>('POST', '/ui/api/filmes/buscar', { limite }),
   grab: (id: number, aplicar: boolean) =>
     request<GrabReport>('POST', `/ui/api/filmes/${id}/pegar`, { aplicar }),
   importDownloads: () => request<{ downloads: unknown[] }>('POST', '/ui/api/downloads/importar'),
@@ -290,8 +290,6 @@ export interface InteractiveRelease {
   idade_horas: number | null
   qualidade: string | null
   idiomas: string[]
-  formatos: string[]
-  nota: number
   aprovado: boolean
   outro_filme: boolean
   motivos: string[]
@@ -369,7 +367,7 @@ export interface DecisionRules {
   pular_checagem_de_espaco: boolean
   carencia_dias: number
   indexadores: Record<string, IndexerRules>
-  atraso: { minutos: number; pular_se_melhor_qualidade: boolean; pular_acima_da_nota: number | null }
+  atraso: { minutos: number; pular_se_melhor_qualidade: boolean }
 }
 
 export interface RulesView {

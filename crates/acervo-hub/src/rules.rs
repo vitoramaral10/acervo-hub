@@ -4,12 +4,12 @@
 
 use std::collections::BTreeMap;
 
-use acervo_decision::{Delay, FormatSpec, Propers, Settings};
+use acervo_decision::{Delay, Propers, Settings};
 use acervo_store::Store;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::shadow::now_rfc3339;
+use crate::decide::now_rfc3339;
 
 /// Onde as regras ficam na tabela de configurações.
 pub const RULES_KEY: &str = "decisao.regras";
@@ -36,8 +36,6 @@ impl Default for IndexerRules {
 pub struct DelayRules {
     pub minutos: u32,
     pub pular_se_melhor_qualidade: bool,
-    /// Pula a espera a partir desta nota de formatos.
-    pub pular_acima_da_nota: Option<i32>,
 }
 
 /// As regras, no formato do banco e da tela.
@@ -118,7 +116,6 @@ impl DecisionRules {
         Delay {
             minutes: self.atraso.minutos,
             bypass_if_highest_quality: self.atraso.pular_se_melhor_qualidade,
-            bypass_if_above_score: self.atraso.pular_acima_da_nota,
         }
     }
 
@@ -152,32 +149,4 @@ pub async fn save(store: &Store, rules: &DecisionRules) -> Result<()> {
         .set_setting(RULES_KEY, Some(&text), &now_rfc3339())
         .await?;
     Ok(())
-}
-
-/// Os formatos do banco, prontos para o motor. Formato com expressão
-/// inválida fica de fora, com aviso.
-#[must_use]
-pub fn compiled_formats(
-    formats: &[acervo_store::CustomFormat],
-) -> Vec<acervo_decision::CustomFormat> {
-    formats
-        .iter()
-        .filter_map(|format| {
-            let specs: Vec<FormatSpec> = match serde_json::from_value(format.specifications.clone())
-            {
-                Ok(specs) => specs,
-                Err(error) => {
-                    tracing::warn!(formato = format.name, "especificações ilegíveis: {error}");
-                    return None;
-                }
-            };
-            match acervo_decision::CustomFormat::new(format.id, format.name.clone(), specs) {
-                Ok(compiled) => Some(compiled),
-                Err(error) => {
-                    tracing::warn!(formato = format.name, "{error}");
-                    None
-                }
-            }
-        })
-        .collect()
 }

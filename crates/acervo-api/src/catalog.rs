@@ -100,7 +100,7 @@ struct Slot {
 ///
 /// Quem pede o que já está a caminho espera a mesma resposta, e quem pede o
 /// que chegou há pouco a recebe sem ir ao tracker: o gerenciador de séries,
-/// o de filmes e a decisão em sombra passam por aqui, e cada tracker vê uma
+/// o de filmes e a busca dos que faltam passam por aqui, e cada tracker vê uma
 /// requisição só. Erro não fica guardado — a próxima consulta tenta de novo.
 #[derive(Default)]
 struct Requests {

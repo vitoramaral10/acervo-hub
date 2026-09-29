@@ -1,21 +1,18 @@
-//! Decisão em sombra: o acervo-hub busca os filmes que faltam nos próprios
-//! indexadores e decide o que pegaria, sem pegar nada. O gerenciador de
-//! filmes segue decidindo e baixando; o relatório compara as duas escolhas.
-//!
-//! As regras de decisão vêm de [`crate::rules`]: do gerenciador enquanto ele
-//! for o dono, do banco depois que o acervo assumir. A fila soma a do
-//! gerenciador (se ele responde) com os downloads do próprio acervo.
+//! A decisão: o [`Decider`] carrega a biblioteca, as regras de
+//! [`crate::rules`] e os downloads do acervo em andamento (que contam como
+//! fila), e escolhe entre os releases. Aqui também mora a busca dos filmes
+//! que faltam: sem `grab`, só registra o que pegaria; com, pega.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use acervo_api::{ALL, Catalog};
 use acervo_decision::{
-    BlockedRelease, CustomFormat, Decision, Delay, Engine, ExistingFile, FormatInput, Indexer,
-    Mode, Profile, Queued, Release, Settings, Target,
+    BlockedRelease, Decision, Delay, Engine, ExistingFile, Indexer, Mode, Profile, Queued, Release,
+    Settings, Target,
 };
 use acervo_indexers::SearchQuery;
-use acervo_parser::{Language, QualityModel, Revision, clean_movie_title, parse_movie_title};
+use acervo_parser::{Language, QualityModel, Revision, clean_movie_title};
 use acervo_store::{CatalogMovie, ShadowPick, ShadowRun, Store};
 use anyhow::{Result, bail};
 use serde::Serialize;
@@ -51,40 +48,6 @@ fn automatic_profile() -> Profile {
     Profile::automatic(Language::Original)
 }
 
-/// Nota de formatos de um nome de release ou de arquivo no perfil.
-pub(crate) fn title_score(
-    formats: &[CustomFormat],
-    profile: &Profile,
-    title: &str,
-    original_language: Language,
-    size: u64,
-    languages: Option<&[Language]>,
-) -> i32 {
-    if formats.is_empty() {
-        return 0;
-    }
-    let parsed = parse_movie_title(title);
-    let found = parsed
-        .as_ref()
-        .map(|p| p.languages.clone())
-        .unwrap_or_default();
-    let quality = parsed.as_ref().map_or_else(
-        || acervo_parser::parse_quality(title).quality,
-        |p| p.quality.quality,
-    );
-    let input = FormatInput {
-        title,
-        release_group: parsed.as_ref().and_then(|p| p.release_group.as_deref()),
-        edition: parsed.as_ref().and_then(|p| p.edition.as_deref()),
-        languages: languages.unwrap_or(&found),
-        original_language,
-        quality,
-        size,
-        flags: 0,
-    };
-    profile.score(&acervo_decision::matching(formats, &input))
-}
-
 /// Dias desde uma data RFC 3339; desconhecida conta como antiga.
 fn age_days(date: Option<&str>, now: time::OffsetDateTime) -> u32 {
     date.and_then(|d| {
@@ -99,12 +62,7 @@ struct Remote {
     rules: DecisionRules,
 }
 
-fn target(
-    entry: &CatalogMovie,
-    remote: &Remote,
-    formats: &[CustomFormat],
-    now: time::OffsetDateTime,
-) -> Target {
+fn target(entry: &CatalogMovie, remote: &Remote, now: time::OffsetDateTime) -> Target {
     let movie = &entry.movie;
     let profile = automatic_profile();
     let mut clean_titles: Vec<String> = movie.clean_title.iter().cloned().collect();
@@ -134,25 +92,10 @@ fn target(
         monitored: movie.monitored,
         // Calculada das datas, como a referência faz, com a carência dela.
         available: crate::library::is_available(movie, now.date(), remote.rules.carencia_dias),
-        file: movie.file.as_ref().map(|file| {
-            let languages: Vec<Language> = file
-                .languages
-                .iter()
-                .filter_map(|l| Language::from_name(l))
-                .collect();
-            ExistingFile {
-                quality: file.quality,
-                release_group: file.release_group.clone(),
-                age_days: age_days(file.date_added.as_deref(), now),
-                format_score: title_score(
-                    formats,
-                    &profile,
-                    file.scene_name.as_deref().unwrap_or(&file.relative_path),
-                    original_language,
-                    file.size,
-                    (!languages.is_empty()).then_some(&languages[..]),
-                ),
-            }
+        file: movie.file.as_ref().map(|file| ExistingFile {
+            quality: file.quality,
+            release_group: file.release_group.clone(),
+            age_days: age_days(file.date_added.as_deref(), now),
         }),
         profile,
         // A fila é a dos grabs do acervo, somada em `Decider::load`.
@@ -182,7 +125,7 @@ fn indexers(served: &[String], remote: &Remote) -> Vec<Indexer> {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ShadowLine {
+pub struct MissingLine {
     pub filme: String,
     pub releases: usize,
     pub pegaria: Option<String>,
@@ -216,7 +159,6 @@ pub(crate) struct Decider {
     pub library: Vec<Target>,
     indexers: Vec<Indexer>,
     settings: Settings,
-    formats: Vec<CustomFormat>,
     blocklist: Vec<BlockedRelease>,
     delay: Delay,
 }
@@ -245,22 +187,20 @@ impl Decider {
     #[allow(clippy::too_many_lines)] // Leitura em sequência; dividir só espalharia.
     pub async fn load(store: &Store, catalog: &Catalog) -> Result<Self> {
         let rules = crate::rules::stored(store).await?;
-        let (movies, definitions, grabs, stored_formats, blocked) = tokio::try_join!(
+        let (movies, definitions, grabs, blocked) = tokio::try_join!(
             store.movies(),
             store.quality_definitions(),
             store.grabs(),
-            store.custom_formats(),
             store.blocklist(),
         )?;
         if movies.is_empty() {
             bail!("catálogo vazio: adicione filmes antes");
         }
-        let formats = crate::rules::compiled_formats(&stored_formats);
         let remote = Remote { rules };
         let now = time::OffsetDateTime::now_utc();
         let mut library: Vec<Target> = movies
             .iter()
-            .map(|entry| target(entry, &remote, &formats, now))
+            .map(|entry| target(entry, &remote, now))
             .collect();
         // O que o acervo mesmo mandou ao cliente conta como fila: sem isso,
         // pegaria o mesmo filme de novo enquanto o primeiro baixa.
@@ -269,20 +209,11 @@ impl Decider {
             .filter(|g| g.state == acervo_store::GrabState::Downloading)
         {
             if let Some(target) = library.iter_mut().find(|t| t.id == grab.movie_id) {
-                let format_score = title_score(
-                    &formats,
-                    &target.profile,
-                    &grab.title,
-                    target.original_language,
-                    grab.size,
-                    None,
-                );
                 target.queued.push(Queued {
                     quality: QualityModel {
                         quality: grab.quality,
                         revision: Revision::default(),
                     },
-                    format_score,
                 });
             }
         }
@@ -294,7 +225,6 @@ impl Decider {
             indexers: indexers(&served, &remote),
             settings: remote.rules.settings(definitions),
             delay: remote.rules.delay(),
-            formats,
             blocklist: blocked
                 .into_iter()
                 .map(|b| BlockedRelease {
@@ -312,7 +242,6 @@ impl Decider {
             library: &self.library,
             indexers: &self.indexers,
             settings: &self.settings,
-            formats: &self.formats,
             blocklist: &self.blocklist,
             delay: self.delay,
         }
@@ -370,14 +299,6 @@ impl Decider {
             .await
             .map(|page| page.releases)
             .map_err(|error| error.to_string())
-    }
-
-    /// Nome de cada formato, pelo id.
-    pub fn format_name(&self, id: i64) -> Option<&str> {
-        self.formats
-            .iter()
-            .find(|f| f.id == id)
-            .map(|f| f.name.as_str())
     }
 
     /// Releases recentes, sem filme buscado: cada um casado com a biblioteca
@@ -439,7 +360,7 @@ pub async fn run(
     catalog: &Catalog,
     limit: usize,
     print: bool,
-) -> Result<Vec<ShadowLine>> {
+) -> Result<Vec<MissingLine>> {
     search(config, store, catalog, limit, print, false).await
 }
 
@@ -456,7 +377,7 @@ pub async fn search(
     limit: usize,
     print: bool,
     grab: bool,
-) -> Result<Vec<ShadowLine>> {
+) -> Result<Vec<MissingLine>> {
     let (decider, latest) = tokio::try_join!(Decider::load(store, catalog), async {
         Ok(store.latest_shadow_runs().await?)
     },)?;
@@ -485,7 +406,7 @@ pub async fn search(
                     rejections: Vec::new(),
                     error: Some(error.clone()),
                 },
-                ShadowLine {
+                MissingLine {
                     filme: label(movie),
                     releases: 0,
                     pegaria: None,
@@ -527,7 +448,7 @@ pub async fn search(
                         rejections: reasons.clone(),
                         error: None,
                     },
-                    ShadowLine {
+                    MissingLine {
                         filme: label(movie),
                         releases: outcome.releases.len(),
                         pegaria: pick.map(|p| p.title),
@@ -556,7 +477,7 @@ pub(crate) fn now_rfc3339() -> String {
         .unwrap_or_default()
 }
 
-fn print_line(line: &ShadowLine) {
+fn print_line(line: &MissingLine) {
     match (&line.erro, &line.pegaria) {
         (Some(error), _) => println!("{}: busca falhou — {error}", line.filme),
         (None, Some(pick)) => println!("{}: pegaria {pick}", line.filme),

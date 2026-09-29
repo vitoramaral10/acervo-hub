@@ -125,13 +125,13 @@ pub trait Admin: Send + Sync + std::fmt::Debug {
     /// Catálogo ilegível.
     async fn movies(&self) -> Result<serde_json::Value, String>;
 
-    /// Uma rodada de decisão em sombra: busca até `limit` filmes que faltam e
+    /// Uma rodada da busca dos que faltam: busca até `limit` filmes que faltam e
     /// grava o que pegaria, sem pegar nada.
     ///
     /// # Errors
     ///
     /// Catálogo vazio ou gerenciador de filmes inalcançável.
-    async fn shadow(&self, limit: usize) -> Result<serde_json::Value, String>;
+    async fn search_missing(&self, limit: usize) -> Result<serde_json::Value, String>;
 
     /// Busca e decide um filme do catálogo; com `apply`, manda o escolhido
     /// ao cliente de download.
@@ -265,7 +265,7 @@ pub(crate) fn routes() -> Router<Arc<Server>> {
         .route("/ui/api/limpeza", get(last_cycle))
         .route("/ui/api/limpeza/simular", post(simulate_cycle))
         .route("/ui/api/filmes", get(movies))
-        .route("/ui/api/filmes/sombra", post(shadow))
+        .route("/ui/api/filmes/buscar", post(search_missing))
         .route("/ui/api/filmes/{id}/pegar", post(grab_movie))
         .route("/ui/api/downloads", get(downloads))
         .route(
@@ -735,23 +735,23 @@ async fn movies(
 }
 
 #[derive(Deserialize)]
-struct ShadowBody {
-    #[serde(default = "default_shadow_limit")]
+struct SearchBody {
+    #[serde(default = "default_search_limit")]
     limite: usize,
 }
 
-const fn default_shadow_limit() -> usize {
+const fn default_search_limit() -> usize {
     5
 }
 
-async fn shadow(
+async fn search_missing(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
-    Json(body): Json<ShadowBody>,
+    Json(body): Json<SearchBody>,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::POST).await?;
     let report = admin(&server)?
-        .shadow(body.limite.clamp(1, 20))
+        .search_missing(body.limite.clamp(1, 20))
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     Ok(ok(json!({ "filmes": report })))

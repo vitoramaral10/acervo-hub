@@ -129,18 +129,17 @@ pub struct ServerConfig {
     /// primeiro que tiver um id vence.
     #[serde(default)]
     pub catalogs: Vec<PathBuf>,
-    /// De quantos em quantos minutos o serviço reimporta o catálogo de filmes
-    /// e roda a decisão em sombra. Sem valor, não roda sozinho. Roda aqui, e
-    /// não num processo à parte, para dividir sessão e consultas guardadas com
-    /// o que os gerenciadores pedem.
-    #[serde(default)]
-    pub shadow_interval_minutes: Option<u64>,
-    /// Quantos filmes cada rodada de sombra busca.
-    #[serde(default = "default_shadow_limit")]
-    pub shadow_limit: usize,
+    /// De quantos em quantos minutos o serviço busca os filmes que faltam.
+    /// Sem valor, não busca sozinho. Roda aqui, e não num processo à parte,
+    /// para dividir sessão e consultas guardadas com o Sonarr.
+    #[serde(default, alias = "shadow_interval_minutes")]
+    pub search_interval_minutes: Option<u64>,
+    /// Quantos filmes cada rodada busca.
+    #[serde(default = "default_search_limit", alias = "shadow_limit")]
+    pub search_limit: usize,
 }
 
-fn default_shadow_limit() -> usize {
+fn default_search_limit() -> usize {
     5
 }
 
@@ -571,6 +570,29 @@ mod tests {
         config.server().unwrap();
         let (_, public_url) = config.sync().unwrap();
         assert_eq!(public_url, "http://acervo-hub-indexadores:9797");
+    }
+
+    #[test]
+    fn nomes_antigos_da_busca_continuam_aceitos() {
+        let exemplo = include_str!("../../../config.example.toml");
+        let novos = exemplo
+            .replace(
+                "# search_interval_minutes = 120",
+                "search_interval_minutes = 60",
+            )
+            .replace("# search_limit = 5", "search_limit = 3");
+        let antigos = exemplo
+            .replace(
+                "# search_interval_minutes = 120",
+                "shadow_interval_minutes = 60",
+            )
+            .replace("# search_limit = 5", "shadow_limit = 3");
+        for texto in [novos, antigos] {
+            let config = load(&texto).unwrap();
+            let server = config.server().unwrap();
+            assert_eq!(server.search_interval_minutes, Some(60));
+            assert_eq!(server.search_limit, 3);
+        }
     }
 
     #[test]

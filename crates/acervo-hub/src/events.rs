@@ -12,7 +12,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::shadow::now_rfc3339;
+use crate::decide::now_rfc3339;
 
 /// Onde a configuração das notificações fica.
 pub const NOTIFY_KEY: &str = "notificacoes.gotify";

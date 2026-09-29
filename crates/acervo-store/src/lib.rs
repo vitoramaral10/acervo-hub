@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio_postgres::{NoTls, Row};
 
 pub use accounts::SESSION_DAYS;
-pub use manage::{Blocked, CustomFormat, HistoryEvent, HistoryPage, NewHistory};
+pub use manage::{Blocked, HistoryEvent, HistoryPage, NewHistory};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

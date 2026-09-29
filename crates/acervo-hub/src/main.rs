@@ -22,6 +22,7 @@ mod collect;
 mod config;
 mod credentials;
 mod cycle;
+mod decide;
 mod definitions;
 mod events;
 mod grab;
@@ -36,7 +37,6 @@ mod report;
 mod rules;
 mod search;
 mod serve;
-mod shadow;
 mod sync;
 mod web;
 
@@ -99,7 +99,7 @@ enum MoviesAction {
     Check,
     /// Busca os filmes que faltam nos indexadores daqui e decide o que
     /// pegaria, sem pegar nada.
-    Shadow {
+    Missing {
         /// Quantos filmes buscar nesta rodada.
         #[arg(long, default_value_t = 5)]
         limit: usize,
@@ -341,9 +341,9 @@ async fn movies_command(config: &config::Config, action: MoviesAction) -> Result
             }
             grabs.iter().any(|g| g.erro.is_some())
         }
-        MoviesAction::Shadow { limit } => {
+        MoviesAction::Missing { limit } => {
             let catalog = acervo_api::Catalog::new(serve::entries(config).await?)?;
-            shadow::run(config, &store, &catalog, limit, true)
+            decide::run(config, &store, &catalog, limit, true)
                 .await?
                 .iter()
                 .any(|line| line.erro.is_some())

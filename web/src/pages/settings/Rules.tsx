@@ -171,20 +171,6 @@ export function RulesSection({ view }: { view: RulesView }) {
               aria-describedby="atraso-ajuda"
             />
           </Field>
-          <Field id="atraso-nota" label="Não esperar a partir da nota" help="Vazio: sempre espera.">
-            <Input
-              id="atraso-nota"
-              type="number"
-              value={rules.atraso.pular_acima_da_nota ?? ''}
-              onChange={(e) =>
-                set('atraso', {
-                  ...rules.atraso,
-                  pular_acima_da_nota: e.target.value.trim() === '' ? null : Math.trunc(Number(e.target.value)),
-                })
-              }
-              aria-describedby="atraso-nota-ajuda"
-            />
-          </Field>
           <div className="sm:col-span-2">
             <Toggle
               id="atraso-melhor"

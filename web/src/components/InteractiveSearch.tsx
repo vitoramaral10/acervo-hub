@@ -46,17 +46,6 @@ function ReleaseRow({
         </p>
         <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
           {release.qualidade && <Badge>{release.qualidade}</Badge>}
-          {release.formatos.map((format) => (
-            <Badge key={format} tone="accent">
-              {format}
-            </Badge>
-          ))}
-          {release.nota !== 0 && (
-            <span className="text-xs text-content-muted tabular-nums">
-              nota {release.nota > 0 ? '+' : ''}
-              {release.nota}
-            </span>
-          )}
           {release.idiomas.length > 0 && (
             <span className="text-xs text-content-subtle">{release.idiomas.join(', ')}</span>
           )}

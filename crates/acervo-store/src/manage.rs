@@ -76,16 +76,6 @@ pub struct Blocked {
     pub message: Option<String>,
 }
 
-/// Formato personalizado. As especificações ficam no formato que o motor de
-/// decisão lê; o banco só as guarda.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct CustomFormat {
-    pub id: i64,
-    pub name: String,
-    pub specifications: Value,
-    pub include_when_renaming: bool,
-}
-
 fn size(value: Option<i64>) -> Option<u64> {
     value.and_then(|v| u64::try_from(v).ok())
 }
@@ -236,29 +226,5 @@ impl Store {
             .execute("DELETE FROM blocklist WHERE id = $1", &[&id])
             .await?
             > 0)
-    }
-
-    /// # Errors
-    ///
-    /// Falha de leitura.
-    pub async fn custom_formats(&self) -> Result<Vec<CustomFormat>> {
-        let client = self.pool.get().await?;
-        client
-            .query(
-                "SELECT id, name, specifications, include_when_renaming
-                 FROM custom_formats ORDER BY name",
-                &[],
-            )
-            .await?
-            .iter()
-            .map(|row| {
-                Ok(CustomFormat {
-                    id: row.try_get(0)?,
-                    name: row.try_get(1)?,
-                    specifications: row.try_get(2)?,
-                    include_when_renaming: row.try_get(3)?,
-                })
-            })
-            .collect()
     }
 }

@@ -24,8 +24,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::Config;
+use crate::decide::now_rfc3339;
 use crate::serve::Database;
-use crate::shadow::now_rfc3339;
 
 /// Versão anunciada: o app de legendas escolhe o dialeto da API por ela, e
 /// o desta é o da série 5.

@@ -12,15 +12,11 @@
 
 use acervo_parser::{Language, ParsedMovie, Quality, QualityModel, parse_movie_title};
 
-mod formats;
 mod languages;
 mod mapping;
 mod rank;
 mod specs;
 
-pub use formats::{
-    CustomFormat, FormatInput, FormatSpec, Rule, matching, modifier_name, source_name,
-};
 pub use rank::compare;
 
 /// Tamanhos por minuto de filme, em megabytes, de uma qualidade.
@@ -94,10 +90,6 @@ pub struct Profile {
     pub upgrade_allowed: bool,
     /// `Any`, `Original` ou um idioma.
     pub language: Language,
-    pub min_format_score: i32,
-    pub cutoff_format_score: i32,
-    /// Nota de cada formato, pelo id; formato ausente vale zero.
-    pub format_scores: Vec<(i64, i32)>,
     /// Com valor, a saúde do torrent pesa antes da qualidade: release com
     /// pelo menos esse tanto de seeders vence qualquer um abaixo, e sem
     /// seeder nenhum fica por último. `None` é a ordem da referência.
@@ -105,16 +97,6 @@ pub struct Profile {
 }
 
 impl Profile {
-    /// Soma das notas dos formatos.
-    #[must_use]
-    pub fn score(&self, formats: &[i64]) -> i32 {
-        formats
-            .iter()
-            .filter_map(|id| self.format_scores.iter().find(|(f, _)| f == id))
-            .map(|(_, score)| score)
-            .sum()
-    }
-
     /// Posição da qualidade no perfil; fora dele é -1, abaixo de tudo.
     fn index(&self, quality: Quality) -> i64 {
         self.items
@@ -203,9 +185,6 @@ impl Profile {
             cutoff: None,
             upgrade_allowed: false,
             language,
-            min_format_score: 0,
-            cutoff_format_score: 0,
-            format_scores: Vec::new(),
             healthy_seeders: Some(HEALTHY_SEEDERS),
         }
     }
@@ -218,15 +197,12 @@ pub struct ExistingFile {
     pub release_group: Option<String>,
     /// Dias desde que entrou na biblioteca.
     pub age_days: u32,
-    /// Nota dos formatos do arquivo no perfil do filme.
-    pub format_score: i32,
 }
 
 /// Um download do filme já na fila.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Queued {
     pub quality: QualityModel,
-    pub format_score: i32,
 }
 
 /// Um filme da biblioteca, com o que a decisão precisa dele.
@@ -321,7 +297,6 @@ pub enum Rejection {
     DiskCutoffMet,
     DiskHigherPreference,
     DiskHigherRevision,
-    DiskCustomFormatScore,
     DiskUpgradesNotAllowed,
     QualityUpgradesDisabled,
     RepackDisabled,
@@ -331,11 +306,9 @@ pub enum Rejection {
     ProperForOldFile,
     MovieNotMonitored,
     Availability,
-    CustomFormatMinimumScore,
     QueueCutoffMet,
     QueueHigherPreference,
     QueueHigherRevision,
-    QueueCustomFormatScore,
     QueueUpgradesNotAllowed,
     QueuePropersDisabled,
     MinimumFreeSpace {
@@ -369,7 +342,6 @@ impl Rejection {
             Self::DiskCutoffMet => "DiskCutoffMet",
             Self::DiskHigherPreference => "DiskHigherPreference",
             Self::DiskHigherRevision => "DiskHigherRevision",
-            Self::DiskCustomFormatScore => "DiskCustomFormatScore",
             Self::DiskUpgradesNotAllowed => "DiskUpgradesNotAllowed",
             Self::QualityUpgradesDisabled => "QualityUpgradesDisabled",
             Self::RepackDisabled => "RepackDisabled",
@@ -379,11 +351,9 @@ impl Rejection {
             Self::ProperForOldFile => "ProperForOldFile",
             Self::MovieNotMonitored => "MovieNotMonitored",
             Self::Availability => "Availability",
-            Self::CustomFormatMinimumScore => "CustomFormatMinimumScore",
             Self::QueueCutoffMet => "QueueCutoffMet",
             Self::QueueHigherPreference => "QueueHigherPreference",
             Self::QueueHigherRevision => "QueueHigherRevision",
-            Self::QueueCustomFormatScore => "QueueCustomFormatScore",
             Self::QueueUpgradesNotAllowed => "QueueUpgradesNotAllowed",
             Self::QueuePropersDisabled => "QueuePropersDisabled",
             Self::MinimumFreeSpace { .. } => "MinimumFreeSpace",
@@ -428,12 +398,6 @@ impl std::fmt::Display for Rejection {
             Self::DiskCutoffMet => write!(f, "o arquivo atual já atinge o corte"),
             Self::DiskHigherPreference => write!(f, "o arquivo atual é igual ou melhor"),
             Self::DiskHigherRevision => write!(f, "o arquivo atual tem revisão igual ou maior"),
-            Self::DiskCustomFormatScore => {
-                write!(
-                    f,
-                    "o arquivo atual tem nota de custom format igual ou maior"
-                )
-            }
             Self::DiskUpgradesNotAllowed | Self::QualityUpgradesDisabled => {
                 write!(f, "o perfil não permite upgrade")
             }
@@ -444,17 +408,10 @@ impl std::fmt::Display for Rejection {
             Self::ProperForOldFile => write!(f, "proper para arquivo antigo"),
             Self::MovieNotMonitored => write!(f, "filme não monitorado"),
             Self::Availability => write!(f, "filme ainda não disponível"),
-            Self::CustomFormatMinimumScore => write!(f, "nota de custom format abaixo do mínimo"),
             Self::QueueCutoffMet => write!(f, "o que já está na fila atinge o corte"),
             Self::QueueHigherPreference => write!(f, "o que já está na fila é igual ou melhor"),
             Self::QueueHigherRevision => {
                 write!(f, "o que já está na fila tem revisão igual ou maior")
-            }
-            Self::QueueCustomFormatScore => {
-                write!(
-                    f,
-                    "o que já está na fila tem nota de custom format igual ou maior"
-                )
             }
             Self::QueueUpgradesNotAllowed => {
                 write!(f, "já há download na fila e o perfil não permite upgrade")
@@ -491,10 +448,6 @@ pub struct Decision {
     pub movie: Option<i64>,
     /// Idiomas depois da agregação.
     pub languages: Vec<Language>,
-    /// Formatos personalizados que casaram, pelos ids.
-    pub formats: Vec<i64>,
-    /// Nota dos formatos no perfil do filme.
-    pub format_score: i32,
     pub rejections: Vec<Rejection>,
 }
 
@@ -511,8 +464,6 @@ impl Decision {
 pub struct Delay {
     pub minutes: u32,
     pub bypass_if_highest_quality: bool,
-    /// Pula a espera se a nota de formatos chega a este valor.
-    pub bypass_if_above_score: Option<i32>,
 }
 
 /// Um release bloqueado: não se pega de novo.
@@ -529,7 +480,6 @@ pub struct Engine<'a> {
     pub library: &'a [Target],
     pub indexers: &'a [Indexer],
     pub settings: &'a Settings,
-    pub formats: &'a [CustomFormat],
     pub blocklist: &'a [BlockedRelease],
     pub delay: Delay,
 }
@@ -584,8 +534,6 @@ impl Engine<'_> {
                 languages: acervo_parser::parse_languages(&release.title),
                 parsed: None,
                 movie: None,
-                formats: Vec::new(),
-                format_score: 0,
                 rejections: vec![Rejection::UnableToParse],
             };
         };
@@ -596,34 +544,17 @@ impl Engine<'_> {
                 languages: parsed.languages.clone(),
                 parsed: Some(parsed),
                 movie: None,
-                formats: Vec::new(),
-                format_score: 0,
                 rejections: vec![Rejection::UnknownMovie],
             };
         };
         let languages =
             languages::aggregate(&parsed, release, target, self.indexer(&release.indexer));
-        let formats = formats::matching(
-            self.formats,
-            &FormatInput {
-                title: &release.title,
-                release_group: parsed.release_group.as_deref(),
-                edition: parsed.edition.as_deref(),
-                languages: &languages,
-                original_language: target.original_language,
-                quality: parsed.quality.quality,
-                size: release.size,
-                flags: release.flags,
-            },
-        );
-        let format_score = target.profile.score(&formats);
         let rejections = specs::evaluate(
             self,
             &specs::Candidate {
                 release,
                 parsed: &parsed,
                 languages: &languages,
-                format_score,
             },
             target,
             searched,
@@ -634,8 +565,6 @@ impl Engine<'_> {
             movie: Some(target.id),
             parsed: Some(parsed),
             languages,
-            formats,
-            format_score,
             rejections,
         }
     }
@@ -694,9 +623,6 @@ mod tests {
             cutoff: Some(0),
             upgrade_allowed: false,
             language: Language::Original,
-            min_format_score: 0,
-            cutoff_format_score: 0,
-            format_scores: Vec::new(),
             healthy_seeders: None,
         }
     }
@@ -749,7 +675,6 @@ mod tests {
             library,
             indexers: &indexers,
             settings: &settings,
-            formats: &[],
             blocklist: &[],
             delay: Delay::default(),
         }
@@ -811,7 +736,6 @@ mod tests {
             },
             release_group: Some("GRP".into()),
             age_days: 30,
-            format_score: 0,
         });
         let decisions = decide(&[target], &[release("The Housemaid 2025 2160p WEB-DL-GRP")]);
         assert_eq!(

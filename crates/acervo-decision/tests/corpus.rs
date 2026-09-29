@@ -92,10 +92,6 @@ fn profile(value: &Value) -> Profile {
         items: items.into_iter().map(|(_, item)| item).collect(),
         upgrade_allowed: value["upgradeAllowed"].as_bool().unwrap_or(false),
         language: language(&value["language"]),
-        min_format_score: i32::try_from(value["minFormatScore"].as_i64().unwrap_or(0)).unwrap_or(0),
-        cutoff_format_score: i32::try_from(value["cutoffFormatScore"].as_i64().unwrap_or(0))
-            .unwrap_or(0),
-        format_scores: Vec::new(),
         healthy_seeders: None,
     }
 }
@@ -128,7 +124,6 @@ fn target(movie: &Value, profiles: &BTreeMap<i64, Profile>, library: &Value) -> 
         quality: quality_model(&movie["movieFile"]["quality"]),
         release_group: text(&movie["movieFile"]["releaseGroup"]),
         age_days: 30,
-        format_score: 0,
     });
     Target {
         id: movie["id"].as_i64().unwrap_or_default(),
@@ -154,7 +149,6 @@ fn target(movie: &Value, profiles: &BTreeMap<i64, Profile>, library: &Value) -> 
             .filter(|q| q["movieId"] == movie["id"] && q["status"] != "failedPending")
             .map(|q| Queued {
                 quality: quality_model(&q["quality"]),
-                format_score: 0,
             })
             .collect(),
         free_space: library["raiz"]
@@ -374,7 +368,6 @@ fn corpus() {
         library: &library,
         indexers: &indexers,
         settings: &settings,
-        formats: &[],
         blocklist: &[],
         delay: Delay::default(),
     };
