@@ -3,7 +3,7 @@
 Um serviço único, em Rust, para gerenciar uma biblioteca de mídia — no lugar de quatro
 processos separados conversando por HTTP.
 
-> **Estado: fase 1, em construção.** Nada aqui é utilizável em produção ainda.
+> **Estado: indexadores, limpeza e filmes em produção; séries ainda no gerenciador de séries.**
 
 ## Por quê
 
@@ -43,15 +43,15 @@ Workspace Cargo, binário único `acervo-hub`:
 | `acervo-core` | Domínio puro, zero IO: `Work`, `Item`, `Download`, `Inventory` | existe |
 | `acervo-janitor` | Reconciliação: órfãos de fila, hardlink perdido, limpeza de download | existe |
 | `acervo-fs` | Tradução de caminho container→host e `stat(2)` | existe |
-| `acervo-arr` | Cliente da API v3: fila, inventário, remoção | existe |
+| `acervo-arr` | Cliente da API v3 do gerenciador de séries: fila, inventário, indexadores | existe |
 | `acervo-clients` | Clientes de download (hoje qBittorrent) | existe |
 | `acervo-hub` | Binário: configuração, coleta, relato, execução | existe |
-| `acervo-indexers` | Busca em indexadores (Torznab e Cardigann), rate limit compartilhado | em construção |
-| `acervo-metadata` | Provedores de metadados + cache | |
-| `acervo-parser` | Parsing de nome de release | |
-| `acervo-decision` | Perfis de qualidade, formatos customizados, pontuação | |
-| `acervo-library` | Import, hardlink, rename, varredura de filesystem | |
-| `acervo-api` | HTTP: superfície nova + compatibilidade com a API v3 existente | Torznab existe |
+| `acervo-indexers` | Busca em indexadores (Torznab e Cardigann), rate limit compartilhado | existe |
+| `acervo-metadata` | Metadados do TMDB | existe |
+| `acervo-parser` | Parsing de nome de release | existe |
+| `acervo-decision` | Casamento com o filme, rejeições e ordem de preferência (perfil automático) | existe |
+| `acervo-store` | Catálogo, histórico, fila e contas no Postgres | existe |
+| `acervo-api` | HTTP: Torznab, interface web e compatibilidade com a API v3 de filmes | existe |
 
 ### Duas decisões que mandam no projeto
 
@@ -88,19 +88,23 @@ cargo run --bin acervo-hub -- -c config.toml search "termo" [-i indexador] [-k 5
   definições (`server.catalogs`) ou de qualquer endpoint Torznab. As definições que o
   executor ainda não roda aparecem com o motivo, em vez de sumirem.
 - **Busca** manual em todos os indexadores, com download do `.torrent` pela sessão.
-- **Filmes** — a biblioteca em pôsteres. Adicionar pelo TMDB; editar monitoramento, perfil
-  e disponibilidade; busca automática ou interativa (cada release com qualidade,
-  formatos, nota e o motivo de cada recusa); apagar o arquivo ou remover o filme (com a
-  pasta, e com exclusão para listas); histórico do filme; cada arquivo conferido contra o
-  disco.
+- **Filmes** — a biblioteca em pôsteres. Adicionar pelo TMDB; editar monitoramento e
+  disponibilidade; buscar os que faltam ou buscar um só, interativamente (cada release com
+  qualidade, idiomas e o motivo de cada recusa); apagar o arquivo ou remover o filme — com a
+  pasta e o download no qBittorrent, na hora; histórico do filme; cada arquivo conferido
+  contra o disco.
 - **Atividade** — a fila com o progresso do qBittorrent (tirar da fila, bloquear, buscar
   outro), o histórico de tudo e a lista de bloqueio.
-- **Aplicativos** — o `sync` na tela: mostra o que mudaria no Sonarr e no Radarr e aplica.
+- **Aplicativos** — o `sync` na tela: mostra o que mudaria no gerenciador de séries e aplica.
 - **Limpeza** — o último ciclo (gravado ao lado do ledger) e uma simulação na hora.
-- **Configurações** — quem decide (o Radarr ou o acervo), TMDB e busca automática, regras
-  de decisão, perfis de qualidade, formatos personalizados (com testador de nome de
-  release), tamanhos por qualidade, notificações (Gotify), listas de importação do TMDB,
-  exclusões e a migração do que só o Radarr sabe.
+- **Configurações** — TMDB e busca automática, regras de decisão (teto de tamanho,
+  propers, legenda embutida, carência, prioridade e seeders por indexador, espera) e
+  notificações (Gotify).
+
+A qualidade não se configura: todo filme usa o **perfil automático**, da melhor qualidade de
+arquivo para a pior (Remux 2160p … SD), sem upgrade. Os seeders pesam antes: um release com
+5 ou mais vence qualquer um mais fraco, e a qualidade decide dentro da faixa. Espaço livre
+não trava o grab — com o disco cheio, o cliente pausa o download.
 
 Entra-se com usuário e senha, cadastrados por linha de comando — a senha vem da entrada
 padrão, nunca de argumento:
@@ -230,7 +234,7 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
       conferido em produção.
       Consultas iguais são reaproveitadas: pedido idêntico em andamento espera a mesma
       resposta, e a resposta fica guardada por 30 minutos (5 para o feed recente). Os
-      gerenciadores e a decisão em sombra passam pelo mesmo serviço, e cada tracker vê uma
+      gerenciadores e a busca dos filmes que faltam passam pelo mesmo serviço, e cada tracker vê uma
       requisição por consulta. A busca roda até o fim mesmo se o consumidor desistir, e a
       tentativa seguinte a encontra pronta. Em produção desde 24/09/2026 como único
       agregador: o anterior foi desligado.
@@ -245,7 +249,7 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
 4. Compare as buscas manuais pelos dois. Satisfeito, desabilite os cadastros antigos no
    gerenciador e pare a sincronização do agregador antes de desligá-lo — senão ele os
    recria.
-- [ ] **Fase 3 — filmes.** Árvore mais simples; o gerenciador de séries segue de pé como
+- [x] **Fase 3 — filmes.** Árvore mais simples; o gerenciador de séries seguiu de pé como
       controle. Em etapas, cada uma conferida contra o gerenciador de filmes em produção
       antes da seguinte:
   - [x] **Parser de release** (`acervo-parser`). Porte do parser de referência: título e
@@ -255,58 +259,35 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
         todos os campos de todos os títulos, esquisitices incluídas. O corpus fica fora do
         repositório (tem nome de tracker privado); o teste `corpus`, ignorado por padrão,
         refaz a conta.
-  - [x] **Catálogo de filmes** (`acervo-store`, Postgres). `movies import` espelha filmes,
-        arquivos e perfis de qualidade do gerenciador pela API v3 — sem `--apply`, numa
-        transação que é desfeita, então a simulação relata exatamente o que a aplicação
-        faria. Filme que some da origem sai do catálogo só se tiver vindo dela.
-        `movies check` confere cada arquivo contra o disco. Contra o gerenciador em
-        produção: 294 filmes, 132 arquivos, todos confirmados no disco com o tamanho
-        exato; reimportar dá 294 iguais.
+  - [x] **Catálogo de filmes** (`acervo-store`, Postgres), espelhado do gerenciador de
+        filmes enquanto os dois conviveram — 294 filmes e 132 arquivos, todos confirmados no
+        disco. `movies check` confere cada arquivo contra o disco.
   - [x] **Motor de decisão** (`acervo-decision`). Porte do da referência: casamento do
         release com o filme (ids do indexador, título limpo, numerais romanos, ano), agregação
         de idiomas ("Original" e nome sem idioma viram o idioma original do filme), as
         especificações de rejeição — perfil, idioma, tamanho por minuto, teto global,
-        seeders, disco bruto, legenda embutida, upgrade e corte, repack, fila, espaço livre —
-        e a ordem de preferência. Contra 40 buscas interativas reais (470 releases), com a
-        decisão da referência como gabarito: nenhuma divergência em casamento, motivos,
-        ordem ou escolha. Depois vieram formatos personalizados (as especificações da
-        referência, com nota por perfil, nota mínima e de corte, upgrade por nota), lista de
-        bloqueio e espera antes de pegar — com tudo zerado, a conta acima continua exata.
-  - [ ] **Decisão em sombra**. `movies shadow` busca os filmes que faltam nos indexadores
-        daqui e grava o que o acervo-hub pegaria, sem pegar nada; `movies shadow --report`
-        compara cada escolha com o primeiro grab do gerenciador depois dela. A tela de filmes
-        mostra a última sombra de cada um. Falta acumular dias de comparação antes do corte.
-  - [x] **Grab e import**. `movies grab <tmdb>` (ou "Pegar agora" na tela) busca, decide
-        e manda o escolhido ao qBittorrent numa categoria própria (`[movies] category`), que o
-        gerenciador não importa. O serviço confere a cada `import_interval_minutes` os
-        downloads que terminaram e liga o maior vídeo na pasta do filme por hardlink, com o
-        nome que o gerenciador daria — a regra confere com os 134 arquivos de um gerenciador
-        real —, e pede a ele que releia a pasta. Só cria: filme que já tem arquivo fica de
-        fora, e upgrade continua com o gerenciador.
+        seeders, disco bruto, legenda embutida, corte, repack, fila — e a ordem de
+        preferência. Contra 40 buscas interativas reais (470 releases), com a decisão da
+        referência como gabarito: nenhuma divergência em casamento, motivos, ordem ou escolha.
+        Por cima disso, o perfil automático (acima) substitui perfis, formatos e tamanhos
+        configuráveis.
+  - [x] **Grab e import**. `movies grab <tmdb>` (ou "Pegar agora" na tela) busca, decide e
+        manda o escolhido ao qBittorrent numa categoria própria (`[movies] category`). O
+        serviço confere a cada `import_interval_minutes` os downloads que terminaram e liga o
+        maior vídeo na pasta do filme por hardlink, com o nome `Título (ano) {imdb-tt…}`.
   - [x] **Metadados próprios** (`acervo-metadata`, TMDB, chave nas Configurações da tela).
         Datas de cinema, digital e física, status e disponibilidade calculados com as regras
-        da referência — contra 293 filmes de um gerenciador real, batem em todos. `movies add`
-        adiciona um filme com o acervo como dono; o serviço mantém os metadados em dia.
-  - [x] **API v3 de filmes** para os apps de pedidos e de legendas: status, perfis, pastas
-        raiz, tags, filmes (listar, procurar, adicionar, atualizar, remover), fila, comandos e
-        histórico. Contra o gerenciador em produção, os 294 filmes saem idênticos nos 32
-        campos que esses apps leem, `mediaInfo` e id de arquivo incluídos.
-  - [x] **Busca automática e upgrades**, ligada nas Configurações: RSS de todos os
-        indexadores decidido contra a biblioteca inteira (é por onde vêm os upgrades) e a busca
-        rotativa dos filmes que faltam. A importação troca o arquivo antigo no upgrade e grava o
-        novo no catálogo. As regras de decisão do gerenciador ficam guardadas no banco, e o
-        espaço livre é lido do disco: o acervo decide igual depois que ele sair.
-  - [x] **Gerenciador completo**. Adicionar, editar e remover pela tela (enquanto o
-        gerenciador decide, a mudança vai para ele primeiro); busca interativa; fila,
-        histórico e lista de bloqueio — download que o cliente perde é bloqueado e o filme,
-        buscado de novo; perfis, formatos, tamanhos e regras editáveis; notificações pelo
-        Gotify; `ffprobe` no import (o `mediaInfo` da API v3); listas de importação do TMDB
-        (pessoa, coleção, lista) com exclusões; e `movies migrate` (ou a aba Migração), que
-        traz do gerenciador histórico, bloqueados, exclusões, notificação e listas.
-  - [ ] **O corte**: `movies take-over` (ou "Assumir" nas Configurações) copia uma última vez
-        filmes, perfis, formatos e regras, adota os filmes (com os ids do gerenciador, que os
-        apps de pedidos e de legendas guardam) e para de importar. Depois: apontar esses apps
-        para cá, ligar a busca automática e desligar o gerenciador.
+        da referência — contra 293 filmes reais, batem em todos.
+  - [x] **API v3 de filmes** para o app de pedidos: status, perfis, pastas raiz, tags,
+        filmes (listar, procurar, adicionar, atualizar, remover), fila, comandos e histórico.
+  - [x] **Busca automática**, ligada nas Configurações: o RSS de todos os indexadores é
+        decidido contra a biblioteca inteira, e os filmes que faltam são buscados em rodadas
+        (`search_interval_minutes`, `search_limit`). Desligada, a busca só registra o que
+        pegaria — a "última busca" de cada filme na tela.
+  - [x] **O corte**. O gerenciador de filmes foi desligado: o acervo adotou os filmes com
+        os ids dele (que o app de pedidos guarda), e o app de pedidos passou a falar com a API
+        v3 daqui. O código que só servia à convivência saiu junto — importação, migração,
+        listas de importação e exclusões. Filme entra à mão, pela tela ou pelo app de pedidos.
 - [ ] **Fase 4 — séries.** Só depois de o parser passar no corpus real.
 
 ## Licença
