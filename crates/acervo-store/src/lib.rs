@@ -9,18 +9,13 @@
 mod accounts;
 mod manage;
 
-use std::collections::BTreeSet;
-
 use acervo_parser::{Quality, QualityModel, Revision};
 use deadpool_postgres::{GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod};
 use serde::{Deserialize, Serialize};
 use tokio_postgres::{NoTls, Row};
 
 pub use accounts::SESSION_DAYS;
-use manage::mirror_formats;
-pub use manage::{
-    Blocked, CustomFormat, Exclusion, HistoryEvent, HistoryPage, ImportList, NewHistory,
-};
+pub use manage::{Blocked, CustomFormat, HistoryEvent, HistoryPage, NewHistory};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -237,36 +232,6 @@ pub struct Grab {
     /// Arquivo que o filme tinha quando o grab saiu: um upgrade o troca.
     /// Relativo à pasta do filme.
     pub replaces: Option<String>,
-}
-
-/// Tudo o que uma instância tem, para espelhar.
-#[derive(Debug, Clone)]
-pub struct Import {
-    /// Nome da origem, como `radarr:filmes`. Filme que some da origem sai do
-    /// catálogo só se tiver vindo dela.
-    pub source: String,
-    pub profiles: Vec<QualityProfile>,
-    pub definitions: Vec<QualityDefinition>,
-    /// Id do filme na origem, e o filme.
-    pub movies: Vec<(i64, Movie)>,
-    /// Tags da origem, com os ids de lá.
-    pub tags: Vec<Tag>,
-    /// Formatos personalizados da origem, com os ids de lá.
-    pub custom_formats: Vec<CustomFormat>,
-    /// Perfis, formatos e tamanhos vêm da origem. Falso depois que o acervo
-    /// assume as regras: aí só os filmes são espelhados.
-    pub mirror_rules: bool,
-}
-
-/// O que uma importação muda. Nomes como "Título (Ano)".
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct ImportSummary {
-    pub created: Vec<String>,
-    pub updated: Vec<String>,
-    pub removed: Vec<String>,
-    pub unchanged: usize,
-    pub profiles: usize,
-    pub applied: bool,
 }
 
 /// Cada migração roda uma vez, na ordem; a posição é a versão.
@@ -779,47 +744,6 @@ impl Store {
         write_extras(&self.pool.get().await?, id, extras).await
     }
 
-    /// O acervo passa a ser dono de todos os filmes: importar do gerenciador
-    /// deixa de mexer neles. Filmes e perfis ganham o id que tinham lá — é
-    /// por ele que os apps de pedidos e de legendas os conhecem —, e o que o
-    /// acervo tinha criado vai para depois do maior. Devolve quantos filmes
-    /// vieram da origem.
-    ///
-    /// # Errors
-    ///
-    /// Falha de escrita; nada fica pela metade.
-    pub async fn adopt_all(&self) -> Result<u64> {
-        let mut client = self.pool.get().await?;
-        let tx = client.transaction().await?;
-        let adopted = tx
-            .execute("SELECT 1 FROM movies WHERE source IS NOT NULL", &[])
-            .await?;
-        for (table, sequence_owner) in [
-            ("quality_profiles", "quality_profiles"),
-            ("movies", "movies"),
-        ] {
-            tx.batch_execute(&format!(
-                "UPDATE {table} SET id = -id;
-                 UPDATE {table} SET id = source_id WHERE source_id IS NOT NULL;
-                 UPDATE {table} t SET id = sub.new_id
-                 FROM (SELECT id, (SELECT COALESCE(MAX(id), 0) FROM {table} WHERE id > 0)
-                              + ROW_NUMBER() OVER (ORDER BY id DESC) AS new_id
-                       FROM {table} WHERE id < 0) sub
-                 WHERE t.id = sub.id;
-                 SELECT setval(pg_get_serial_sequence('{sequence_owner}', 'id'),
-                     GREATEST((SELECT COALESCE(MAX(id), 0) FROM {table}), 1));"
-            ))
-            .await?;
-        }
-        tx.batch_execute(
-            "UPDATE movies SET source = NULL, source_id = NULL;
-             UPDATE quality_profiles SET source_id = NULL;",
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(adopted)
-    }
-
     /// Tira um filme do catálogo, com o registro do arquivo, títulos, sombra
     /// e grabs. O arquivo no disco não é tocado aqui. `false` se não existia.
     ///
@@ -884,20 +808,6 @@ impl Store {
             .execute("UPDATE tags SET label = $2 WHERE id = $1", &[&id, &label])
             .await?;
         Ok((changed > 0).then_some(Tag { id, label }))
-    }
-
-    /// Espelha as tags do gerenciador com os mesmos ids: quem guardou o id
-    /// de uma tag (o app de pedidos guarda) continua achando a mesma.
-    ///
-    /// # Errors
-    ///
-    /// Falha de escrita.
-    pub async fn mirror_tags(&self, tags: &[Tag]) -> Result<()> {
-        let mut client = self.pool.get().await?;
-        let tx = client.transaction().await?;
-        write_tags(&tx, tags).await?;
-        tx.commit().await?;
-        Ok(())
     }
 
     /// Uma configuração guardada pela interface.
@@ -1035,92 +945,6 @@ impl Store {
             .await?;
         Ok(())
     }
-
-    /// Espelha a origem: cria, atualiza e remove o que for preciso. Com
-    /// `apply` falso, faz tudo numa transação e desfaz.
-    ///
-    /// # Errors
-    ///
-    /// Falha de escrita; nada fica pela metade.
-    pub async fn import(&self, import: &Import, apply: bool) -> Result<ImportSummary> {
-        let mut client = self.pool.get().await?;
-        let tx = client.transaction().await?;
-        let mut summary = ImportSummary {
-            applied: apply,
-            profiles: import.profiles.len(),
-            ..ImportSummary::default()
-        };
-        if import.mirror_rules {
-            mirror_formats(&tx, &import.custom_formats).await?;
-            for profile in &import.profiles {
-                upsert_profile(&tx, profile).await?;
-            }
-        }
-        write_tags(&tx, &import.tags).await?;
-        for definition in import.definitions.iter().filter(|_| import.mirror_rules) {
-            tx.execute(
-                "INSERT INTO quality_definitions (quality, min_size, max_size, preferred_size)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (quality) DO UPDATE SET min_size = excluded.min_size,
-                     max_size = excluded.max_size, preferred_size = excluded.preferred_size",
-                &[
-                    &i16::from(definition.quality.id()),
-                    &definition.min_size,
-                    &definition.max_size,
-                    &definition.preferred_size,
-                ],
-            )
-            .await?;
-        }
-
-        let existing = read_movies(&tx).await?;
-        let seen: BTreeSet<u32> = import.movies.iter().map(|(_, m)| m.tmdb_id).collect();
-        for (source_id, movie) in &import.movies {
-            let current = existing.iter().find(|c| c.movie.tmdb_id == movie.tmdb_id);
-            let origin = Some((import.source.clone(), *source_id));
-            match current {
-                Some(current) if current.movie == *movie && current.origin == origin => {
-                    summary.unchanged += 1;
-                }
-                Some(current) => {
-                    write_movie(
-                        &tx,
-                        Some(current.id),
-                        movie,
-                        Some((&import.source, *source_id)),
-                    )
-                    .await?;
-                    summary.updated.push(label(movie));
-                }
-                None => {
-                    write_movie(&tx, None, movie, Some((&import.source, *source_id))).await?;
-                    summary.created.push(label(movie));
-                }
-            }
-        }
-        for gone in existing.iter().filter(|c| {
-            c.origin.as_ref().is_some_and(|(s, _)| *s == import.source)
-                && !seen.contains(&c.movie.tmdb_id)
-        }) {
-            tx.execute("DELETE FROM movies WHERE id = $1", &[&gone.id])
-                .await?;
-            summary.removed.push(label(&gone.movie));
-        }
-
-        if apply {
-            tx.commit().await?;
-        } else {
-            tx.rollback().await?;
-        }
-        Ok(summary)
-    }
-}
-
-fn label(movie: &Movie) -> String {
-    match movie.year {
-        Some(year) => format!("{} ({year})", movie.title),
-        None => movie.title.clone(),
-    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1128,18 +952,6 @@ struct StoredItem {
     name: String,
     qualities: Vec<u8>,
     allowed: bool,
-}
-
-fn encode_items(items: &[ProfileItem]) -> serde_json::Value {
-    let stored: Vec<_> = items
-        .iter()
-        .map(|item| StoredItem {
-            name: item.name.clone(),
-            qualities: item.qualities.iter().map(|q| q.id()).collect(),
-            allowed: item.allowed,
-        })
-        .collect();
-    serde_json::to_value(stored).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
 }
 
 fn decode_items(value: serde_json::Value) -> Result<Vec<ProfileItem>> {
@@ -1174,42 +986,6 @@ fn small(value: u8) -> i16 {
 
 fn narrow<T: TryFrom<i32>>(value: i32, what: &str) -> Result<T> {
     T::try_from(value).map_err(|_| StoreError::Corrupt(format!("{what} {value}")))
-}
-
-async fn upsert_profile(client: &impl GenericClient, profile: &QualityProfile) -> Result<()> {
-    client
-        .execute(
-            "INSERT INTO quality_profiles (name, upgrade_allowed, cutoff, language, items,
-                 min_format_score, cutoff_format_score, source_id, format_scores)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-             ON CONFLICT (name) DO UPDATE SET upgrade_allowed = excluded.upgrade_allowed,
-                 cutoff = excluded.cutoff, language = excluded.language, items = excluded.items,
-                 min_format_score = excluded.min_format_score,
-                 cutoff_format_score = excluded.cutoff_format_score,
-                 source_id = excluded.source_id, format_scores = excluded.format_scores",
-            &[
-                &profile.name,
-                &profile.upgrade_allowed,
-                &profile.cutoff.and_then(|c| i32::try_from(c).ok()),
-                &profile.language,
-                &encode_items(&profile.items),
-                &profile.min_format_score,
-                &profile.cutoff_format_score,
-                &profile.source_id,
-                &encode_scores(&profile.format_scores),
-            ],
-        )
-        .await?;
-    Ok(())
-}
-
-pub(crate) fn encode_scores(scores: &std::collections::BTreeMap<i64, i32>) -> serde_json::Value {
-    serde_json::Value::Object(
-        scores
-            .iter()
-            .map(|(id, score)| (id.to_string(), serde_json::Value::from(*score)))
-            .collect(),
-    )
 }
 
 pub(crate) fn decode_scores(
@@ -1358,26 +1134,6 @@ async fn insert_file(client: &impl GenericClient, movie_id: i64, file: &MovieFil
                 &file.id,
                 &file.media_info,
             ],
-        )
-        .await?;
-    Ok(())
-}
-
-async fn write_tags(client: &impl GenericClient, tags: &[Tag]) -> Result<()> {
-    for tag in tags {
-        client
-            .execute(
-                "INSERT INTO tags (id, label) VALUES ($1, $2)
-                 ON CONFLICT (id) DO UPDATE SET label = excluded.label",
-                &[&tag.id, &tag.label.to_lowercase()],
-            )
-            .await?;
-    }
-    client
-        .execute(
-            "SELECT setval(pg_get_serial_sequence('tags', 'id'),
-                 GREATEST((SELECT COALESCE(MAX(id), 0) FROM tags), 1))",
-            &[],
         )
         .await?;
     Ok(())
@@ -1587,31 +1343,6 @@ mod tests {
     use super::testing::TestDb;
     use super::*;
 
-    fn profile() -> QualityProfile {
-        QualityProfile {
-            name: "Any".into(),
-            upgrade_allowed: false,
-            cutoff: Some(1),
-            language: Some("Original".into()),
-            items: vec![
-                ProfileItem {
-                    name: "WEB 1080p".into(),
-                    qualities: vec![Quality::WebDl1080p, Quality::WebRip1080p],
-                    allowed: true,
-                },
-                ProfileItem {
-                    name: "Bluray-1080p".into(),
-                    qualities: vec![Quality::Bluray1080p],
-                    allowed: true,
-                },
-            ],
-            min_format_score: 0,
-            cutoff_format_score: 0,
-            source_id: Some(7),
-            format_scores: std::collections::BTreeMap::new(),
-        }
-    }
-
     fn movie(tmdb_id: u32, title: &str, with_file: bool) -> Movie {
         Movie {
             tmdb_id,
@@ -1654,201 +1385,17 @@ mod tests {
         }
     }
 
-    fn import(movies: Vec<(i64, Movie)>) -> Import {
-        Import {
-            source: "radarr:filmes".into(),
-            profiles: vec![profile()],
-            definitions: vec![QualityDefinition {
-                quality: Quality::WebDl1080p,
-                min_size: Some(5.0),
-                max_size: Some(400.0),
-                preferred_size: None,
-            }],
-            movies,
+    /// Um filme adicionado como a tela faz: sem perfil nem tag.
+    async fn added(store: &Store, movie: Movie) -> i64 {
+        let movie = Movie {
+            quality_profile: None,
             tags: Vec::new(),
-            custom_formats: Vec::new(),
-            mirror_rules: true,
-        }
-    }
-
-    #[tokio::test]
-    async fn simulacao_nao_grava_e_relata_o_mesmo_que_a_aplicacao() {
-        let Some(db) = TestDb::new("simulacao").await else {
-            return;
+            ..movie
         };
-        let store = &db.store;
-        let first = import(vec![
-            (1, movie(10, "Um", true)),
-            (2, movie(20, "Dois", false)),
-        ]);
-
-        let simulated = store.import(&first, false).await.unwrap();
-        assert!(store.movies().await.unwrap().is_empty());
-        let applied = store.import(&first, true).await.unwrap();
-        assert_eq!(simulated.created, applied.created);
-        assert_eq!(applied.created, ["Um (2020)", "Dois (2020)"]);
-
-        let movies = store.movies().await.unwrap();
-        assert_eq!(movies.len(), 2);
-        let um = movies.iter().find(|m| m.movie.tmdb_id == 10).unwrap();
-        assert_eq!(um.movie, movie(10, "Um", true));
-        assert_eq!(um.origin, Some(("radarr:filmes".into(), 1)));
-        assert_eq!(store.profiles().await.unwrap(), [profile()]);
-        assert_eq!(store.quality_definitions().await.unwrap().len(), 1);
-        db.drop().await;
-    }
-
-    #[tokio::test]
-    async fn reimportar_atualiza_mantem_e_remove_so_o_que_veio_da_origem() {
-        let Some(db) = TestDb::new("reimportar").await else {
-            return;
-        };
-        let store = &db.store;
         store
-            .import(
-                &import(vec![
-                    (1, movie(10, "Um", false)),
-                    (2, movie(20, "Dois", false)),
-                ]),
-                true,
-            )
+            .add_movie(&movie, &MovieExtras::default())
             .await
-            .unwrap();
-
-        let again = store
-            .import(&import(vec![(1, movie(10, "Um", true))]), true)
-            .await
-            .unwrap();
-        assert_eq!(again.updated, ["Um (2020)"]);
-        assert_eq!(again.removed, ["Dois (2020)"]);
-        assert!(again.created.is_empty());
-
-        let same = store
-            .import(&import(vec![(1, movie(10, "Um", true))]), true)
-            .await
-            .unwrap();
-        assert_eq!(same.unchanged, 1);
-        assert!(same.updated.is_empty() && same.removed.is_empty());
-        db.drop().await;
-    }
-
-    #[tokio::test]
-    async fn migrar_de_novo_nao_refaz_nada() {
-        let Some(db) = TestDb::new("migrar").await else {
-            return;
-        };
-        db.store
-            .import(&import(vec![(1, movie(10, "Um", true))]), true)
-            .await
-            .unwrap();
-        db.store.migrate().await.unwrap();
-        assert_eq!(db.store.movies().await.unwrap().len(), 1);
-        db.drop().await;
-    }
-
-    #[tokio::test]
-    async fn filme_do_acervo_sobrevive_ao_espelho_e_adotar_solta_os_da_origem() {
-        let Some(db) = TestDb::new("adotar").await else {
-            return;
-        };
-        let store = &db.store;
-        store
-            .import(&import(vec![(50, movie(10, "Um", false))]), true)
-            .await
-            .unwrap();
-        let extras = MovieExtras {
-            metadata_title: Some("One".into()),
-            poster: Some("https://img/p.jpg".into()),
-            fanart: None,
-            refreshed_at: Some("2026-01-01T00:00:00Z".into()),
-        };
-        let own = store
-            .add_movie(&movie(30, "Três", false), &extras)
-            .await
-            .unwrap();
-        // Reimportar a origem não remove o que o acervo adicionou.
-        let again = store
-            .import(&import(vec![(50, movie(10, "Um", false))]), true)
-            .await
-            .unwrap();
-        assert!(again.removed.is_empty());
-        let movies = store.movies().await.unwrap();
-        let tres = movies.iter().find(|m| m.id == own).unwrap();
-        assert_eq!(tres.origin, None);
-        assert_eq!(tres.extras, extras);
-        assert_eq!(tres.movie, movie(30, "Três", false));
-
-        let mut changed = movie(30, "Três", false);
-        changed.monitored = false;
-        store.update_movie(own, &changed).await.unwrap();
-        assert!(
-            !store
-                .movies()
-                .await
-                .unwrap()
-                .iter()
-                .find(|m| m.id == own)
-                .unwrap()
-                .movie
-                .monitored
-        );
-
-        assert_eq!(store.adopt_all().await.unwrap(), 1);
-        let movies = store.movies().await.unwrap();
-        assert!(movies.iter().all(|m| m.origin.is_none()));
-        // O que veio da origem fica com o id de lá; o do acervo vai depois.
-        let um = movies.iter().find(|m| m.movie.tmdb_id == 10).unwrap();
-        let tres = movies.iter().find(|m| m.movie.tmdb_id == 30).unwrap();
-        assert_eq!(um.id, 50);
-        assert_eq!(tres.id, 51);
-        assert_eq!(tres.extras, extras);
-        assert_eq!(store.profile_ids().await.unwrap(), [(7, "Any".to_owned())]);
-        assert_eq!(um.movie.quality_profile.as_deref(), Some("Any"));
-        // O próximo filme novo não colide.
-        let next = store
-            .add_movie(&movie(40, "Quatro", false), &MovieExtras::default())
-            .await
-            .unwrap();
-        assert_eq!(next, 52);
-        assert!(store.delete_movie(tres.id).await.unwrap());
-        assert!(!store.delete_movie(tres.id).await.unwrap());
-        db.drop().await;
-    }
-
-    #[tokio::test]
-    async fn tags_espelhadas_mantem_o_id_e_as_novas_continuam_depois() {
-        let Some(db) = TestDb::new("tags").await else {
-            return;
-        };
-        let store = &db.store;
-        store
-            .mirror_tags(&[Tag {
-                id: 5,
-                label: "Pedidos".into(),
-            }])
-            .await
-            .unwrap();
-        let new = store.create_tag("Kids").await.unwrap();
-        assert!(new.id > 5);
-        assert_eq!(store.create_tag("kids").await.unwrap().id, new.id);
-        assert_eq!(
-            store.rename_tag(5, "pedido").await.unwrap().unwrap().label,
-            "pedido"
-        );
-        assert_eq!(
-            store.tags().await.unwrap(),
-            [
-                Tag {
-                    id: 5,
-                    label: "pedido".into()
-                },
-                Tag {
-                    id: new.id,
-                    label: "kids".into()
-                }
-            ]
-        );
-        db.drop().await;
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1881,11 +1428,7 @@ mod tests {
             return;
         };
         let store = &db.store;
-        store
-            .import(&import(vec![(1, movie(10, "Um", false))]), true)
-            .await
-            .unwrap();
-        let movie_id = store.movies().await.unwrap()[0].id;
+        let movie_id = added(store, movie(10, "Um", false)).await;
         let mut grab = Grab {
             id: 0,
             movie_id,
@@ -1932,11 +1475,7 @@ mod tests {
             return;
         };
         let store = &db.store;
-        store
-            .import(&import(vec![(1, movie(10, "Um", false))]), true)
-            .await
-            .unwrap();
-        let id = store.movies().await.unwrap()[0].id;
+        let id = added(store, movie(10, "Um", false)).await;
         let run = |at: &str, pick: bool| ShadowRun {
             movie_id: id,
             at: at.into(),
@@ -1966,17 +1505,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)] // Um roteiro só, de ponta a ponta.
-    async fn gerenciador_guarda_historico_bloqueio_formatos_e_listas() {
+    async fn guarda_historico_e_bloqueio() {
         let Some(db) = TestDb::new("gerenciador").await else {
             return;
         };
         let store = &db.store;
-        store
-            .import(&import(vec![(1, movie(10, "Um", true))]), true)
-            .await
-            .unwrap();
-        let movie_id = store.movies().await.unwrap()[0].id;
+        let movie_id = added(store, movie(10, "Um", false)).await;
 
         let event = |at: &str| NewHistory {
             movie_id: Some(movie_id),
@@ -1994,13 +1528,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .record_history_batch(&[event("2026-01-01T00:00:00Z")])
+            .record_history(&event("2026-01-01T00:00:00Z"))
             .await
             .unwrap();
         let page = store.history(Some(movie_id), None, 10, 0).await.unwrap();
         assert_eq!(page.total, 2);
         assert_eq!(page.events[0].at, "2026-01-02T00:00:00Z");
-        assert_eq!(store.history_from("radarr").await.unwrap(), 2);
         // O filme sai; o histórico fica, sem o id.
         store.delete_movie(movie_id).await.unwrap();
         let page = store.history(None, Some("grabbed"), 10, 0).await.unwrap();
@@ -2024,69 +1557,6 @@ mod tests {
         assert_eq!(store.blocklist().await.unwrap().len(), 1);
         assert!(store.unblock(blocked).await.unwrap());
 
-        let exclusion = Exclusion {
-            tmdb_id: 99,
-            title: "Nunca".into(),
-            year: Some(1999),
-        };
-        assert_eq!(
-            store
-                .add_exclusions(&[exclusion.clone(), exclusion.clone()])
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(store.exclusions().await.unwrap(), [exclusion]);
-
-        let format = store
-            .save_custom_format(&CustomFormat {
-                id: 0,
-                name: "HEVC".into(),
-                specifications: serde_json::json!([{ "tipo": "titulo", "valor": "x265" }]),
-                include_when_renaming: false,
-            })
-            .await
-            .unwrap();
-        let (profile_id, mut edited) = store.profiles_by_id().await.unwrap().remove(0);
-        edited.format_scores.insert(format, 50);
-        edited.name = "Renomeado".into();
-        store.save_profile(Some(profile_id), &edited).await.unwrap();
-        assert_eq!(
-            store.profiles().await.unwrap()[0].format_scores[&format],
-            50
-        );
-        // Apagar o formato tira a nota dos perfis.
-        store.delete_custom_format(format).await.unwrap();
-        assert!(store.profiles().await.unwrap()[0].format_scores.is_empty());
-
-        let list = store
-            .save_import_list(&ImportList {
-                id: 0,
-                name: "Pessoa".into(),
-                kind: "tmdb_person".into(),
-                settings: serde_json::json!({ "pessoa": 17276 }),
-                enabled: true,
-                monitor: true,
-                search_on_add: false,
-                quality_profile_id: Some(profile_id),
-                root_folder: "/filmes".into(),
-                minimum_availability: "released".into(),
-                tags: vec![],
-                last_sync: None,
-                last_error: None,
-            })
-            .await
-            .unwrap();
-        // Perfil em uso por lista não sai.
-        assert!(store.delete_profile(profile_id).await.is_err());
-        store
-            .set_import_list_sync(list, "2026-01-01T00:00:00Z", Some("erro"))
-            .await
-            .unwrap();
-        assert_eq!(
-            store.import_lists().await.unwrap()[0].last_error.as_deref(),
-            Some("erro")
-        );
         db.drop().await;
     }
 }
