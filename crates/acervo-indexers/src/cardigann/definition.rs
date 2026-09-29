@@ -132,6 +132,8 @@ struct RawSearch {
     #[serde(default)]
     keywordsfilters: Vec<RawFilterYaml>,
     #[serde(default)]
+    preprocessingfilters: Vec<RawFilterYaml>,
+    #[serde(default)]
     headers: Option<BTreeMap<String, Yaml>>,
     #[serde(default, rename = "allowEmptyInputs")]
     allow_empty_inputs: bool,
@@ -398,6 +400,11 @@ impl Document {
             .into_iter()
             .map(|raw| Filter::compile(raw.flatten()?, Scope::Request, &names))
             .collect::<Result<Vec<_>, _>>()?;
+        let preprocessing_filters = search
+            .preprocessingfilters
+            .into_iter()
+            .map(|raw| Filter::compile(raw.flatten()?, Scope::Request, &names))
+            .collect::<Result<Vec<_>, _>>()?;
         let headers = compile_headers(search.headers.unwrap_or_default())?;
         let (rows, and_match) = compile_rows(search.rows, &names)?;
         let fields = compile_fields(search.fields, &names)?;
@@ -436,6 +443,7 @@ impl Document {
             raw_inputs,
             allow_empty_inputs: search.allow_empty_inputs,
             keywords_filters,
+            preprocessing_filters,
             headers,
             rows,
             and_match,
@@ -763,10 +771,8 @@ fn compile_field(raw: RawField, names: &Names<'_>) -> Result<Field, IndexerError
             }
             Source::Text(template(&scalar(&text, "search.fields.text")?)?)
         }
+        // Sem selector, o campo lê a própria linha, como na referência.
         (None, selector) => {
-            if selector.is_none() && raw.case.is_none() {
-                return Err(invalid("search.fields", "campo sem selector, text ou case"));
-            }
             let case = raw
                 .case
                 .unwrap_or_default()

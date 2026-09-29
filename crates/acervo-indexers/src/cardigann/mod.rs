@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use reqwest::cookie::{CookieStore, Jar};
 use reqwest::header::{COOKIE, HeaderValue, LOCATION};
 use scraper::Html;
 use time::OffsetDateTime;
@@ -54,6 +55,8 @@ pub struct CardigannDefinition {
     raw_inputs: Option<Template>,
     allow_empty_inputs: bool,
     keywords_filters: Vec<Filter>,
+    /// Aplicados à página inteira antes do HTML ser lido.
+    preprocessing_filters: Vec<Filter>,
     headers: Vec<(String, String)>,
     rows: Rows,
     and_match: bool,
@@ -232,6 +235,8 @@ pub struct CardigannClient {
     base: Url,
     config: Arc<Vars>,
     http: reqwest::Client,
+    /// Os cookies do `http`, lidos no login para o `XSRF-TOKEN`.
+    jar: Arc<Jar>,
     budget: Arc<RateBudget>,
     session: Arc<Mutex<Session>>,
     /// Maior página já vista por rota: o tamanho de página do site, aprendido.
@@ -304,9 +309,10 @@ impl CardigannClient {
         if timeout.is_zero() {
             return Err(invalid("timeout", "timeout deve ser maior que zero"));
         }
+        let jar = Arc::new(Jar::default());
         let http = reqwest::Client::builder()
             .timeout(timeout)
-            .cookie_store(true)
+            .cookie_provider(Arc::clone(&jar))
             .redirect(reqwest::redirect::Policy::none())
             .user_agent("Mozilla/5.0 (compatible; acervo-hub)")
             .build()
@@ -317,6 +323,7 @@ impl CardigannClient {
             base,
             config: Arc::new(config),
             http,
+            jar,
             budget,
             session: Arc::new(Mutex::new(Session::default())),
             page_sizes: Arc::default(),
@@ -590,10 +597,10 @@ impl CardigannClient {
                     .iter()
                     .map(|(key, template)| (key.clone(), template.render(&self.config)))
                     .collect();
-                self.budget.acquire().await;
                 let request = if *post {
-                    self.http.post(url.clone()).form(&form)
+                    self.post_request(&url).await?.form(&form)
                 } else {
+                    self.budget.acquire().await;
                     self.http.get(url.clone()).query(&form)
                 };
                 let response = request
@@ -635,6 +642,36 @@ impl CardigannClient {
         }
         session.logged_in = true;
         Ok(session.cookie.clone())
+    }
+
+    /// POST de login como o navegador faz: abre a página antes, e se o site
+    /// deixou o `XSRF-TOKEN` (Laravel, Rails com axios) devolve-o no
+    /// cabeçalho. Sem isso, o site responde 419 e a senha nem é conferida.
+    async fn post_request(&self, url: &Url) -> Result<reqwest::RequestBuilder, IndexerError> {
+        // O que a página responde não importa: só os cookies que ela deixa.
+        drop(self.get(url.clone(), None).await?);
+        let mut request = self.http.post(url.clone());
+        if let Some(token) = self.xsrf_token(url) {
+            request = request.header("X-XSRF-TOKEN", token);
+        }
+        self.budget.acquire().await;
+        Ok(request)
+    }
+
+    fn xsrf_token(&self, url: &Url) -> Option<HeaderValue> {
+        let cookies = self.jar.cookies(url)?;
+        let token = cookies
+            .to_str()
+            .ok()?
+            .split(';')
+            .filter_map(|pair| pair.trim().split_once('='))
+            .find_map(|(name, value)| (name == "XSRF-TOKEN").then_some(value))?;
+        // Percent-decode sem a regra de formulário, que leria `+` como espaço.
+        let token = token.replace('+', "%2B");
+        let decoded = url::form_urlencoded::parse(format!("t={token}").as_bytes())
+            .next()
+            .map(|(_, value)| value.into_owned())?;
+        HeaderValue::from_str(&decoded).ok()
     }
 
     /// Segue redirects na mesma origem — o login por formulário costuma

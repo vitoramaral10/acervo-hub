@@ -1,21 +1,22 @@
 //! Filtros de campo, de `keywordsfilters`, e a interpretação de tamanho,
 //! contagem e data — com a semântica do motor Cardigann de referência.
 
-use regex::Regex;
 use time::format_description::well_known::{Rfc2822, Rfc3339};
-use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
+use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
 
 use super::definition::RawFilter;
 use super::invalid;
-use super::template::{Names, Scope, Template, Vars, compile_regex, dotnet_replacement};
+use super::template::{Names, Pattern, Scope, Template, Vars, compile_regex, dotnet_replacement};
 use crate::IndexerError;
 
 #[derive(Debug)]
 pub(super) enum Filter {
     Trim(Option<String>),
     Replace(String, Template),
-    ReReplace(Regex, Template),
-    Regexp(Regex),
+    ReReplace(Pattern, Template),
+    Regexp(Pattern),
+    /// `jsonjoinarray`: caminho `$.a.b` num objeto JSON e separador.
+    JsonJoinArray(Vec<String>, String),
     Append(Template),
     Prepend(Template),
     Split(char, isize),
@@ -58,6 +59,9 @@ impl Filter {
                     .parse()
                     .map_err(|_| invalid("filters.split", "índice inteiro obrigatório"))?,
             ),
+            ("jsonjoinarray", [path, separator]) => {
+                Self::JsonJoinArray(json_path(path)?, separator.clone())
+            }
             ("querystring", [name]) => Self::QueryString(name.clone()),
             ("dateparse" | "timeparse", [layout]) => Self::DateParse(layout_tokens(layout)?),
             ("tolower", []) => Self::ToLower,
@@ -81,15 +85,10 @@ impl Filter {
                 .trim_matches(|character| chars.contains(character))
                 .to_owned(),
             Self::Replace(from, to) => value.replace(from.as_str(), &to.render(vars)),
-            Self::ReReplace(pattern, to) => pattern
-                .replace_all(&value, to.render(vars).as_str())
-                .into_owned(),
+            Self::ReReplace(pattern, to) => pattern.replace_all(&value, &to.render(vars))?,
             // Como na referência: sempre o primeiro grupo; sem casar, vazio.
-            Self::Regexp(pattern) => pattern
-                .captures(&value)
-                .and_then(|captures| captures.get(1))
-                .map(|group| group.as_str().to_owned())
-                .unwrap_or_default(),
+            Self::Regexp(pattern) => pattern.first_group(&value).unwrap_or_default(),
+            Self::JsonJoinArray(path, separator) => json_join(&value, path, separator).ok_or(())?,
             Self::Append(suffix) => value + &suffix.render(vars),
             Self::Prepend(prefix) => prefix.render(vars) + &value,
             Self::Split(separator, index) => {
@@ -115,6 +114,52 @@ impl Filter {
                 .unwrap_or_default(),
         })
     }
+}
+
+/// Só o subconjunto que as definições usam: `$` seguido de chaves.
+fn json_path(path: &str) -> Result<Vec<String>, IndexerError> {
+    let refused = || {
+        invalid(
+            "filters.jsonjoinarray",
+            "caminho JSON fora de `$.chave.chave`",
+        )
+    };
+    let keys = path.strip_prefix('$').ok_or_else(refused)?;
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys: Vec<String> = keys
+        .strip_prefix('.')
+        .ok_or_else(refused)?
+        .split('.')
+        .map(str::to_owned)
+        .collect();
+    if keys
+        .iter()
+        .any(|key| key.is_empty() || key.contains(['[', ']', '*', '\'', '"']))
+    {
+        return Err(refused());
+    }
+    Ok(keys)
+}
+
+/// Como na referência: o valor no caminho é uma lista, e os itens escalares
+/// se juntam pelo separador. Texto que não é JSON, ou caminho que não leva a
+/// uma lista, faz o campo falhar.
+fn json_join(value: &str, path: &[String], separator: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(value).ok()?;
+    let items = path
+        .iter()
+        .try_fold(&json, |node, key| node.get(key))?
+        .as_array()?;
+    let parts: Vec<String> = items
+        .iter()
+        .map(|item| match item {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+        .collect();
+    Some(parts.join(separator))
 }
 
 fn query_value(value: &str, name: &str) -> Option<String> {
@@ -213,6 +258,8 @@ pub(super) enum Token {
     Minute,
     Second,
     Meridiem,
+    /// `z`, `zz` e `zzz` do .NET: `+1`, `+01`, `+01:00`.
+    Offset,
     Literal(char),
 }
 
@@ -243,6 +290,7 @@ fn layout_tokens(layout: &str) -> Result<Vec<Token>, IndexerError> {
             ('m', 1 | 2) => Token::Minute,
             ('s', 1 | 2) => Token::Second,
             ('t', 2) => Token::Meridiem,
+            ('z', 1..=3) => Token::Offset,
             ('\'', _) => {
                 let end = chars[index + 1..]
                     .iter()
@@ -259,7 +307,7 @@ fn layout_tokens(layout: &str) -> Result<Vec<Token>, IndexerError> {
             (c, _) if c.is_ascii_alphabetic() => {
                 return Err(invalid(
                     "filters.dateparse",
-                    "token de data não suportado (fuso, dia da semana, fração)",
+                    "token de data não suportado (dia da semana, fração, ...)",
                 ));
             }
             (c, _) => {
@@ -310,6 +358,7 @@ fn parse_with_layout(value: &str, layout: &[Token]) -> Option<OffsetDateTime> {
     let mut rest = value;
     let (mut year, mut month, mut day) = (None, None, None);
     let (mut hour, mut minute, mut second, mut pm) = (0_u8, 0_u8, 0_u8, None);
+    let mut offset = UtcOffset::UTC;
     let digits = |rest: &mut &str, min: usize, max: usize| -> Option<u32> {
         let count = rest
             .chars()
@@ -350,6 +399,24 @@ fn parse_with_layout(value: &str, layout: &[Token]) -> Option<OffsetDateTime> {
                 });
                 rest = &rest[2..];
             }
+            Token::Offset => {
+                let negative = match rest.chars().next()? {
+                    '+' => false,
+                    '-' => true,
+                    _ => return None,
+                };
+                rest = &rest[1..];
+                let hours = i8::try_from(digits(&mut rest, 1, 2)?).ok()?;
+                let minutes = match rest.strip_prefix(':') {
+                    Some(tail) => {
+                        rest = tail;
+                        i8::try_from(digits(&mut rest, 2, 2)?).ok()?
+                    }
+                    None => 0,
+                };
+                let sign = if negative { -1 } else { 1 };
+                offset = UtcOffset::from_hms(sign * hours, sign * minutes, 0).ok()?;
+            }
             Token::Literal(expected) => {
                 let mut chars = rest.chars();
                 if chars.next()? != *expected {
@@ -377,7 +444,7 @@ fn parse_with_layout(value: &str, layout: &[Token]) -> Option<OffsetDateTime> {
     )
     .ok()?;
     let time = Time::from_hms(hour, minute, second).ok()?;
-    Some(PrimitiveDateTime::new(date, time).assume_utc())
+    Some(PrimitiveDateTime::new(date, time).assume_offset(offset))
 }
 
 #[cfg(test)]
@@ -416,7 +483,40 @@ mod tests {
         assert_eq!(parsed.format(&Rfc3339).unwrap(), "2026-09-24T21:05:00Z");
 
         assert!(parse_with_layout("31/02/26 00:00:00", &tokens).is_none());
-        assert!(layout_tokens("dd/MM/yyyy zzz").is_err());
+        assert!(layout_tokens("dddd, dd/MM/yyyy").is_err());
+    }
+
+    #[test]
+    fn dateparse_com_fuso() {
+        let tokens = layout_tokens("yyyy-MM-dd zzz").unwrap();
+        let parsed = parse_with_layout("2026-09-26 +00:01", &tokens).unwrap();
+        assert_eq!(
+            parsed.format(&Rfc3339).unwrap(),
+            "2026-09-26T00:00:00+00:01"
+        );
+        let tokens = layout_tokens("dd/MM/yyyy HH:mm z").unwrap();
+        let parsed = parse_with_layout("24/09/2026 10:00 -3", &tokens).unwrap();
+        assert_eq!(parsed.unix_timestamp(), 1_790_254_800);
+        assert!(parse_with_layout("24/09/2026 10:00 3", &tokens).is_none());
+    }
+
+    #[test]
+    fn jsonjoinarray_junta_a_lista_do_caminho() {
+        let join = |path: &str, value: &str| json_join(value, &json_path(path).unwrap(), ", ");
+        assert_eq!(
+            join("$.genres", r#"{"genres":["Drama","Ação"]}"#),
+            Some("Drama, Ação".into())
+        );
+        assert_eq!(
+            join("$.v", r#"{"v":["Cora\u00e7\u00e3o \/ 2"]}"#),
+            Some("Coração / 2".into())
+        );
+        assert_eq!(join("$.a.b", r#"{"a":{"b":[1,2]}}"#), Some("1, 2".into()));
+        assert_eq!(join("$.genres", r#"{"genres":"Drama"}"#), None);
+        assert_eq!(join("$.genres", "não é json"), None);
+        for path in ["genres", "$..x", "$.a[0]", "$.*"] {
+            assert!(json_path(path).is_err(), "{path}");
+        }
     }
 
     #[test]

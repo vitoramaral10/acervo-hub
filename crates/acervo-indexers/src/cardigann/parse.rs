@@ -30,7 +30,14 @@ impl CardigannDefinition {
         request: &Vars,
         now: OffsetDateTime,
     ) -> Result<(Vec<(Release, String)>, usize), IndexerError> {
-        let document = Html::parse_document(html);
+        // Filtro que falha deixa a página sem linhas — e página sem linhas é
+        // o "nada encontrado" de sempre.
+        let html = self
+            .preprocessing_filters
+            .iter()
+            .try_fold(html.to_owned(), |body, filter| filter.apply(body, request))
+            .unwrap_or_default();
+        let document = Html::parse_document(&html);
         let rendered;
         let rows = match &self.rows {
             Rows::Fixed(css) => css,

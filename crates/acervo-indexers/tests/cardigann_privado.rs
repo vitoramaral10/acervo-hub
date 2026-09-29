@@ -12,7 +12,7 @@ use acervo_indexers::{CardigannClient, CardigannDefinition, Indexer, IndexerErro
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use wiremock::matchers::{
-    body_string_contains, header, method, path, query_param, query_param_is_missing,
+    body_string_contains, header, header_regex, method, path, query_param, query_param_is_missing,
 };
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -21,6 +21,9 @@ const COOKIE_HTML: &str = include_str!("fixtures/cardigann-cookie.html");
 const FORM_YAML: &str = include_str!("fixtures/cardigann-formulario.yml");
 const FORM_PAGE0: &str = include_str!("fixtures/cardigann-formulario-pagina0.html");
 const FORM_PAGE1: &str = include_str!("fixtures/cardigann-formulario-pagina1.html");
+
+const INERTIA_YAML: &str = include_str!("fixtures/cardigann-inertia.yml");
+const INERTIA_PAGE: &str = include_str!("fixtures/cardigann-inertia-busca.html");
 
 const COOKIE: &str = "sessao=abc; outra=1";
 const LOGGED_IN: &str = r#"<a href="account-logout.php">Sair</a>"#;
@@ -414,4 +417,119 @@ fn chave_desconhecida_e_nomeada_sem_expor_valores() {
     let error = CardigannDefinition::from_yaml_v11(&yaml).unwrap_err();
     assert!(matches!(&error, IndexerError::UnsupportedDefinitionKey { key } if key == "captcha"));
     assert!(!error.to_string().contains("segredo-fixture"));
+}
+
+/// Laravel: o POST de login sem o `XSRF-TOKEN` da página devolvido no
+/// cabeçalho responde 419. O token vem percent-encoded no cookie.
+async fn mount_laravel_login(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/login"))
+        .respond_with(
+            html("<html>login</html>")
+                .append_header("Set-Cookie", "XSRF-TOKEN=ab%2Bc%3D; Path=/")
+                .append_header("Set-Cookie", "app-session=anonima; Path=/"),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/login"))
+        .and(header("x-xsrf-token", "ab+c="))
+        .and(body_string_contains("username=usuario"))
+        .and(body_string_contains("remember=1"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", "/dashboard")
+                .insert_header("Set-Cookie", "app-session=logada; Path=/"),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/login"))
+        .respond_with(ResponseTemplate::new(419))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/dashboard"))
+        .and(header_regex("cookie", "app-session=logada"))
+        .respond_with(html(
+            r#"<script data-page="app">{"props":{"auth":{"user":{"id":7}}}}</script>"#,
+        ))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn laravel_inertia_loga_com_xsrf_e_le_o_json_da_pagina() {
+    let server = MockServer::start().await;
+    mount_laravel_login(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/torrents"))
+        // O ano sai do termo por `keywordsfilters`.
+        .and(query_param("q", "Um Filme"))
+        .and(query_param("per_page", "96"))
+        .respond_with(html(INERTIA_PAGE))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = client(
+        INERTIA_YAML,
+        &server,
+        &[("username", "usuario"), ("password", "senha")],
+    );
+
+    let results = client
+        .search(&SearchQuery::general("Um Filme 2026"))
+        .await
+        .unwrap();
+
+    let titles: Vec<_> = results
+        .iter()
+        .map(|release| release.title.as_str())
+        .collect();
+    assert_eq!(titles, ["Um Filme épico 2026", "Uma Série - S01E02"]);
+    assert_eq!(results[0].categories, [2000]);
+    assert_eq!(results[1].categories, [5000]);
+    assert_eq!(results[0].size, 1_610_612_736);
+    assert_eq!(results[0].seeders, Some(12));
+    assert_eq!(results[0].leechers, Some(3));
+    assert_eq!(
+        results[0].published.unwrap().format(&Rfc3339).unwrap(),
+        "2026-09-26T00:00:00Z"
+    );
+    assert!(
+        results[0]
+            .info_url
+            .as_ref()
+            .is_some_and(|url| url.path() == "/torrents/11")
+    );
+}
+
+#[tokio::test]
+async fn laravel_sem_o_token_certo_nao_loga() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/login"))
+        .respond_with(html("<html>login sem token</html>"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/login"))
+        .respond_with(ResponseTemplate::new(419))
+        .mount(&server)
+        .await;
+    Mock::given(path("/torrents"))
+        .respond_with(html(INERTIA_PAGE))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let error = client(
+        INERTIA_YAML,
+        &server,
+        &[("username", "usuario"), ("password", "senha")],
+    )
+    .search(&SearchQuery::general("x"))
+    .await
+    .unwrap_err();
+    assert!(!matches!(error, IndexerError::Definition { .. }), "{error}");
 }

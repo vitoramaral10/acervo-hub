@@ -71,7 +71,7 @@ fn recursos_nao_implementados_falham_no_load_sem_expor_yaml() {
             "table.results > tbody > tr.release",
             "tr:contains(secret-value) td",
         ),
-        YAML.replace("args: ['_', '.']", "args: ['(?=x)', '.']")
+        YAML.replace("args: ['_', '.']", "args: ['(x', '.']")
             .replace("name: replace", "name: re_replace"),
     ];
     for yaml in cases {

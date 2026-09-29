@@ -113,12 +113,14 @@ name = "acervo-indexers"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "fancy-regex",
  "futures",
  "quick-xml",
  "regex",
  "reqwest",
  "scraper",
  "serde",
+ "serde_json",
  "serde_yaml_ng",
  "thiserror",
  "time",

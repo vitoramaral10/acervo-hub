@@ -1,0 +1,109 @@
+---
+id: inertia
+name: Tracker Inertia
+description: "Tracker privado Laravel + Inertia: resultados em JSON dentro de <script data-page>"
+language: pt-BR
+type: private
+encoding: UTF-8
+links:
+  - https://tracker.invalid/
+
+caps:
+  categorymappings:
+    - {id: 119, cat: Movies, desc: "Filmes"}
+    - {id: 120, cat: TV, desc: "Séries"}
+  modes:
+    search: [q]
+    movie-search: [q, imdbid]
+
+settings:
+  - name: username
+    type: text
+    label: Username
+  - name: password
+    type: password
+    label: Password
+
+login:
+  path: login
+  method: post
+  inputs:
+    username: "{{ .Config.username }}"
+    password: "{{ .Config.password }}"
+    remember: 1
+  test:
+    path: dashboard
+    selector: script[data-page="app"]:contains('"user":{"id":')
+
+search:
+  paths:
+    - path: torrents
+  inputs:
+    q: "{{ if .Query.IMDBID }}{{ .Query.IMDBID }}{{ else }}{{ .Keywords }}{{ end }}"
+    per_page: 96
+  keywordsfilters:
+    - name: re_replace
+      args: ["(\\s*\\b((19|20)\\d{2})\\b)", ""]
+  preprocessingfilters:
+    - name: regexp
+      args: "\"torrents\":\\{\"current_page\":\\d+,\"data\":\\[(.*?)\\],\"first_page_url\""
+    - name: re_replace
+      args: ["(\\{\"id\":\\d+,.*?\\})(?=,\\{\"id\":\\d+,|$)", "<div class=\"torrent\">$1</div>"]
+  rows:
+    selector: div.torrent
+  fields:
+    _id:
+      filters:
+        - name: regexp
+          args: "\"id\":(\\d+)"
+    category:
+      filters:
+        - name: regexp
+          args: "\"categoryId\":(\\d+)"
+    _name:
+      filters:
+        - name: regexp
+          args: "\"name\":(\"(?:[^\"\\\\]|\\\\.)*\")"
+        - name: prepend
+          args: "{\"v\":["
+        - name: append
+          args: "]}"
+        - name: jsonjoinarray
+          args: ["$.v", ""]
+    _year:
+      optional: true
+      filters:
+        - name: regexp
+          args: "\"year\":(\\d{4})"
+    title:
+      text: "{{ .Result._name }}{{ if .Result._year }} {{ .Result._year }}{{ else }}{{ end }}"
+    details:
+      text: "/torrents/{{ .Result._id }}"
+    download:
+      text: "/torrents/{{ .Result._id }}/download"
+    date:
+      filters:
+        - name: regexp
+          args: "\"releasedAt\":\"([^\"]+)\""
+        - name: append
+          args: " +00:00"
+        - name: dateparse
+          args: "yyyy-MM-dd zzz"
+    size:
+      filters:
+        - name: regexp
+          args: "\"size\":(\\d+)"
+    seeders:
+      filters:
+        - name: regexp
+          args: "\"seeders\":(\\d+)"
+    leechers:
+      filters:
+        - name: regexp
+          args: "\"leechers\":(\\d+)"
+    genre:
+      filters:
+        - name: jsonjoinarray
+          args: ["$.genres", ", "]
+    description:
+      text: "{{ .Result.genre }}"

@@ -8,6 +8,8 @@
 
 use std::collections::HashMap;
 
+use std::borrow::Cow;
+
 use regex::Regex;
 
 use super::invalid;
@@ -100,7 +102,7 @@ enum Expr {
     Literal(String),
     Call(Func, Vec<Expr>),
     /// `re_replace` com padrão literal: compilado uma vez só.
-    ReReplace(Box<Expr>, Regex, String),
+    ReReplace(Box<Expr>, Pattern, String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -203,11 +205,10 @@ fn eval(expr: &Expr, vars: &Vars, dot: Option<&str>) -> Value {
         Expr::Var(name) if name == "." => dot.map_or(Value::Null, |item| Value::Str(item.into())),
         Expr::Var(name) => vars.get(name),
         Expr::Literal(value) => Value::Str(value.clone()),
-        Expr::ReReplace(input, pattern, replacement) => Value::Str(
-            pattern
-                .replace_all(&eval(input, vars, dot).text(), replacement.as_str())
-                .into_owned(),
-        ),
+        Expr::ReReplace(input, pattern, replacement) => {
+            let text = eval(input, vars, dot).text();
+            Value::Str(pattern.replace_all(&text, replacement).unwrap_or(text))
+        }
         Expr::Call(func, args) => {
             let mut values = args.iter().map(|arg| eval(arg, vars, dot));
             match func {
@@ -667,16 +668,57 @@ impl Parser<'_> {
 }
 
 /// Regex das definições, com teto de tamanho: a definição é arquivo de fora.
-pub(super) fn compile_regex(pattern: &str, section: &'static str) -> Result<Regex, IndexerError> {
-    regex::RegexBuilder::new(pattern)
+///
+/// A referência usa o motor do .NET, que tem lookaround. O `regex` cobre
+/// quase todas as definições em tempo linear; só o padrão que ele recusa cai
+/// no `fancy-regex`, que tem teto de backtracking.
+#[derive(Debug)]
+pub(super) enum Pattern {
+    Linear(Regex),
+    Backtracking(fancy_regex::Regex),
+}
+
+impl Pattern {
+    /// Primeiro grupo do primeiro casamento, como o filtro `regexp`.
+    pub fn first_group(&self, text: &str) -> Option<String> {
+        match self {
+            Self::Linear(regex) => regex
+                .captures(text)
+                .and_then(|captures| captures.get(1))
+                .map(|group| group.as_str().to_owned()),
+            Self::Backtracking(regex) => regex
+                .captures(text)
+                .ok()
+                .flatten()
+                .and_then(|captures| captures.get(1))
+                .map(|group| group.as_str().to_owned()),
+        }
+    }
+
+    /// `Err` só quando o backtracking estoura o teto.
+    pub fn replace_all(&self, text: &str, replacement: &str) -> Result<String, ()> {
+        match self {
+            Self::Linear(regex) => Ok(regex.replace_all(text, replacement).into_owned()),
+            Self::Backtracking(regex) => regex
+                .try_replacen(text, 0, replacement)
+                .map(Cow::into_owned)
+                .map_err(|_| ()),
+        }
+    }
+}
+
+pub(super) fn compile_regex(pattern: &str, section: &'static str) -> Result<Pattern, IndexerError> {
+    if let Ok(regex) = regex::RegexBuilder::new(pattern)
         .size_limit(1 << 20)
         .build()
-        .map_err(|_| {
-            invalid(
-                section,
-                "regex inválida ou com recurso não suportado (lookaround, backreference)",
-            )
-        })
+    {
+        return Ok(Pattern::Linear(regex));
+    }
+    fancy_regex::RegexBuilder::new(pattern)
+        .delegate_size_limit(1 << 20)
+        .build()
+        .map(Pattern::Backtracking)
+        .map_err(|_| invalid(section, "regex inválida ou com recurso não suportado"))
 }
 
 /// `$1` do .NET vira `${1}`: em Rust, `$1abc` seria o grupo chamado `1abc`.
@@ -827,9 +869,22 @@ mod tests {
             Scope::Request
         ));
         assert!(!compiles(
-            "{{ re_replace .Keywords \"(?=x)\" \"\" }}",
+            "{{ re_replace .Keywords \"(x\" \"\" }}",
             Scope::Request
         ));
+    }
+
+    #[test]
+    fn lookaround_cai_no_motor_com_backtracking() {
+        let pattern = compile_regex(r"(\{\d\})(?=,\{|$)", "teste").unwrap();
+        assert!(matches!(pattern, Pattern::Backtracking(_)));
+        assert_eq!(
+            pattern.replace_all("{1},{2}", "<$1>").unwrap(),
+            "<{1}>,<{2}>"
+        );
+        let linear = compile_regex(r"a(\d+)", "teste").unwrap();
+        assert!(matches!(linear, Pattern::Linear(_)));
+        assert_eq!(linear.first_group("xa42"), Some("42".into()));
     }
 
     #[test]
