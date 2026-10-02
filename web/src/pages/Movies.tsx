@@ -1,6 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  ArrowDown,
   ArrowDownToLine,
+  ArrowUp,
+  ArrowUpDown,
+  LayoutGrid,
+  Table2,
   CircleAlert,
   CircleCheck,
   CircleDashed,
@@ -32,6 +37,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Badge, Skeleton, Switch } from '@/components/ui/misc'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import {
   type GrabReport,
   type Movie,
@@ -42,16 +48,28 @@ import {
   library,
 } from '@/lib/api'
 import { formatAgo, formatCount, formatSize } from '@/lib/format'
+import {
+  AUDIOS,
+  DEFAULT_PREFS,
+  type MovieListPrefs,
+  MONITORED,
+  QUALITIES,
+  SORTS,
+  STATES,
+  type SortKey,
+  applyList,
+  defaultDir,
+  filterExceptState,
+  hasActiveFilters,
+  hasFailed,
+  hasProblem,
+  isDownloading,
+  isQueued,
+  loadPrefs,
+  savePrefs,
+  stateCounts,
+} from '@/lib/movieList'
 import { cn } from '@/lib/utils'
-
-type Filter = 'todos' | 'com-arquivo' | 'sem-arquivo' | 'problemas'
-
-const FILTERS: { value: Filter; label: string }[] = [
-  { value: 'todos', label: 'Todos' },
-  { value: 'com-arquivo', label: 'No disco' },
-  { value: 'sem-arquivo', label: 'Faltando' },
-  { value: 'problemas', label: 'Com problema' },
-]
 
 const DISK = {
   ok: { label: 'No disco', tone: 'success', icon: CircleCheck },
@@ -260,20 +278,11 @@ function GrabDialog({
   )
 }
 
-const hasProblem = (movie: Movie) => movie.arquivo !== null && movie.arquivo.disco !== 'ok'
-
-function normalize(text: string) {
-  return text
-    .normalize('NFD')
-    .replace(/\p{Diacritic}/gu, '')
-    .toLowerCase()
-}
-
 export function MoviesPage() {
   const queryClient = useQueryClient()
   const movies = useQuery({ queryKey: ['filmes'], queryFn: api.movies })
   const [query, setQuery] = useState('')
-  const [filter, setFilter] = useState<Filter>('todos')
+  const [prefs, setPrefs] = useState<MovieListPrefs>(loadPrefs)
   const [selected, setSelected] = useState<number | null>(null)
   const [adding, setAdding] = useState(false)
 
@@ -313,24 +322,15 @@ export function MoviesPage() {
     }
   }, [list])
 
-  const visible = useMemo(() => {
-    const needle = normalize(query.trim())
-    return (list ?? [])
-      .filter((movie) => {
-        if (filter === 'com-arquivo' && !movie.arquivo) return false
-        if (filter === 'sem-arquivo' && movie.arquivo) return false
-        if (filter === 'problemas' && !hasProblem(movie)) return false
-        if (!needle) return true
-        const haystack = normalize(
-          [movie.titulo, movie.titulo_original ?? '', String(movie.ano ?? ''), movie.imdb ?? ''].join(' '),
-        )
-        return haystack.includes(needle)
-      })
-      .sort((a, b) => sortKey(a).localeCompare(sortKey(b), 'pt-BR'))
-  }, [list, query, filter])
+  // Ordem, filtros e visualização vão para a URL e para o localStorage a cada mudança.
+  useEffect(() => savePrefs(prefs), [prefs])
+  const update = (change: Partial<MovieListPrefs>) => setPrefs((old) => ({ ...old, ...change }))
+
+  const visible = useMemo(() => applyList(list ?? [], query, prefs), [list, query, prefs])
+  // Contadores do estado: lista já cortada pela busca e pelos outros filtros, menos o próprio estado.
+  const stateTotals = useMemo(() => stateCounts(filterExceptState(list ?? [], query, prefs)), [list, query, prefs])
 
   const current = list?.find((movie) => movie.id === selected) ?? null
-  const filters = FILTERS.filter((f) => f.value !== 'problemas' || counts.problems > 0)
 
   return (
     <>
@@ -394,35 +394,13 @@ export function MoviesPage() {
         </div>
       ) : (
         <>
-          <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <label className="sm:w-80">
-              <span className="sr-only">Buscar na biblioteca</span>
-              <Input
-                type="search"
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder="Buscar por título, ano ou IMDb"
-              />
-            </label>
-            <div role="radiogroup" aria-label="Filtro" className="flex flex-wrap rounded-md border border-border p-0.5">
-              {filters.map(({ value, label }) => (
-                <button
-                  key={value}
-                  type="button"
-                  role="radio"
-                  aria-checked={filter === value}
-                  onClick={() => setFilter(value)}
-                  className={cn(
-                    'rounded-sm px-2.5 py-1.5 text-xs font-medium text-content-muted transition-colors hover:text-content focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring',
-                    filter === value && 'bg-surface-raised text-content',
-                  )}
-                >
-                  {label}
-                  {value === 'problemas' && <span className="ml-1 text-danger tabular-nums">{counts.problems}</span>}
-                </button>
-              ))}
-            </div>
-          </div>
+          <MovieToolbar
+            query={query}
+            onQuery={setQuery}
+            prefs={prefs}
+            onChange={update}
+            stateTotals={stateTotals}
+          />
 
           {visible.length === 0 ? (
             <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed border-border-strong px-6 py-12 text-center">
@@ -433,12 +411,26 @@ export function MoviesPage() {
                 size="sm"
                 onClick={() => {
                   setQuery('')
-                  setFilter('todos')
+                  update({ ...CLEARED })
                 }}
               >
                 Limpar filtros
               </Button>
             </div>
+          ) : prefs.view === 'tabela' ? (
+            <MovieTable
+              movies={visible}
+              sort={prefs.sort}
+              dir={prefs.dir}
+              onSort={(sort) =>
+                update(
+                  sort === prefs.sort
+                    ? { dir: prefs.dir === 'asc' ? 'desc' : 'asc' }
+                    : { sort, dir: defaultDir(sort) },
+                )
+              }
+              onOpen={setSelected}
+            />
           ) : (
             <ul className={GRID} aria-label="Filmes">
               {visible.map((movie) => (
@@ -463,13 +455,337 @@ export function MoviesPage() {
   )
 }
 
+const CLEARED = {
+  state: DEFAULT_PREFS.state,
+  qualities: DEFAULT_PREFS.qualities,
+  audio: DEFAULT_PREFS.audio,
+  monitored: DEFAULT_PREFS.monitored,
+}
+
+const CHIP =
+  'inline-flex h-8 items-center gap-1 rounded-sm px-2.5 text-xs font-medium whitespace-nowrap text-content-muted transition-colors hover:text-content focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring'
+
+/** Grupo de opções num contorno só; `single` vira radiogroup, o resto são botões de alternar. */
+function ChipGroup({ label, children, single = false }: { label: string; children: ReactNode; single?: boolean }) {
+  return (
+    <div role={single ? 'radiogroup' : 'group'} aria-label={label} className="flex flex-wrap rounded-md border border-border p-0.5">
+      {children}
+    </div>
+  )
+}
+
+function Chip({
+  active,
+  single = false,
+  onClick,
+  children,
+}: {
+  active: boolean
+  single?: boolean
+  onClick: () => void
+  children: ReactNode
+}) {
+  return (
+    <button
+      type="button"
+      role={single ? 'radio' : undefined}
+      aria-checked={single ? active : undefined}
+      aria-pressed={single ? undefined : active}
+      onClick={onClick}
+      className={cn(CHIP, active && 'bg-surface-raised text-content')}
+    >
+      {children}
+    </button>
+  )
+}
+
+function toggle<T>(list: T[], value: T): T[] {
+  return list.includes(value) ? list.filter((item) => item !== value) : [...list, value]
+}
+
+function MovieToolbar({
+  query,
+  onQuery,
+  prefs,
+  onChange,
+  stateTotals,
+}: {
+  query: string
+  onQuery: (value: string) => void
+  prefs: MovieListPrefs
+  onChange: (change: Partial<MovieListPrefs>) => void
+  stateTotals: Record<(typeof STATES)[number]['value'], number>
+}) {
+  const filtered = hasActiveFilters(prefs)
+  const DirIcon = prefs.dir === 'asc' ? ArrowUp : ArrowDown
+  return (
+    <div className="mb-6 flex flex-col gap-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-end">
+        <label className="sm:w-80">
+          <span className="sr-only">Buscar na biblioteca</span>
+          <Input
+            type="search"
+            value={query}
+            onChange={(event) => onQuery(event.target.value)}
+            placeholder="Buscar por título, ano ou IMDb"
+          />
+        </label>
+        <div className="flex items-end gap-2 sm:ml-auto">
+          <div className="flex min-w-0 flex-1 flex-col gap-1.5 sm:w-52 sm:flex-none">
+            <Label htmlFor="filmes-ordem" className="text-xs text-content-muted">
+              Ordenar por
+            </Label>
+            <Select
+              value={prefs.sort}
+              onValueChange={(value) => onChange({ sort: value as SortKey, dir: defaultDir(value as SortKey) })}
+            >
+              <SelectTrigger id="filmes-ordem">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {SORTS.map(({ value, label }) => (
+                  <SelectItem key={value} value={value}>
+                    {label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <Button
+            variant="secondary"
+            size="icon"
+            onClick={() => onChange({ dir: prefs.dir === 'asc' ? 'desc' : 'asc' })}
+            aria-label={`Inverter a ordem (agora ${prefs.dir === 'asc' ? 'crescente' : 'decrescente'})`}
+            title={prefs.dir === 'asc' ? 'Crescente' : 'Decrescente'}
+          >
+            <DirIcon aria-hidden="true" />
+          </Button>
+          <ChipGroup label="Visualização" single>
+            <Chip single active={prefs.view === 'poster'} onClick={() => onChange({ view: 'poster' })}>
+              <LayoutGrid className="size-4" aria-hidden="true" />
+              Pôster
+            </Chip>
+            <Chip single active={prefs.view === 'tabela'} onClick={() => onChange({ view: 'tabela' })}>
+              <Table2 className="size-4" aria-hidden="true" />
+              Tabela
+            </Chip>
+          </ChipGroup>
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-3">
+        <ChipGroup label="Estado" single>
+          {STATES.filter((s) => s.value !== 'problemas' || stateTotals.problemas > 0 || prefs.state === 'problemas').map(
+            ({ value, label }) => (
+              <Chip key={value} single active={prefs.state === value} onClick={() => onChange({ state: value })}>
+                {label}
+                <span className={cn('tabular-nums', value === 'problemas' && stateTotals[value] > 0 ? 'text-danger' : 'text-content-subtle')}>
+                  ({formatCount(stateTotals[value])})
+                </span>
+              </Chip>
+            ),
+          )}
+        </ChipGroup>
+        <div className="flex flex-wrap items-center gap-3">
+          <ChipGroup label="Qualidade">
+            {QUALITIES.map(({ value, label }) => (
+              <Chip
+                key={value}
+                active={prefs.qualities.includes(value)}
+                onClick={() => onChange({ qualities: toggle(prefs.qualities, value) })}
+              >
+                {label}
+              </Chip>
+            ))}
+          </ChipGroup>
+          <ChipGroup label="Áudio">
+            {AUDIOS.map(({ value, label }) => (
+              <Chip
+                key={value}
+                active={prefs.audio.includes(value)}
+                onClick={() => onChange({ audio: toggle(prefs.audio, value) })}
+              >
+                {label}
+              </Chip>
+            ))}
+          </ChipGroup>
+          <ChipGroup label="Monitoramento" single>
+            {MONITORED.map(({ value, label }) => (
+              <Chip key={value} single active={prefs.monitored === value} onClick={() => onChange({ monitored: value })}>
+                {label}
+              </Chip>
+            ))}
+          </ChipGroup>
+          {filtered && (
+            <Button variant="ghost" size="sm" onClick={() => onChange({ ...CLEARED })}>
+              Limpar filtros
+            </Button>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/** Estado do filme numa palavra, para a tabela. */
+function StateBadge({ movie }: { movie: Movie }) {
+  if (hasProblem(movie)) {
+    const disk = DISK[movie.arquivo!.disco]
+    return (
+      <Badge tone={disk.tone}>
+        <disk.icon aria-hidden="true" />
+        {disk.label}
+      </Badge>
+    )
+  }
+  if (movie.arquivo) {
+    return (
+      <Badge tone="success">
+        <CircleCheck aria-hidden="true" />
+        No disco
+      </Badge>
+    )
+  }
+  if (isQueued(movie)) {
+    return (
+      <Badge>
+        <CircleDashed aria-hidden="true" />
+        Na fila
+      </Badge>
+    )
+  }
+  if (isDownloading(movie)) {
+    return (
+      <Badge tone="accent">
+        <LoaderCircle className="animate-spin motion-reduce:animate-none" aria-hidden="true" />
+        Baixando
+      </Badge>
+    )
+  }
+  if (hasFailed(movie)) {
+    return (
+      <Badge tone="danger">
+        <CircleAlert aria-hidden="true" />
+        Falhou
+      </Badge>
+    )
+  }
+  return (
+    <Badge>
+      <CircleDashed aria-hidden="true" />
+      {movie.monitorado ? 'Faltando' : 'Não monitorado'}
+    </Badge>
+  )
+}
+
+const dateFormat = new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: 'short', year: 'numeric' })
+
+function formatDay(iso: string | null | undefined): string {
+  if (!iso) return '—'
+  const date = new Date(iso)
+  return Number.isNaN(date.getTime()) ? '—' : dateFormat.format(date)
+}
+
+const COLUMNS: { label: string; sort: SortKey | null; align: 'left' | 'right' }[] = [
+  { label: 'Título', sort: 'titulo', align: 'left' },
+  { label: 'Ano', sort: 'ano', align: 'right' },
+  { label: 'Qualidade', sort: 'qualidade', align: 'left' },
+  { label: 'Tamanho', sort: 'tamanho', align: 'right' },
+  { label: 'Estado', sort: null, align: 'left' },
+  { label: 'Adicionado', sort: 'adicionado', align: 'right' },
+]
+
+function MovieTable({
+  movies,
+  sort,
+  dir,
+  onSort,
+  onOpen,
+}: {
+  movies: Movie[]
+  sort: SortKey
+  dir: 'asc' | 'desc'
+  onSort: (sort: SortKey) => void
+  onOpen: (id: number) => void
+}) {
+  return (
+    <div className="overflow-x-auto rounded-lg border border-border">
+      <table className="w-full min-w-[42rem] border-collapse text-sm">
+        <caption className="sr-only">Filmes</caption>
+        <thead className="bg-surface-raised text-xs text-content-muted">
+          <tr>
+            {COLUMNS.map(({ label, sort: key, align }) => {
+              const active = key !== null && key === sort
+              const Icon = active ? (dir === 'asc' ? ArrowUp : ArrowDown) : ArrowUpDown
+              return (
+                <th
+                  key={label}
+                  scope="col"
+                  aria-sort={active ? (dir === 'asc' ? 'ascending' : 'descending') : key ? 'none' : undefined}
+                  className={cn('px-3 py-2 font-medium whitespace-nowrap', align === 'right' ? 'text-right' : 'text-left')}
+                >
+                  {key ? (
+                    <button
+                      type="button"
+                      onClick={() => onSort(key)}
+                      className={cn(
+                        'inline-flex items-center gap-1 rounded-sm hover:text-content focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring',
+                        active && 'text-content',
+                      )}
+                    >
+                      {label}
+                      <Icon className={cn('size-3.5', !active && 'opacity-50')} aria-hidden="true" />
+                    </button>
+                  ) : (
+                    label
+                  )}
+                </th>
+              )
+            })}
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-border">
+          {movies.map((movie) => (
+            <tr
+              key={movie.id}
+              onClick={() => onOpen(movie.id)}
+              className="cursor-pointer bg-surface transition-colors hover:bg-surface-raised"
+            >
+              <td className="max-w-[22rem] px-3 py-2">
+                {/* O botão é o alvo de teclado; o clique na linha inteira é só conveniência do mouse. */}
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    onOpen(movie.id)
+                  }}
+                  className="block max-w-full truncate rounded-sm text-left font-medium focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+                  title={movie.titulo}
+                >
+                  {movie.titulo}
+                </button>
+              </td>
+              <td className="px-3 py-2 text-right text-content-muted tabular-nums">{movie.ano ?? '—'}</td>
+              <td className="px-3 py-2 whitespace-nowrap text-content-muted">{movie.arquivo?.qualidade ?? '—'}</td>
+              <td className="px-3 py-2 text-right whitespace-nowrap text-content-muted tabular-nums">
+                {movie.arquivo ? formatSize(movie.arquivo.tamanho) : '—'}
+              </td>
+              <td className="px-3 py-2">
+                <StateBadge movie={movie} />
+              </td>
+              <td className="px-3 py-2 text-right whitespace-nowrap text-content-muted tabular-nums">
+                {formatDay(movie.adicionado)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
 const GRID =
   'grid grid-cols-[repeat(auto-fill,minmax(6.5rem,1fr))] gap-x-3 gap-y-5 sm:gap-x-4 sm:gap-y-6 sm:grid-cols-[repeat(auto-fill,minmax(10rem,1fr))]'
-
-/** Ordem de estante: sem artigo inicial. */
-function sortKey(movie: Movie) {
-  return normalize(movie.titulo).replace(/^(the|a|an|o|os|as|um|uma)\s+/, '')
-}
 
 const STATUS: Record<string, string> = {
   announced: 'Anunciado',

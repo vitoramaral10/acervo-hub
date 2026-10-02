@@ -71,7 +71,8 @@ const VIEWS: View[] = [...MAIN, ...CONFIG].map((item) => item.view)
 const inConfig = (view: View) => CONFIG.some((item) => item.view === view)
 
 function viewFromHash(): View {
-  const hash = window.location.hash.slice(1)
+  // A query depois de `?` é da tela (ex.: `#filmes?ordem=ano`), não faz parte do nome.
+  const hash = window.location.hash.slice(1).split('?')[0]
   // Endereço salvo da antiga página única de configurações.
   if (hash === 'configuracoes') return 'servidor'
   return VIEWS.includes(hash as View) ? (hash as View) : 'filmes'
