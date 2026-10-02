@@ -147,8 +147,7 @@ pub fn router(web: Arc<Web>) -> Router {
 // ---------------------------------------------------------------- opções
 
 async fn options(State(web): Shared, headers: HeaderMap) -> WebResult {
-    let store = enter(&web, &headers, &Method::GET).await?;
-    let tags = store.tags().await.map_err(|e| fail(bad(e)))?;
+    enter(&web, &headers, &Method::GET).await?;
     let map = web.config().path_map();
     let roots = web.config().library.root_folders.clone();
     let folders = tokio::task::spawn_blocking(move || {
@@ -167,7 +166,6 @@ async fn options(State(web): Shared, headers: HeaderMap) -> WebResult {
     .unwrap_or_default();
     ok(&json!({
         "pastas": folders,
-        "tags": tags.iter().map(|t| json!({ "id": t.id, "nome": t.label })).collect::<Vec<_>>(),
         "qualidades": Quality::ALL.iter().filter(|q| **q != Quality::Unknown)
             .map(|q| json!({ "id": q.id(), "nome": q.name() })).collect::<Vec<_>>(),
         "indexadores": web.catalog.views().into_iter().map(|v| v.name).collect::<Vec<_>>(),
@@ -280,8 +278,6 @@ struct AddBody {
     #[serde(default = "yes")]
     monitorado: bool,
     #[serde(default)]
-    tags: Vec<i64>,
-    #[serde(default)]
     buscar: bool,
 }
 
@@ -306,10 +302,8 @@ async fn add_movie(
         .map_err(|e| fail(anyhow_bad(&e)))?;
     let request = crate::library::AddRequest {
         tmdb_id: body.tmdb,
-        quality_profile: None,
         root_folder: body.pasta,
         monitored: body.monitorado,
-        tags: body.tags,
     };
     let id = crate::library::add(store, &tmdb, &request)
         .await

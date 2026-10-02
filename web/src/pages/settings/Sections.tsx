@@ -216,7 +216,7 @@ function ServerForm({ data, save, saving }: FormProps<'servidor'>) {
       <Field
         id="servidor-chave"
         label="Chave de API"
-        help="Vale para o Torznab, a API v3 de filmes e o cabeçalho X-Api-Key. Ao menos 16 caracteres. Trocar derruba quem usa a antiga: sincronize os aplicativos depois."
+        help="Vale para o Torznab e o cabeçalho X-Api-Key. Ao menos 16 caracteres. Trocar derruba quem usa a antiga: sincronize os aplicativos depois."
       >
         {generated ? (
           <Input
@@ -582,7 +582,7 @@ function LibraryForm({ data, save, saving }: FormProps<'biblioteca'>) {
       <Field
         id="biblioteca-pastas"
         label="Pastas raiz dos filmes"
-        help="Uma por linha, como os gerenciadores as veem. A API v3 as oferece aos apps de pedidos."
+        help="Uma por linha, como o cliente de download as vê. São as opções ao adicionar um filme."
       >
         <LinesInput
           id="biblioteca-pastas"

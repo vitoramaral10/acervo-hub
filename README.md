@@ -51,14 +51,14 @@ Workspace Cargo, binário único `acervo-hub`:
 | `acervo-parser` | Parsing de nome de release | existe |
 | `acervo-decision` | Casamento com o filme, rejeições e ordem de preferência (perfil automático) | existe |
 | `acervo-store` | Catálogo, histórico, fila e contas no Postgres | existe |
-| `acervo-api` | HTTP: Torznab, interface web e compatibilidade com a API v3 de filmes | existe |
+| `acervo-api` | HTTP: Torznab e interface web | existe |
 
 ### Duas decisões que mandam no projeto
 
-**Compatibilidade de API não é opcional.** Gerenciadores de legenda e portais de pedido
-falam a API v3 dos serviços existentes. Substituir os quatro sem expor um subconjunto
-compatível (`/series`, `/movie`, `/queue`, `/history`, `/qualityprofile`, `/rootfolder` e
-webhooks) quebra o resto do ecossistema. Por isso `acervo-api` nasce com duas superfícies.
+**Filme entra só pela tela.** O acervo não expõe a API v3 de gerenciador de filmes: o
+portal de pedidos fica só com as séries, no gerenciador de séries, e filme novo se adiciona
+em **Filmes**. A superfície HTTP é o Torznab, que o gerenciador de séries consome, e a
+interface.
 
 **O parser é o crate perigoso.** O parsing de nome de release é uma década de regex
 acumulada contra a criatividade dos grupos de scene. É tabela de dados, não lógica — mas
@@ -89,7 +89,7 @@ As tabelas são criadas na primeira conexão. Banco novo sobe com os padrões; o
 preenche em **Configurações**: Cliente de download, Jellyfin, Biblioteca, Limpeza, Regras de
 decisão, Notificações, TMDB e Servidor (onde se gera a chave de API). Os gerenciadores
 (Sonarr, Radarr) se cadastram em **Aplicativos**; os intervalos das tarefas, na própria tela
-**Tarefas**. Sem chave de API definida, Torznab e API v3 recusam tudo.
+**Tarefas**. Sem chave de API definida, o Torznab recusa tudo.
 
 **Vindo do `config.toml`?** Uma vez só, aponte `ACERVO_IMPORT_CONFIG` para o arquivo antigo
 e suba o `serve`: com o banco ainda sem configuração, ele lê o arquivo e os arquivos de
@@ -201,8 +201,8 @@ docker build -t acervo-hub .
 ```
 
 Multi-stage com alvo musl e distroless `static` como base: o binário estático e um
-`ffprobe` estático (≈135 MB, a maior parte da imagem), que lê as faixas de áudio e legenda
-do que o acervo importa. Sem shell, sem gerenciador de pacotes, sem `curl` — o que não está
+`ffprobe` estático (≈135 MB, a maior parte da imagem), que lê os idiomas das faixas de
+áudio do que o acervo importa. Sem shell, sem gerenciador de pacotes, sem `curl` — o que não está
 lá não precisa ser corrigido nem serve a quem entrar.
 
 `deploy/` traz o serviço para um stack Compose existente. Dois pontos do desenho que

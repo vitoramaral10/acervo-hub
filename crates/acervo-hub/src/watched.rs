@@ -484,7 +484,6 @@ mod tests {
             year: Some(2024),
             status: None,
             monitored: false,
-            quality_profile: None,
             path: path.into(),
             added: None,
             file: None,
@@ -497,7 +496,6 @@ mod tests {
             digital_release: None,
             physical_release: None,
             overview: None,
-            tags: Vec::new(),
         }
     }
 

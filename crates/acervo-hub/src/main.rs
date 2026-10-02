@@ -9,15 +9,11 @@
 //! há duas variáveis de ambiente: `ACERVO_DATABASE_URL`, que todo comando
 //! usa, e `ACERVO_BIND`, o endereço de escuta do `serve`.
 
-// O filme da API v3 é um `json!` de ~50 campos, um nível de macro por campo.
-#![recursion_limit = "256"]
-
 use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-mod api_v3;
 mod apply;
 mod automatic;
 mod collect;
@@ -114,9 +110,6 @@ enum MoviesAction {
     Add {
         /// Id do filme no TMDB.
         tmdb: u32,
-        /// Perfil guardado, pelo nome; a decisão usa sempre o automático.
-        #[arg(long)]
-        profile: Option<String>,
         /// Pasta raiz, como o gerenciador a vê.
         #[arg(long, default_value = "/media/movies")]
         root: String,
@@ -124,8 +117,7 @@ enum MoviesAction {
         #[arg(long)]
         unmonitored: bool,
     },
-    /// Atualiza os metadados pelo TMDB: dos filmes do acervo, tudo; dos que
-    /// vieram do gerenciador, só o que ele não expõe (título em inglês, pôster).
+    /// Atualiza os metadados pelo TMDB.
     Refresh {
         /// Todos, e não só os conferidos há mais de um dia.
         #[arg(long)]
@@ -265,7 +257,6 @@ async fn movies_command(
         }
         MoviesAction::Add {
             tmdb,
-            profile,
             root,
             unmonitored,
         } => {
@@ -275,10 +266,8 @@ async fn movies_command(
                 &client,
                 &library::AddRequest {
                     tmdb_id: tmdb,
-                    quality_profile: profile,
                     root_folder: root,
                     monitored: !unmonitored,
-                    tags: Vec::new(),
                 },
             )
             .await?;

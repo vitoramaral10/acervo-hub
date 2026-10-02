@@ -67,7 +67,7 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     /// Chave que os consumidores mandam em `apikey`. Vale para todos os
-    /// indexadores servidos, para a API v3 e para a tela em `X-Api-Key`.
+    /// indexadores servidos e para a tela em `X-Api-Key`.
     /// Vazia, nada disso aceita chave nenhuma.
     pub api_key: String,
     /// Como os gerenciadores alcançam este serviço — o endereço que `sync`
@@ -202,8 +202,8 @@ pub struct LibraryConfig {
     /// Raízes do acervo, no host. Servem para medir o tamanho total, que é a
     /// base da trava proporcional.
     pub roots: Vec<PathBuf>,
-    /// Pastas raiz dos filmes, como os gerenciadores as veem. A API v3 as
-    /// oferece aos apps de pedidos.
+    /// Pastas raiz dos filmes, como o cliente de download as vê. A tela
+    /// oferece-as ao adicionar filme; apagar pasta só vale dentro delas.
     pub root_folders: Vec<String>,
     /// Categoria do cliente de download para o que o acervo pega. Separada da
     /// do gerenciador, para ele não tentar importar o que não pegou.

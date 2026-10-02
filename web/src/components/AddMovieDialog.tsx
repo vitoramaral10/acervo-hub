@@ -36,7 +36,6 @@ function Choose({ result, onBack, onDone }: { result: TmdbResult; onBack: () => 
         tmdb: result.tmdb,
         pasta: folder,
         monitorado: monitored,
-        tags: [],
         buscar: search && monitored,
       }),
     onSuccess: ({ id }) => {

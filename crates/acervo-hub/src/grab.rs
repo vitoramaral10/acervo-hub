@@ -4,7 +4,7 @@
 //! O que é pego vai ao cliente numa categoria própria, que o gerenciador de
 //! filmes não importa. A importação liga (hardlink) o arquivo baixado com o
 //! nome que o gerenciador daria, na pasta do filme; num upgrade, troca o
-//! antigo. Filme que ainda é do gerenciador é relido por ele depois.
+//! antigo.
 //!
 //! Download que o cliente dá como perdido vai para a lista de bloqueio e o
 //! filme é buscado de novo (com a busca automática ligada). Problema na
@@ -489,8 +489,7 @@ fn imported_file(
         .filter(|l| *l != acervo_parser::Language::Unknown)
         .collect();
     let languages = probe
-        .as_ref()
-        .map(|p| p.audio_languages.clone())
+        .map(|p| p.audio_languages)
         .filter(|l| !l.is_empty())
         .unwrap_or(from_name);
     MovieFile {
@@ -502,8 +501,6 @@ fn imported_file(
         edition: parsed.and_then(|p| p.edition),
         scene_name: Some(grab.title.clone()),
         date_added: Some(now_rfc3339()),
-        id: None,
-        media_info: probe.map(|p| p.media_info),
     }
 }
 

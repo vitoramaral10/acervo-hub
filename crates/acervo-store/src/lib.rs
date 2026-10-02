@@ -1,10 +1,6 @@
-//! Catálogo persistente: filmes, o arquivo de cada um, os perfis de
-//! qualidade e as contas da interface, num banco Postgres.
-//!
-//! Nesta etapa o catálogo é um espelho do gerenciador de filmes em produção,
-//! importado pela API dele. A importação roda numa transação: a simulação faz
-//! o mesmo trabalho e desfaz no fim, então o que ela relata é exatamente o que
-//! a aplicação faria.
+//! Catálogo persistente: filmes, o arquivo de cada um, downloads, histórico,
+//! configuração e as contas da interface, num banco Postgres. O acervo é o
+//! único dono dos filmes: eles entram pela tela.
 
 mod accounts;
 mod config;
@@ -13,7 +9,7 @@ mod tasks;
 
 use acervo_parser::{Quality, QualityModel, Revision};
 use deadpool_postgres::{GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio_postgres::{NoTls, Row};
 
 pub use accounts::SESSION_DAYS;
@@ -41,31 +37,6 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-/// Um degrau do perfil: uma qualidade, ou um grupo delas que vale o mesmo.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProfileItem {
-    pub name: String,
-    pub qualities: Vec<Quality>,
-    pub allowed: bool,
-}
-
-/// Perfil de qualidade. `items` vai do pior ao melhor, como na referência.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QualityProfile {
-    pub name: String,
-    pub upgrade_allowed: bool,
-    /// Posição em `items` a partir da qual não se busca mais upgrade.
-    pub cutoff: Option<usize>,
-    pub language: Option<String>,
-    pub items: Vec<ProfileItem>,
-    pub min_format_score: i32,
-    pub cutoff_format_score: i32,
-    /// Id do perfil no gerenciador de onde ele veio.
-    pub source_id: Option<i64>,
-    /// Nota de cada formato personalizado, pelo id dele.
-    pub format_scores: std::collections::BTreeMap<i64, i32>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MovieFile {
     /// Relativo à pasta do filme.
@@ -78,11 +49,6 @@ pub struct MovieFile {
     /// Nome do release de onde o arquivo veio.
     pub scene_name: Option<String>,
     pub date_added: Option<String>,
-    /// Id estável do arquivo: o do gerenciador, se veio de lá. Quem guarda
-    /// esse id (o app de legendas guarda) percebe troca de arquivo por ele.
-    pub id: Option<i64>,
-    /// Faixas de áudio, vídeo e legenda, como o gerenciador as leu.
-    pub media_info: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,8 +62,6 @@ pub struct Movie {
     /// `announced`, `inCinemas` ou `released`.
     pub status: Option<String>,
     pub monitored: bool,
-    /// Nome do perfil de qualidade.
-    pub quality_profile: Option<String>,
     /// Pasta do filme, como o gerenciador a vê.
     pub path: String,
     pub added: Option<String>,
@@ -118,8 +82,6 @@ pub struct Movie {
     pub digital_release: Option<String>,
     pub physical_release: Option<String>,
     pub overview: Option<String>,
-    /// Ids da tabela de tags.
-    pub tags: Vec<i64>,
 }
 
 /// O que só a base de metadados sabe e o gerenciador não expõe.
@@ -133,21 +95,11 @@ pub struct MovieExtras {
     pub refreshed_at: Option<String>,
 }
 
-/// Uma tag, como a API v3 a mostra.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Tag {
-    pub id: i64,
-    pub label: String,
-}
-
-/// Um filme do catálogo, com o id local e de onde veio.
+/// Um filme do catálogo, com o id local.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogMovie {
     pub id: i64,
     pub movie: Movie,
-    /// Instância de origem e o id do filme lá, se veio de importação. Sem
-    /// origem, o acervo é o dono do filme.
-    pub origin: Option<(String, i64)>,
     pub extras: MovieExtras,
 }
 
@@ -491,6 +443,24 @@ const MIGRATIONS: &[&str] = &[
     r"
     ALTER TABLE movies DROP COLUMN minimum_availability;
 ",
+    // Sai a API v3 de filmes e o que só ela lia: perfis guardados, tags, a
+    // origem no gerenciador, o id e as faixas do arquivo no formato dela; e
+    // as tabelas que sobraram do espelho do Radarr. Os tamanhos por
+    // qualidade (`quality_definitions`) ficam: o motor de decisão os usa.
+    r"
+    DROP TABLE import_lists;
+    DROP TABLE exclusions;
+    DROP TABLE custom_formats;
+    ALTER TABLE movies
+        DROP COLUMN quality_profile_id,
+        DROP COLUMN tags,
+        DROP COLUMN source,
+        DROP COLUMN source_id;
+    DROP TABLE quality_profiles;
+    DROP TABLE tags;
+    ALTER TABLE movie_files DROP COLUMN file_id, DROP COLUMN media_info;
+    DROP SEQUENCE movie_file_ids;
+",
 ];
 
 /// Chave do lock consultivo que serializa as migrações: o serviço e um
@@ -579,54 +549,6 @@ impl Store {
     /// Falha de leitura ou registro inconsistente.
     pub async fn movies(&self) -> Result<Vec<CatalogMovie>> {
         read_movies(&self.pool.get().await?).await
-    }
-
-    /// # Errors
-    ///
-    /// Falha de leitura ou registro inconsistente.
-    pub async fn profiles(&self) -> Result<Vec<QualityProfile>> {
-        let client = self.pool.get().await?;
-        let rows = client
-            .query(
-                "SELECT name, upgrade_allowed, cutoff, language, items, min_format_score,
-                        cutoff_format_score, source_id, format_scores
-                 FROM quality_profiles ORDER BY name",
-                &[],
-            )
-            .await?;
-        rows.iter()
-            .map(|row| {
-                let items: serde_json::Value = row.try_get(4)?;
-                Ok(QualityProfile {
-                    name: row.try_get(0)?,
-                    upgrade_allowed: row.try_get(1)?,
-                    cutoff: row
-                        .try_get::<_, Option<i32>>(2)?
-                        .and_then(|c| usize::try_from(c).ok()),
-                    language: row.try_get(3)?,
-                    items: decode_items(items)?,
-                    min_format_score: row.try_get(5)?,
-                    cutoff_format_score: row.try_get(6)?,
-                    source_id: row.try_get(7)?,
-                    format_scores: decode_scores(row.try_get(8)?)?,
-                })
-            })
-            .collect()
-    }
-
-    /// Os perfis com o id do catálogo, que é o que a API v3 mostra.
-    ///
-    /// # Errors
-    ///
-    /// Falha de leitura ou registro inconsistente.
-    pub async fn profile_ids(&self) -> Result<Vec<(i64, String)>> {
-        let client = self.pool.get().await?;
-        client
-            .query("SELECT id, name FROM quality_profiles ORDER BY id", &[])
-            .await?
-            .iter()
-            .map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
-            .collect()
     }
 
     /// Tamanhos por qualidade.
@@ -742,13 +664,13 @@ impl Store {
     pub async fn add_movie(&self, movie: &Movie, extras: &MovieExtras) -> Result<i64> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
-        let id = write_movie(&tx, None, movie, None).await?;
+        let id = write_movie(&tx, None, movie).await?;
         write_extras(&tx, id, extras).await?;
         tx.commit().await?;
         Ok(id)
     }
 
-    /// Regrava um filme do acervo, mantendo a origem que ele tiver.
+    /// Regrava um filme do acervo.
     ///
     /// # Errors
     ///
@@ -756,16 +678,14 @@ impl Store {
     pub async fn update_movie(&self, id: i64, movie: &Movie) -> Result<()> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
-        let origin: Option<(Option<String>, Option<i64>)> = tx
-            .query_opt("SELECT source, source_id FROM movies WHERE id = $1", &[&id])
+        let exists = tx
+            .query_opt("SELECT 1 FROM movies WHERE id = $1", &[&id])
             .await?
-            .map(|row| Ok::<_, StoreError>((row.try_get(0)?, row.try_get(1)?)))
-            .transpose()?;
-        let Some((source, source_id)) = origin else {
+            .is_some();
+        if !exists {
             return Err(StoreError::Corrupt(format!("filme {id} não existe")));
-        };
-        let origin = source.as_deref().zip(source_id);
-        write_movie(&tx, Some(id), movie, origin).await?;
+        }
+        write_movie(&tx, Some(id), movie).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -809,58 +729,6 @@ impl Store {
             .execute("DELETE FROM movies WHERE id = $1", &[&id])
             .await?
             > 0)
-    }
-
-    /// # Errors
-    ///
-    /// Falha de leitura.
-    pub async fn tags(&self) -> Result<Vec<Tag>> {
-        let client = self.pool.get().await?;
-        client
-            .query("SELECT id, label FROM tags ORDER BY id", &[])
-            .await?
-            .iter()
-            .map(|row| {
-                Ok(Tag {
-                    id: row.try_get(0)?,
-                    label: row.try_get(1)?,
-                })
-            })
-            .collect()
-    }
-
-    /// Cria a tag, ou devolve a que já tem esse rótulo.
-    ///
-    /// # Errors
-    ///
-    /// Falha de escrita.
-    pub async fn create_tag(&self, label: &str) -> Result<Tag> {
-        let client = self.pool.get().await?;
-        let label = label.trim().to_lowercase();
-        let row = client
-            .query_one(
-                "INSERT INTO tags (label) VALUES ($1)
-                 ON CONFLICT (label) DO UPDATE SET label = excluded.label
-                 RETURNING id",
-                &[&label],
-            )
-            .await?;
-        Ok(Tag {
-            id: row.try_get(0)?,
-            label,
-        })
-    }
-
-    /// # Errors
-    ///
-    /// Rótulo já usado por outra tag ou falha de escrita.
-    pub async fn rename_tag(&self, id: i64, label: &str) -> Result<Option<Tag>> {
-        let client = self.pool.get().await?;
-        let label = label.trim().to_lowercase();
-        let changed = client
-            .execute("UPDATE tags SET label = $2 WHERE id = $1", &[&id, &label])
-            .await?;
-        Ok((changed > 0).then_some(Tag { id, label }))
     }
 
     /// Uma configuração guardada pela interface.
@@ -1007,32 +875,6 @@ impl Store {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct StoredItem {
-    name: String,
-    qualities: Vec<u8>,
-    allowed: bool,
-}
-
-fn decode_items(value: serde_json::Value) -> Result<Vec<ProfileItem>> {
-    let stored: Vec<StoredItem> = serde_json::from_value(value)
-        .map_err(|e| StoreError::Corrupt(format!("itens de perfil: {e}")))?;
-    stored
-        .into_iter()
-        .map(|item| {
-            Ok(ProfileItem {
-                qualities: item
-                    .qualities
-                    .into_iter()
-                    .map(|id| quality(i16::from(id)))
-                    .collect::<Result<_>>()?,
-                name: item.name,
-                allowed: item.allowed,
-            })
-        })
-        .collect()
-}
-
 fn quality(id: i16) -> Result<Quality> {
     u8::try_from(id)
         .ok()
@@ -1048,43 +890,12 @@ fn narrow<T: TryFrom<i32>>(value: i32, what: &str) -> Result<T> {
     T::try_from(value).map_err(|_| StoreError::Corrupt(format!("{what} {value}")))
 }
 
-pub(crate) fn decode_scores(
-    value: serde_json::Value,
-) -> Result<std::collections::BTreeMap<i64, i32>> {
-    let raw: std::collections::BTreeMap<String, i32> = serde_json::from_value(value)
-        .map_err(|e| StoreError::Corrupt(format!("notas de formato: {e}")))?;
-    raw.into_iter()
-        .map(|(id, score)| {
-            id.parse()
-                .map(|id| (id, score))
-                .map_err(|_| StoreError::Corrupt(format!("formato `{id}`")))
-        })
-        .collect()
-}
-
-async fn write_movie(
-    client: &impl GenericClient,
-    id: Option<i64>,
-    movie: &Movie,
-    source: Option<(&str, i64)>,
-) -> Result<i64> {
-    let profile_id: Option<i64> = match &movie.quality_profile {
-        Some(name) => client
-            .query_opt("SELECT id FROM quality_profiles WHERE name = $1", &[name])
-            .await?
-            .map(|row| row.try_get(0))
-            .transpose()?,
-        None => None,
-    };
+async fn write_movie(client: &impl GenericClient, id: Option<i64>, movie: &Movie) -> Result<i64> {
     let tmdb_id = i64::from(movie.tmdb_id);
     let year = movie.year.map(i32::from);
     let runtime = i32::try_from(movie.runtime).unwrap_or(i32::MAX);
     let secondary_year = movie.secondary_year.map(i32::from);
-    let source_id = source.map(|(_, id)| id);
-    let source = source.map(|(name, _)| name);
-    let tags =
-        serde_json::to_value(&movie.tags).map_err(|e| StoreError::Corrupt(format!("tags: {e}")))?;
-    let values: [&(dyn tokio_postgres::types::ToSql + Sync); 22] = [
+    let values: [&(dyn tokio_postgres::types::ToSql + Sync); 18] = [
         &tmdb_id,
         &movie.imdb_id,
         &movie.title,
@@ -1093,11 +904,8 @@ async fn write_movie(
         &year,
         &movie.status,
         &movie.monitored,
-        &profile_id,
         &movie.path,
         &movie.added,
-        &source,
-        &source_id,
         &runtime,
         &secondary_year,
         &movie.clean_title,
@@ -1106,7 +914,6 @@ async fn write_movie(
         &movie.digital_release,
         &movie.physical_release,
         &movie.overview,
-        &tags,
     ];
     let id: i64 = if let Some(id) = id {
         let mut params = values.to_vec();
@@ -1114,12 +921,11 @@ async fn write_movie(
         client
             .execute(
                 "UPDATE movies SET tmdb_id = $1, imdb_id = $2, title = $3, original_title = $4,
-                     original_language = $5, year = $6, status = $7,
-                     monitored = $8, quality_profile_id = $9, path = $10, added = $11,
-                     source = $12, source_id = $13, runtime = $14, secondary_year = $15,
-                     clean_title = $16, available = $17, in_cinemas = $18,
-                     digital_release = $19, physical_release = $20, overview = $21, tags = $22
-                 WHERE id = $23",
+                     original_language = $5, year = $6, status = $7, monitored = $8,
+                     path = $9, added = $10, runtime = $11, secondary_year = $12,
+                     clean_title = $13, available = $14, in_cinemas = $15,
+                     digital_release = $16, physical_release = $17, overview = $18
+                 WHERE id = $19",
                 &params,
             )
             .await?;
@@ -1128,11 +934,11 @@ async fn write_movie(
         client
             .query_one(
                 "INSERT INTO movies (tmdb_id, imdb_id, title, original_title, original_language,
-                     year, status, monitored, quality_profile_id, path,
-                     added, source, source_id, runtime, secondary_year, clean_title, available,
-                     in_cinemas, digital_release, physical_release, overview, tags)
+                     year, status, monitored, path, added, runtime, secondary_year,
+                     clean_title, available, in_cinemas, digital_release, physical_release,
+                     overview)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                     $17, $18, $19, $20, $21, $22)
+                     $17, $18)
                  RETURNING id",
                 &values,
             )
@@ -1174,9 +980,8 @@ async fn insert_file(client: &impl GenericClient, movie_id: i64, file: &MovieFil
         .execute(
             "INSERT INTO movie_files (movie_id, relative_path, size, quality,
                  revision_version, revision_real, is_repack, languages, release_group,
-                 edition, scene_name, date_added, file_id, media_info)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                 COALESCE($13, nextval('movie_file_ids')), $14)",
+                 edition, scene_name, date_added)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             &[
                 &movie_id,
                 &file.relative_path,
@@ -1190,8 +995,6 @@ async fn insert_file(client: &impl GenericClient, movie_id: i64, file: &MovieFil
                 &file.edition,
                 &file.scene_name,
                 &file.date_added,
-                &file.id,
-                &file.media_info,
             ],
         )
         .await?;
@@ -1216,52 +1019,53 @@ async fn write_extras(client: &impl GenericClient, id: i64, extras: &MovieExtras
     Ok(())
 }
 
+/// O arquivo da linha de `read_movies`, cujas colunas vêm com prefixo `f_`.
 fn read_file(row: &Row) -> Result<Option<MovieFile>> {
-    let Some(relative_path) = row.try_get::<_, Option<String>>(14)? else {
+    let Some(relative_path) = row.try_get::<_, Option<String>>("f_relative_path")? else {
         return Ok(None);
     };
-    let languages: serde_json::Value = row.try_get(20)?;
-    let revision = |index: usize| -> Result<u8> {
-        u8::try_from(row.try_get::<_, i16>(index)?)
+    let languages: serde_json::Value = row.try_get("f_languages")?;
+    let revision = |column: &str| -> Result<u8> {
+        u8::try_from(row.try_get::<_, i16>(column)?)
             .map_err(|_| StoreError::Corrupt("revisão".into()))
     };
     Ok(Some(MovieFile {
         relative_path,
-        size: u64::try_from(row.try_get::<_, i64>(15)?).unwrap_or(0),
+        size: u64::try_from(row.try_get::<_, i64>("f_size")?).unwrap_or(0),
         quality: QualityModel {
-            quality: quality(row.try_get(16)?)?,
+            quality: quality(row.try_get("f_quality")?)?,
             revision: Revision {
-                version: revision(17)?,
-                real: revision(18)?,
-                is_repack: row.try_get(19)?,
+                version: revision("f_revision_version")?,
+                real: revision("f_revision_real")?,
+                is_repack: row.try_get("f_is_repack")?,
             },
         },
         languages: serde_json::from_value(languages)
             .map_err(|e| StoreError::Corrupt(format!("idiomas: {e}")))?,
-        release_group: row.try_get(21)?,
-        edition: row.try_get(22)?,
-        scene_name: row.try_get(23)?,
-        date_added: row.try_get(24)?,
-        id: row.try_get(38)?,
-        media_info: row.try_get(39)?,
+        release_group: row.try_get("f_release_group")?,
+        edition: row.try_get("f_edition")?,
+        scene_name: row.try_get("f_scene_name")?,
+        date_added: row.try_get("f_date_added")?,
     }))
 }
 
 async fn read_movies(client: &impl GenericClient) -> Result<Vec<CatalogMovie>> {
+    // Colunas lidas pelo nome: o arquivo vem com prefixo `f_`, para não
+    // colidir com as do filme.
     let rows = client
         .query(
             "SELECT m.id, m.tmdb_id, m.imdb_id, m.title, m.original_title, m.original_language,
-                    m.year, m.status, m.monitored, p.name, m.path,
-                    m.added, m.source, m.source_id,
-                    f.relative_path, f.size, f.quality, f.revision_version, f.revision_real,
-                    f.is_repack, f.languages, f.release_group, f.edition, f.scene_name,
-                    f.date_added,
+                    m.year, m.status, m.monitored, m.path, m.added,
                     m.runtime, m.secondary_year, m.clean_title, m.available,
-                    m.in_cinemas, m.digital_release, m.physical_release, m.overview, m.tags,
+                    m.in_cinemas, m.digital_release, m.physical_release, m.overview,
                     m.metadata_title, m.poster, m.fanart, m.metadata_refreshed_at,
-                    f.file_id, f.media_info
+                    f.relative_path AS f_relative_path, f.size AS f_size,
+                    f.quality AS f_quality, f.revision_version AS f_revision_version,
+                    f.revision_real AS f_revision_real, f.is_repack AS f_is_repack,
+                    f.languages AS f_languages, f.release_group AS f_release_group,
+                    f.edition AS f_edition, f.scene_name AS f_scene_name,
+                    f.date_added AS f_date_added
              FROM movies m
-             LEFT JOIN quality_profiles p ON p.id = m.quality_profile_id
              LEFT JOIN movie_files f ON f.movie_id = m.id
              ORDER BY lower(m.title), m.year",
             &[],
@@ -1269,54 +1073,43 @@ async fn read_movies(client: &impl GenericClient) -> Result<Vec<CatalogMovie>> {
         .await?;
     let mut movies = Vec::with_capacity(rows.len());
     for row in &rows {
-        let origin = match (
-            row.try_get::<_, Option<String>>(12)?,
-            row.try_get::<_, Option<i64>>(13)?,
-        ) {
-            (Some(source), Some(id)) => Some((source, id)),
-            _ => None,
-        };
-        let tmdb_id: i64 = row.try_get(1)?;
+        let tmdb_id: i64 = row.try_get("tmdb_id")?;
         movies.push(CatalogMovie {
-            id: row.try_get(0)?,
-            origin,
+            id: row.try_get("id")?,
             movie: Movie {
                 tmdb_id: u32::try_from(tmdb_id)
                     .map_err(|_| StoreError::Corrupt(format!("tmdb {tmdb_id}")))?,
-                imdb_id: row.try_get(2)?,
-                title: row.try_get(3)?,
-                original_title: row.try_get(4)?,
-                original_language: row.try_get(5)?,
+                imdb_id: row.try_get("imdb_id")?,
+                title: row.try_get("title")?,
+                original_title: row.try_get("original_title")?,
+                original_language: row.try_get("original_language")?,
                 year: row
-                    .try_get::<_, Option<i32>>(6)?
+                    .try_get::<_, Option<i32>>("year")?
                     .map(|y| narrow(y, "ano"))
                     .transpose()?,
-                status: row.try_get(7)?,
-                monitored: row.try_get(8)?,
-                quality_profile: row.try_get(9)?,
-                path: row.try_get(10)?,
-                added: row.try_get(11)?,
+                status: row.try_get("status")?,
+                monitored: row.try_get("monitored")?,
+                path: row.try_get("path")?,
+                added: row.try_get("added")?,
                 file: read_file(row)?,
-                runtime: narrow(row.try_get(25)?, "duração")?,
+                runtime: narrow(row.try_get("runtime")?, "duração")?,
                 secondary_year: row
-                    .try_get::<_, Option<i32>>(26)?
+                    .try_get::<_, Option<i32>>("secondary_year")?
                     .map(|y| narrow(y, "ano"))
                     .transpose()?,
-                clean_title: row.try_get(27)?,
-                available: row.try_get(28)?,
+                clean_title: row.try_get("clean_title")?,
+                available: row.try_get("available")?,
                 alternate_titles: Vec::new(),
-                in_cinemas: row.try_get(29)?,
-                digital_release: row.try_get(30)?,
-                physical_release: row.try_get(31)?,
-                overview: row.try_get(32)?,
-                tags: serde_json::from_value(row.try_get(33)?)
-                    .map_err(|e| StoreError::Corrupt(format!("tags: {e}")))?,
+                in_cinemas: row.try_get("in_cinemas")?,
+                digital_release: row.try_get("digital_release")?,
+                physical_release: row.try_get("physical_release")?,
+                overview: row.try_get("overview")?,
             },
             extras: MovieExtras {
-                metadata_title: row.try_get(34)?,
-                poster: row.try_get(35)?,
-                fanart: row.try_get(36)?,
-                refreshed_at: row.try_get(37)?,
+                metadata_title: row.try_get("metadata_title")?,
+                poster: row.try_get("poster")?,
+                fanart: row.try_get("fanart")?,
+                refreshed_at: row.try_get("metadata_refreshed_at")?,
             },
         });
     }
@@ -1413,7 +1206,6 @@ mod tests {
             year: Some(2020),
             status: Some("released".into()),
             monitored: true,
-            quality_profile: Some("Any".into()),
             path: format!("/filmes/{title} (2020)"),
             added: Some("2026-01-01T00:00:00Z".into()),
             file: with_file.then(|| MovieFile {
@@ -1428,8 +1220,6 @@ mod tests {
                 edition: None,
                 scene_name: Some(format!("{title}.2020.1080p.WEB-DL-GRUPO")),
                 date_added: Some("2026-01-02T00:00:00Z".into()),
-                id: Some(i64::from(tmdb_id) + 500),
-                media_info: Some(serde_json::json!({ "audioLanguages": "Portuguese/English" })),
             }),
             runtime: 110,
             secondary_year: None,
@@ -1440,17 +1230,11 @@ mod tests {
             digital_release: None,
             physical_release: Some("2020-04-01".into()),
             overview: Some("Sinopse".into()),
-            tags: vec![1],
         }
     }
 
-    /// Um filme adicionado como a tela faz: sem perfil nem tag.
+    /// Um filme adicionado como a tela faz.
     async fn added(store: &Store, movie: Movie) -> i64 {
-        let movie = Movie {
-            quality_profile: None,
-            tags: Vec::new(),
-            ..movie
-        };
         store
             .add_movie(&movie, &MovieExtras::default())
             .await
@@ -1630,6 +1414,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filme_volta_como_foi_gravado() {
+        let Some(db) = TestDb::new("ida_e_volta").await else {
+            return;
+        };
+        let store = &db.store;
+        let extras = MovieExtras {
+            metadata_title: Some("One".into()),
+            poster: Some("https://image.tmdb.org/t/p/original/p.jpg".into()),
+            fanart: None,
+            refreshed_at: Some("2026-01-03T00:00:00Z".into()),
+        };
+        let with_file = movie(10, "Um", true);
+        let id = store.add_movie(&with_file, &extras).await.unwrap();
+        let without = added(store, movie(20, "Dois", false)).await;
+        let movies = store.movies().await.unwrap();
+        assert_eq!(movies.len(), 2);
+        assert_eq!(
+            movies[0],
+            CatalogMovie {
+                id: without,
+                movie: movie(20, "Dois", false),
+                extras: MovieExtras::default(),
+            }
+        );
+        assert_eq!(
+            movies[1],
+            CatalogMovie {
+                id,
+                movie: with_file.clone(),
+                extras: extras.clone(),
+            }
+        );
+        // Regravar troca o arquivo e mantém o resto.
+        let changed = Movie {
+            monitored: false,
+            file: None,
+            ..with_file
+        };
+        store.update_movie(id, &changed).await.unwrap();
+        let movies = store.movies().await.unwrap();
+        assert_eq!(movies[1].movie, changed);
+        assert!(store.update_movie(999, &changed).await.is_err());
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Montar o banco antigo e conferir tudo o que saiu.
+    async fn migracao_tira_a_api_v3_sem_perder_filmes() {
+        let Some(url) = std::env::var("ACERVO_TEST_DATABASE_URL").ok() else {
+            eprintln!("ACERVO_TEST_DATABASE_URL ausente: teste de banco pulado");
+            return;
+        };
+        let schema = format!("teste_sem_v3_{}", std::process::id());
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        // Banco parado na versão anterior, com perfil, tag, origem no
+        // gerenciador e arquivo com id e faixas.
+        let before = MIGRATIONS
+            .iter()
+            .position(|m| m.contains("DROP TABLE quality_profiles"))
+            .unwrap();
+        let mut setup = format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path = {schema};"
+        );
+        for migration in &MIGRATIONS[..before] {
+            setup.push_str(migration);
+        }
+        let _ = write!(
+            setup,
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES ({before});
+             INSERT INTO quality_profiles (name, upgrade_allowed, items)
+                 VALUES ('Any', false, '[]');
+             INSERT INTO tags (label) VALUES ('pedido');
+             INSERT INTO custom_formats (name, specifications) VALUES ('x', '[]');
+             INSERT INTO exclusions (tmdb_id, title) VALUES (9, 'Fora');
+             INSERT INTO import_lists (name, kind, settings, enabled, monitor, search_on_add,
+                     quality_profile_id, root_folder, minimum_availability)
+                 SELECT 'lista', 'tmdb', '{{}}', true, true, false, id, '/filmes', 'released'
+                 FROM quality_profiles;
+             INSERT INTO quality_definitions (quality, min_size, max_size)
+                 VALUES (3, 1.5, 100);
+             INSERT INTO movies (tmdb_id, imdb_id, title, path, monitored, quality_profile_id,
+                     source, source_id, runtime, available, in_cinemas, overview, tags,
+                     metadata_title, poster)
+                 SELECT 10, 'tt0000010', 'Um', '/filmes/Um (2020)', true, id, 'radarr', 77,
+                     110, true, '2020-01-10', 'Sinopse', '[1]', 'One', 'p.jpg'
+                 FROM quality_profiles;
+             INSERT INTO movie_titles (movie_id, title) SELECT id, 'Um 2' FROM movies;
+             INSERT INTO movie_files (movie_id, relative_path, size, quality, revision_version,
+                     revision_real, is_repack, languages, release_group, scene_name, file_id,
+                     media_info)
+                 SELECT id, 'Um (2020).mkv', 4000, 3, 1, 0, false, '[\"English\"]', 'GRUPO',
+                     'Um.2020.1080p.WEB-DL-GRUPO', 501, '{{\"audioLanguages\": \"eng\"}}'
+                 FROM movies;"
+        );
+        client.batch_execute(&setup).await.unwrap();
+
+        let mut config: tokio_postgres::Config = url.parse().unwrap();
+        config.options(format!("-c search_path={schema}"));
+        let store = Store::with_config(config).await.unwrap();
+        let movies = store.movies().await.unwrap();
+        assert_eq!(movies.len(), 1);
+        let entry = &movies[0];
+        assert_eq!(entry.movie.tmdb_id, 10);
+        assert_eq!(entry.movie.title, "Um");
+        assert_eq!(entry.movie.path, "/filmes/Um (2020)");
+        assert!(entry.movie.monitored);
+        assert_eq!(entry.movie.runtime, 110);
+        assert_eq!(entry.movie.in_cinemas.as_deref(), Some("2020-01-10"));
+        assert_eq!(entry.movie.alternate_titles, ["Um 2"]);
+        assert_eq!(entry.extras.metadata_title.as_deref(), Some("One"));
+        let file = entry.movie.file.as_ref().unwrap();
+        assert_eq!(file.relative_path, "Um (2020).mkv");
+        assert_eq!(file.size, 4000);
+        assert_eq!(file.quality.quality, Quality::WebDl1080p);
+        assert_eq!(file.languages, ["English"]);
+        assert_eq!(file.release_group.as_deref(), Some("GRUPO"));
+        // Os tamanhos por qualidade ficam.
+        let definitions = store.quality_definitions().await.unwrap();
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].max_size, Some(100.0));
+        for gone in [
+            "quality_profiles",
+            "tags",
+            "custom_formats",
+            "exclusions",
+            "import_lists",
+            "movie_file_ids",
+        ] {
+            let row = client
+                .query_one(&format!("SELECT to_regclass('{schema}.{gone}')::text"), &[])
+                .await
+                .unwrap();
+            assert_eq!(row.get::<_, Option<String>>(0), None, "{gone}");
+        }
+        let columns = client
+            .query(
+                "SELECT table_name || '.' || column_name FROM information_schema.columns
+                 WHERE table_schema = $1 AND column_name IN
+                     ('quality_profile_id', 'tags', 'source', 'source_id', 'file_id', 'media_info')",
+                &[&schema],
+            )
+            .await
+            .unwrap();
+        assert!(
+            columns.is_empty(),
+            "{:?}",
+            columns
+                .iter()
+                .map(|r| r.get::<_, String>(0))
+                .collect::<Vec<_>>()
+        );
+        client
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn guarda_historico_e_bloqueio() {
         let Some(db) = TestDb::new("gerenciador").await else {
             return;
@@ -1646,7 +1592,7 @@ mod tests {
             quality: Some(Quality::WebDl1080p),
             indexer: Some("tracker".into()),
             download_id: None,
-            data: serde_json::json!({ "origem": "radarr" }),
+            data: serde_json::json!({ "origem": "tela" }),
         };
         store
             .record_history(&event("2026-01-02T00:00:00Z"))

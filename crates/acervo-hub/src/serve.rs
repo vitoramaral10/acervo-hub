@@ -158,15 +158,9 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
     });
     if settings.get().server.api_key.is_empty() {
         tracing::warn!(
-            "sem chave de API: Torznab e API v3 recusam tudo até gerar uma em Configurações → Servidor"
+            "sem chave de API: o Torznab recusa tudo até gerar uma em Configurações → Servidor"
         );
     }
-    // A API v3 de filmes, para os apps de pedidos e de legendas.
-    let v3 = Arc::new(crate::api_v3::V3 {
-        settings: Arc::clone(&settings),
-        database: database.clone(),
-        catalog: catalog.clone(),
-    });
     let web = Arc::new(crate::web::Web {
         settings: Arc::clone(&settings),
         database: database.clone(),
@@ -183,7 +177,6 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
     axum::serve(
         listener,
         acervo_api::router_with_admin(catalog, api_key, Some(Arc::new(admin)), accounts)
-            .merge(crate::api_v3::router(v3))
             .merge(crate::web::router(web)),
     )
     .with_graceful_shutdown(shutdown())

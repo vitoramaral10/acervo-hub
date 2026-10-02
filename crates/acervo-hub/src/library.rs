@@ -1,10 +1,6 @@
 //! O catálogo como dono dos filmes: status e disponibilidade calculados das
 //! datas, metadados vindos do TMDB e filmes adicionados pelo próprio acervo.
-//!
-//! Filme importado do gerenciador (com origem) continua sendo dele: aqui só
-//! se completa o que ele não expõe (título em inglês, pôster). Filme sem
-//! origem — adicionado aqui ou adotado no corte — tem título, datas e status
-//! mantidos a partir do TMDB.
+//! Título, datas e status de todo filme são mantidos a partir do TMDB.
 
 use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
@@ -74,8 +70,8 @@ fn today() -> Date {
 }
 
 /// Passa para o filme o que veio da base de metadados, recalculando status
-/// e disponibilidade. O que é escolha de quem usa (monitorado, perfil,
-/// pasta, disponibilidade mínima, tags) fica como está.
+/// e disponibilidade. O que é escolha de quem usa (monitorado, pasta) fica
+/// como está.
 fn apply(movie: &mut Movie, meta: &MovieMetadata) {
     movie.title = meta
         .localized_title
@@ -172,13 +168,9 @@ pub async fn refresh(store: &Store, tmdb: &Tmdb, stale_hours: i64) -> Result<Ref
 #[derive(Debug, Clone)]
 pub struct AddRequest {
     pub tmdb_id: u32,
-    /// Nome de um perfil guardado; só serve à API v3 e ao Radarr. A decisão
-    /// do acervo usa sempre o perfil automático.
-    pub quality_profile: Option<String>,
     /// Pasta raiz, como o gerenciador a vê (`/media/movies`).
     pub root_folder: String,
     pub monitored: bool,
-    pub tags: Vec<i64>,
 }
 
 /// Um filme novo, montado a partir do TMDB, sem gravar.
@@ -200,7 +192,6 @@ pub async fn lookup(tmdb: &Tmdb, tmdb_id: u32) -> Result<(Movie, MovieExtras)> {
         year: None,
         status: None,
         monitored: false,
-        quality_profile: None,
         path: String::new(),
         added: None,
         file: None,
@@ -213,7 +204,6 @@ pub async fn lookup(tmdb: &Tmdb, tmdb_id: u32) -> Result<(Movie, MovieExtras)> {
         digital_release: None,
         physical_release: None,
         overview: None,
-        tags: Vec::new(),
     };
     apply(&mut movie, &meta);
     Ok((movie, extras(&meta)))
@@ -233,7 +223,6 @@ pub async fn add(store: &Store, tmdb: &Tmdb, request: &AddRequest) -> Result<i64
     {
         bail!("o filme {} já está no catálogo", request.tmdb_id);
     }
-    let profiles = store.profiles().await?;
     let (mut movie, extras) = lookup(tmdb, request.tmdb_id).await?;
     let folder = formatted_name(
         extras.metadata_title.as_deref().unwrap_or(&movie.title),
@@ -241,12 +230,7 @@ pub async fn add(store: &Store, tmdb: &Tmdb, request: &AddRequest) -> Result<i64
         movie.imdb_id.as_deref(),
     );
     movie.path = format!("{}/{folder}", request.root_folder.trim_end_matches('/'));
-    movie.quality_profile = request
-        .quality_profile
-        .clone()
-        .filter(|name| profiles.iter().any(|p| p.name == *name));
     movie.monitored = request.monitored;
-    movie.tags.clone_from(&request.tags);
     movie.added = Some(now_rfc3339());
     movie.available = is_available(&movie, today(), 0);
     let id = store.add_movie(&movie, &extras).await?;
@@ -270,20 +254,13 @@ pub async fn add(store: &Store, tmdb: &Tmdb, request: &AddRequest) -> Result<i64
 pub struct MovieEdit {
     #[serde(default, rename = "monitorado")]
     pub monitored: Option<bool>,
-    /// Nome do perfil.
-    #[serde(default, rename = "perfil")]
-    pub quality_profile: Option<String>,
-    #[serde(default)]
-    pub tags: Option<Vec<i64>>,
 }
 
-/// Muda um filme. Filme que ainda é do gerenciador muda lá primeiro — senão a
-/// próxima importação desfaria a mudança.
+/// Muda um filme.
 ///
 /// # Errors
 ///
-/// Filme ou perfil desconhecido ou falha de
-/// escrita.
+/// Filme desconhecido ou falha de escrita.
 pub async fn edit(store: &Store, id: i64, change: &MovieEdit) -> Result<CatalogMovie> {
     let entry = store
         .movies()
@@ -294,16 +271,6 @@ pub async fn edit(store: &Store, id: i64, change: &MovieEdit) -> Result<CatalogM
     let mut movie = entry.movie.clone();
     if let Some(monitored) = change.monitored {
         movie.monitored = monitored;
-    }
-    let profiles = store.profiles().await?;
-    if let Some(name) = &change.quality_profile {
-        if !profiles.iter().any(|p| p.name == *name) {
-            bail!("perfil de qualidade `{name}` não existe");
-        }
-        movie.quality_profile = Some(name.clone());
-    }
-    if let Some(tags) = &change.tags {
-        movie.tags.clone_from(tags);
     }
     movie.available = is_available(&movie, today(), 0);
     store.update_movie(id, &movie).await?;
@@ -432,11 +399,11 @@ async fn delete_downloads(
 }
 
 /// Apaga só o arquivo do filme; o filme fica no catálogo, sem arquivo (e,
-/// monitorado, volta a ser procurado). Filme do gerenciador apaga por lá.
+/// monitorado, volta a ser procurado).
 ///
 /// # Errors
 ///
-/// Filme sem arquivo, gerenciador que recusa ou falha ao apagar.
+/// Filme sem arquivo ou falha ao apagar.
 pub async fn delete_file(config: &Config, store: &Store, id: i64) -> Result<()> {
     let entry = store
         .movies()
@@ -646,7 +613,6 @@ mod tests {
             year: None,
             status: None,
             monitored: true,
-            quality_profile: None,
             path: "/filmes/Filme".into(),
             added: None,
             file: None,
@@ -659,7 +625,6 @@ mod tests {
             digital_release: digital.map(str::to_owned),
             physical_release: physical.map(str::to_owned),
             overview: None,
-            tags: Vec::new(),
         }
     }
 

@@ -203,9 +203,6 @@ export interface Movie {
   sinopse: string | null
   status: string | null
   monitorado: boolean
-  tags: number[]
-  do_radarr: boolean
-  perfil: string | null
   pasta: string
   adicionado: string | null
   arquivo: MovieFile | null
@@ -382,7 +379,6 @@ export const api = {
 
 export interface LibraryOptions {
   pastas: { caminho: string; livre: number | null }[]
-  tags: { id: number; nome: string }[]
   qualidades: { id: number; nome: string }[]
   indexadores: string[]
 }
@@ -402,13 +398,11 @@ export interface NewMovie {
   tmdb: number
   pasta: string
   monitorado: boolean
-  tags: number[]
   buscar: boolean
 }
 
 export interface MovieChange {
   monitorado?: boolean
-  tags?: number[]
 }
 
 export interface InteractiveRelease {
