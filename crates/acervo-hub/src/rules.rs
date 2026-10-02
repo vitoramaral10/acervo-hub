@@ -50,7 +50,7 @@ pub struct DecisionRules {
     /// `preferir_e_atualizar`, `nao_atualizar` ou `nao_preferir`.
     pub propers: String,
     pub preferir_flags_do_indexador: bool,
-    /// Folga que precisa sobrar no disco depois do download.
+    /// Folga que a fila de downloads deixa sempre livre no disco do cliente.
     pub folga_minima_mb: u64,
     pub pular_checagem_de_espaco: bool,
     /// Dias depois da data de disponibilidade.

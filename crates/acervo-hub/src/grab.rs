@@ -65,9 +65,11 @@ const UNALLOCATED: &[&str] = &["metaDL", "forcedMetaDL", "queuedDL", "allocating
 static QUEUE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Inicia os torrents da fila que cabem no disco, do menor para o maior,
-/// pulando quem não cabe. Com a pré-alocação ligada, todo torrent ativo já ocupa o tamanho
-/// inteiro, então o espaço livre basta; só quem ainda não alocou é
-/// descontado à mão.
+/// pulando quem não cabe. Com a pré-alocação ligada, todo torrent ativo já
+/// ocupa o tamanho inteiro, então o espaço livre basta; só quem ainda não
+/// alocou é descontado à mão. A folga mínima das regras fica sempre livre: a
+/// importação cria a pasta do filme e o servidor de mídia grava miniaturas
+/// no mesmo disco.
 ///
 /// # Errors
 ///
@@ -99,7 +101,12 @@ pub(crate) async fn start_queued(store: &Store, client: &QbitClient) -> Result<V
         .filter(|t| UNALLOCATED.contains(&t.state.as_str()))
         .map(|t| left(size(t), t.progress))
         .sum();
-    let mut budget = client.free_space().await?.saturating_sub(pending);
+    let reserve = crate::rules::stored(store).await?.folga_minima_mb << 20;
+    let mut budget = client
+        .free_space()
+        .await?
+        .saturating_sub(pending)
+        .saturating_sub(reserve);
     let mut queue: Vec<_> = torrents
         .iter()
         .filter(|t| t.has_tag(QUEUE_TAG) && size(t) > 0)
