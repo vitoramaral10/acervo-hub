@@ -4,9 +4,10 @@ import { Fragment, useState } from 'react'
 import { toast } from 'sonner'
 import { CycleCard } from '@/components/CycleCard'
 import { PageHeader } from '@/components/PageHeader'
+import { WatchedCard } from '@/components/WatchedCard'
 import { Button } from '@/components/ui/button'
 import { Badge, Skeleton, Tooltip } from '@/components/ui/misc'
-import { type CycleReport, type Task, type TaskRun, api } from '@/lib/api'
+import { type CycleReport, type Task, type TaskRun, type WatchedReport, api } from '@/lib/api'
 import { formatAgo, formatDuration, formatInterval } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
@@ -43,7 +44,7 @@ export function TasksPage() {
     <>
       <PageHeader
         title="Tarefas"
-        description="O que o serviço roda sozinho: busca dos que faltam, RSS, importação, metadados e a limpeza — que tira da fila o que o gerenciador esqueceu e apaga o seed que perdeu o hardlink com a biblioteca. Cada uma pode rodar agora, fora da hora."
+        description="O que o serviço roda sozinho: busca dos que faltam, RSS, importação, metadados, a limpeza — que tira da fila o que o gerenciador esqueceu e apaga o seed que perdeu o hardlink com a biblioteca — e, com o Jellyfin configurado, a remoção dos filmes já assistidos. Cada uma pode rodar agora, fora da hora."
       />
 
       <section className="mb-10" aria-labelledby="titulo-agendadas">
@@ -239,8 +240,8 @@ function HistoryTable({ runs }: { runs: TaskRun[] }) {
         </thead>
         <tbody className="divide-y divide-border">
           {runs.map((run) => {
-            // Só a limpeza tem relatório para abrir.
-            const report = run.tarefa === 'limpeza' && run.detalhe ? (run.detalhe as CycleReport) : null
+            // Só a limpeza e os assistidos têm relatório para abrir.
+            const report = run.detalhe ? detail(run) : null
             const expanded = report !== null && open === run.id
             return (
               <Fragment key={run.id}>
@@ -289,7 +290,11 @@ function HistoryTable({ runs }: { runs: TaskRun[] }) {
                 {expanded && (
                   <tr>
                     <td colSpan={5} className="bg-surface-raised/40 px-4 py-4">
-                      <CycleCard report={report} />
+                      {report.tarefa === 'limpeza' ? (
+                        <CycleCard report={report.report} />
+                      ) : (
+                        <WatchedCard report={report.report} />
+                      )}
                     </td>
                   </tr>
                 )}
@@ -300,4 +305,12 @@ function HistoryTable({ runs }: { runs: TaskRun[] }) {
       </table>
     </div>
   )
+}
+
+type Detail = { tarefa: 'limpeza'; report: CycleReport } | { tarefa: 'assistidos'; report: WatchedReport }
+
+function detail(run: TaskRun): Detail | null {
+  if (run.tarefa === 'limpeza') return { tarefa: 'limpeza', report: run.detalhe as CycleReport }
+  if (run.tarefa === 'assistidos') return { tarefa: 'assistidos', report: run.detalhe as WatchedReport }
+  return null
 }

@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use acervo_api::Catalog;
+use acervo_clients::jellyfin::JellyfinClient;
 use acervo_store::NewTaskRun;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -35,6 +36,8 @@ const SUMMARY_CHARS: usize = 300;
 
 /// Id da busca dos que faltam: o botão da tela de filmes dispara esta tarefa.
 pub const BUSCA: &str = "busca";
+/// Id da tarefa que apaga os filmes assistidos no Jellyfin.
+pub const ASSISTIDOS: &str = "assistidos";
 
 /// Por que uma execução começou.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,6 +483,33 @@ pub fn service(
         }),
         Err(error) => tracing::info!("limpeza fora das tarefas: {error:#}"),
     }
+    match (config.jellyfin.as_ref(), with_database) {
+        (None, _) => {
+            tracing::info!("apagar assistidos fora das tarefas: seção `[jellyfin]` ausente");
+        }
+        (Some(_), false) => {
+            tracing::info!("apagar assistidos fora das tarefas: sem `[database]`, não há catálogo");
+        }
+        (Some(jellyfin), true) => {
+            match JellyfinClient::new(&jellyfin.url, &jellyfin.api_key, config.http_timeout()) {
+                Ok(client) => tasks.push(Task {
+                    id: ASSISTIDOS,
+                    name: "Apagar assistidos",
+                    interval: minutes(jellyfin.interval_minutes),
+                    // Apagar não precisa correr na subida do serviço; o
+                    // primeiro intervalo pega o que houver.
+                    first: First::AfterInterval,
+                    job: Arc::new(Watched {
+                        config: Arc::clone(config),
+                        database: database.clone(),
+                        jellyfin: client,
+                        grace_minutes: jellyfin.delete_watched_after_minutes,
+                    }),
+                }),
+                Err(error) => tracing::warn!("apagar assistidos fora das tarefas: {error}"),
+            }
+        }
+    }
     tasks
 }
 
@@ -642,6 +672,31 @@ struct Cleanup {
 impl Job for Cleanup {
     async fn run(&self, _: Trigger) -> Result<Outcome> {
         let report = crate::cycle::run(&self.config, false).await?;
+        let (ok, summary) = report.summary();
+        Ok(Outcome {
+            ok,
+            summary,
+            detail: Some(serde_json::to_value(&report)?),
+        })
+    }
+}
+
+/// Apaga do acervo o que já foi assistido no Jellyfin. O relatório, com os
+/// apagados e os pulados, vira o detalhe da execução.
+#[derive(Debug)]
+struct Watched {
+    config: Arc<Config>,
+    database: Database,
+    jellyfin: JellyfinClient,
+    grace_minutes: u64,
+}
+
+#[async_trait]
+impl Job for Watched {
+    async fn run(&self, _: Trigger) -> Result<Outcome> {
+        let store = store(&self.database)?;
+        let report =
+            crate::watched::run(&self.config, store, &self.jellyfin, self.grace_minutes).await?;
         let (ok, summary) = report.summary();
         Ok(Outcome {
             ok,

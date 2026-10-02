@@ -1,4 +1,5 @@
-//! Cliente do qBittorrent (`WebUI` API v2).
+//! Cliente do qBittorrent (`WebUI` API v2) e, em [`jellyfin`], o mínimo do
+//! Jellyfin.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -7,6 +8,7 @@ use acervo_core::{DownloadHash, DownloadState};
 use url::Url;
 
 mod dto;
+pub mod jellyfin;
 mod torrent;
 
 pub use dto::{TorrentFile, TorrentInfo};

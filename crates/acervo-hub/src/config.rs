@@ -45,6 +45,49 @@ pub struct Config {
     /// Grab e importação de filmes pelo próprio acervo.
     #[serde(default)]
     pub movies: MoviesConfig,
+    /// Servidor de mídia que diz o que já foi assistido. Sem ele, a tarefa
+    /// de apagar assistidos não existe.
+    #[serde(default)]
+    pub jellyfin: Option<JellyfinConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JellyfinConfig {
+    /// Como o serviço alcança o Jellyfin; em Compose, `http://jellyfin:8096`.
+    pub url: String,
+    pub api_key: String,
+    /// Carência depois da última vez que alguém assistiu: dá tempo de
+    /// marcar como favorito o que é para ficar.
+    #[serde(default = "default_watched_grace")]
+    pub delete_watched_after_minutes: u64,
+    /// De quanto em quanto tempo a tarefa roda. Zero desliga o agendamento;
+    /// "rodar agora" continua valendo.
+    #[serde(default = "default_watched_interval")]
+    pub interval_minutes: u64,
+}
+
+impl std::fmt::Debug for JellyfinConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A chave dá acesso de administrador ao servidor de mídia.
+        formatter
+            .debug_struct("JellyfinConfig")
+            .field("url", &self.url)
+            .field(
+                "delete_watched_after_minutes",
+                &self.delete_watched_after_minutes,
+            )
+            .field("interval_minutes", &self.interval_minutes)
+            .finish_non_exhaustive()
+    }
+}
+
+const fn default_watched_grace() -> u64 {
+    60
+}
+
+const fn default_watched_interval() -> u64 {
+    15
 }
 
 #[derive(Debug, Deserialize)]
@@ -681,6 +724,51 @@ mod tests {
         let texto = MINIMA.to_string() + "\n[policy]\nprivate_seed_grace_hours = 0\n";
         let p = parse(&texto).unwrap().policy.to_policy();
         assert!(p.private_seed_grace.is_none());
+    }
+
+    /// O bloco `[jellyfin]` do exemplo, descomentado.
+    fn exemplo_com_jellyfin() -> String {
+        let exemplo = include_str!("../../../config.example.toml");
+        let mut dentro = false;
+        exemplo
+            .lines()
+            .map(|line| {
+                if line == "# [jellyfin]" {
+                    dentro = true;
+                }
+                if dentro && line.is_empty() {
+                    dentro = false;
+                }
+                match line.strip_prefix("# ") {
+                    Some(rest) if dentro && !rest.starts_with(' ') => rest,
+                    _ => line,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn jellyfin_e_opcional_e_documentado_no_exemplo() {
+        assert!(load(SERVIDOR).unwrap().jellyfin.is_none());
+        let texto = exemplo_com_jellyfin();
+        let jellyfin = load(&texto).unwrap().jellyfin.unwrap();
+        assert_eq!(jellyfin.url, "http://jellyfin:8096");
+        assert_eq!(jellyfin.delete_watched_after_minutes, 60);
+        assert_eq!(jellyfin.interval_minutes, 15);
+        // A chave não aparece em log de depuração.
+        assert!(!format!("{jellyfin:?}").contains(&jellyfin.api_key));
+    }
+
+    #[test]
+    fn jellyfin_assume_carencia_e_intervalo_padrao() {
+        let texto =
+            SERVIDOR.to_string() + "\n[jellyfin]\nurl = \"http://j:8096\"\napi_key = \"k\"\n";
+        let jellyfin = load(&texto).unwrap().jellyfin.unwrap();
+        assert_eq!(jellyfin.delete_watched_after_minutes, 60);
+        assert_eq!(jellyfin.interval_minutes, 15);
+        let torto = texto + "delete_watched_after_minute = 5\n";
+        assert!(load(&torto).is_err());
     }
 
     #[test]

@@ -96,8 +96,9 @@ cargo run --bin acervo-hub -- -c config.toml search "termo" [-i indexador] [-k 5
   outro), o histórico de tudo e a lista de bloqueio.
 - **Aplicativos** — o `sync` na tela: mostra o que mudaria no gerenciador de séries e aplica.
 - **Tarefas** — as rotinas de fundo do serviço (busca dos que faltam, RSS, importação,
-  metadados e a limpeza), com intervalo, última e próxima execução e "rodar agora"; e o
-  histórico das últimas execuções, gravado no banco — o da limpeza abre o relatório do ciclo.
+  metadados, a limpeza e, com `[jellyfin]`, apagar assistidos), com intervalo, última e
+  próxima execução e "rodar agora"; e o histórico das últimas execuções, gravado no banco —
+  o da limpeza abre o relatório do ciclo, o dos assistidos a lista do que saiu e do que ficou.
 - **Configurações** — TMDB, regras de decisão (teto de tamanho,
   propers, legenda embutida, carência, prioridade e seeders por indexador, espera, espaço
   livre reservado) e
@@ -161,6 +162,12 @@ A limpeza roda dentro de `serve`, como a tarefa "Limpeza", a cada
 `server.cleanup_interval_minutes` (padrão 60). Não há modo de simulação: cada ciclo avança
 os strikes e executa o plano, e as travas abortam o ciclo inteiro quando a leitura do mundo
 não é confiável.
+
+Com a seção `[jellyfin]`, a tarefa "Apagar assistidos" roda a cada
+`jellyfin.interval_minutes` (padrão 15): o filme que algum usuário do Jellyfin assistiu, há
+mais de `jellyfin.delete_watched_after_minutes` (padrão 60) e que ninguém marcou como
+favorito, sai do catálogo com a pasta e o download — sem simulação. Assistido sem data
+conhecida fica.
 
 Códigos de saída: `0` sucesso, `1` falha de execução, `3` ciclo abortado por trava. O `3`
 é próprio para que um agendador distinga "a leitura do mundo não era confiável" de "algo

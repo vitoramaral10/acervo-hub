@@ -131,6 +131,15 @@ export interface CycleReport {
   falharam: number | null
 }
 
+/** O detalhe de "Apagar assistidos": o que saiu do acervo e o que ficou, com o motivo. */
+export interface WatchedReport {
+  apagados: { titulo: string; ano: number | null; assistido_por: string; assistido_em: string; tamanho: string }[]
+  pulados: { titulo: string; ano: number | null; motivo: string }[]
+  recusados: number
+  liberado: string
+  aviso: string | null
+}
+
 /** Como uma execução de tarefa terminou. */
 export interface TaskLastRun {
   inicio: string
@@ -153,7 +162,7 @@ export interface Task {
   ultima: TaskLastRun | null
 }
 
-/** Uma execução no histórico; `detalhe` é o relatório dela (na limpeza, um `CycleReport`). */
+/** Uma execução no histórico; `detalhe` é o relatório dela (na limpeza, um `CycleReport`; em assistidos, um `WatchedReport`). */
 export interface TaskRun extends TaskLastRun {
   id: number
   tarefa: string

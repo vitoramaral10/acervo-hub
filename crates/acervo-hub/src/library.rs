@@ -495,6 +495,25 @@ pub async fn delete_file(config: &Config, store: &Store, id: i64) -> Result<()> 
 ///
 /// Filme desconhecido, pasta fora das raízes ou falha de escrita.
 pub async fn remove(config: &Config, store: &Store, id: i64, delete_files: bool) -> Result<()> {
+    remove_because(config, store, id, delete_files, delete_files, None).await
+}
+
+/// [`remove`], com o motivo à frente da mensagem do evento no histórico —
+/// para quem remove sozinho dizer por quê. Sem `delete_seed`, a pasta
+/// sai mas o torrent fica semeando até o ciclo de limpeza: quem remove
+/// sozinho não pode pular a carência de tracker privado.
+///
+/// # Errors
+///
+/// Os de [`remove`].
+pub async fn remove_because(
+    config: &Config,
+    store: &Store,
+    id: i64,
+    delete_files: bool,
+    delete_seed: bool,
+    reason: Option<&str>,
+) -> Result<()> {
     let entry = store
         .movies()
         .await?
@@ -502,7 +521,7 @@ pub async fn remove(config: &Config, store: &Store, id: i64, delete_files: bool)
         .find(|m| m.id == id)
         .context("filme fora do catálogo")?;
     // Antes de apagar a pasta: depois dela, não há mais inode para casar.
-    let downloads = if delete_files {
+    let downloads = if delete_files && delete_seed {
         downloads_of(config, &entry.movie.path)
             .await
             .map_err(|error| format!("{error:#}"))
@@ -534,7 +553,23 @@ pub async fn remove(config: &Config, store: &Store, id: i64, delete_files: bool)
     events::record(
         store,
         Event {
-            message: delete_files.then(|| removal_message(&entry.movie.path, &removed)),
+            message: match (
+                reason,
+                delete_files.then(|| {
+                    if delete_seed {
+                        removal_message(&entry.movie.path, &removed)
+                    } else {
+                        format!(
+                            "pasta apagada: {}; o download segue semeando até o ciclo de limpeza",
+                            entry.movie.path
+                        )
+                    }
+                }),
+            ) {
+                (Some(reason), Some(message)) => Some(format!("{reason}; {message}")),
+                (Some(reason), None) => Some(reason.to_owned()),
+                (None, message) => message,
+            },
             poster: entry.extras.poster.clone(),
             ..Event::new(
                 Kind::MovieDeleted,

@@ -38,6 +38,7 @@ mod search;
 mod serve;
 mod sync;
 mod tasks;
+mod watched;
 mod web;
 
 #[derive(Debug, Parser)]

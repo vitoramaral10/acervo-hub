@@ -132,6 +132,20 @@ catalogs = ["/etc/acervo-hub/definicoes", "/etc/acervo-hub/catalogo"]
 # espera um intervalo inteiro: reiniciar o serviço não conta como ciclo.
 cleanup_interval_minutes = 60
 
+# Apagar assistidos: a tarefa "Apagar assistidos" lê do Jellyfin os filmes que
+# algum usuário assistiu e, passada a carência desde a última vez que alguém
+# assistiu, REMOVE o filme do acervo — catálogo, pasta e o download semeando,
+# sem simulação. Filme favorito de qualquer usuário fica; assistido sem data
+# conhecida também. Casa com o catálogo pelo id do TMDB. A chave é uma chave
+# de API do Jellyfin (Painel → Chaves de API); a varredura da biblioteca, pedida
+# depois de apagar, exige chave de administrador. Sem esta seção, a tarefa não
+# existe. `interval_minutes = 0` deixa só o "rodar agora".
+# [jellyfin]
+# url = "http://jellyfin:8096"
+# api_key = "CHAVE_DA_API"
+# delete_watched_after_minutes = 60
+# interval_minutes = 15
+
 # Endpoint Torznab existente — por exemplo, o feed de um indexador no agregador
 # atual. As capacidades são lidas no início; se ele não responder, fica fora do
 # catálogo até o próximo reinício, sem derrubar os outros.
