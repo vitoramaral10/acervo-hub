@@ -18,17 +18,10 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { type TmdbResult, library } from '@/lib/api'
 import { formatSize } from '@/lib/format'
 
-export const AVAILABILITIES = [
-  { value: 'announced', label: 'Anunciado' },
-  { value: 'inCinemas', label: 'No cinema' },
-  { value: 'released', label: 'Lançado' },
-]
-
 function Choose({ result, onBack, onDone }: { result: TmdbResult; onBack: () => void; onDone: (id: number) => void }) {
   const queryClient = useQueryClient()
   const options = useQuery({ queryKey: ['biblioteca-opcoes'], queryFn: library.options })
   const [folder, setFolder] = useState('')
-  const [availability, setAvailability] = useState('released')
   const [monitored, setMonitored] = useState(true)
   const [search, setSearch] = useState(true)
 
@@ -43,7 +36,6 @@ function Choose({ result, onBack, onDone }: { result: TmdbResult; onBack: () => 
         tmdb: result.tmdb,
         pasta: folder,
         monitorado: monitored,
-        disponibilidade_minima: availability,
         tags: [],
         buscar: search && monitored,
       }),
@@ -84,21 +76,6 @@ function Choose({ result, onBack, onDone }: { result: TmdbResult; onBack: () => 
         </p>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2">
-          <div className="grid gap-2">
-            <Label htmlFor="novo-disponibilidade">Pegar a partir de</Label>
-            <Select value={availability} onValueChange={setAvailability}>
-              <SelectTrigger id="novo-disponibilidade">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {AVAILABILITIES.map((a) => (
-                  <SelectItem key={a.value} value={a.value}>
-                    {a.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
           <div className="grid gap-2 sm:col-span-2">
             <Label htmlFor="novo-pasta">Pasta</Label>
             <Select value={folder} onValueChange={setFolder}>

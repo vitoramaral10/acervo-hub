@@ -16,7 +16,7 @@ import {
 } from 'lucide-react'
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
-import { AVAILABILITIES, AddMovieDialog } from '@/components/AddMovieDialog'
+import { AddMovieDialog } from '@/components/AddMovieDialog'
 import { HistoryList } from '@/components/HistoryList'
 import { InteractiveSearch } from '@/components/InteractiveSearch'
 import { PageHeader } from '@/components/PageHeader'
@@ -32,7 +32,6 @@ import {
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Badge, Skeleton, Switch } from '@/components/ui/misc'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import {
   type GrabReport,
   type Movie,
@@ -656,25 +655,6 @@ function MovieSettings({ movie }: { movie: Movie }) {
           disabled={edit.isPending}
           onCheckedChange={(on) => edit.mutate({ monitorado: on })}
         />
-      </div>
-      <div className="grid gap-1.5">
-        <Label htmlFor={`disponibilidade-${movie.id}`}>Pegar a partir de</Label>
-        <Select
-          value={movie.disponibilidade_minima ?? 'released'}
-          disabled={edit.isPending}
-          onValueChange={(disponibilidade_minima) => edit.mutate({ disponibilidade_minima })}
-        >
-          <SelectTrigger id={`disponibilidade-${movie.id}`}>
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {AVAILABILITIES.map((a) => (
-              <SelectItem key={a.value} value={a.value}>
-                {a.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
       </div>
     </div>
   )

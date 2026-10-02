@@ -95,7 +95,6 @@ pub struct Movie {
     pub year: Option<u16>,
     /// `announced`, `inCinemas` ou `released`.
     pub status: Option<String>,
-    pub minimum_availability: Option<String>,
     pub monitored: bool,
     /// Nome do perfil de qualidade.
     pub quality_profile: Option<String>,
@@ -486,6 +485,11 @@ const MIGRATIONS: &[&str] = &[
         key TEXT PRIMARY KEY,
         count INTEGER NOT NULL CHECK (count > 0)
     );
+",
+    // A disponibilidade mínima por filme deixou de existir: todo filme vale pela
+    // regra de lançado (ver `is_available` no hub).
+    r"
+    ALTER TABLE movies DROP COLUMN minimum_availability;
 ",
 ];
 
@@ -1080,7 +1084,7 @@ async fn write_movie(
     let source = source.map(|(name, _)| name);
     let tags =
         serde_json::to_value(&movie.tags).map_err(|e| StoreError::Corrupt(format!("tags: {e}")))?;
-    let values: [&(dyn tokio_postgres::types::ToSql + Sync); 23] = [
+    let values: [&(dyn tokio_postgres::types::ToSql + Sync); 22] = [
         &tmdb_id,
         &movie.imdb_id,
         &movie.title,
@@ -1088,7 +1092,6 @@ async fn write_movie(
         &movie.original_language,
         &year,
         &movie.status,
-        &movie.minimum_availability,
         &movie.monitored,
         &profile_id,
         &movie.path,
@@ -1111,12 +1114,12 @@ async fn write_movie(
         client
             .execute(
                 "UPDATE movies SET tmdb_id = $1, imdb_id = $2, title = $3, original_title = $4,
-                     original_language = $5, year = $6, status = $7, minimum_availability = $8,
-                     monitored = $9, quality_profile_id = $10, path = $11, added = $12,
-                     source = $13, source_id = $14, runtime = $15, secondary_year = $16,
-                     clean_title = $17, available = $18, in_cinemas = $19,
-                     digital_release = $20, physical_release = $21, overview = $22, tags = $23
-                 WHERE id = $24",
+                     original_language = $5, year = $6, status = $7,
+                     monitored = $8, quality_profile_id = $9, path = $10, added = $11,
+                     source = $12, source_id = $13, runtime = $14, secondary_year = $15,
+                     clean_title = $16, available = $17, in_cinemas = $18,
+                     digital_release = $19, physical_release = $20, overview = $21, tags = $22
+                 WHERE id = $23",
                 &params,
             )
             .await?;
@@ -1125,11 +1128,11 @@ async fn write_movie(
         client
             .query_one(
                 "INSERT INTO movies (tmdb_id, imdb_id, title, original_title, original_language,
-                     year, status, minimum_availability, monitored, quality_profile_id, path,
+                     year, status, monitored, quality_profile_id, path,
                      added, source, source_id, runtime, secondary_year, clean_title, available,
                      in_cinemas, digital_release, physical_release, overview, tags)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                     $17, $18, $19, $20, $21, $22, $23)
+                     $17, $18, $19, $20, $21, $22)
                  RETURNING id",
                 &values,
             )
@@ -1214,33 +1217,33 @@ async fn write_extras(client: &impl GenericClient, id: i64, extras: &MovieExtras
 }
 
 fn read_file(row: &Row) -> Result<Option<MovieFile>> {
-    let Some(relative_path) = row.try_get::<_, Option<String>>(15)? else {
+    let Some(relative_path) = row.try_get::<_, Option<String>>(14)? else {
         return Ok(None);
     };
-    let languages: serde_json::Value = row.try_get(21)?;
+    let languages: serde_json::Value = row.try_get(20)?;
     let revision = |index: usize| -> Result<u8> {
         u8::try_from(row.try_get::<_, i16>(index)?)
             .map_err(|_| StoreError::Corrupt("revisão".into()))
     };
     Ok(Some(MovieFile {
         relative_path,
-        size: u64::try_from(row.try_get::<_, i64>(16)?).unwrap_or(0),
+        size: u64::try_from(row.try_get::<_, i64>(15)?).unwrap_or(0),
         quality: QualityModel {
-            quality: quality(row.try_get(17)?)?,
+            quality: quality(row.try_get(16)?)?,
             revision: Revision {
-                version: revision(18)?,
-                real: revision(19)?,
-                is_repack: row.try_get(20)?,
+                version: revision(17)?,
+                real: revision(18)?,
+                is_repack: row.try_get(19)?,
             },
         },
         languages: serde_json::from_value(languages)
             .map_err(|e| StoreError::Corrupt(format!("idiomas: {e}")))?,
-        release_group: row.try_get(22)?,
-        edition: row.try_get(23)?,
-        scene_name: row.try_get(24)?,
-        date_added: row.try_get(25)?,
-        id: row.try_get(39)?,
-        media_info: row.try_get(40)?,
+        release_group: row.try_get(21)?,
+        edition: row.try_get(22)?,
+        scene_name: row.try_get(23)?,
+        date_added: row.try_get(24)?,
+        id: row.try_get(38)?,
+        media_info: row.try_get(39)?,
     }))
 }
 
@@ -1248,7 +1251,7 @@ async fn read_movies(client: &impl GenericClient) -> Result<Vec<CatalogMovie>> {
     let rows = client
         .query(
             "SELECT m.id, m.tmdb_id, m.imdb_id, m.title, m.original_title, m.original_language,
-                    m.year, m.status, m.minimum_availability, m.monitored, p.name, m.path,
+                    m.year, m.status, m.monitored, p.name, m.path,
                     m.added, m.source, m.source_id,
                     f.relative_path, f.size, f.quality, f.revision_version, f.revision_real,
                     f.is_repack, f.languages, f.release_group, f.edition, f.scene_name,
@@ -1267,8 +1270,8 @@ async fn read_movies(client: &impl GenericClient) -> Result<Vec<CatalogMovie>> {
     let mut movies = Vec::with_capacity(rows.len());
     for row in &rows {
         let origin = match (
-            row.try_get::<_, Option<String>>(13)?,
-            row.try_get::<_, Option<i64>>(14)?,
+            row.try_get::<_, Option<String>>(12)?,
+            row.try_get::<_, Option<i64>>(13)?,
         ) {
             (Some(source), Some(id)) => Some((source, id)),
             _ => None,
@@ -1289,32 +1292,31 @@ async fn read_movies(client: &impl GenericClient) -> Result<Vec<CatalogMovie>> {
                     .map(|y| narrow(y, "ano"))
                     .transpose()?,
                 status: row.try_get(7)?,
-                minimum_availability: row.try_get(8)?,
-                monitored: row.try_get(9)?,
-                quality_profile: row.try_get(10)?,
-                path: row.try_get(11)?,
-                added: row.try_get(12)?,
+                monitored: row.try_get(8)?,
+                quality_profile: row.try_get(9)?,
+                path: row.try_get(10)?,
+                added: row.try_get(11)?,
                 file: read_file(row)?,
-                runtime: narrow(row.try_get(26)?, "duração")?,
+                runtime: narrow(row.try_get(25)?, "duração")?,
                 secondary_year: row
-                    .try_get::<_, Option<i32>>(27)?
+                    .try_get::<_, Option<i32>>(26)?
                     .map(|y| narrow(y, "ano"))
                     .transpose()?,
-                clean_title: row.try_get(28)?,
-                available: row.try_get(29)?,
+                clean_title: row.try_get(27)?,
+                available: row.try_get(28)?,
                 alternate_titles: Vec::new(),
-                in_cinemas: row.try_get(30)?,
-                digital_release: row.try_get(31)?,
-                physical_release: row.try_get(32)?,
-                overview: row.try_get(33)?,
-                tags: serde_json::from_value(row.try_get(34)?)
+                in_cinemas: row.try_get(29)?,
+                digital_release: row.try_get(30)?,
+                physical_release: row.try_get(31)?,
+                overview: row.try_get(32)?,
+                tags: serde_json::from_value(row.try_get(33)?)
                     .map_err(|e| StoreError::Corrupt(format!("tags: {e}")))?,
             },
             extras: MovieExtras {
-                metadata_title: row.try_get(35)?,
-                poster: row.try_get(36)?,
-                fanart: row.try_get(37)?,
-                refreshed_at: row.try_get(38)?,
+                metadata_title: row.try_get(34)?,
+                poster: row.try_get(35)?,
+                fanart: row.try_get(36)?,
+                refreshed_at: row.try_get(37)?,
             },
         });
     }
@@ -1410,7 +1412,6 @@ mod tests {
             original_language: Some("English".into()),
             year: Some(2020),
             status: Some("released".into()),
-            minimum_availability: Some("announced".into()),
             monitored: true,
             quality_profile: Some("Any".into()),
             path: format!("/filmes/{title} (2020)"),

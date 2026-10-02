@@ -203,7 +203,6 @@ export interface Movie {
   sinopse: string | null
   status: string | null
   monitorado: boolean
-  disponibilidade_minima: string | null
   tags: number[]
   do_radarr: boolean
   perfil: string | null
@@ -403,14 +402,12 @@ export interface NewMovie {
   tmdb: number
   pasta: string
   monitorado: boolean
-  disponibilidade_minima: string
   tags: number[]
   buscar: boolean
 }
 
 export interface MovieChange {
   monitorado?: boolean
-  disponibilidade_minima?: string
   tags?: number[]
 }
 

@@ -135,7 +135,6 @@ mod tests {
             original_language: Some(language.into()),
             year,
             status: None,
-            minimum_availability: None,
             monitored: true,
             quality_profile: None,
             path: path.into(),

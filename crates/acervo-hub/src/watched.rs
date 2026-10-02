@@ -483,7 +483,6 @@ mod tests {
             original_language: None,
             year: Some(2024),
             status: None,
-            minimum_availability: Some("released".into()),
             monitored: false,
             quality_profile: None,
             path: path.into(),

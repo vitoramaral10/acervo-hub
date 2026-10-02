@@ -404,7 +404,8 @@ fn movie_json(entry: &CatalogMovie, profiles: &HashMap<String, i64>, delay_days:
         "path": movie.path,
         "qualityProfileId": movie.quality_profile.as_ref().and_then(|p| profiles.get(p)),
         "monitored": movie.monitored,
-        "minimumAvailability": movie.minimum_availability.clone().unwrap_or_else(|| "released".into()),
+        // Sem disponibilidade mínima por filme; o Seerr só precisa do campo.
+        "minimumAvailability": "released",
         "isAvailable": crate::library::is_available(movie, today, delay_days),
         "folderName": movie.path,
         "runtime": movie.runtime,
@@ -542,8 +543,6 @@ struct AddBody {
     #[serde(default)]
     monitored: Option<bool>,
     #[serde(default)]
-    minimum_availability: Option<String>,
-    #[serde(default)]
     tags: Vec<i64>,
     #[serde(default)]
     add_options: Option<AddOptions>,
@@ -595,9 +594,6 @@ async fn add_movie(
                 .or_else(|| v3.config().library.root_folders.first().cloned())
                 .unwrap_or_else(|| "/media/movies".into()),
             monitored: body.monitored.unwrap_or(true),
-            minimum_availability: body
-                .minimum_availability
-                .unwrap_or_else(|| "released".into()),
             tags: body.tags,
         },
     )
@@ -630,8 +626,6 @@ struct UpdateBody {
     monitored: Option<bool>,
     #[serde(default)]
     quality_profile_id: Option<i64>,
-    #[serde(default)]
-    minimum_availability: Option<String>,
     #[serde(default)]
     tags: Option<Vec<i64>>,
     #[serde(default)]
@@ -668,7 +662,6 @@ async fn update_movie(
                 .find(|(_, p)| **p == pid)
                 .map(|(name, _)| name.clone())
         }),
-        minimum_availability: body.minimum_availability,
         tags: body.tags,
     };
     let updated = crate::library::edit(store, id, &change)
@@ -921,7 +914,6 @@ mod tests {
                 original_language: Some("English".into()),
                 year: Some(2024),
                 status: None,
-                minimum_availability: Some("released".into()),
                 monitored: true,
                 quality_profile: Some("Any".into()),
                 path: "/media/movies/The Throwback (2024) {imdb-tt11327404}".into(),

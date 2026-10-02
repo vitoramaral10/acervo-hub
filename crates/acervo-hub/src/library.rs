@@ -50,26 +50,21 @@ pub fn status(movie: &Movie, today: Date) -> &'static str {
     }
 }
 
-/// Já passou da disponibilidade mínima, mais `delay_days` de carência. A
-/// regra da referência: "anunciado" vale sempre; "no cinema" vale da
-/// estreia; "lançado" vale do primeiro lançamento digital ou físico, ou de
-/// 90 dias depois da estreia se não houver nenhum.
+/// Já passou do lançamento, mais `delay_days` de carência. Todo filme segue
+/// a regra de "lançado": o primeiro lançamento digital ou físico, ou 90 dias
+/// depois da estreia se não houver nenhum; sem data nenhuma, indisponível.
+/// Não há mais disponibilidade mínima por filme, para não buscar o que ainda
+/// não saiu.
 #[must_use]
 pub fn is_available(movie: &Movie, today: Date, delay_days: i64) -> bool {
     let cinema = date(movie.in_cinemas.as_deref());
-    let when = match movie.minimum_availability.as_deref() {
-        Some("tba" | "announced") | None => return true,
-        Some("inCinemas") if cinema.is_some() => cinema,
-        _ => {
-            let digital = date(movie.digital_release.as_deref());
-            let physical = date(movie.physical_release.as_deref());
-            match (digital, physical) {
-                (Some(d), Some(p)) => Some(d.min(p)),
-                (Some(d), None) => Some(d),
-                (None, Some(p)) => Some(p),
-                (None, None) => cinema.map(|c| c + Duration::days(90)),
-            }
-        }
+    let digital = date(movie.digital_release.as_deref());
+    let physical = date(movie.physical_release.as_deref());
+    let when = match (digital, physical) {
+        (Some(d), Some(p)) => Some(d.min(p)),
+        (Some(d), None) => Some(d),
+        (None, Some(p)) => Some(p),
+        (None, None) => cinema.map(|c| c + Duration::days(90)),
     };
     when.is_some_and(|when| when + Duration::days(delay_days) <= today)
 }
@@ -183,7 +178,6 @@ pub struct AddRequest {
     /// Pasta raiz, como o gerenciador a vê (`/media/movies`).
     pub root_folder: String,
     pub monitored: bool,
-    pub minimum_availability: String,
     pub tags: Vec<i64>,
 }
 
@@ -205,7 +199,6 @@ pub async fn lookup(tmdb: &Tmdb, tmdb_id: u32) -> Result<(Movie, MovieExtras)> {
         original_language: None,
         year: None,
         status: None,
-        minimum_availability: Some("released".into()),
         monitored: false,
         quality_profile: None,
         path: String::new(),
@@ -253,7 +246,6 @@ pub async fn add(store: &Store, tmdb: &Tmdb, request: &AddRequest) -> Result<i64
         .clone()
         .filter(|name| profiles.iter().any(|p| p.name == *name));
     movie.monitored = request.monitored;
-    movie.minimum_availability = Some(request.minimum_availability.clone());
     movie.tags.clone_from(&request.tags);
     movie.added = Some(now_rfc3339());
     movie.available = is_available(&movie, today(), 0);
@@ -281,20 +273,16 @@ pub struct MovieEdit {
     /// Nome do perfil.
     #[serde(default, rename = "perfil")]
     pub quality_profile: Option<String>,
-    #[serde(default, rename = "disponibilidade_minima")]
-    pub minimum_availability: Option<String>,
     #[serde(default)]
     pub tags: Option<Vec<i64>>,
 }
-
-const AVAILABILITIES: &[&str] = &["announced", "inCinemas", "released"];
 
 /// Muda um filme. Filme que ainda é do gerenciador muda lá primeiro — senão a
 /// próxima importação desfaria a mudança.
 ///
 /// # Errors
 ///
-/// Filme ou perfil desconhecido, disponibilidade inválida ou falha de
+/// Filme ou perfil desconhecido ou falha de
 /// escrita.
 pub async fn edit(store: &Store, id: i64, change: &MovieEdit) -> Result<CatalogMovie> {
     let entry = store
@@ -313,12 +301,6 @@ pub async fn edit(store: &Store, id: i64, change: &MovieEdit) -> Result<CatalogM
             bail!("perfil de qualidade `{name}` não existe");
         }
         movie.quality_profile = Some(name.clone());
-    }
-    if let Some(minimum) = &change.minimum_availability {
-        if !AVAILABILITIES.contains(&minimum.as_str()) {
-            bail!("disponibilidade mínima `{minimum}` inválida");
-        }
-        movie.minimum_availability = Some(minimum.clone());
     }
     if let Some(tags) = &change.tags {
         movie.tags.clone_from(tags);
@@ -603,7 +585,7 @@ mod tests {
         let Some(db) = acervo_store::testing::TestDb::new("refresh_404").await else {
             return;
         };
-        let mut gone = movie("released", None, None, None);
+        let mut gone = movie(None, None, None);
         gone.tmdb_id = 1_553_031;
         gone.title = "Untitled Cancelled Film".into();
         db.store
@@ -654,12 +636,7 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    fn movie(
-        minimum: &str,
-        cinema: Option<&str>,
-        digital: Option<&str>,
-        physical: Option<&str>,
-    ) -> Movie {
+    fn movie(cinema: Option<&str>, digital: Option<&str>, physical: Option<&str>) -> Movie {
         Movie {
             tmdb_id: 1,
             imdb_id: None,
@@ -668,7 +645,6 @@ mod tests {
             original_language: None,
             year: None,
             status: None,
-            minimum_availability: Some(minimum.into()),
             monitored: true,
             quality_profile: None,
             path: "/filmes/Filme".into(),
@@ -694,75 +670,84 @@ mod tests {
     #[test]
     fn status_como_a_referencia() {
         let today = day("2026-09-25");
+        assert_eq!(status(&movie(None, None, None), today), "announced");
         assert_eq!(
-            status(&movie("released", None, None, None), today),
+            status(&movie(Some("2026-10-01"), None, None), today),
             "announced"
         );
         assert_eq!(
-            status(&movie("released", Some("2026-10-01"), None, None), today),
-            "announced"
-        );
-        assert_eq!(
-            status(&movie("released", Some("2026-09-01"), None, None), today),
+            status(&movie(Some("2026-09-01"), None, None), today),
             "inCinemas"
         );
         // 90 dias de cinema sem digital nem físico contam como lançado.
         assert_eq!(
-            status(&movie("released", Some("2026-06-01"), None, None), today),
+            status(&movie(Some("2026-06-01"), None, None), today),
             "released"
         );
         assert_eq!(
-            status(
-                &movie("released", Some("2026-09-01"), Some("2026-10-30"), None),
-                today
-            ),
+            status(&movie(Some("2026-09-01"), Some("2026-10-30"), None), today),
             "inCinemas"
         );
         assert_eq!(
-            status(&movie("released", None, Some("2026-09-20"), None), today),
+            status(&movie(None, Some("2026-09-20"), None), today),
             "released"
         );
     }
 
     #[test]
-    fn disponibilidade_como_a_referencia() {
+    fn disponibilidade_so_pela_regra_de_lancado() {
         let today = day("2026-09-25");
-        assert!(is_available(
-            &movie("announced", None, None, None),
+        // Só anunciado, sem data nenhuma: indisponível.
+        assert!(!is_available(&movie(None, None, None), today, 0));
+        // Cinema recente, sem digital nem físico: ainda não.
+        assert!(!is_available(
+            &movie(Some("2026-08-26"), None, None),
             today,
             0
         ));
         assert!(!is_available(
-            &movie("released", None, None, None),
+            &movie(Some("2026-09-20"), None, None),
+            today,
+            0
+        ));
+        // Cinema há mais de 90 dias: lançado.
+        assert!(is_available(
+            &movie(Some("2026-06-17"), None, None),
+            today,
+            0
+        ));
+        // Digital passada vale; a menor entre digital e física manda.
+        assert!(is_available(
+            &movie(None, Some("2026-09-24"), None),
             today,
             0
         ));
         assert!(is_available(
-            &movie("inCinemas", Some("2026-09-20"), None, None),
+            &movie(Some("2026-01-01"), None, Some("2026-09-24")),
             today,
             0
         ));
+        assert!(is_available(
+            &movie(None, Some("2026-09-24"), Some("2026-12-01")),
+            today,
+            0
+        ));
+        // Digital futura não vale, mesmo com cinema antigo.
         assert!(!is_available(
-            &movie("released", Some("2026-09-20"), None, None),
-            today,
-            0
-        ));
-        assert!(is_available(
-            &movie("released", Some("2026-01-01"), None, Some("2026-09-24")),
+            &movie(Some("2026-01-01"), Some("2026-10-30"), None),
             today,
             0
         ));
         // A carência empurra a data.
         assert!(!is_available(
-            &movie("released", None, Some("2026-09-24"), None),
+            &movie(None, Some("2026-09-24"), None),
             today,
             2
         ));
-        // Sem digital nem físico: 90 dias depois do cinema.
         assert!(is_available(
-            &movie("released", Some("2026-06-01"), None, None),
+            &movie(None, Some("2026-09-23"), None),
             today,
-            0
+            2
         ));
     }
 }

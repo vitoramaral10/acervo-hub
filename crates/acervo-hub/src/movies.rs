@@ -62,7 +62,6 @@ pub struct MovieView {
     pub status: Option<String>,
     pub monitorado: bool,
     pub perfil: Option<String>,
-    pub disponibilidade_minima: Option<String>,
     pub tags: Vec<i64>,
     /// O filme ainda é do gerenciador (veio da importação).
     pub do_radarr: bool,
@@ -139,7 +138,6 @@ fn view(
         status: movie.status,
         monitorado: movie.monitored,
         perfil: movie.quality_profile,
-        disponibilidade_minima: movie.minimum_availability,
         tags: movie.tags,
         do_radarr: entry.origin.is_some(),
         pasta: movie.path,

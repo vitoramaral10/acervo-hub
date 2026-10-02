@@ -279,8 +279,6 @@ struct AddBody {
     pasta: String,
     #[serde(default = "yes")]
     monitorado: bool,
-    #[serde(default = "released")]
-    disponibilidade_minima: String,
     #[serde(default)]
     tags: Vec<i64>,
     #[serde(default)]
@@ -289,10 +287,6 @@ struct AddBody {
 
 const fn yes() -> bool {
     true
-}
-
-fn released() -> String {
-    "released".into()
 }
 
 async fn add_movie(
@@ -315,7 +309,6 @@ async fn add_movie(
         quality_profile: None,
         root_folder: body.pasta,
         monitored: body.monitorado,
-        minimum_availability: body.disponibilidade_minima,
         tags: body.tags,
     };
     let id = crate::library::add(store, &tmdb, &request)

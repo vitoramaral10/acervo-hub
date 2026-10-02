@@ -120,9 +120,6 @@ enum MoviesAction {
         /// Pasta raiz, como o gerenciador a vê.
         #[arg(long, default_value = "/media/movies")]
         root: String,
-        /// `announced`, `inCinemas` ou `released`.
-        #[arg(long, default_value = "released")]
-        minimum_availability: String,
         /// Adiciona sem monitorar.
         #[arg(long)]
         unmonitored: bool,
@@ -270,7 +267,6 @@ async fn movies_command(
             tmdb,
             profile,
             root,
-            minimum_availability,
             unmonitored,
         } => {
             let client = metadata::require_tmdb(config, &store).await?;
@@ -282,7 +278,6 @@ async fn movies_command(
                     quality_profile: profile,
                     root_folder: root,
                     monitored: !unmonitored,
-                    minimum_availability,
                     tags: Vec::new(),
                 },
             )
