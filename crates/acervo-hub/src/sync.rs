@@ -256,19 +256,20 @@ pub async fn execute(
 ///
 /// # Errors
 ///
-/// Configuração incompleta ou nenhum indexador utilizável.
-pub async fn run(config: &Config, apply: bool) -> Result<usize> {
+/// Configuração incompleta ou banco inalcançável.
+pub async fn run(config: &Config, store: &acervo_store::Store, apply: bool) -> Result<usize> {
     config.sync()?;
-    let indexers: Vec<(String, Capabilities)> = crate::serve::entries(config)
-        .await?
-        .into_iter()
-        .map(
-            |Entry {
-                 indexer,
-                 capabilities,
-             }| (indexer.name().to_owned(), capabilities),
-        )
-        .collect();
+    let indexers: Vec<(String, Capabilities)> =
+        crate::serve::entries(config, &store.indexers().await?)
+            .await
+            .into_iter()
+            .map(
+                |Entry {
+                     indexer,
+                     capabilities,
+                 }| (indexer.name().to_owned(), capabilities),
+            )
+            .collect();
     Ok(execute(config, &indexers, apply, true).await?.falhas)
 }
 

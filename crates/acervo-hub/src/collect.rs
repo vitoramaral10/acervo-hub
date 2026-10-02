@@ -98,13 +98,7 @@ pub async fn collect(config: &Config) -> Result<Session> {
         }
     }
 
-    let roots: Vec<_> = config
-        .library
-        .roots
-        .iter()
-        .map(|r| crate::config::expand_tilde(r))
-        .collect();
-    inventory.library_size = acervo_fs::measure_roots(&roots);
+    inventory.library_size = acervo_fs::measure_roots(&config.library.roots);
     tracing::info!(biblioteca = %inventory.library_size, "biblioteca medida");
 
     Ok(Session {

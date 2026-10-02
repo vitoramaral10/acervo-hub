@@ -149,7 +149,16 @@ pub async fn refresh(store: &Store, tmdb: &Tmdb, stale_hours: i64) -> Result<Ref
         let meta = match tmdb.movie(entry.movie.tmdb_id).await {
             Ok(meta) => meta,
             Err(error) => {
-                report.falhas.push((label, error.to_string()));
+                // O 404 é o caso comum (filme apagado ou fundido no TMDB):
+                // dito em português, sem o código. O filme fica no catálogo;
+                // remover é decisão de quem lê o relato.
+                let message = match error {
+                    acervo_metadata::MetadataError::NotFound(id) => {
+                        format!("não existe mais no TMDB (id {id})")
+                    }
+                    other => other.to_string(),
+                };
+                report.falhas.push((label, message));
                 continue;
             }
         };
@@ -327,7 +336,7 @@ pub async fn edit(store: &Store, id: i64, change: &MovieEdit) -> Result<CatalogM
 /// Pasta fora das raízes ou falha ao apagar.
 pub async fn delete_folder(config: &Config, movie_path: &str) -> Result<()> {
     let folder = Path::new(movie_path);
-    let inside_root = config.movies.root_folders.iter().any(|root| {
+    let inside_root = config.library.root_folders.iter().any(|root| {
         folder
             .parent()
             .is_some_and(|p| p == Path::new(root.trim_end_matches('/')))
@@ -585,6 +594,47 @@ pub async fn remove_because(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn filme_sumido_do_tmdb_vira_falha_legivel_e_fica_no_catalogo() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(db) = acervo_store::testing::TestDb::new("refresh_404").await else {
+            return;
+        };
+        let mut gone = movie("released", None, None, None);
+        gone.tmdb_id = 1_553_031;
+        gone.title = "Untitled Cancelled Film".into();
+        db.store
+            .add_movie(&gone, &acervo_store::MovieExtras::default())
+            .await
+            .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(path("/3/movie/1553031"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "status_message": "The resource you requested could not be found."
+            })))
+            .mount(&server)
+            .await;
+        let tmdb = Tmdb::with_base(
+            &format!("{}/3/", server.uri()),
+            "chave",
+            "pt-BR",
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let report = refresh(&db.store, &tmdb, 0).await.unwrap();
+        assert_eq!(
+            report.falhas,
+            [(
+                "Untitled Cancelled Film".to_owned(),
+                "não existe mais no TMDB (id 1553031)".to_owned()
+            )]
+        );
+        assert_eq!(db.store.movies().await.unwrap().len(), 1);
+        db.drop().await;
+    }
 
     #[test]
     fn so_arquivo_com_outro_link_conta_como_download() {

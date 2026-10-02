@@ -521,11 +521,12 @@ mod tests {
         std::fs::create_dir_all(&amado).unwrap();
         std::fs::write(visto.join("visto.mkv"), vec![0_u8; 64 * 1024]).unwrap();
         std::fs::write(amado.join("amado.mkv"), b"fica").unwrap();
-        let config: Config = toml::from_str(&format!(
-            "[paths]\n\"/media\" = \"{}\"\n[movies]\nroot_folders = [\"/media/movies\"]\n",
-            root.display()
-        ))
-        .unwrap();
+        let mut config = Config::default();
+        config
+            .library
+            .paths
+            .insert("/media".into(), root.display().to_string());
+        config.library.root_folders = vec!["/media/movies".into()];
         let store = &db.store;
         let extras = MovieExtras::default();
         store

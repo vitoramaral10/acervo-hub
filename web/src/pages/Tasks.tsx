@@ -1,15 +1,25 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronRight, CircleAlert, CircleCheck, Clock, Loader2, Play } from 'lucide-react'
-import { Fragment, useState } from 'react'
+import { Fragment, useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { CycleCard } from '@/components/CycleCard'
 import { PageHeader } from '@/components/PageHeader'
 import { WatchedCard } from '@/components/WatchedCard'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { Badge, Skeleton, Tooltip } from '@/components/ui/misc'
-import { type CycleReport, type Task, type TaskRun, type WatchedReport, api } from '@/lib/api'
+import {
+  type CycleReport,
+  type MetadataReport,
+  type Task,
+  type TaskRun,
+  type TasksSection,
+  type WatchedReport,
+  api,
+} from '@/lib/api'
 import { formatAgo, formatDuration, formatInterval } from '@/lib/format'
 import { cn } from '@/lib/utils'
+import { useSection } from '@/pages/settings/Sections'
 
 // Enquanto alguma tarefa roda, a tela acompanha de perto; parada, só confere de vez em quando.
 const FAST = 3_000
@@ -29,6 +39,13 @@ export function TasksPage() {
     refetchInterval: anyRunning ? FAST : SLOW,
   })
 
+  // Intervalos e limite da busca moram na seção `tarefas` da configuração.
+  const { query: schedule, save } = useSection('tarefas')
+  const saveSchedule = (patch: Partial<TasksSection>) => {
+    if (!schedule.data) return
+    save.mutate({ ...schedule.data, ...patch })
+  }
+
   const run = useMutation({
     mutationFn: api.runTask,
     onSuccess: (result, id) => {
@@ -44,7 +61,7 @@ export function TasksPage() {
     <>
       <PageHeader
         title="Tarefas"
-        description="O que o serviço roda sozinho: busca dos que faltam, RSS, importação, metadados, a limpeza — que tira da fila o que o gerenciador esqueceu e apaga o seed que perdeu o hardlink com a biblioteca — e, com o Jellyfin configurado, a remoção dos filmes já assistidos. Cada uma pode rodar agora, fora da hora."
+        description="O que o serviço roda sozinho: busca dos que faltam, RSS, importação, metadados, a limpeza — que tira da fila o que o gerenciador esqueceu e apaga o seed que perdeu o hardlink com a biblioteca — e, com o Jellyfin configurado, a remoção dos filmes já assistidos. O intervalo se muda aqui, em minutos (0 desliga o agendamento), e vale na hora; cada uma pode rodar agora, fora da hora."
       />
 
       <section className="mb-10" aria-labelledby="titulo-agendadas">
@@ -56,13 +73,26 @@ export function TasksPage() {
         ) : tasks.isError ? (
           <Failure what="as tarefas" message={tasks.error.message} onRetry={() => void tasks.refetch()} />
         ) : tasks.data.tarefas.length === 0 ? (
-          <Empty title="Nenhuma tarefa neste serviço" text="Sem banco de dados nem configuração da limpeza, não há o que agendar." />
+          <Empty title="Nenhuma tarefa neste serviço" text="O serviço não registrou tarefas de fundo." />
         ) : (
-          <ScheduledTable
-            tasks={tasks.data.tarefas}
-            pending={run.isPending ? run.variables : undefined}
-            onRun={(id) => run.mutate(id)}
-          />
+          <>
+            <ScheduledTable
+              tasks={tasks.data.tarefas}
+              pending={run.isPending ? run.variables : undefined}
+              onRun={(id) => run.mutate(id)}
+              intervals={schedule.data?.intervalos}
+              onInterval={(id, minutes) =>
+                schedule.data && saveSchedule({ intervalos: { ...schedule.data.intervalos, [id]: minutes } })
+              }
+            />
+            {schedule.data && (
+              <SearchLimit
+                value={schedule.data.search_limit}
+                saving={save.isPending}
+                onSave={(search_limit) => saveSchedule({ search_limit })}
+              />
+            )}
+          </>
         )}
       </section>
 
@@ -113,14 +143,82 @@ function When({ iso }: { iso: string | null | undefined }) {
   )
 }
 
+/** Minutos inteiros de 0 a 30 dias, ou `null` se o texto não é isso. */
+function parseMinutes(text: string): number | null {
+  const value = Number(text)
+  return text.trim() !== '' && Number.isInteger(value) && value >= 0 && value <= 43_200 ? value : null
+}
+
+/** Campo de minutos que grava ao sair dele ou no Enter, só se mudou. */
+function MinutesInput({
+  id,
+  label,
+  value,
+  min = 0,
+  onSave,
+}: {
+  id: string
+  label: string
+  value: number
+  min?: number
+  onSave: (value: number) => void
+}) {
+  const [text, setText] = useState(String(value))
+  useEffect(() => setText(String(value)), [value])
+  const commit = () => {
+    const parsed = parseMinutes(text)
+    if (parsed === null || parsed < min) {
+      setText(String(value))
+      return
+    }
+    if (parsed !== value) onSave(parsed)
+  }
+  return (
+    <Input
+      id={id}
+      type="number"
+      min={min}
+      step={1}
+      inputMode="numeric"
+      aria-label={label}
+      value={text}
+      onChange={(event) => setText(event.target.value)}
+      onBlur={commit}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault()
+          commit()
+        }
+        if (event.key === 'Escape') setText(String(value))
+      }}
+      className="h-8 w-20 tabular-nums"
+    />
+  )
+}
+
+function SearchLimit({ value, saving, onSave }: { value: number; saving: boolean; onSave: (value: number) => void }) {
+  return (
+    <div className="mt-3 flex flex-wrap items-center gap-2 text-sm text-content-muted">
+      <label htmlFor="limite-busca">A busca agendada pega até</label>
+      <MinutesInput id="limite-busca" label="Filmes por rodada da busca agendada" value={value} min={1} onSave={onSave} />
+      <span>filmes por rodada; “rodar agora” busca todos.</span>
+      {saving && <Loader2 className="size-3.5 animate-spin" aria-label="Salvando" />}
+    </div>
+  )
+}
+
 function ScheduledTable({
   tasks,
   pending,
   onRun,
+  intervals,
+  onInterval,
 }: {
   tasks: Task[]
   pending: string | undefined
   onRun: (id: string) => void
+  intervals: Record<string, number> | undefined
+  onInterval: (id: string, minutes: number) => void
 }) {
   return (
     <div className="overflow-x-auto rounded-lg border border-border bg-surface">
@@ -131,7 +229,7 @@ function ScheduledTable({
               Nome
             </th>
             <th scope="col" className="px-3 py-2.5 font-medium">
-              Intervalo
+              Intervalo (min)
             </th>
             <th scope="col" className="px-3 py-2.5 font-medium">
               Última execução
@@ -152,7 +250,15 @@ function ScheduledTable({
         </thead>
         <tbody className="divide-y divide-border">
           {tasks.map((task) => (
-            <ScheduledRow key={task.id} task={task} pending={pending === task.id} onRun={() => onRun(task.id)} />
+            <ScheduledRow
+              key={task.id}
+              task={task}
+              pending={pending === task.id}
+              onRun={() => onRun(task.id)}
+              minutes={intervals?.[task.id] ?? task.intervalo_minutos}
+              editable={intervals !== undefined}
+              onInterval={(minutes) => onInterval(task.id, minutes)}
+            />
           ))}
         </tbody>
       </table>
@@ -160,12 +266,37 @@ function ScheduledTable({
   )
 }
 
-function ScheduledRow({ task, pending, onRun }: { task: Task; pending: boolean; onRun: () => void }) {
+function ScheduledRow({
+  task,
+  pending,
+  onRun,
+  minutes,
+  editable,
+  onInterval,
+}: {
+  task: Task
+  pending: boolean
+  onRun: () => void
+  minutes: number
+  editable: boolean
+  onInterval: (minutes: number) => void
+}) {
   const last = task.ultima
   return (
     <tr className="transition-colors hover:bg-surface-raised/60">
       <td className="px-4 py-3 font-medium">{task.nome}</td>
-      <td className="px-3 py-3 whitespace-nowrap text-content-muted">{formatInterval(task.intervalo_minutos)}</td>
+      <td className="px-3 py-2 whitespace-nowrap text-content-muted">
+        {editable ? (
+          <MinutesInput
+            id={`intervalo-${task.id}`}
+            label={`Intervalo de ${task.nome}, em minutos (0 desliga)`}
+            value={minutes}
+            onSave={onInterval}
+          />
+        ) : (
+          formatInterval(minutes)
+        )}
+      </td>
       <td className="px-3 py-3 whitespace-nowrap text-content-muted">
         {task.rodando ? <When iso={task.iniciada_em} /> : <When iso={last?.inicio} />}
       </td>
@@ -173,7 +304,21 @@ function ScheduledRow({ task, pending, onRun }: { task: Task; pending: boolean; 
         {last ? formatDuration(last.duracao_ms) : '—'}
       </td>
       <td className="px-3 py-3 whitespace-nowrap text-content-muted">
-        {task.rodando ? '—' : task.intervalo_minutos > 0 ? <When iso={task.proxima} /> : 'só manual'}
+        {task.rodando ? (
+          '—'
+        ) : task.indisponivel ? (
+          <Tooltip content={task.indisponivel}>
+            <span className="inline-flex items-center gap-1 text-warning" tabIndex={0}>
+              <CircleAlert className="size-3.5" aria-hidden="true" />
+              parada
+              <span className="sr-only">: {task.indisponivel}</span>
+            </span>
+          </Tooltip>
+        ) : task.intervalo_minutos > 0 ? (
+          <When iso={task.proxima} />
+        ) : (
+          'só manual'
+        )}
       </td>
       <td className="px-3 py-3">
         {task.rodando ? (
@@ -240,7 +385,7 @@ function HistoryTable({ runs }: { runs: TaskRun[] }) {
         </thead>
         <tbody className="divide-y divide-border">
           {runs.map((run) => {
-            // Só a limpeza e os assistidos têm relatório para abrir.
+            // Só a limpeza, os assistidos e os metadados têm relatório para abrir.
             const report = run.detalhe ? detail(run) : null
             const expanded = report !== null && open === run.id
             return (
@@ -292,6 +437,8 @@ function HistoryTable({ runs }: { runs: TaskRun[] }) {
                     <td colSpan={5} className="bg-surface-raised/40 px-4 py-4">
                       {report.tarefa === 'limpeza' ? (
                         <CycleCard report={report.report} />
+                      ) : report.tarefa === 'metadados' ? (
+                        <MetadataCard report={report.report} />
                       ) : (
                         <WatchedCard report={report.report} />
                       )}
@@ -307,10 +454,52 @@ function HistoryTable({ runs }: { runs: TaskRun[] }) {
   )
 }
 
-type Detail = { tarefa: 'limpeza'; report: CycleReport } | { tarefa: 'assistidos'; report: WatchedReport }
+type Detail =
+  | { tarefa: 'limpeza'; report: CycleReport }
+  | { tarefa: 'assistidos'; report: WatchedReport }
+  | { tarefa: 'metadados'; report: MetadataReport }
 
 function detail(run: TaskRun): Detail | null {
   if (run.tarefa === 'limpeza') return { tarefa: 'limpeza', report: run.detalhe as CycleReport }
   if (run.tarefa === 'assistidos') return { tarefa: 'assistidos', report: run.detalhe as WatchedReport }
+  if (run.tarefa === 'metadados') return { tarefa: 'metadados', report: run.detalhe as MetadataReport }
   return null
+}
+
+/** O que a atualização de metadados mudou e o que falhou, filme a filme. */
+function MetadataCard({ report }: { report: MetadataReport }) {
+  return (
+    <div className="grid gap-4 text-sm sm:grid-cols-2">
+      <div>
+        <h3 className="mb-2 font-semibold">Falharam ({report.falhas.length})</h3>
+        {report.falhas.length === 0 ? (
+          <p className="text-content-muted">Nenhuma falha.</p>
+        ) : (
+          <ul className="grid gap-1.5">
+            {report.falhas.map((falha) => (
+              <li key={falha.filme} className="flex items-start gap-1.5">
+                <CircleAlert className="mt-0.5 size-3.5 shrink-0 text-danger" aria-hidden="true" />
+                <span>
+                  <span className="font-medium">{falha.filme}</span>
+                  <span className="text-content-muted"> — {falha.erro}</span>
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+      <div>
+        <h3 className="mb-2 font-semibold">Atualizados ({report.atualizados.length})</h3>
+        {report.atualizados.length === 0 ? (
+          <p className="text-content-muted">Nada mudou.</p>
+        ) : (
+          <ul className="grid gap-1 text-content-muted">
+            {report.atualizados.map((title) => (
+              <li key={title}>{title}</li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  )
 }

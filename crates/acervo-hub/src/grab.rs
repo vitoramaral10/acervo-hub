@@ -195,10 +195,10 @@ fn left(size: u64, progress: f64) -> u64 {
 }
 
 pub(crate) async fn qbit(config: &Config) -> Result<QbitClient> {
-    let spec = config
-        .qbittorrent
-        .as_ref()
-        .context("seção `[qbittorrent]` ausente: o grab manda o torrent ao cliente")?;
+    let spec = config.qbittorrent().context(
+        "cliente de download não configurado: o grab manda o torrent ao qBittorrent \
+         (Configurações → Cliente de download)",
+    )?;
     QbitClient::login(
         &spec.url,
         &spec.username,
@@ -238,14 +238,14 @@ pub async fn send(
     };
     let client = qbit(config).await?;
     client
-        .ensure_category(&config.movies.category)
+        .ensure_category(&config.library.category)
         .await
         .context("criando a categoria no qBittorrent")?;
     let added = client
         .add(
             torrent,
             &AddOptions {
-                category: config.movies.category.clone(),
+                category: config.library.category.clone(),
                 save_path: None,
                 stopped: true,
                 tags: vec![QUEUE_TAG.into()],

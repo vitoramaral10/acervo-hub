@@ -3,18 +3,21 @@
 #
 # A tag `main` acompanha o último build da branch principal. `latest` só nasce
 # em tag semver (`v*`). Para fixar uma versão, troque por `:vX.Y.Z` ou digest.
+#
+# Toda a configuração mora no Postgres e se edita na interface (Configurações,
+# Aplicativos, Tarefas). Fora do banco, só o ambiente abaixo.
 
 services:
-  # Sobe com o resto do stack. Os gerenciadores o alcançam pela rede `media` em
-  # `http://acervo-hub-indexadores:9797/<indexador>`; nenhuma porta vai para o
-  # host, porque a chave dá acesso a links com passkey.
+  # Os gerenciadores o alcançam pela rede `media` em
+  # `http://acervo-hub-indexadores:9797/<indexador>` — que é o "Endereço
+  # público" a pôr em Configurações → Servidor.
   #
-  # Em `config.toml`, `[server] bind = "0.0.0.0:9797"` — dentro do container,
-  # o padrão `127.0.0.1` não seria alcançável pelos vizinhos.
+  # Cadastrar os indexadores nos gerenciadores (simula sem `--apply`; também
+  # há o botão em Aplicativos):
+  #   docker compose run --rm acervo-hub-indexadores sync --apply
   #
-  # Cadastrar os indexadores nos gerenciadores (simula sem `--apply`):
-  #   docker compose run --rm acervo-hub-indexadores \
-  #       -c /etc/acervo-hub/config.toml sync --apply
+  # Contas da interface (a senha vem da entrada padrão):
+  #   echo 'senha-longa' | docker compose run --rm -T acervo-hub-indexadores users set admin
   acervo-hub-indexadores:
     image: ghcr.io/vitoramaral10/acervo-hub:main
     user: "65532:65532"
@@ -30,16 +33,30 @@ services:
     pids_limit: 64
     cpus: "0.50"
 
-    volumes:
-      - ./config.toml:/etc/acervo-hub/config.toml:ro
-      # Definições Cardigann, se houver. Não precisa do acervo.
-      - ./definicoes:/etc/acervo-hub/definicoes:ro
-      # Credenciais trocadas pela interface web. Com
-      # `[state] credentials = "/var/lib/acervo-hub/credenciais.toml"` no
-      # config; o diretório precisa ser do UID do container.
-      - ./state:/var/lib/acervo-hub
+    environment:
+      # Obrigatória. Guarda a senha do banco: prefira um `.env` fora do
+      # versionamento (`ACERVO_DATABASE_URL=postgres://...` lá) a escrevê-la
+      # aqui.
+      ACERVO_DATABASE_URL: ${ACERVO_DATABASE_URL:?defina ACERVO_DATABASE_URL}
+      # Padrão `0.0.0.0:9797`: dentro do container, `127.0.0.1` não seria
+      # alcançável pelos vizinhos.
+      # ACERVO_BIND: 0.0.0.0:9797
+      #
+      # Migração, uma vez só: com o banco ainda sem configuração, o serviço
+      # importa o `config.toml` antigo e os arquivos de `[state]` que ele
+      # aponta. Monte os dois (somente leitura, nos mesmos caminhos do
+      # arquivo) e, depois da primeira subida, tire a variável e as montagens.
+      # ACERVO_IMPORT_CONFIG: /etc/acervo-hub/config.toml
 
-    command: ["-c", "/etc/acervo-hub/config.toml", "serve"]
+    volumes:
+      # Definições Cardigann, se houver: o diretório vai em Configurações →
+      # Servidor → "Diretórios de definições".
+      - ./definicoes:/etc/acervo-hub/definicoes:ro
+      # Só durante a migração (veja ACERVO_IMPORT_CONFIG):
+      # - ./config.toml:/etc/acervo-hub/config.toml:ro
+      # - ./state:/var/lib/acervo-hub:ro
+
+    command: ["serve"]
 
     # A interface web (e a API Torznab) só na própria máquina: de fora, por
     # túnel SSH ou atrás de um proxy com TLS.

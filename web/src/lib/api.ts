@@ -46,7 +46,8 @@ export interface Health {
 export interface Indexer {
   nome: string
   ativo: boolean
-  origem: 'config' | 'interface'
+  /** Todo indexador é cadastro do banco; o rótulo fica só por compatibilidade. */
+  origem: string
   privado: boolean
   editavel: boolean
   modos: { busca: boolean; series: boolean; filmes: boolean }
@@ -154,6 +155,8 @@ export interface Task {
   id: string
   nome: string
   intervalo_minutos: number
+  /** Por que a tarefa está fora do agendamento (falta configuração), ou `null`. */
+  indisponivel: string | null
   rodando: boolean
   iniciada_em: string | null
   /** Quanto falta, como "3 de 10", quando a tarefa sabe dizer. */
@@ -162,7 +165,13 @@ export interface Task {
   ultima: TaskLastRun | null
 }
 
-/** Uma execução no histórico; `detalhe` é o relatório dela (na limpeza, um `CycleReport`; em assistidos, um `WatchedReport`). */
+/** O detalhe de "Atualização de metadados": o que mudou e o que falhou, filme a filme. */
+export interface MetadataReport {
+  atualizados: string[]
+  falhas: { filme: string; erro: string }[]
+}
+
+/** Uma execução no histórico; `detalhe` é o relatório dela (limpeza: `CycleReport`; assistidos: `WatchedReport`; metadados: `MetadataReport`). */
 export interface TaskRun extends TaskLastRun {
   id: number
   tarefa: string
@@ -241,6 +250,80 @@ export interface LastSearch {
   erro: string | null
 }
 
+// ---------------------------------------------------------------- configuração
+
+/** Segredo como a API o devolve: nunca o valor, só se está definido. */
+export interface Secret {
+  definida: boolean
+}
+
+export interface ServerSection {
+  api_key: Secret
+  public_url: string | null
+  catalogos: string[]
+  http_timeout_seconds: number
+}
+
+export interface DownloadClientSection {
+  url: string
+  username: string
+  password: Secret
+}
+
+export interface JellyfinSection {
+  url: string
+  api_key: Secret
+  delete_watched_after_minutes: number
+}
+
+export interface Manager {
+  name: string
+  kind: 'series' | 'movie'
+  url: string
+  api_key: Secret
+}
+
+export interface LibrarySection {
+  roots: string[]
+  root_folders: string[]
+  category: string
+  paths: Record<string, string>
+}
+
+export interface CleanupSection {
+  orphan_strikes: number
+  delete_private_orphans: boolean
+  skip_orphan_if_missing_in_client: boolean
+  private_seed_grace_hours: number
+  recent_change_grace_hours: number
+  max_batch_gib: number
+  max_batch_fraction: number
+  managed_categories: string[]
+}
+
+export interface TasksSection {
+  intervalos: Record<string, number>
+  search_limit: number
+}
+
+/** As seções e o formato de cada uma, como o GET devolve. */
+export interface Sections {
+  servidor: ServerSection
+  qbittorrent: DownloadClientSection
+  jellyfin: JellyfinSection
+  gerenciadores: Manager[]
+  biblioteca: LibrarySection
+  limpeza: CleanupSection
+  tarefas: TasksSection
+}
+
+export type SectionName = keyof Sections
+
+/** No PUT, segredo vai como texto; vazio ou ausente mantém o guardado. */
+type Input<T> = T extends Secret ? string : T extends (infer U)[] ? Input<U>[] : T extends object ? { [K in keyof T]?: Input<T[K]> } : T
+
+export type SectionInput<N extends SectionName> = Input<Sections[N]>
+
 export const api = {
   session: () => request<{ ok: boolean; usuario: string | null }>('GET', '/ui/api/sessao'),
   login: (credentials: { usuario: string; senha: string }) =>
@@ -284,6 +367,9 @@ export const api = {
   configuration: () => request<Configuration>('GET', '/ui/api/configuracoes'),
   saveConfiguration: (values: Record<string, string | null>) =>
     request<Configuration>('PUT', '/ui/api/configuracoes', values),
+  section: <N extends SectionName>(name: N) => request<Sections[N]>('GET', `/ui/api/configuracoes/${name}`),
+  saveSection: <N extends SectionName>(name: N, value: SectionInput<N>) =>
+    request<Sections[N]>('PUT', `/ui/api/configuracoes/${name}`, value),
   search: (params: { q: string; indexador: string; cat: string }) => {
     const query = new URLSearchParams()
     query.set('q', params.q)

@@ -1,70 +1,146 @@
-//! Configuração em TOML.
+//! A configuração do serviço, em memória.
 //!
-//! Todas as structs usam `deny_unknown_fields`. Um campo escrito errado tem de
-//! ser erro barulhento: silenciosamente ignorado, ele faria uma trava de
-//! segurança cair no padrão sem ninguém notar — que é o pior dos dois mundos,
-//! porque a configuração *parece* estar valendo.
+//! Vem do banco, uma seção por linha de `config_sections`, e se edita pela
+//! tela; fora dele só ficam o endereço do banco e o de escuta, no ambiente.
+//! Seção ausente vale o padrão. Cada seção é um JSON com
+//! `deny_unknown_fields`: campo escrito errado é erro barulhento, não uma
+//! trava de segurança caindo no padrão em silêncio.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use acervo_arr::ArrKind;
 use acervo_core::Allocated;
 use acervo_janitor::{Guards, Policy};
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Config {
-    /// Só o ciclo de limpeza usa; `serve` sobe sem ele.
-    #[serde(default)]
-    pub qbittorrent: Option<QbitConfig>,
-    #[serde(default)]
-    pub instances: Vec<InstanceConfig>,
-    /// Caminho como o cliente vê → caminho no host.
-    #[serde(default)]
-    pub paths: BTreeMap<String, String>,
-    #[serde(default)]
-    pub library: LibraryConfig,
-    #[serde(default)]
-    pub policy: PolicyConfig,
-    #[serde(default)]
-    pub state: StateConfig,
-    #[serde(default = "default_timeout_seconds")]
-    pub http_timeout_seconds: u64,
-    /// Superfície Torznab. Só `serve` usa.
-    #[serde(default)]
-    pub server: Option<ServerConfig>,
-    #[serde(default)]
-    pub indexers: Vec<IndexerConfig>,
-    /// Banco do catálogo de filmes e das contas da interface.
-    #[serde(default)]
-    pub database: Option<DatabaseConfig>,
-    /// Grab e importação de filmes pelo próprio acervo.
-    #[serde(default)]
-    pub movies: MoviesConfig,
-    /// Servidor de mídia que diz o que já foi assistido. Sem ele, a tarefa
-    /// de apagar assistidos não existe.
-    #[serde(default)]
-    pub jellyfin: Option<JellyfinConfig>,
+/// As seções, na ordem da tela.
+pub const SECTIONS: [&str; 7] = [
+    SERVIDOR,
+    QBITTORRENT,
+    JELLYFIN,
+    GERENCIADORES,
+    BIBLIOTECA,
+    LIMPEZA,
+    TAREFAS,
+];
+pub const SERVIDOR: &str = "servidor";
+pub const QBITTORRENT: &str = "qbittorrent";
+pub const JELLYFIN: &str = "jellyfin";
+pub const GERENCIADORES: &str = "gerenciadores";
+pub const BIBLIOTECA: &str = "biblioteca";
+pub const LIMPEZA: &str = "limpeza";
+pub const TAREFAS: &str = "tarefas";
+
+/// Campos secretos de cada seção: nunca voltam pela API, e vazio ao salvar
+/// mantém o valor guardado. Em `gerenciadores`, vale para cada item.
+#[must_use]
+pub fn secrets(section: &str) -> &'static [&'static str] {
+    match section {
+        SERVIDOR | JELLYFIN | GERENCIADORES => &["api_key"],
+        QBITTORRENT => &["password"],
+        _ => &[],
+    }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Config {
+    /// Superfície Torznab, catálogo de definições e timeout HTTP.
+    pub server: ServerConfig,
+    /// Cliente de download. Sem URL, não há cliente: o grab e a limpeza
+    /// ficam parados.
+    pub qbittorrent: QbitConfig,
+    /// Servidor de mídia que diz o que já foi assistido. Sem URL, a tarefa de
+    /// apagar assistidos fica parada.
+    pub jellyfin: JellyfinConfig,
+    /// Os gerenciadores de série e de filme.
+    pub instances: Vec<InstanceConfig>,
+    pub library: LibraryConfig,
+    pub policy: PolicyConfig,
+    pub tasks: TasksConfig,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerConfig {
+    /// Chave que os consumidores mandam em `apikey`. Vale para todos os
+    /// indexadores servidos, para a API v3 e para a tela em `X-Api-Key`.
+    /// Vazia, nada disso aceita chave nenhuma.
+    pub api_key: String,
+    /// Como os gerenciadores alcançam este serviço — o endereço que `sync`
+    /// cadastra neles. Em Compose, o nome do serviço na rede interna.
+    pub public_url: Option<String>,
+    /// Diretórios de definições Cardigann que a interface oferece para
+    /// adicionar. O primeiro que tiver um id vence.
+    #[serde(rename = "catalogos")]
+    pub catalogs: Vec<PathBuf>,
+    /// Timeout de cada chamada HTTP, em segundos.
+    pub http_timeout_seconds: u64,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A chave dá acesso a links com passkey.
+        formatter
+            .debug_struct("ServerConfig")
+            .field("public_url", &self.public_url)
+            .field("catalogs", &self.catalogs)
+            .field("http_timeout_seconds", &self.http_timeout_seconds)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            public_url: None,
+            catalogs: Vec::new(),
+            http_timeout_seconds: 30,
+        }
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct QbitConfig {
+    pub url: String,
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for QbitConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QbitConfig")
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct JellyfinConfig {
     /// Como o serviço alcança o Jellyfin; em Compose, `http://jellyfin:8096`.
     pub url: String,
     pub api_key: String,
     /// Carência depois da última vez que alguém assistiu: dá tempo de
     /// marcar como favorito o que é para ficar.
-    #[serde(default = "default_watched_grace")]
     pub delete_watched_after_minutes: u64,
-    /// De quanto em quanto tempo a tarefa roda. Zero desliga o agendamento;
-    /// "rodar agora" continua valendo.
-    #[serde(default = "default_watched_interval")]
-    pub interval_minutes: u64,
+}
+
+impl Default for JellyfinConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            api_key: String::new(),
+            delete_watched_after_minutes: 60,
+        }
+    }
 }
 
 impl std::fmt::Debug for JellyfinConfig {
@@ -77,175 +153,34 @@ impl std::fmt::Debug for JellyfinConfig {
                 "delete_watched_after_minutes",
                 &self.delete_watched_after_minutes,
             )
-            .field("interval_minutes", &self.interval_minutes)
             .finish_non_exhaustive()
     }
 }
 
-const fn default_watched_grace() -> u64 {
-    60
-}
-
-const fn default_watched_interval() -> u64 {
-    15
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MoviesConfig {
-    /// Categoria do cliente de download para o que o acervo pega. Separada da
-    /// do gerenciador, para ele não tentar importar o que não pegou; entra em
-    /// `policy.managed_categories` para a limpeza cuidar do seed depois.
-    #[serde(default = "default_movie_category")]
-    pub category: String,
-    /// De quanto em quanto tempo o serviço procura download concluído para
-    /// importar. Zero desliga.
-    #[serde(default = "default_import_interval")]
-    pub import_interval_minutes: u64,
-    /// Pastas raiz dos filmes, como os gerenciadores as veem. A API v3 as
-    /// oferece aos apps de pedidos.
-    #[serde(default = "default_root_folders")]
-    pub root_folders: Vec<String>,
-    /// De quanto em quanto tempo a busca automática lê os releases recentes
-    /// (quando ligada nas Configurações).
-    #[serde(default = "default_rss_interval")]
-    pub rss_interval_minutes: u64,
-}
-
-impl Default for MoviesConfig {
-    fn default() -> Self {
-        Self {
-            category: default_movie_category(),
-            import_interval_minutes: default_import_interval(),
-            root_folders: default_root_folders(),
-            rss_interval_minutes: default_rss_interval(),
-        }
-    }
-}
-
-fn default_movie_category() -> String {
-    "acervo".into()
-}
-
-fn default_rss_interval() -> u64 {
-    30
-}
-
-fn default_root_folders() -> Vec<String> {
-    vec!["/media/movies".into()]
-}
-
-fn default_import_interval() -> u64 {
-    5
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DatabaseConfig {
-    /// `postgres://usuário:senha@host:5432/banco`.
-    pub url: String,
-}
-
-impl std::fmt::Debug for DatabaseConfig {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // O endereço carrega a senha do banco.
-        formatter
-            .debug_struct("DatabaseConfig")
-            .finish_non_exhaustive()
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServerConfig {
-    #[serde(default = "default_bind")]
-    pub bind: String,
-    /// Chave que os consumidores mandam em `apikey`. Vale para todos os
-    /// indexadores servidos.
-    pub api_key: String,
-    /// Como os gerenciadores alcançam este serviço — o endereço que `sync`
-    /// cadastra neles. Em Compose, o nome do serviço na rede interna.
-    #[serde(default)]
-    pub public_url: Option<String>,
-    /// Diretórios de definições Cardigann que a interface oferece para
-    /// adicionar — por exemplo, o `Definitions` do agregador atual. O
-    /// primeiro que tiver um id vence.
-    #[serde(default)]
-    pub catalogs: Vec<PathBuf>,
-    /// De quantos em quantos minutos o serviço busca os filmes que faltam.
-    /// Sem valor, não busca sozinho. Roda aqui, e não num processo à parte,
-    /// para dividir sessão e consultas guardadas com o Sonarr.
-    #[serde(default)]
-    pub search_interval_minutes: Option<u64>,
-    /// Quantos filmes cada rodada busca.
-    #[serde(default = "default_search_limit")]
-    pub search_limit: usize,
-    /// De quantos em quantos minutos o serviço roda o ciclo de limpeza. Zero
-    /// desliga o agendamento; "rodar agora" na tela continua valendo.
-    #[serde(default = "default_cleanup_interval")]
-    pub cleanup_interval_minutes: u64,
-}
-
-fn default_search_limit() -> usize {
-    5
-}
-
-fn default_cleanup_interval() -> u64 {
-    60
-}
-
-/// Um indexador servido. `kind` decide de onde vêm as capacidades: a
-/// definição Cardigann as declara; um endpoint Torznab as anuncia em `t=caps`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-pub enum IndexerConfig {
-    Torznab(TorznabIndexer),
-    Cardigann(CardigannIndexer),
-}
-
-#[derive(Debug, Clone, PartialEq, serde::Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TorznabIndexer {
-    pub name: String,
-    pub url: String,
-    #[serde(default)]
-    pub api_key: Option<String>,
-    /// Intervalo mínimo entre duas requisições ao mesmo indexador.
-    #[serde(default = "default_request_interval")]
-    pub request_interval_seconds: f64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CardigannIndexer {
-    /// Arquivo YAML da definição, no formato v11.
-    pub definition: PathBuf,
-    /// Qual dos `links` da definição usar.
-    #[serde(default)]
-    pub link: usize,
-    /// Sobrescreve os `settings` declarados na definição.
-    #[serde(default)]
-    pub settings: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QbitConfig {
-    pub url: String,
-    pub username: String,
-    pub password: String,
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstanceConfig {
     pub name: String,
     pub kind: InstanceKind,
     pub url: String,
+    #[serde(default)]
     pub api_key: String,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+impl std::fmt::Debug for InstanceConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InstanceConfig")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `series` ou `movie`: decide qual campo da fila aponta para a obra — ler o
+/// campo do outro produto esconderia órfão.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InstanceKind {
     Series,
@@ -261,74 +196,59 @@ impl From<InstanceKind> for ArrKind {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct LibraryConfig {
     /// Raízes do acervo, no host. Servem para medir o tamanho total, que é a
     /// base da trava proporcional.
-    #[serde(default)]
     pub roots: Vec<PathBuf>,
+    /// Pastas raiz dos filmes, como os gerenciadores as veem. A API v3 as
+    /// oferece aos apps de pedidos.
+    pub root_folders: Vec<String>,
+    /// Categoria do cliente de download para o que o acervo pega. Separada da
+    /// do gerenciador, para ele não tentar importar o que não pegou.
+    pub category: String,
+    /// Caminho como o cliente vê → caminho no host.
+    pub paths: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StateConfig {
-    /// Onde os strikes sobrevivem entre execuções.
-    #[serde(default = "default_ledger_path")]
-    pub ledger: PathBuf,
-    /// Credenciais trocadas pela interface web. Ficam fora do `config.toml`
-    /// para que ele possa ser montado somente leitura; valem por cima dele.
-    #[serde(default = "default_credentials_path")]
-    pub credentials: PathBuf,
-    /// Indexadores adicionados e desativados pela interface web.
-    #[serde(default = "default_registry_path")]
-    pub registry: PathBuf,
-}
-
-impl Default for StateConfig {
+impl Default for LibraryConfig {
     fn default() -> Self {
         Self {
-            ledger: default_ledger_path(),
-            credentials: default_credentials_path(),
-            registry: default_registry_path(),
+            roots: Vec::new(),
+            root_folders: vec!["/media/movies".into()],
+            category: "acervo".into(),
+            paths: BTreeMap::new(),
         }
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PolicyConfig {
-    #[serde(default = "default_strikes")]
     pub orphan_strikes: u32,
-    #[serde(default)]
     pub delete_private_orphans: bool,
-    #[serde(default = "default_true")]
     pub skip_orphan_if_missing_in_client: bool,
-    /// `None` (omitido ou `0`) apaga sem carência de seed.
-    #[serde(default = "default_private_grace")]
+    /// Zero apaga sem carência de seed.
     pub private_seed_grace_hours: u64,
-    #[serde(default = "default_recent_grace")]
     pub recent_change_grace_hours: u64,
-    #[serde(default = "default_max_batch_gib")]
     pub max_batch_gib: u64,
-    #[serde(default = "default_max_fraction")]
     pub max_batch_fraction: f64,
     /// Categorias do cliente que os *arr usam. Só seed nelas pode ser apagado
     /// por perda de hardlink; vazia, essa regra não apaga nada.
-    #[serde(default)]
     pub managed_categories: Vec<String>,
 }
 
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
-            orphan_strikes: default_strikes(),
+            orphan_strikes: 3,
             delete_private_orphans: false,
             skip_orphan_if_missing_in_client: true,
-            private_seed_grace_hours: default_private_grace(),
-            recent_change_grace_hours: default_recent_grace(),
-            max_batch_gib: default_max_batch_gib(),
-            max_batch_fraction: default_max_fraction(),
+            private_seed_grace_hours: 120,
+            recent_change_grace_hours: 24,
+            max_batch_gib: 300,
+            max_batch_fraction: 0.30,
             managed_categories: Vec::new(),
         }
     }
@@ -353,427 +273,426 @@ impl PolicyConfig {
     }
 }
 
+/// Ids das tarefas de fundo com o intervalo padrão, em minutos. Zero desliga
+/// o agendamento; "rodar agora" continua valendo.
+pub const TASK_DEFAULTS: [(&str, u64); 6] = [
+    // Sem intervalo, só pelo botão.
+    ("busca", 0),
+    ("rss", 30),
+    ("importacao", 5),
+    ("metadados", 360),
+    ("limpeza", 60),
+    ("assistidos", 15),
+];
+
+/// Teto de qualquer intervalo: 30 dias.
+const MAX_INTERVAL: u64 = 30 * 24 * 60;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TasksConfig {
+    /// Minutos entre execuções, por id de tarefa. Id ausente vale o padrão.
+    pub intervalos: BTreeMap<String, u64>,
+    /// Quantos filmes cada rodada agendada da busca dos que faltam busca.
+    pub search_limit: usize,
+}
+
+impl Default for TasksConfig {
+    fn default() -> Self {
+        Self {
+            intervalos: TASK_DEFAULTS
+                .iter()
+                .map(|(id, minutes)| ((*id).to_owned(), *minutes))
+                .collect(),
+            search_limit: 5,
+        }
+    }
+}
+
+impl TasksConfig {
+    /// Minutos entre execuções da tarefa.
+    #[must_use]
+    pub fn minutes(&self, id: &str) -> u64 {
+        self.intervalos.get(id).copied().unwrap_or_else(|| {
+            TASK_DEFAULTS
+                .iter()
+                .find(|(known, _)| *known == id)
+                .map_or(0, |(_, minutes)| *minutes)
+        })
+    }
+
+    #[must_use]
+    pub fn interval(&self, id: &str) -> Duration {
+        Duration::from_secs(self.minutes(id) * 60)
+    }
+}
+
+/// Uma URL HTTP(S) sem credencial nem query, ou a mensagem do porquê não.
+fn check_url(field: &str, value: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(value).map_err(|_| format!("{field}: URL inválida"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("{field}: use http:// ou https://"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "{field}: tire usuário e senha da URL; eles têm campo próprio"
+        ));
+    }
+    Ok(())
+}
+
 impl Config {
-    /// Lê e valida o arquivo de configuração.
+    /// Monta a configuração das seções gravadas; a que falta vale o padrão.
     ///
     /// # Errors
     ///
-    /// Arquivo ausente, TOML inválido, campo desconhecido ou configuração
-    /// incoerente.
-    pub fn load(path: &Path) -> Result<Self> {
-        warn_if_world_readable(path);
-
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("lendo a configuração em `{}`", path.display()))?;
-        let config: Self = toml::from_str(&text)
-            .with_context(|| format!("interpretando a configuração em `{}`", path.display()))?;
-
-        anyhow::ensure!(
-            (0.0..=1.0).contains(&config.policy.max_batch_fraction),
-            "`policy.max_batch_fraction` precisa ficar entre 0.0 e 1.0"
-        );
+    /// Seção desconhecida ou fora do formato.
+    pub fn from_sections(rows: impl IntoIterator<Item = (String, Value)>) -> Result<Self> {
+        let mut config = Self::default();
+        for (name, value) in rows {
+            config = config
+                .with_section(&name, value)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("lendo a seção `{name}` do banco"))?;
+        }
         Ok(config)
     }
 
-    /// O que o ciclo de limpeza exige além do que o arquivo já garante.
+    /// A seção como ela é gravada, segredo incluso.
+    ///
+    /// # Errors
+    ///
+    /// Seção desconhecida.
+    pub fn section(&self, name: &str) -> Result<Value, String> {
+        let value = match name {
+            SERVIDOR => serde_json::to_value(&self.server),
+            QBITTORRENT => serde_json::to_value(&self.qbittorrent),
+            JELLYFIN => serde_json::to_value(&self.jellyfin),
+            GERENCIADORES => serde_json::to_value(&self.instances),
+            BIBLIOTECA => serde_json::to_value(&self.library),
+            LIMPEZA => serde_json::to_value(&self.policy),
+            TAREFAS => serde_json::to_value(&self.tasks),
+            other => return Err(format!("seção desconhecida: {other}")),
+        };
+        value.map_err(|e| e.to_string())
+    }
+
+    /// Esta configuração com uma seção trocada, sem validar o conjunto.
+    ///
+    /// # Errors
+    ///
+    /// Seção desconhecida, campo desconhecido ou valor do tipo errado.
+    pub fn with_section(&self, name: &str, value: Value) -> Result<Self, String> {
+        fn parse<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, String> {
+            serde_json::from_value(value).map_err(|e| format!("valor inválido: {e}"))
+        }
+        let mut config = self.clone();
+        match name {
+            SERVIDOR => config.server = parse(value)?,
+            QBITTORRENT => config.qbittorrent = parse(value)?,
+            JELLYFIN => config.jellyfin = parse(value)?,
+            GERENCIADORES => config.instances = parse(value)?,
+            BIBLIOTECA => config.library = parse(value)?,
+            LIMPEZA => config.policy = parse(value)?,
+            TAREFAS => config.tasks = parse(value)?,
+            other => return Err(format!("seção desconhecida: {other}")),
+        }
+        Ok(config)
+    }
+
+    /// Confere o que o banco não confere: faixas, URLs, campos obrigatórios.
+    /// A mensagem vai para a tela.
+    ///
+    /// # Errors
+    ///
+    /// O primeiro problema encontrado.
+    pub fn validate(&self) -> Result<(), String> {
+        let server = &self.server;
+        // A superfície devolve links de download de tracker, com passkey.
+        // Chave curta é chave adivinhável.
+        if !server.api_key.is_empty() && server.api_key.chars().count() < 16 {
+            return Err("servidor: a chave de API precisa de ao menos 16 caracteres".into());
+        }
+        if let Some(public_url) = &server.public_url {
+            check_url("servidor: endereço público", public_url)?;
+            if public_url.contains('?') {
+                return Err("servidor: o endereço público não leva query".into());
+            }
+        }
+        if !(1..=600).contains(&server.http_timeout_seconds) {
+            return Err("servidor: o timeout HTTP precisa ficar entre 1 e 600 segundos".into());
+        }
+        if !self.qbittorrent.url.is_empty() {
+            check_url("cliente de download: URL", &self.qbittorrent.url)?;
+        }
+        if !self.jellyfin.url.is_empty() {
+            check_url("Jellyfin: URL", &self.jellyfin.url)?;
+            if self.jellyfin.api_key.is_empty() {
+                return Err("Jellyfin: informe a chave de API".into());
+            }
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for instance in &self.instances {
+            let name = instance.name.trim();
+            if name.is_empty() {
+                return Err("gerenciadores: todo gerenciador precisa de nome".into());
+            }
+            if !names.insert(name) {
+                return Err(format!("gerenciadores: o nome {name} aparece duas vezes"));
+            }
+            check_url(&format!("gerenciador {name}: URL"), &instance.url)?;
+            if instance.api_key.is_empty() {
+                return Err(format!("gerenciador {name}: informe a chave de API"));
+            }
+        }
+        let library = &self.library;
+        if library.root_folders.iter().any(|f| f.trim().is_empty()) {
+            return Err("biblioteca: pasta raiz em branco".into());
+        }
+        if library.category.trim().is_empty() {
+            return Err("biblioteca: informe a categoria do cliente de download".into());
+        }
+        if library
+            .paths
+            .iter()
+            .any(|(from, to)| !from.starts_with('/') || !to.starts_with('/'))
+        {
+            return Err("biblioteca: os dois lados de cada caminho precisam ser absolutos".into());
+        }
+        let policy = &self.policy;
+        if !(0.0..=1.0).contains(&policy.max_batch_fraction) {
+            return Err("limpeza: a fração máxima do lote precisa ficar entre 0 e 1".into());
+        }
+        if policy.orphan_strikes == 0 {
+            return Err("limpeza: são precisos ao menos 1 strike".into());
+        }
+        for (id, minutes) in &self.tasks.intervalos {
+            if !TASK_DEFAULTS.iter().any(|(known, _)| known == id) {
+                return Err(format!("tarefas: tarefa desconhecida: {id}"));
+            }
+            if *minutes > MAX_INTERVAL {
+                return Err(format!(
+                    "tarefas: o intervalo de {id} passa de 30 dias ({MAX_INTERVAL} minutos)"
+                ));
+            }
+        }
+        // Ler os releases recentes de todos os indexadores mais de uma vez a
+        // cada 5 minutos só gasta consulta de tracker.
+        if (1..5).contains(&self.tasks.minutes("rss")) {
+            return Err("tarefas: o RSS roda no mínimo a cada 5 minutos (0 desliga)".into());
+        }
+        if !(1..=1000).contains(&self.tasks.search_limit) {
+            return Err("tarefas: o limite da busca precisa ficar entre 1 e 1000".into());
+        }
+        Ok(())
+    }
+
+    /// O cliente de download, se configurado.
+    #[must_use]
+    pub fn qbittorrent(&self) -> Option<&QbitConfig> {
+        (!self.qbittorrent.url.is_empty()).then_some(&self.qbittorrent)
+    }
+
+    /// O Jellyfin, se configurado.
+    #[must_use]
+    pub fn jellyfin(&self) -> Option<&JellyfinConfig> {
+        (!self.jellyfin.url.is_empty()).then_some(&self.jellyfin)
+    }
+
+    /// O que o ciclo de limpeza exige.
     ///
     /// # Errors
     ///
     /// Sem cliente de download, sem instância ou sem raiz de biblioteca.
     pub fn janitor(&self) -> Result<&QbitConfig> {
-        let qbit = self
-            .qbittorrent
-            .as_ref()
-            .context("seção `[qbittorrent]` ausente: o ciclo age pelo cliente de download")?;
+        let qbit = self.qbittorrent().context(
+            "cliente de download não configurado: o ciclo age pelo qBittorrent \
+             (Configurações → Cliente de download)",
+        )?;
         anyhow::ensure!(
             !self.instances.is_empty(),
-            "nenhuma instância configurada: sem fila para cruzar, todo download \
+            "nenhum gerenciador configurado: sem fila para cruzar, todo download \
              pareceria fora de fila"
         );
         anyhow::ensure!(
             !self.library.roots.is_empty(),
-            "`library.roots` está vazio: sem medir a biblioteca, a trava \
-             proporcional não tem denominador"
+            "nenhuma raiz de biblioteca configurada: sem medir a biblioteca, a \
+             trava proporcional não tem denominador"
         );
-
         Ok(qbit)
     }
 
-    /// O que `serve` exige.
-    ///
-    /// Conecta ao banco do catálogo e das contas, aplicando as migrações.
+    /// O que `sync` exige: chave, endereço público e gerenciadores.
     ///
     /// # Errors
     ///
-    /// Sem `[database]`, ou banco inalcançável.
-    pub async fn store(&self) -> Result<acervo_store::Store> {
-        let database = self
-            .database
-            .as_ref()
-            .context("seção `[database]` ausente: catálogo e contas precisam do Postgres")?;
-        acervo_store::Store::connect(&database.url)
-            .await
-            .context("conectando ao banco")
-    }
-
-    /// # Errors
-    ///
-    /// Sem `[server]`, chave curta demais ou nenhum indexador.
-    pub fn server(&self) -> Result<&ServerConfig> {
-        let server = self
-            .server
-            .as_ref()
-            .context("seção `[server]` ausente: `serve` precisa de endereço e chave")?;
-        // A superfície devolve links de download de tracker, com passkey.
-        // Chave curta é chave adivinhável.
-        anyhow::ensure!(
-            server.api_key.len() >= 16,
-            "`server.api_key` precisa de ao menos 16 caracteres"
-        );
-        for indexer in &self.indexers {
-            if let IndexerConfig::Torznab(spec) = indexer {
-                anyhow::ensure!(
-                    spec.request_interval_seconds.is_finite()
-                        && (0.0..=3600.0).contains(&spec.request_interval_seconds),
-                    "`request_interval_seconds` de `{}` precisa ficar entre 0 e 3600",
-                    spec.name
-                );
-            }
-        }
-        Ok(server)
-    }
-
-    /// O que `sync` exige além de `serve`: o endereço público e as instâncias.
-    ///
-    /// # Errors
-    ///
-    /// Sem `server.public_url`, URL inválida ou nenhuma instância.
+    /// Sem chave, sem endereço público ou sem gerenciador.
     pub fn sync(&self) -> Result<(&ServerConfig, String)> {
-        let server = self.server()?;
-        let public_url = server
-            .public_url
-            .as_deref()
-            .context("`server.public_url` ausente: `sync` precisa saber como os gerenciadores alcançam este serviço")?;
-        let parsed = url::Url::parse(public_url)
-            .with_context(|| format!("`server.public_url` inválida: `{public_url}`"))?;
+        let server = &self.server;
         anyhow::ensure!(
-            matches!(parsed.scheme(), "http" | "https")
-                && parsed.query().is_none()
-                && parsed.username().is_empty(),
-            "`server.public_url` precisa ser HTTP(S), sem query e sem credencial"
+            !server.api_key.is_empty(),
+            "a chave de API do servidor não está definida (Configurações → Servidor)"
         );
+        let public_url = server.public_url.as_deref().context(
+            "endereço público ausente: `sync` precisa saber como os gerenciadores \
+             alcançam este serviço (Configurações → Servidor)",
+        )?;
         anyhow::ensure!(
             !self.instances.is_empty(),
-            "nenhuma `[[instances]]` configurada: não haveria onde cadastrar"
+            "nenhum gerenciador configurado: não haveria onde cadastrar"
         );
         Ok((server, public_url.trim_end_matches('/').to_owned()))
     }
 
     #[must_use]
     pub fn http_timeout(&self) -> Duration {
-        Duration::from_secs(self.http_timeout_seconds)
+        Duration::from_secs(self.server.http_timeout_seconds)
     }
 
     #[must_use]
     pub fn path_map(&self) -> acervo_fs::PathMap {
         acervo_fs::PathMap::new(
-            self.paths
+            self.library
+                .paths
                 .iter()
                 .map(|(from, to)| (PathBuf::from(from), PathBuf::from(to))),
         )
     }
 }
 
-/// O arquivo guarda chave de API e senha em texto puro.
-fn warn_if_world_readable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    let Ok(meta) = std::fs::metadata(path) else {
-        return;
-    };
-    let mode = meta.permissions().mode() & 0o777;
-
-    if mode & 0o077 != 0 {
-        tracing::warn!(
-            path = %path.display(),
-            mode = format!("{mode:o}"),
-            "configuração legível por outros usuários e contém segredo; use chmod 600"
-        );
-    }
-}
-
-/// Expande `~` no início do caminho.
-#[must_use]
-pub fn expand_tilde(path: &Path) -> PathBuf {
-    let Ok(rest) = path.strip_prefix("~") else {
-        return path.to_path_buf();
-    };
-    std::env::var_os("HOME")
-        .map_or_else(|| path.to_path_buf(), |home| PathBuf::from(home).join(rest))
-}
-
-const fn default_timeout_seconds() -> u64 {
-    30
-}
-const fn default_strikes() -> u32 {
-    3
-}
-const fn default_true() -> bool {
-    true
-}
-const fn default_private_grace() -> u64 {
-    120
-}
-const fn default_recent_grace() -> u64 {
-    24
-}
-const fn default_max_batch_gib() -> u64 {
-    300
-}
-const fn default_max_fraction() -> f64 {
-    0.30
-}
-fn default_bind() -> String {
-    // Só a própria máquina, a menos que se diga o contrário. Em container, a
-    // configuração diz `0.0.0.0:9797`.
-    "127.0.0.1:9797".into()
-}
-const fn default_request_interval() -> f64 {
-    2.0
-}
-fn default_ledger_path() -> PathBuf {
-    PathBuf::from("~/.local/state/acervo-hub/strikes.json")
-}
-fn default_credentials_path() -> PathBuf {
-    PathBuf::from("~/.local/state/acervo-hub/credenciais.toml")
-}
-fn default_registry_path() -> PathBuf {
-    PathBuf::from("~/.local/state/acervo-hub/indexadores.toml")
-}
-
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
-    const MINIMA: &str = r#"
-        [qbittorrent]
-        url = "http://localhost:8080"
-        username = "u"
-        password = "p"
-
-        [library]
-        roots = ["/acervo"]
-
-        [[instances]]
-        name = "filmes"
-        kind = "movie"
-        url = "http://localhost:7878"
-        api_key = "k"
-    "#;
-
-    fn load(text: &str) -> Result<Config> {
-        let path = std::env::temp_dir().join(format!(
-            "acervo-hub-config-{}-{:?}.toml",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::write(&path, text)?;
-        let config = Config::load(&path);
-        std::fs::remove_file(&path)?;
+    fn valid() -> Config {
+        let mut config = Config::default();
+        config.server.api_key = "0123456789abcdef".into();
+        config.qbittorrent = QbitConfig {
+            url: "http://localhost:8080".into(),
+            username: "u".into(),
+            password: "p".into(),
+        };
+        config.instances.push(InstanceConfig {
+            name: "filmes".into(),
+            kind: InstanceKind::Movie,
+            url: "http://localhost:7878".into(),
+            api_key: "k".into(),
+        });
+        config.library.roots.push("/acervo".into());
         config
     }
 
-    fn parse(text: &str) -> Result<Config> {
-        let config = load(text)?;
-        config.janitor()?;
-        Ok(config)
-    }
-
-    const SERVIDOR: &str = r#"
-        [server]
-        api_key = "0123456789abcdef"
-
-        [[indexers]]
-        kind = "torznab"
-        name = "agregador"
-        url = "http://localhost:9696/1/api"
-        api_key = "k"
-
-        [[indexers]]
-        kind = "cardigann"
-        definition = "/etc/acervo-hub/definicoes/publico.yml"
-        settings = { token = "t" }
-    "#;
-
     #[test]
-    fn exemplo_versionado_serve_aos_dois_modos() {
-        let config = load(include_str!("../../../config.example.toml")).unwrap();
-        config.janitor().unwrap();
-        config.server().unwrap();
-        let (_, public_url) = config.sync().unwrap();
-        assert_eq!(public_url, "http://acervo-hub-indexadores:9797");
-    }
-
-    #[test]
-    fn busca_dos_que_faltam_le_intervalo_e_limite() {
-        let exemplo = include_str!("../../../config.example.toml");
-        let texto = exemplo
-            .replace(
-                "# search_interval_minutes = 120",
-                "search_interval_minutes = 60",
-            )
-            .replace("# search_limit = 5", "search_limit = 3");
-        let config = load(&texto).unwrap();
-        let server = config.server().unwrap();
-        assert_eq!(server.search_interval_minutes, Some(60));
-        assert_eq!(server.search_limit, 3);
-    }
-
-    #[test]
-    fn limpeza_roda_de_hora_em_hora_por_padrao() {
-        assert_eq!(
-            load(SERVIDOR)
-                .unwrap()
-                .server()
-                .unwrap()
-                .cleanup_interval_minutes,
-            60
-        );
-        let exemplo = include_str!("../../../config.example.toml");
-        let texto = exemplo.replace(
-            "cleanup_interval_minutes = 60",
-            "cleanup_interval_minutes = 0",
-        );
-        assert_ne!(texto, exemplo, "o exemplo documenta o intervalo da limpeza");
-        assert_eq!(
-            load(&texto)
-                .unwrap()
-                .server()
-                .unwrap()
-                .cleanup_interval_minutes,
-            0
-        );
-    }
-
-    #[test]
-    fn sync_exige_endereco_publico_valido() {
-        let exemplo = include_str!("../../../config.example.toml");
-        let sem = exemplo.replace("public_url = \"http://acervo-hub-indexadores:9797\"\n", "");
-        assert!(load(&sem).unwrap().sync().is_err());
-        let com_credencial = exemplo.replace("http://acervo-hub-indexadores", "http://u:p@acervo");
-        assert!(load(&com_credencial).unwrap().sync().is_err());
-    }
-
-    #[test]
-    fn servidor_sobe_sem_a_configuracao_do_ciclo() {
-        let config = load(SERVIDOR).unwrap();
-        assert_eq!(config.server().unwrap().bind, "127.0.0.1:9797");
-        assert_eq!(config.indexers.len(), 2);
-        assert!(config.janitor().is_err());
-    }
-
-    #[test]
-    fn campo_errado_em_indexador_tambem_e_erro() {
-        let torto = SERVIDOR.replace("api_key = \"k\"", "apikey = \"k\"");
-        assert!(load(&torto).is_err());
-        let tipo = SERVIDOR.replace("kind = \"torznab\"", "kind = \"newznab\"");
-        assert!(load(&tipo).is_err());
-    }
-
-    #[test]
-    fn chave_curta_ou_sem_indexador_e_recusada() {
-        let curta = SERVIDOR.replace("0123456789abcdef", "curta");
-        assert!(load(&curta).unwrap().server().is_err());
-        // Sem indexador sobe: eles podem ser adicionados pela interface.
-        let vazio = SERVIDOR.split("[[indexers]]").next().unwrap();
-        assert!(load(vazio).unwrap().server().is_ok());
-    }
-
-    #[test]
-    fn configuracao_minima_assume_padroes_conservadores() {
-        let c = parse(MINIMA).unwrap();
-        let p = c.policy.to_policy();
-
+    fn sem_secoes_valem_os_padroes_conservadores() {
+        let config = Config::from_sections([]).unwrap();
+        assert!(config.validate().is_ok());
+        let p = config.policy.to_policy();
         assert_eq!(p.orphan_strikes, 3);
         assert!(!p.delete_private_orphans);
         assert!(p.private_seed_grace.is_some());
         assert!((p.guards.max_batch_fraction - 0.30).abs() < f64::EPSILON);
+        assert_eq!(config.tasks.minutes("busca"), 0);
+        assert_eq!(config.tasks.minutes("rss"), 30);
+        assert_eq!(config.tasks.minutes("limpeza"), 60);
+        assert_eq!(config.tasks.minutes("assistidos"), 15);
+        assert_eq!(config.tasks.search_limit, 5);
+        assert_eq!(config.library.root_folders, ["/media/movies"]);
+        assert_eq!(config.library.category, "acervo");
+        assert_eq!(config.http_timeout(), Duration::from_secs(30));
+        assert!(config.qbittorrent().is_none() && config.jellyfin().is_none());
+        assert!(config.janitor().is_err());
     }
 
     #[test]
     fn campo_escrito_errado_e_erro_e_nao_silencio() {
-        let torto = MINIMA.to_string() + "\n[policy]\norphan_strikez = 99\n";
-        let erro = format!("{:#}", parse(&torto).unwrap_err());
+        let erro = Config::default()
+            .with_section(LIMPEZA, json!({ "orphan_strikez": 99 }))
+            .unwrap_err();
         assert!(erro.contains("orphan_strikez"), "erro veio: {erro}");
+        assert!(Config::default().with_section("outra", json!({})).is_err());
     }
 
     #[test]
-    fn sem_raiz_de_biblioteca_a_configuracao_e_recusada() {
-        let sem_raiz = MINIMA.replace(r#"roots = ["/acervo"]"#, "roots = []");
-        assert!(parse(&sem_raiz).is_err());
+    fn secao_parcial_completa_com_o_padrao() {
+        let config = Config::default()
+            .with_section(TAREFAS, json!({ "intervalos": { "busca": 120 } }))
+            .unwrap();
+        assert_eq!(config.tasks.minutes("busca"), 120);
+        assert_eq!(config.tasks.minutes("importacao"), 5);
+        assert_eq!(config.tasks.search_limit, 5);
     }
 
     #[test]
-    fn sem_instancia_a_configuracao_e_recusada() {
-        let sem_instancia = MINIMA.split("[[instances]]").next().unwrap().to_string();
-        assert!(parse(&sem_instancia).is_err());
+    fn ida_e_volta_de_cada_secao() {
+        let config = valid();
+        let mut back = Config::default();
+        for name in SECTIONS {
+            back = back
+                .with_section(name, config.section(name).unwrap())
+                .unwrap();
+        }
+        assert_eq!(back, config);
     }
 
     #[test]
-    fn carencia_zero_desliga_a_carencia() {
-        let texto = MINIMA.to_string() + "\n[policy]\nprivate_seed_grace_hours = 0\n";
-        let p = parse(&texto).unwrap().policy.to_policy();
-        assert!(p.private_seed_grace.is_none());
+    fn limpeza_exige_cliente_gerenciador_e_raiz() {
+        assert!(valid().janitor().is_ok());
+        let mut sem_raiz = valid();
+        sem_raiz.library.roots.clear();
+        assert!(sem_raiz.janitor().is_err());
+        let mut sem_instancia = valid();
+        sem_instancia.instances.clear();
+        assert!(sem_instancia.janitor().is_err());
     }
 
-    /// O bloco `[jellyfin]` do exemplo, descomentado.
-    fn exemplo_com_jellyfin() -> String {
-        let exemplo = include_str!("../../../config.example.toml");
-        let mut dentro = false;
-        exemplo
-            .lines()
-            .map(|line| {
-                if line == "# [jellyfin]" {
-                    dentro = true;
-                }
-                if dentro && line.is_empty() {
-                    dentro = false;
-                }
-                match line.strip_prefix("# ") {
-                    Some(rest) if dentro && !rest.starts_with(' ') => rest,
-                    _ => line,
-                }
+    #[test]
+    fn validacao_recusa_com_mensagem() {
+        let erro = |change: fn(&mut Config)| {
+            let mut config = valid();
+            change(&mut config);
+            config.validate().unwrap_err()
+        };
+        assert!(erro(|c| c.server.api_key = "curta".into()).contains("16"));
+        assert!(erro(|c| c.policy.max_batch_fraction = 1.5).contains("fração"));
+        assert!(erro(|c| c.server.public_url = Some("http://u:p@x".into())).contains("usuário"));
+        assert!(erro(|c| c.qbittorrent.url = "nada".into()).contains("URL"));
+        assert!(erro(|c| c.instances[0].api_key.clear()).contains("chave"));
+        assert!(
+            erro(|c| {
+                c.tasks.intervalos.insert("rss".into(), 2);
             })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .contains("RSS")
+        );
+        assert!(
+            erro(|c| {
+                c.tasks.intervalos.insert("outra".into(), 2);
+            })
+            .contains("desconhecida")
+        );
+        assert!(erro(|c| c.jellyfin.url = "http://j:8096".into()).contains("chave"));
+        assert!(valid().validate().is_ok());
     }
 
     #[test]
-    fn jellyfin_e_opcional_e_documentado_no_exemplo() {
-        assert!(load(SERVIDOR).unwrap().jellyfin.is_none());
-        let texto = exemplo_com_jellyfin();
-        let jellyfin = load(&texto).unwrap().jellyfin.unwrap();
-        assert_eq!(jellyfin.url, "http://jellyfin:8096");
-        assert_eq!(jellyfin.delete_watched_after_minutes, 60);
-        assert_eq!(jellyfin.interval_minutes, 15);
-        // A chave não aparece em log de depuração.
-        assert!(!format!("{jellyfin:?}").contains(&jellyfin.api_key));
+    fn sync_exige_chave_endereco_e_gerenciador() {
+        let mut config = valid();
+        assert!(config.sync().is_err());
+        config.server.public_url = Some("http://acervo:9797/".into());
+        let (_, url) = config.sync().unwrap();
+        assert_eq!(url, "http://acervo:9797");
+        config.server.api_key.clear();
+        assert!(config.sync().is_err());
     }
 
     #[test]
-    fn jellyfin_assume_carencia_e_intervalo_padrao() {
-        let texto =
-            SERVIDOR.to_string() + "\n[jellyfin]\nurl = \"http://j:8096\"\napi_key = \"k\"\n";
-        let jellyfin = load(&texto).unwrap().jellyfin.unwrap();
-        assert_eq!(jellyfin.delete_watched_after_minutes, 60);
-        assert_eq!(jellyfin.interval_minutes, 15);
-        let torto = texto + "delete_watched_after_minute = 5\n";
-        assert!(load(&torto).is_err());
-    }
-
-    #[test]
-    fn fracao_fora_da_faixa_e_recusada() {
-        let texto = MINIMA.to_string() + "\n[policy]\nmax_batch_fraction = 1.5\n";
-        assert!(parse(&texto).is_err());
+    fn segredo_nao_aparece_em_depuracao() {
+        let mut config = valid();
+        config.jellyfin.api_key = "chave-jellyfin".into();
+        let text = format!("{config:?}");
+        assert!(!text.contains("chave-jellyfin"));
+        assert!(!text.contains("0123456789abcdef"));
+        assert!(!text.contains("password: \"p\""));
     }
 }

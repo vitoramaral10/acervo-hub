@@ -5,7 +5,6 @@ import {
   CircleDashed,
   Film,
   CirclePause,
-  FileCode2,
   Pencil,
   Lock,
   Plus,
@@ -187,14 +186,6 @@ function IndexerCard({ indexer, onEdit }: { indexer: Indexer; onEdit: () => void
             <h2 id={`indexador-${indexer.nome}`} className="truncate text-base font-semibold tracking-tight">
               {indexer.nome}
             </h2>
-            {indexer.origem === 'config' && (
-              <Tooltip content="Veio do config.toml. O que você muda aqui vale por cima do arquivo, que não é alterado.">
-                <span className="inline-flex text-content-subtle">
-                  <FileCode2 className="size-3.5" aria-hidden="true" />
-                  <span className="sr-only">do config.toml</span>
-                </span>
-              </Tooltip>
-            )}
             {indexer.privado && (
               <Tooltip content="Tracker privado: login e download passam pela sessão guardada aqui.">
                 <span className="inline-flex text-content-subtle">
@@ -300,10 +291,8 @@ function IndexerCard({ indexer, onEdit }: { indexer: Indexer; onEdit: () => void
           <DialogHeader>
             <DialogTitle>Remover {indexer.nome}?</DialogTitle>
             <DialogDescription>
-              Sai do acervo-hub junto com as credenciais guardadas pela tela. O cadastro dele no Sonarr só
-              some na próxima sincronização.
-              {indexer.origem === 'config' &&
-                ' Ele veio do config.toml: o arquivo não muda, e dá para trazê-lo de volta pelo catálogo.'}
+              Sai do acervo-hub junto com as credenciais guardadas. O cadastro dele no Sonarr só some na
+              próxima sincronização; para trazê-lo de volta, adicione-o de novo pelo catálogo.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

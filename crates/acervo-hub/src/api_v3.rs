@@ -33,10 +33,16 @@ const VERSION: &str = "5.26.2.10099";
 
 #[derive(Debug)]
 pub struct V3 {
-    pub config: Arc<Config>,
+    pub settings: Arc<crate::settings::Settings>,
     pub database: Database,
     pub catalog: Catalog,
-    pub api_key: String,
+}
+
+impl V3 {
+    /// O instantâneo da configuração, pego a cada requisição.
+    fn config(&self) -> Arc<Config> {
+        self.settings.get()
+    }
 }
 
 type Shared = State<Arc<V3>>;
@@ -86,7 +92,7 @@ fn store<'a>(
                 .map(|(_, v)| v.as_str())
         })
         .unwrap_or_default();
-    if !constant_time_eq(presented.as_bytes(), v3.api_key.as_bytes()) {
+    if !constant_time_eq(presented.as_bytes(), v3.config().server.api_key.as_bytes()) {
         return Err(ApiError(StatusCode::UNAUTHORIZED, "Unauthorized".into()));
     }
     v3.database
@@ -94,8 +100,11 @@ fn store<'a>(
         .map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e))
 }
 
+/// Chave vazia nunca confere: sem chave definida, a API fica fechada.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0_u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    !b.is_empty()
+        && a.len() == b.len()
+        && a.iter().zip(b).fold(0_u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 pub fn router(v3: Arc<V3>) -> Router {
@@ -217,8 +226,8 @@ async fn root_folders(
     Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
     store(&v3, &headers, &query)?;
-    let map = v3.config.path_map();
-    let roots = v3.config.movies.root_folders.clone();
+    let map = v3.config().path_map();
+    let roots = v3.config().library.root_folders.clone();
     let listed = tokio::task::spawn_blocking(move || {
         roots
             .iter()
@@ -476,7 +485,7 @@ async fn lookup(
 ) -> ApiResult {
     let store = store(&v3, &headers, &query)?;
     let term = query.get("term").map(|t| t.trim()).unwrap_or_default();
-    let tmdb = crate::metadata::tmdb(&v3.config, store)
+    let tmdb = crate::metadata::tmdb(&v3.config(), store)
         .await
         .map_err(internal)?;
     let tmdb_id: Option<u32> = if let Some(id) = term.strip_prefix("tmdb:") {
@@ -554,7 +563,7 @@ async fn add_movie(
     Json(body): Json<AddBody>,
 ) -> ApiResult {
     let store = store(&v3, &headers, &query)?;
-    let tmdb = crate::metadata::require_tmdb(&v3.config, store)
+    let tmdb = crate::metadata::require_tmdb(&v3.config(), store)
         .await
         .map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
     let profiles = profile_map(store).await?;
@@ -583,7 +592,7 @@ async fn add_movie(
             quality_profile: Some(profile),
             root_folder: body
                 .root_folder_path
-                .or_else(|| v3.config.movies.root_folders.first().cloned())
+                .or_else(|| v3.config().library.root_folders.first().cloned())
                 .unwrap_or_else(|| "/media/movies".into()),
             monitored: body.monitored.unwrap_or(true),
             minimum_availability: body
@@ -700,7 +709,7 @@ async fn delete_movie(
             .is_some_and(|v| v.eq_ignore_ascii_case("true"))
     };
     // `addImportExclusion` não tem efeito: o acervo não tem listas.
-    crate::library::remove(&v3.config, store, id, flag("deleteFiles"))
+    crate::library::remove(&v3.config(), store, id, flag("deleteFiles"))
         .await
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     ok(json!({}))
@@ -715,7 +724,7 @@ fn search_later(v3: &Arc<V3>, ids: Vec<i64>) {
             return;
         };
         for id in ids {
-            match crate::grab::grab(&v3.config, store, &v3.catalog, id, true).await {
+            match crate::grab::grab(&v3.config(), store, &v3.catalog, id, true).await {
                 Ok(report) => tracing::info!(
                     filme = report.filme,
                     pegou = report.escolhido.as_ref().map(|p| p.titulo.as_str()),
@@ -755,7 +764,7 @@ async fn command(
             tokio::spawn(async move {
                 if let Ok(store) = v3.database.get()
                     && let Err(error) =
-                        crate::grab::import_downloads(&v3.config, store, Some(&v3.catalog), true)
+                        crate::grab::import_downloads(&v3.config(), store, Some(&v3.catalog), true)
                             .await
                 {
                     tracing::warn!("importação pedida pela API: {error:#}");
@@ -794,12 +803,13 @@ async fn queue(
         .into_iter()
         .filter(|g| g.state == GrabState::Downloading)
         .collect();
-    let client = match &v3.config.qbittorrent {
+    let config = v3.config();
+    let client = match config.qbittorrent() {
         Some(spec) if !grabs.is_empty() => acervo_clients::QbitClient::login(
             &spec.url,
             &spec.username,
             &spec.password,
-            v3.config.http_timeout(),
+            config.http_timeout(),
         )
         .await
         .ok(),

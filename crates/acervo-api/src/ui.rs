@@ -54,10 +54,11 @@ pub trait Admin: Send + Sync + std::fmt::Debug {
         values: BTreeMap<String, String>,
     ) -> Result<Entry, String>;
 
-    /// De onde o indexador vem: `config` (arquivo, só leitura) ou `interface`.
+    /// Se o indexador está cadastrado, e como a tela o rotula.
     fn origin(&self, indexer: &str) -> Option<&'static str>;
 
-    /// Indexadores desativados — fora do catálogo servido, mas ainda listados.
+    /// Indexadores cadastrados fora do catálogo servido — desativados, ou
+    /// que não subiram —, ainda listados.
     fn disabled(&self) -> Vec<(String, &'static str)>;
 
     /// Todas as definições conhecidas, suportadas ou não.
@@ -78,11 +79,11 @@ pub trait Admin: Send + Sync + std::fmt::Debug {
         values: BTreeMap<String, String>,
     ) -> Result<Entry, String>;
 
-    /// Remove um indexador adicionado pela interface.
+    /// Remove um indexador cadastrado.
     ///
     /// # Errors
     ///
-    /// Indexador do `config.toml` (só leitura) ou falha ao gravar.
+    /// Indexador desconhecido ou falha ao gravar.
     async fn remove(&self, indexer: &str) -> Result<(), String>;
 
     /// Ativa ou desativa. Ativar devolve o indexador montado, para entrar no
@@ -177,6 +178,31 @@ pub trait Admin: Send + Sync + std::fmt::Debug {
         &self,
         values: BTreeMap<String, Option<String>>,
     ) -> Result<serde_json::Value, String>;
+
+    /// Uma seção da configuração do serviço. Segredo volta só como
+    /// `{"definida": bool}`.
+    ///
+    /// # Errors
+    ///
+    /// Seção desconhecida.
+    async fn config_section(&self, _section: &str) -> Result<serde_json::Value, String> {
+        Err("este serviço não tem configuração editável".into())
+    }
+
+    /// Valida e grava uma seção; devolve como ela ficou, no formato de
+    /// [`Admin::config_section`]. Segredo vazio ou ausente mantém o atual.
+    ///
+    /// # Errors
+    ///
+    /// Seção desconhecida, valor inválido (a mensagem diz qual) ou falha ao
+    /// gravar.
+    async fn save_config_section(
+        &self,
+        _section: &str,
+        _value: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("este serviço não tem configuração editável".into())
+    }
 }
 
 /// Contas da interface: confere usuário e senha e guarda as sessões.
@@ -286,6 +312,10 @@ pub(crate) fn routes() -> Router<Arc<Server>> {
             "/ui/api/configuracoes",
             get(configuration).put(save_configuration),
         )
+        .route(
+            "/ui/api/configuracoes/{secao}",
+            get(config_section).put(save_config_section),
+        )
         .route("/ui/api/downloads/importar", post(import_downloads))
         .route("/ui/api/indexadores/{nome}/testar", post(test))
         .route(
@@ -384,7 +414,13 @@ async fn guard(
     headers: &HeaderMap,
     method: &Method,
 ) -> Result<Option<String>, UiError> {
-    check(&server.api_key, server.accounts.as_ref(), headers, method).await
+    check(
+        &server.api_key.get(),
+        server.accounts.as_ref(),
+        headers,
+        method,
+    )
+    .await
 }
 
 async fn check(
@@ -467,7 +503,7 @@ async fn login(
     let Some(accounts) = &server.accounts else {
         return Err(UiError(
             StatusCode::SERVICE_UNAVAILABLE,
-            "nenhum banco de contas configurado: defina [database] no config.toml".into(),
+            "nenhum banco de contas configurado: defina ACERVO_DATABASE_URL".into(),
         ));
     };
     let token = match accounts.login(body.usuario.trim(), &body.senha).await {
@@ -538,7 +574,7 @@ fn indexer_json(server: &Server, view: &crate::IndexerView) -> serde_json::Value
     json!({
         "nome": view.name,
         "ativo": true,
-        "origem": admin.and_then(|admin| admin.origin(&view.name)).unwrap_or("config"),
+        "origem": admin.and_then(|admin| admin.origin(&view.name)).unwrap_or("cadastro"),
         "privado": view.proxies_downloads,
         "editavel": admin.and_then(|admin| admin.settings(&view.name)).is_some(),
         "modos": {
@@ -811,6 +847,33 @@ async fn save_configuration(
     guard(&server, &headers, &Method::PUT).await?;
     let body = admin(&server)?
         .save_configuration(values)
+        .await
+        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    Ok(ok(body))
+}
+
+async fn config_section(
+    State(server): State<Arc<Server>>,
+    Path(section): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::GET).await?;
+    let body = admin(&server)?
+        .config_section(&section)
+        .await
+        .map_err(|error| UiError(StatusCode::NOT_FOUND, error))?;
+    Ok(ok(body))
+}
+
+async fn save_config_section(
+    State(server): State<Arc<Server>>,
+    Path(section): Path<String>,
+    headers: HeaderMap,
+    Json(value): Json<serde_json::Value>,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::PUT).await?;
+    let body = admin(&server)?
+        .save_config_section(&section, value)
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     Ok(ok(body))

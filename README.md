@@ -67,16 +67,36 @@ no lugar errado.
 
 ## Como rodar
 
-```sh
-cp config.example.toml config.toml   # preencha urls, chaves e caminhos
-chmod 600 config.toml                # guarda segredo em texto puro
+Toda a configuração mora no Postgres e se edita na tela, sem reiniciar. Fora do banco há
+só duas variáveis de ambiente:
 
-cargo run --bin acervo-hub -- -c config.toml serve   # indexadores, interface e tarefas
-cargo run --bin acervo-hub -- -c config.toml apply   # um ciclo de limpeza à mão
-cargo run --bin acervo-hub -- -c config.toml sync    # planeja o cadastro nos *arr
-cargo run --bin acervo-hub -- -c config.toml sync --apply
-cargo run --bin acervo-hub -- -c config.toml search "termo" [-i indexador] [-k 5000]
+| Variável | Para quê | Padrão |
+|---|---|---|
+| `ACERVO_DATABASE_URL` | `postgres://usuário:senha@host:5432/banco` — obrigatória para todo comando | — |
+| `ACERVO_BIND` | Endereço de escuta do `serve` | `0.0.0.0:9797` |
+
+```sh
+export ACERVO_DATABASE_URL=postgres://acervo:senha@localhost:5432/acervo
+
+cargo run --bin acervo-hub -- serve   # indexadores, interface e tarefas
+cargo run --bin acervo-hub -- apply   # um ciclo de limpeza à mão
+cargo run --bin acervo-hub -- sync    # planeja o cadastro nos *arr
+cargo run --bin acervo-hub -- sync --apply
+cargo run --bin acervo-hub -- search "termo" [-i indexador] [-k 5000]
 ```
+
+As tabelas são criadas na primeira conexão. Banco novo sobe com os padrões; o resto se
+preenche em **Configurações**: Cliente de download, Jellyfin, Biblioteca, Limpeza, Regras de
+decisão, Notificações, TMDB e Servidor (onde se gera a chave de API). Os gerenciadores
+(Sonarr, Radarr) se cadastram em **Aplicativos**; os intervalos das tarefas, na própria tela
+**Tarefas**. Sem chave de API definida, Torznab e API v3 recusam tudo.
+
+**Vindo do `config.toml`?** Uma vez só, aponte `ACERVO_IMPORT_CONFIG` para o arquivo antigo
+e suba o `serve`: com o banco ainda sem configuração, ele lê o arquivo e os arquivos de
+`[state]` (credenciais, indexadores adicionados/desativados/removidos e strikes) e grava tudo
+numa transação, logando quantas seções, indexadores e strikes entraram. Com o banco já
+configurado, a variável é ignorada — tire-a do ambiente depois. `[database]` e
+`server.bind` do arquivo são ignorados: vêm das variáveis acima.
 
 ### Interface web
 
@@ -84,7 +104,7 @@ cargo run --bin acervo-hub -- -c config.toml search "termo" [-i indexador] [-k 5
 
 - **Indexadores** — estado de cada um (último sucesso, último erro, falhas seguidas), teste,
   ativar e desativar, trocar credencial, remover, e **adicionar** a partir do catálogo de
-  definições (`server.catalogs`) ou de qualquer endpoint Torznab. As definições que o
+  definições (diretórios em Configurações → Servidor) ou de qualquer endpoint Torznab. As definições que o
   executor ainda não roda aparecem com o motivo, em vez de sumirem.
 - **Busca** manual em todos os indexadores, com download do `.torrent` pela sessão.
 - **Filmes** — a biblioteca em pôsteres. Adicionar pelo TMDB; editar monitoramento e
@@ -94,15 +114,18 @@ cargo run --bin acervo-hub -- -c config.toml search "termo" [-i indexador] [-k 5
   contra o disco.
 - **Atividade** — a fila com o progresso do qBittorrent (tirar da fila, bloquear, buscar
   outro), o histórico de tudo e a lista de bloqueio.
-- **Aplicativos** — o `sync` na tela: mostra o que mudaria no gerenciador de séries e aplica.
+- **Aplicativos** — os gerenciadores (adicionar, editar, remover) e o `sync` na tela: mostra
+  o que mudaria em cada um e aplica.
 - **Tarefas** — as rotinas de fundo do serviço (busca dos que faltam, RSS, importação,
-  metadados, a limpeza e, com `[jellyfin]`, apagar assistidos), com intervalo, última e
+  metadados, a limpeza e, com o Jellyfin configurado, apagar assistidos), com intervalo
+  editável (vale na hora; tarefa sem o que precisa fica parada, com o motivo), última e
   próxima execução e "rodar agora"; e o histórico das últimas execuções, gravado no banco —
-  o da limpeza abre o relatório do ciclo, o dos assistidos a lista do que saiu e do que ficou.
-- **Configurações** — TMDB, regras de decisão (teto de tamanho,
-  propers, legenda embutida, carência, prioridade e seeders por indexador, espera, espaço
-  livre reservado) e
-  notificações (Gotify).
+  o da limpeza abre o relatório do ciclo, o dos assistidos a lista do que saiu e do que ficou,
+  o dos metadados o que mudou e qual filme falhou, com o motivo.
+- **Configurações** — um item de menu por seção: cliente de download, Jellyfin, biblioteca
+  (pastas, caminhos, categoria), limpeza (strikes, carências, travas), regras de decisão,
+  notificações (Gotify), TMDB e servidor (chave de API, endereço público, catálogo de
+  definições, timeout HTTP).
 
 A qualidade não se configura: todo filme usa o **perfil automático**, da melhor qualidade de
 arquivo para a pior (Remux 2160p … SD), sem upgrade. Os seeders pesam antes: um release com
@@ -118,14 +141,13 @@ acervo-hub users list
 acervo-hub users remove admin
 ```
 
-Scripts e automação podem, em vez disso, mandar a chave de `server.api_key` no cabeçalho
+Scripts e automação podem, em vez disso, mandar a chave de API do servidor no cabeçalho
 `X-Api-Key`.
 
-- **A tela não reescreve o `config.toml`**, que pode ficar somente leitura. Indexadores
-  adicionados e desativados vão para `[state] registry`; credenciais, para
-  `[state] credentials` (gravação atômica, permissão 600). Os dois valem por cima da config.
-  Indexador do arquivo não se remove pela tela — desativa-se. Segredo nunca volta para a tela: campo em branco
-  mantém o valor atual.
+- **Segredo nunca volta para a tela.** Senhas e chaves (do cliente, do Jellyfin, dos
+  gerenciadores, dos indexadores e a do servidor) chegam como "definida" ou não; salvar com o
+  campo em branco mantém o valor guardado. Nada disso vai para o log. Indexadores são todos
+  cadastros do banco: editáveis e removíveis.
 - **Senha em argon2id, sessão em cookie `HttpOnly` e `SameSite=Strict`.** O banco guarda
   só o SHA-256 do token da sessão, que vale 30 dias; sair apaga a sessão no servidor, e
   trocar a senha derruba todas as abertas. Toda ação que muda estado exige
@@ -158,16 +180,15 @@ filme cadastram essa URL como cadastrariam o agregador atual. Três escolhas do 
   resposta é erro Torznab `900`: "nada encontrado" e "tracker fora do ar" pedem reações
   opostas de quem consulta.
 
-A limpeza roda dentro de `serve`, como a tarefa "Limpeza", a cada
-`server.cleanup_interval_minutes` (padrão 60). Não há modo de simulação: cada ciclo avança
+A limpeza roda dentro de `serve`, como a tarefa "Limpeza", a cada 60 minutos por padrão
+(editável em Tarefas). Não há modo de simulação: cada ciclo avança
 os strikes e executa o plano, e as travas abortam o ciclo inteiro quando a leitura do mundo
 não é confiável.
 
-Com a seção `[jellyfin]`, a tarefa "Apagar assistidos" roda a cada
-`jellyfin.interval_minutes` (padrão 15): o filme que algum usuário do Jellyfin assistiu, há
-mais de `jellyfin.delete_watched_after_minutes` (padrão 60) e que ninguém marcou como
-favorito, sai do catálogo com a pasta e o download — sem simulação. Assistido sem data
-conhecida fica.
+Com o Jellyfin configurado, a tarefa "Apagar assistidos" roda a cada 15 minutos por padrão:
+o filme que algum usuário do Jellyfin assistiu, há mais que a carência (padrão 60 minutos)
+e que ninguém marcou como favorito, sai do catálogo com a pasta e o download — sem
+simulação. Assistido sem data conhecida fica.
 
 Códigos de saída: `0` sucesso, `1` falha de execução, `3` ciclo abortado por trava. O `3`
 é próprio para que um agendador distinga "a leitura do mundo não era confiável" de "algo
@@ -191,111 +212,6 @@ valem atenção:
 cliente de download: o acervo é montado com escrita porque a importação cria o hardlink do
 filme, então a garantia de não apagar arquivo da biblioteca fica no código do janitor.
 
-**O diretório de estado precisa ser do UID 65532**, senão os strikes não sobrevivem ao fim
-do container e três strikes nunca se completam:
-
-```sh
-mkdir -p state && sudo chown 65532:65532 state
-```
-
-O `SuccessExitStatus=3` na unidade systemd é proposital: ciclo abortado por trava não é
-falha de execução e não deve sujar o status nem disparar alerta.
-
-### Travas que abortam o ciclo inteiro
-
-Nenhuma é ajuste fino. Se uma dispara, a leitura do mundo está errada e **nenhuma** remoção
-daquele ciclo é confiável — inclusive as que pareciam corretas:
-
-- instância `*arr` que não respondeu;
-- instância que respondeu mas não reporta nenhuma obra (meio-viva é pior que morta);
-- biblioteca medindo zero, que desligaria silenciosamente a trava proporcional;
-- lote acima do teto absoluto ou da fração do acervo.
-
-## Roteiro
-
-A migração é *strangler*, na ordem do risco. Cada fase é reversível e entrega valor sozinha.
-
-- [x] **Fase 1 — `acervo-janitor`.** Substitui só o faxineiro, falando as APIs v3
-      existentes. Risco baixo, valor imediato. Validado contra uma stack real e em produção,
-      de hora em hora em modo `apply`, no lugar do faxineiro anterior. A primeira volta
-      simulada pegou o que os testes não pegavam: o login do qBittorrent 5.1+ (204 sem
-      corpo) e um download manual de 50 GB que seria apagado por não ter hardlink — daí
-      `policy.managed_categories`, que restringe essa regra às categorias dos
-      gerenciadores.
-- [x] **Fase 2 — `acervo-indexers`.** Absorve o agregador de indexadores. Em produção. O cliente
-      Torznab, a agregação, o rate limit compartilhado, o executor Cardigann v11 e a
-      superfície Torznab (`serve`) existem. O executor roda tracker público e privado —
-      login por formulário ou por cookie, sessão refeita quando o site deixa de
-      reconhecê-la, download intermediado com a sessão —, com o subconjunto de templates
-      Go, filtros e seletores (`:contains` incluído) que as definições reais usam. O que
-      ele não cobre é recusado na carga, com o motivo. Contra um corpus de 573 definições,
-      carrega 26; as recusas mais comuns são resposta JSON (130), login por `form` (113) e
-      a seção `download` (59). O teste `corpus` (ignorado por padrão) refaz essa conta.
-      `sync` cadastra os indexadores nos gerenciadores, como a tela de apps do agregador
-      atual. Validado contra instâncias reais descartáveis dos dois gerenciadores: ambos
-      aceitam o indexador e o feed, e o `sync` cria, mantém e corrige sem apagar ajuste
-      manual. Contra um tracker privado real, login por formulário, busca em várias páginas e
-      download intermediado funcionam; o login por cookie aguarda um cookie válido para ser
-      conferido em produção.
-      Consultas iguais são reaproveitadas: pedido idêntico em andamento espera a mesma
-      resposta, e a resposta fica guardada por 30 minutos (5 para o feed recente). Os
-      gerenciadores e a busca dos filmes que faltam passam pelo mesmo serviço, e cada tracker vê uma
-      requisição por consulta. A busca roda até o fim mesmo se o consumidor desistir, e a
-      tentativa seguinte a encontra pronta. Em produção desde 24/09/2026 como único
-      agregador: o anterior foi desligado.
-
-### Migrando do agregador atual
-
-1. Copie as definições que você usa para `definicoes/` e liste-as em `[[indexers]]`, com
-   as credenciais em `settings`.
-2. Suba `acervo-hub-indexadores` e rode `sync` — sem `--apply`, ele só mostra o plano.
-3. `sync --apply`. Cada gerenciador passa a ter os dois cadastros lado a lado: o antigo e
-   o ` (acervo-hub)`.
-4. Compare as buscas manuais pelos dois. Satisfeito, desabilite os cadastros antigos no
-   gerenciador e pare a sincronização do agregador antes de desligá-lo — senão ele os
-   recria.
-- [x] **Fase 3 — filmes.** Árvore mais simples; o gerenciador de séries seguiu de pé como
-      controle. Em etapas, cada uma conferida contra o gerenciador de filmes em produção
-      antes da seguinte:
-  - [x] **Parser de release** (`acervo-parser`). Porte do parser de referência: título e
-        títulos alternativos, ano, edição, qualidade e revisão, idiomas, grupo, ids
-        embutidos. Contra um corpus de 684 títulos reais — o histórico de um gerenciador em
-        produção e buscas em trackers, com a leitura dele como gabarito —, concorda em
-        todos os campos de todos os títulos, esquisitices incluídas. O corpus fica fora do
-        repositório (tem nome de tracker privado); o teste `corpus`, ignorado por padrão,
-        refaz a conta.
-  - [x] **Catálogo de filmes** (`acervo-store`, Postgres), espelhado do gerenciador de
-        filmes enquanto os dois conviveram — 294 filmes e 132 arquivos, todos confirmados no
-        disco. `movies check` confere cada arquivo contra o disco.
-  - [x] **Motor de decisão** (`acervo-decision`). Porte do da referência: casamento do
-        release com o filme (ids do indexador, título limpo, numerais romanos, ano), agregação
-        de idiomas ("Original" e nome sem idioma viram o idioma original do filme), as
-        especificações de rejeição — perfil, idioma, tamanho por minuto, teto global,
-        seeders, disco bruto, legenda embutida, corte, repack, fila — e a ordem de
-        preferência. Contra 40 buscas interativas reais (470 releases), com a decisão da
-        referência como gabarito: nenhuma divergência em casamento, motivos, ordem ou escolha.
-        Por cima disso, o perfil automático (acima) substitui perfis, formatos e tamanhos
-        configuráveis.
-  - [x] **Grab e import**. `movies grab <tmdb>` (ou "Pegar agora" na tela) busca, decide e
-        manda o escolhido ao qBittorrent numa categoria própria (`[movies] category`). O
-        serviço confere a cada `import_interval_minutes` os downloads que terminaram e liga o
-        maior vídeo na pasta do filme por hardlink, com o nome `Título (ano) {imdb-tt…}`.
-  - [x] **Metadados próprios** (`acervo-metadata`, TMDB, chave nas Configurações da tela).
-        Datas de cinema, digital e física, status e disponibilidade calculados com as regras
-        da referência — contra 293 filmes reais, batem em todos.
-  - [x] **API v3 de filmes** para o app de pedidos: status, perfis, pastas raiz, tags,
-        filmes (listar, procurar, adicionar, atualizar, remover), fila, comandos e histórico.
-  - [x] **Busca automática**, sempre ligada: o RSS de todos os indexadores é
-        decidido contra a biblioteca inteira, e os filmes que faltam são buscados em rodadas
-        (`search_interval_minutes`, `search_limit`); o botão "Buscar os que faltam" busca todos, em
-        segundo plano. A "última busca" de cada filme aparece na tela.
-  - [x] **O corte**. O gerenciador de filmes foi desligado: o acervo adotou os filmes com
-        os ids dele (que o app de pedidos guarda), e o app de pedidos passou a falar com a API
-        v3 daqui. O código que só servia à convivência saiu junto — importação, migração,
-        listas de importação e exclusões. Filme entra à mão, pela tela ou pelo app de pedidos.
-- [ ] **Fase 4 — séries.** Só depois de o parser passar no corpus real.
-
-## Licença
-
-GPL-3.0. Mesma licença dos projetos que este substitui, pela possibilidade de portar
-definições de indexador e tabelas de parsing derivadas deles.
+**Não há diretório de estado.** Configuração, cadastros de indexador e strikes moram no
+Postgres; o container pode rodar com o sistema de arquivos somente leitura, montando só o
+acervo e, se houver, as definições Cardigann.

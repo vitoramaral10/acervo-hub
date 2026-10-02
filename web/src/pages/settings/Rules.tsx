@@ -14,7 +14,7 @@ const PROPERS = [
   { value: 'nao_preferir', label: 'Ignorar PROPER/REPACK' },
 ] as const
 
-function Field({ id, label, help, children }: { id: string; label: string; help?: string; children: ReactNode }) {
+export function Field({ id, label, help, children }: { id: string; label: string; help?: string; children: ReactNode }) {
   return (
     <div className="grid gap-1.5">
       <Label htmlFor={id}>{label}</Label>
@@ -28,7 +28,7 @@ function Field({ id, label, help, children }: { id: string; label: string; help?
   )
 }
 
-function Toggle({
+export function Toggle({
   id,
   label,
   help,

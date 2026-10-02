@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 use crate::config::Config;
 use crate::decide::{Decider, now_rfc3339};
 use crate::serve::Database;
+use crate::settings::Settings;
 
 /// Por quanto tempo uma busca interativa fica guardada para o grab.
 const SEARCH_TTL: Duration = Duration::from_secs(30 * 60);
@@ -36,13 +37,19 @@ type Cached = (Instant, Vec<acervo_indexers::Release>);
 
 #[derive(Debug)]
 pub struct Web {
-    pub config: Arc<Config>,
+    pub settings: Arc<Settings>,
     pub database: Database,
     pub catalog: Catalog,
-    pub api_key: String,
     pub accounts: Option<Arc<dyn Accounts>>,
     /// Última busca interativa de cada filme: o grab escolhe dela pelo guid.
     pub searches: tokio::sync::Mutex<HashMap<i64, Cached>>,
+}
+
+impl Web {
+    /// O instantâneo da configuração, pego a cada requisição.
+    fn config(&self) -> Arc<Config> {
+        self.settings.get()
+    }
 }
 
 type Shared = State<Arc<Web>>;
@@ -79,9 +86,14 @@ async fn enter<'a>(
     headers: &HeaderMap,
     method: &Method,
 ) -> Result<&'a Store, Response> {
-    authorize_ui(&web.api_key, web.accounts.as_ref(), headers, method)
-        .await
-        .map_err(|response| *response)?;
+    authorize_ui(
+        &web.config().server.api_key,
+        web.accounts.as_ref(),
+        headers,
+        method,
+    )
+    .await
+    .map_err(|response| *response)?;
     web.database
         .get()
         .map_err(|e| fail(WebError(StatusCode::SERVICE_UNAVAILABLE, e)))
@@ -137,8 +149,8 @@ pub fn router(web: Arc<Web>) -> Router {
 async fn options(State(web): Shared, headers: HeaderMap) -> WebResult {
     let store = enter(&web, &headers, &Method::GET).await?;
     let tags = store.tags().await.map_err(|e| fail(bad(e)))?;
-    let map = web.config.path_map();
-    let roots = web.config.movies.root_folders.clone();
+    let map = web.config().path_map();
+    let roots = web.config().library.root_folders.clone();
     let folders = tokio::task::spawn_blocking(move || {
         roots
             .into_iter()
@@ -175,7 +187,7 @@ async fn tmdb_search(
     Query(q): Query<TmdbQuery>,
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::GET).await?;
-    let tmdb = crate::metadata::require_tmdb(&web.config, store)
+    let tmdb = crate::metadata::require_tmdb(&web.config(), store)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     let term = q.termo.trim();
@@ -289,13 +301,13 @@ async fn add_movie(
     axum::Json(body): axum::Json<AddBody>,
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::POST).await?;
-    if !web.config.movies.root_folders.contains(&body.pasta) {
+    if !web.config().library.root_folders.contains(&body.pasta) {
         return Err(fail(bad(format!(
             "pasta raiz `{}` não configurada",
             body.pasta
         ))));
     }
-    let tmdb = crate::metadata::require_tmdb(&web.config, store)
+    let tmdb = crate::metadata::require_tmdb(&web.config(), store)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     let request = crate::library::AddRequest {
@@ -314,7 +326,7 @@ async fn add_movie(
         tokio::spawn(async move {
             if let Ok(store) = web.database.get()
                 && let Err(error) =
-                    crate::grab::grab(&web.config, store, &web.catalog, id, true).await
+                    crate::grab::grab(&web.config(), store, &web.catalog, id, true).await
             {
                 tracing::info!(filme = id, "busca ao adicionar: {error:#}");
             }
@@ -349,7 +361,7 @@ async fn remove_movie(
     Query(q): Query<RemoveQuery>,
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::DELETE).await?;
-    crate::library::remove(&web.config, store, id, q.apagar_arquivos)
+    crate::library::remove(&web.config(), store, id, q.apagar_arquivos)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     ok(&json!({ "ok": true }))
@@ -357,7 +369,7 @@ async fn remove_movie(
 
 async fn delete_file(State(web): Shared, Path(id): Path<i64>, headers: HeaderMap) -> WebResult {
     let store = enter(&web, &headers, &Method::DELETE).await?;
-    crate::library::delete_file(&web.config, store, id)
+    crate::library::delete_file(&web.config(), store, id)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     ok(&json!({ "ok": true }))
@@ -438,7 +450,7 @@ async fn grab_release(
             .and_then(|(_, releases)| releases.iter().find(|r| r.guid == body.guid).cloned())
     }
     .ok_or_else(|| fail(bad("a busca expirou; busque de novo")))?;
-    crate::grab::send_chosen(&web.config, store, &web.catalog, id, &release)
+    crate::grab::send_chosen(&web.config(), store, &web.catalog, id, &release)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     ok(&json!({ "ok": true, "titulo": release.title }))
@@ -458,7 +470,7 @@ async fn queue(State(web): Shared, headers: HeaderMap) -> WebResult {
     let torrents: HashMap<String, acervo_clients::TorrentInfo> = if downloading.is_empty() {
         HashMap::new()
     } else {
-        match crate::grab::qbit(&web.config).await {
+        match crate::grab::qbit(&web.config()).await {
             Ok(client) => client
                 .torrents()
                 .await
@@ -520,7 +532,7 @@ async fn remove_download(
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::DELETE).await?;
     crate::grab::remove_download(
-        &web.config,
+        &web.config(),
         store,
         &web.catalog,
         id,

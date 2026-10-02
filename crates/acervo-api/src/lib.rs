@@ -23,6 +23,42 @@ use time::OffsetDateTime;
 pub use catalog::{ALL, Catalog, CatalogError, Entry, Health, IndexerView, Page, UI};
 pub use ui::{Accounts, Admin, DefinitionView, SettingView, authorize_ui, ui_json};
 
+/// A chave da superfície, lida a cada requisição: trocada pela tela, a nova
+/// vale na hora, sem reiniciar.
+#[derive(Clone)]
+pub struct ApiKey(Arc<dyn Fn() -> String + Send + Sync>);
+
+impl ApiKey {
+    /// Chave que muda: `current` é chamada a cada requisição.
+    pub fn dynamic(current: impl Fn() -> String + Send + Sync + 'static) -> Self {
+        Self(Arc::new(current))
+    }
+
+    /// A chave atual.
+    #[must_use]
+    pub fn get(&self) -> String {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ApiKey(<redacted>)")
+    }
+}
+
+impl From<String> for ApiKey {
+    fn from(key: String) -> Self {
+        Self::dynamic(move || key.clone())
+    }
+}
+
+impl From<&str> for ApiKey {
+    fn from(key: &str) -> Self {
+        key.to_owned().into()
+    }
+}
+
 /// Erros do contrato Torznab, com os códigos que os consumidores entendem.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TorznabError {
@@ -78,7 +114,7 @@ impl IntoResponse for TorznabError {
 
 struct Server {
     catalog: Catalog,
-    api_key: String,
+    api_key: ApiKey,
     admin: Option<Arc<dyn Admin>>,
     accounts: Option<Arc<dyn Accounts>>,
 }
@@ -88,7 +124,7 @@ impl std::fmt::Debug for Server {
         formatter
             .debug_struct("Server")
             .field("catalog", &self.catalog)
-            .field("api_key", &"<redacted>")
+            .field("api_key", &self.api_key)
             .field("admin", &self.admin)
             .field("accounts", &self.accounts)
             .finish()
@@ -100,7 +136,7 @@ impl std::fmt::Debug for Server {
 ///
 /// A chave vale para todos os indexadores e é aceita em `apikey` ou no
 /// cabeçalho `X-Api-Key`, como os consumidores mandam.
-pub fn router(catalog: Catalog, api_key: impl Into<String>) -> Router {
+pub fn router(catalog: Catalog, api_key: impl Into<ApiKey>) -> Router {
     router_with_admin(catalog, api_key, None, None)
 }
 
@@ -109,7 +145,7 @@ pub fn router(catalog: Catalog, api_key: impl Into<String>) -> Router {
 /// `accounts`, ninguém entra pela tela: só vale a chave em `X-Api-Key`.
 pub fn router_with_admin(
     catalog: Catalog,
-    api_key: impl Into<String>,
+    api_key: impl Into<ApiKey>,
     admin: Option<Arc<dyn Admin>>,
     accounts: Option<Arc<dyn Accounts>>,
 ) -> Router {
@@ -150,7 +186,7 @@ fn authorize(
                 .and_then(|value| value.to_str().ok())
         })
         .unwrap_or_default();
-    if constant_time_eq(presented.as_bytes(), server.api_key.as_bytes()) {
+    if constant_time_eq(presented.as_bytes(), server.api_key.get().as_bytes()) {
         Ok(())
     } else {
         Err(TorznabError::IncorrectApiKey)
@@ -205,7 +241,7 @@ async fn torznab(
                     return release.download_url.to_string();
                 }
                 let query: String = url::form_urlencoded::Serializer::new(String::new())
-                    .append_pair("apikey", &server.api_key)
+                    .append_pair("apikey", &server.api_key.get())
                     .append_pair("link", release.download_url.as_str())
                     .finish();
                 format!("{origin}/{}/download?{query}", release.indexer)

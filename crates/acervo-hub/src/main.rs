@@ -4,11 +4,14 @@
 //! Torznab, serve a interface e roda as tarefas de fundo — a limpeza entre
 //! elas. `apply` roda um ciclo de limpeza à mão: ler o mundo, planejar,
 //! relatar e executar.
+//!
+//! A configuração mora no Postgres e se edita pela tela. Fora do banco só
+//! há duas variáveis de ambiente: `ACERVO_DATABASE_URL`, que todo comando
+//! usa, e `ACERVO_BIND`, o endereço de escuta do `serve`.
 
 // O filme da API v3 é um `json!` de ~50 campos, um nível de macro por campo.
 #![recursion_limit = "256"]
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Result;
@@ -19,23 +22,23 @@ mod apply;
 mod automatic;
 mod collect;
 mod config;
-mod credentials;
 mod cycle;
 mod decide;
 mod definitions;
 mod events;
 mod grab;
+mod import_config;
 mod ledger;
 mod library;
 mod mediainfo;
 mod metadata;
 mod movies;
 mod naming;
-mod registry;
 mod report;
 mod rules;
 mod search;
 mod serve;
+mod settings;
 mod sync;
 mod tasks;
 mod watched;
@@ -48,10 +51,6 @@ mod web;
     about = "Reconcilia a biblioteca de mídia e serve os indexadores"
 )]
 struct Cli {
-    /// Arquivo de configuração.
-    #[arg(long, short, default_value = "/etc/acervo-hub/config.toml")]
-    config: PathBuf,
-
     #[command(subcommand)]
     command: Command,
 }
@@ -202,8 +201,7 @@ fn read_password() -> Result<String> {
     Ok(line.trim_end_matches(['\r', '\n']).to_owned())
 }
 
-async fn users(config: &config::Config, action: UsersAction) -> Result<()> {
-    let store = config.store().await?;
+async fn users(store: &acervo_store::Store, action: UsersAction) -> Result<()> {
     match action {
         UsersAction::Set { name } => {
             let password = read_password()?;
@@ -228,8 +226,12 @@ async fn users(config: &config::Config, action: UsersAction) -> Result<()> {
 
 /// Os subcomandos de `movies`. Devolve se algo falhou.
 #[allow(clippy::too_many_lines)] // Um braço por subcomando.
-async fn movies_command(config: &config::Config, action: MoviesAction) -> Result<bool> {
-    let store = config.store().await?;
+async fn movies_command(
+    config: &config::Config,
+    store: acervo_store::Store,
+    action: MoviesAction,
+) -> Result<bool> {
+    let records = store.indexers().await?;
     Ok(match action {
         MoviesAction::Check => movies::check(config, &store).await? > 0,
         MoviesAction::Grab { tmdb, apply } => {
@@ -239,7 +241,7 @@ async fn movies_command(config: &config::Config, action: MoviesAction) -> Result
                 .into_iter()
                 .find(|m| m.movie.tmdb_id == tmdb)
                 .ok_or_else(|| anyhow::anyhow!("TMDB {tmdb} não está no catálogo"))?;
-            let catalog = acervo_api::Catalog::new(serve::entries(config).await?)?;
+            let catalog = acervo_api::Catalog::new(serve::entries(config, &records).await)?;
             let report = grab::grab(config, &store, &catalog, movie.id, apply).await?;
             print_grab(&report);
             report.escolhido.is_none()
@@ -314,7 +316,7 @@ async fn movies_command(config: &config::Config, action: MoviesAction) -> Result
             !report.falhas.is_empty()
         }
         MoviesAction::Rss { apply } => {
-            let catalog = acervo_api::Catalog::new(serve::entries(config).await?)?;
+            let catalog = acervo_api::Catalog::new(serve::entries(config, &records).await)?;
             let grabs = automatic::rss(config, &store, &catalog, apply).await?;
             if grabs.is_empty() {
                 println!("nada entre os releases recentes serve à biblioteca");
@@ -356,29 +358,56 @@ async fn main() -> ExitCode {
     }
 }
 
+/// O endereço do banco, do ambiente.
+fn database_url() -> Result<String> {
+    std::env::var("ACERVO_DATABASE_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "ACERVO_DATABASE_URL ausente: defina-a como \
+                 postgres://usuário:senha@host:5432/banco"
+            )
+        })
+}
+
+/// O padrão escuta em todas as interfaces: o serviço roda em container, e
+/// `127.0.0.1` lá dentro não seria alcançável pelos vizinhos.
+const DEFAULT_BIND: &str = "0.0.0.0:9797";
+
 async fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
-    let config = config::Config::load(&config::expand_tilde(&cli.config))?;
+    let url = database_url()?;
+    if matches!(cli.command, Command::Serve) {
+        let bind = std::env::var("ACERVO_BIND")
+            .ok()
+            .filter(|bind| !bind.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_BIND.to_owned());
+        serve::run(serve::connect(&url).await, &bind).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    // Comando avulso: uma tentativa só, e a configuração de agora.
+    let store = acervo_store::Store::connect(&url)
+        .await
+        .map_err(|error| anyhow::anyhow!("conectando ao banco: {error}"))?;
+    let config = settings::Settings::load(store.clone()).await?.get();
     let failed = match cli.command {
         Command::Apply => {
-            let report = cycle::run(&config, true).await?;
+            let report = cycle::run(&config, &store, true).await?;
             return Ok(ExitCode::from(report.exit_code()));
         }
-        Command::Serve => {
-            serve::run(config).await?;
-            false
-        }
+        Command::Serve => unreachable!("tratado acima"),
         Command::Search {
             term,
             indexer,
             categories,
-        } => search::run(&config, &term, indexer.as_deref(), &categories).await? > 0,
+        } => search::run(&config, &store, &term, indexer.as_deref(), &categories).await? > 0,
         Command::Users { action } => {
-            users(&config, action).await?;
+            users(&store, action).await?;
             false
         }
-        Command::Movies { action } => movies_command(&config, action).await?,
-        Command::Sync { apply } => sync::run(&config, apply).await? > 0,
+        Command::Movies { action } => movies_command(&config, store, action).await?,
+        Command::Sync { apply } => sync::run(&config, &store, apply).await? > 0,
     };
     Ok(if failed {
         ExitCode::FAILURE

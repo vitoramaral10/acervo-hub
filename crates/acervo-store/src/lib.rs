@@ -7,6 +7,7 @@
 //! a aplicação faria.
 
 mod accounts;
+mod config;
 mod manage;
 mod tasks;
 
@@ -16,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio_postgres::{NoTls, Row};
 
 pub use accounts::SESSION_DAYS;
+pub use config::{Imported, IndexerRecord};
 pub use manage::{Blocked, HistoryEvent, HistoryPage, NewHistory};
 pub use tasks::{NewTaskRun, TaskRun};
 
@@ -461,6 +463,29 @@ const MIGRATIONS: &[&str] = &[
         detail JSONB
     );
     CREATE INDEX task_runs_by_task ON task_runs(task, id);
+",
+    // A configuração sai do arquivo e vem para o banco: uma linha por seção,
+    // editada pela tela; os indexadores, todos como cadastro; e os strikes da
+    // limpeza, que antes moravam num JSON ao lado.
+    r"
+    CREATE TABLE config_sections (
+        name TEXT PRIMARY KEY,
+        value JSONB NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE indexers (
+        name TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind IN ('torznab', 'cardigann')),
+        definition TEXT,
+        url TEXT,
+        settings JSONB NOT NULL DEFAULT '{}',
+        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        added_at TEXT
+    );
+    CREATE TABLE strikes (
+        key TEXT PRIMARY KEY,
+        count INTEGER NOT NULL CHECK (count > 0)
+    );
 ",
 ];
 

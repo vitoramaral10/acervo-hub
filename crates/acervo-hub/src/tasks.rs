@@ -4,6 +4,8 @@
 //!
 //! Cada tarefa tem um laço próprio que espera o que vier primeiro — a hora
 //! agendada ou um pedido de rodar agora — e roda uma execução por vez. O
+//! intervalo vem da configuração a cada volta: mudado na tela, o agendador
+//! recalcula a próxima execução ([`Tasks::reschedule`]) sem reiniciar. O
 //! resultado vai para o histórico no banco, que guarda as últimas
 //! [`KEEP`] execuções de cada tarefa. Tarefa nova é uma implementação de [`Job`] e uma
 //! entrada em [`service`].
@@ -22,9 +24,9 @@ use time::format_description::well_known::Rfc3339;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-use crate::config::Config;
 use crate::decide::{Progress, now_rfc3339};
 use crate::serve::Database;
+use crate::settings::Settings;
 
 /// Quantas execuções de cada tarefa o histórico guarda; as mais velhas saem
 /// ao gravar.
@@ -79,6 +81,13 @@ pub trait Job: Send + Sync + std::fmt::Debug {
     fn progress(&self) -> Option<String> {
         None
     }
+
+    /// Por que a tarefa não tem como rodar com a configuração de agora —
+    /// sem cliente de download, sem Jellyfin. Enquanto houver motivo, ela
+    /// sai do agendamento; "rodar agora" ainda tenta, e falha com ele.
+    fn unavailable(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Quando a primeira execução agendada acontece.
@@ -90,17 +99,33 @@ pub enum First {
     AfterInterval,
 }
 
+/// O intervalo de uma tarefa, lido na hora de agendar.
+pub type Interval = Box<dyn Fn() -> Duration + Send + Sync>;
+
 /// Uma tarefa registrada.
-#[derive(Debug)]
 pub struct Task {
     /// Estável: é o que a URL e o histórico guardam.
     pub id: &'static str,
     /// Para a tela.
     pub name: &'static str,
-    /// Zero desliga o agendamento; "rodar agora" continua valendo.
-    pub interval: Duration,
+    /// Lido a cada volta do agendamento, nunca guardado. Zero desliga o
+    /// agendamento; "rodar agora" continua valendo.
+    pub interval: Interval,
     pub first: First,
     pub job: Arc<dyn Job>,
+}
+
+impl std::fmt::Debug for Task {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Task")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("interval", &(self.interval)())
+            .field("first", &self.first)
+            .field("job", &self.job)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -136,12 +161,24 @@ impl Slot {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// O intervalo que vale para agendar: zero se a tarefa não tem como
+    /// rodar agora.
+    fn every(&self) -> Duration {
+        if self.task.job.unavailable().is_some() {
+            Duration::ZERO
+        } else {
+            (self.task.interval)()
+        }
+    }
+
     fn view(&self) -> Value {
+        let unavailable = self.task.job.unavailable();
         let state = self.lock();
         json!({
             "id": self.task.id,
             "nome": self.task.name,
-            "intervalo_minutos": self.task.interval.as_secs() / 60,
+            "intervalo_minutos": (self.task.interval)().as_secs() / 60,
+            "indisponivel": unavailable,
             "rodando": state.running,
             "iniciada_em": state.started,
             "andamento": if state.running { self.task.job.progress() } else { None },
@@ -237,6 +274,13 @@ impl Tasks {
         Some(true)
     }
 
+    /// Recalcula a próxima execução de cada tarefa: a configuração mudou.
+    pub fn reschedule(&self) {
+        for slot in &self.slots {
+            slot.wake.notify_one();
+        }
+    }
+
     /// Se a tarefa está rodando (ou pedida, prestes a rodar).
     pub fn is_running(&self, id: &str) -> bool {
         self.slot(id).is_some_and(|slot| slot.lock().running)
@@ -285,14 +329,22 @@ impl Tasks {
     }
 
     /// O laço de uma tarefa: espera a hora agendada ou um pedido, roda,
-    /// reagenda a partir do início da execução.
+    /// reagenda a partir do início da execução. Acordado sem pedido, só
+    /// recalcula: o intervalo pode ter mudado.
     async fn schedule(self: Arc<Self>, slot: Arc<Slot>) {
-        let every = slot.task.interval;
-        let mut next = (!every.is_zero()).then(|| match slot.task.first {
-            First::Now => Instant::now(),
-            First::AfterInterval => Instant::now() + every,
-        });
+        // De onde se conta o intervalo: a subida, depois o início da última
+        // execução.
+        let mut anchor = Instant::now();
+        let mut ran = false;
         loop {
+            let every = slot.every();
+            let next = (!every.is_zero()).then(|| {
+                if !ran && slot.task.first == First::Now {
+                    anchor
+                } else {
+                    anchor + every
+                }
+            });
             slot.lock().next = next.map(wall_clock);
             let timer = async {
                 match next {
@@ -310,17 +362,17 @@ impl Tasks {
                     state.requested = false;
                     Trigger::Manual
                 } else if woken {
-                    // Aviso que sobrou de um pedido já atendido junto com a
-                    // hora agendada.
+                    // Configuração mudou, ou aviso que sobrou de um pedido já
+                    // atendido: recalcula a próxima.
                     continue;
                 } else {
                     state.running = true;
                     Trigger::Scheduled
                 }
             };
-            let started = Instant::now();
+            anchor = Instant::now();
+            ran = true;
             self.execute(&slot, trigger).await;
-            next = (!every.is_zero()).then(|| started + every);
         }
     }
 
@@ -402,143 +454,130 @@ fn count(n: usize, one: &str, many: &str) -> String {
 
 // --- As tarefas do serviço --------------------------------------------------
 
-/// As tarefas de `serve`, com os intervalos da configuração. Cada uma só
-/// entra se o serviço tem o que ela precisa.
+/// O intervalo de uma tarefa, lido da configuração de agora.
+fn interval(settings: &Arc<Settings>, id: &'static str) -> Interval {
+    let settings = Arc::clone(settings);
+    Box::new(move || settings.get().tasks.interval(id))
+}
+
+/// As tarefas de `serve`. Todas entram; a que não tem o que precisa na
+/// configuração de agora fica fora do agendamento até ter.
 #[must_use]
 pub fn service(
-    config: &Arc<Config>,
+    settings: &Arc<Settings>,
     database: &Database,
     catalog: &Catalog,
     progress: &Arc<Progress>,
 ) -> Vec<Task> {
-    let minutes = |m: u64| Duration::from_secs(m * 60);
-    let with_database = config.database.is_some();
-    let with_client = with_database && config.qbittorrent.is_some();
-    let server = config.server.as_ref();
-    let mut tasks = Vec::new();
-    if with_database {
-        tasks.push(Task {
+    vec![
+        Task {
             id: BUSCA,
             name: "Busca dos que faltam",
-            // Sem intervalo, só pelo botão.
-            interval: minutes(server.and_then(|s| s.search_interval_minutes).unwrap_or(0)),
+            interval: interval(settings, BUSCA),
             // Espera um ciclo para não somar a busca à subida do serviço.
             first: First::AfterInterval,
             job: Arc::new(Missing {
-                config: Arc::clone(config),
+                settings: Arc::clone(settings),
                 database: database.clone(),
                 catalog: catalog.clone(),
                 progress: Arc::clone(progress),
-                limit: server.map_or(5, |s| s.search_limit),
             }),
-        });
-    }
-    if with_client {
-        tasks.push(Task {
+        },
+        Task {
             id: "rss",
             name: "Sincronização de RSS",
-            interval: minutes(config.movies.rss_interval_minutes.max(5)),
+            interval: interval(settings, "rss"),
             first: First::Now,
             job: Arc::new(Rss {
-                config: Arc::clone(config),
+                settings: Arc::clone(settings),
                 database: database.clone(),
                 catalog: catalog.clone(),
             }),
-        });
-        tasks.push(Task {
+        },
+        Task {
             id: "importacao",
             name: "Importação de downloads",
-            interval: minutes(config.movies.import_interval_minutes),
+            interval: interval(settings, "importacao"),
             first: First::Now,
             job: Arc::new(Import {
-                config: Arc::clone(config),
+                settings: Arc::clone(settings),
                 database: database.clone(),
                 catalog: catalog.clone(),
             }),
-        });
-    }
-    if with_database {
-        tasks.push(Task {
+        },
+        Task {
             id: "metadados",
             name: "Atualização de metadados",
-            interval: Duration::from_secs(6 * 3600),
+            interval: interval(settings, "metadados"),
             first: First::Now,
             job: Arc::new(Metadata {
-                config: Arc::clone(config),
+                settings: Arc::clone(settings),
                 database: database.clone(),
             }),
-        });
-    }
-    match config.janitor() {
-        Ok(_) => tasks.push(Task {
+        },
+        Task {
             id: "limpeza",
             name: "Limpeza",
-            interval: minutes(server.map_or(60, |s| s.cleanup_interval_minutes)),
+            interval: interval(settings, "limpeza"),
             // Um ciclo avança strikes: reiniciar o serviço não pode valer
             // como ciclo.
             first: First::AfterInterval,
             job: Arc::new(Cleanup {
-                config: Arc::clone(config),
+                settings: Arc::clone(settings),
+                database: database.clone(),
             }),
-        }),
-        Err(error) => tracing::info!("limpeza fora das tarefas: {error:#}"),
-    }
-    match (config.jellyfin.as_ref(), with_database) {
-        (None, _) => {
-            tracing::info!("apagar assistidos fora das tarefas: seção `[jellyfin]` ausente");
-        }
-        (Some(_), false) => {
-            tracing::info!("apagar assistidos fora das tarefas: sem `[database]`, não há catálogo");
-        }
-        (Some(jellyfin), true) => {
-            match JellyfinClient::new(&jellyfin.url, &jellyfin.api_key, config.http_timeout()) {
-                Ok(client) => tasks.push(Task {
-                    id: ASSISTIDOS,
-                    name: "Apagar assistidos",
-                    interval: minutes(jellyfin.interval_minutes),
-                    // Apagar não precisa correr na subida do serviço; o
-                    // primeiro intervalo pega o que houver.
-                    first: First::AfterInterval,
-                    job: Arc::new(Watched {
-                        config: Arc::clone(config),
-                        database: database.clone(),
-                        jellyfin: client,
-                        grace_minutes: jellyfin.delete_watched_after_minutes,
-                    }),
-                }),
-                Err(error) => tracing::warn!("apagar assistidos fora das tarefas: {error}"),
-            }
-        }
-    }
-    tasks
+        },
+        Task {
+            id: ASSISTIDOS,
+            name: "Apagar assistidos",
+            interval: interval(settings, ASSISTIDOS),
+            // Apagar não precisa correr na subida do serviço; o primeiro
+            // intervalo pega o que houver.
+            first: First::AfterInterval,
+            job: Arc::new(Watched {
+                settings: Arc::clone(settings),
+                database: database.clone(),
+            }),
+        },
+    ]
 }
 
 fn store(database: &Database) -> Result<&acervo_store::Store> {
     database.get().map_err(anyhow::Error::msg)
 }
 
-/// Busca dos que faltam: a agendada pega `limit` filmes; "rodar agora", todos.
+/// Sem cliente de download, nada a pegar nem a importar.
+fn without_client(settings: &Settings) -> Option<String> {
+    settings
+        .get()
+        .qbittorrent()
+        .is_none()
+        .then(|| "cliente de download não configurado".to_owned())
+}
+
+/// Busca dos que faltam: a agendada pega o limite da configuração; "rodar
+/// agora", todos.
 #[derive(Debug)]
 struct Missing {
-    config: Arc<Config>,
+    settings: Arc<Settings>,
     database: Database,
     catalog: Catalog,
     progress: Arc<Progress>,
-    limit: usize,
 }
 
 #[async_trait]
 impl Job for Missing {
     async fn run(&self, trigger: Trigger) -> Result<Outcome> {
         let store = store(&self.database)?;
+        let config = self.settings.get();
         // O registro já garante uma execução por vez; a vez no `Progress` é
         // o que alimenta o andamento.
         let turn = self
             .progress
             .start()
             .context("já há uma busca dos que faltam rodando")?;
-        let limit = (trigger == Trigger::Scheduled).then_some(self.limit);
-        let lines = crate::decide::search(&self.config, store, &self.catalog, limit, &turn).await?;
+        let limit = (trigger == Trigger::Scheduled).then_some(config.tasks.search_limit);
+        let lines = crate::decide::search(&config, store, &self.catalog, limit, &turn).await?;
         if lines.is_empty() {
             return Ok(Outcome::new(true, "nenhum filme faltando"));
         }
@@ -564,7 +603,7 @@ impl Job for Missing {
 /// Sincronização de RSS: pega o que serve à biblioteca.
 #[derive(Debug)]
 struct Rss {
-    config: Arc<Config>,
+    settings: Arc<Settings>,
     database: Database,
     catalog: Catalog,
 }
@@ -573,7 +612,8 @@ struct Rss {
 impl Job for Rss {
     async fn run(&self, _: Trigger) -> Result<Outcome> {
         let store = store(&self.database)?;
-        let grabs = crate::automatic::rss(&self.config, store, &self.catalog, true).await?;
+        let config = self.settings.get();
+        let grabs = crate::automatic::rss(&config, store, &self.catalog, true).await?;
         for grab in &grabs {
             tracing::info!(
                 filme = grab.filme,
@@ -590,12 +630,16 @@ impl Job for Rss {
         };
         Ok(Outcome::new(failed == 0, summary))
     }
+
+    fn unavailable(&self) -> Option<String> {
+        without_client(&self.settings)
+    }
 }
 
 /// Importa os downloads do acervo que terminaram.
 #[derive(Debug)]
 struct Import {
-    config: Arc<Config>,
+    settings: Arc<Settings>,
     database: Database,
     catalog: Catalog,
 }
@@ -604,8 +648,9 @@ struct Import {
 impl Job for Import {
     async fn run(&self, _: Trigger) -> Result<Outcome> {
         let store = store(&self.database)?;
+        let config = self.settings.get();
         let lines =
-            crate::grab::import_downloads(&self.config, store, Some(&self.catalog), true).await?;
+            crate::grab::import_downloads(&config, store, Some(&self.catalog), true).await?;
         for line in lines.iter().filter(|l| l.estado != "baixando") {
             tracing::info!(
                 filme = line.filme,
@@ -634,13 +679,17 @@ impl Job for Import {
         };
         Ok(Outcome::new(failed == 0, summary))
     }
+
+    fn unavailable(&self) -> Option<String> {
+        without_client(&self.settings)
+    }
 }
 
 /// Mantém os metadados em dia: os filmes conferidos há mais de um dia. Sem
 /// chave do TMDB, não há o que fazer.
 #[derive(Debug)]
 struct Metadata {
-    config: Arc<Config>,
+    settings: Arc<Settings>,
     database: Database,
 }
 
@@ -648,7 +697,8 @@ struct Metadata {
 impl Job for Metadata {
     async fn run(&self, _: Trigger) -> Result<Outcome> {
         let store = store(&self.database)?;
-        let Some(tmdb) = crate::metadata::tmdb(&self.config, store).await? else {
+        let config = self.settings.get();
+        let Some(tmdb) = crate::metadata::tmdb(&config, store).await? else {
             return Ok(Outcome::new(true, "sem chave do TMDB; nada a fazer"));
         };
         let report = crate::library::refresh(store, &tmdb, 24).await?;
@@ -658,26 +708,51 @@ impl Job for Metadata {
             count(report.atualizados.len(), "atualizado", "atualizados"),
             count(report.falhas.len(), "falha", "falhas"),
         );
-        Ok(Outcome::new(report.falhas.is_empty(), summary))
+        // Qual filme falhou e por quê: sem isso a tela só mostra a contagem.
+        let detail = (!report.atualizados.is_empty() || !report.falhas.is_empty()).then(|| {
+            json!({
+                "atualizados": report.atualizados,
+                "falhas": report.falhas.iter().map(|(filme, erro)| json!({
+                    "filme": filme,
+                    "erro": erro,
+                })).collect::<Vec<_>>(),
+            })
+        });
+        Ok(Outcome {
+            ok: report.falhas.is_empty(),
+            summary,
+            detail,
+        })
     }
 }
 
 /// O ciclo de limpeza, aplicado. O relatório vira o detalhe da execução.
 #[derive(Debug)]
 struct Cleanup {
-    config: Arc<Config>,
+    settings: Arc<Settings>,
+    database: Database,
 }
 
 #[async_trait]
 impl Job for Cleanup {
     async fn run(&self, _: Trigger) -> Result<Outcome> {
-        let report = crate::cycle::run(&self.config, false).await?;
+        let store = store(&self.database)?;
+        let config = self.settings.get();
+        let report = crate::cycle::run(&config, store, false).await?;
         let (ok, summary) = report.summary();
         Ok(Outcome {
             ok,
             summary,
             detail: Some(serde_json::to_value(&report)?),
         })
+    }
+
+    fn unavailable(&self) -> Option<String> {
+        self.settings
+            .get()
+            .janitor()
+            .err()
+            .map(|error| format!("{error:#}"))
     }
 }
 
@@ -685,24 +760,40 @@ impl Job for Cleanup {
 /// apagados e os pulados, vira o detalhe da execução.
 #[derive(Debug)]
 struct Watched {
-    config: Arc<Config>,
+    settings: Arc<Settings>,
     database: Database,
-    jellyfin: JellyfinClient,
-    grace_minutes: u64,
 }
 
 #[async_trait]
 impl Job for Watched {
     async fn run(&self, _: Trigger) -> Result<Outcome> {
         let store = store(&self.database)?;
-        let report =
-            crate::watched::run(&self.config, store, &self.jellyfin, self.grace_minutes).await?;
+        let config = self.settings.get();
+        let jellyfin = config
+            .jellyfin()
+            .context("Jellyfin não configurado (Configurações → Jellyfin)")?;
+        let client = JellyfinClient::new(&jellyfin.url, &jellyfin.api_key, config.http_timeout())?;
+        let report = crate::watched::run(
+            &config,
+            store,
+            &client,
+            jellyfin.delete_watched_after_minutes,
+        )
+        .await?;
         let (ok, summary) = report.summary();
         Ok(Outcome {
             ok,
             summary,
             detail: Some(serde_json::to_value(&report)?),
         })
+    }
+
+    fn unavailable(&self) -> Option<String> {
+        self.settings
+            .get()
+            .jellyfin()
+            .is_none()
+            .then(|| "Jellyfin não configurado".to_owned())
     }
 }
 
@@ -739,7 +830,7 @@ mod tests {
             vec![Task {
                 id: "teste",
                 name: "Teste",
-                interval,
+                interval: Box::new(move || interval),
                 first,
                 job: Arc::clone(&gate) as Arc<dyn Job>,
             }],
@@ -814,6 +905,84 @@ mod tests {
         assert_eq!(gate.runs.load(Ordering::SeqCst), 2);
     }
 
+    #[tokio::test]
+    async fn intervalo_mudado_reagenda_sem_reiniciar() {
+        use std::sync::atomic::AtomicU64;
+        let millis = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(Gate::default());
+        let tasks = Arc::new(Tasks::new(
+            Database::default(),
+            vec![Task {
+                id: "teste",
+                name: "Teste",
+                interval: Box::new({
+                    let millis = Arc::clone(&millis);
+                    move || Duration::from_millis(millis.load(Ordering::SeqCst))
+                }),
+                first: First::AfterInterval,
+                job: Arc::clone(&gate) as Arc<dyn Job>,
+            }],
+        ));
+        tasks.start().await;
+        // Desligada: sem próxima.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(tasks.view()[0]["proxima"], Value::Null);
+        assert_eq!(tasks.view()[0]["intervalo_minutos"], 0);
+
+        // Ligada na configuração: o laço recalcula e roda, sem reiniciar.
+        millis.store(100, Ordering::SeqCst);
+        tasks.reschedule();
+        until("próxima agendada", || {
+            tasks.view()[0]["proxima"].is_string()
+        })
+        .await;
+        gate.started.notified().await;
+        assert_eq!(*gate.triggers.lock().unwrap(), [Trigger::Scheduled]);
+
+        // Desligada de novo durante a execução: ao terminar, a próxima some.
+        millis.store(0, Ordering::SeqCst);
+        tasks.reschedule();
+        gate.release.notify_one();
+        until("sem próxima", || {
+            tasks.view()[0]["proxima"].is_null() && !tasks.is_running("teste")
+        })
+        .await;
+    }
+
+    #[derive(Debug)]
+    struct Unavailable;
+
+    #[async_trait]
+    impl Job for Unavailable {
+        async fn run(&self, _: Trigger) -> Result<Outcome> {
+            anyhow::bail!("não devia rodar agendada")
+        }
+
+        fn unavailable(&self) -> Option<String> {
+            Some("cliente de download não configurado".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn indisponivel_sai_do_agendamento_e_diz_por_que() {
+        let tasks = Arc::new(Tasks::new(
+            Database::default(),
+            vec![Task {
+                id: "teste",
+                name: "Teste",
+                interval: Box::new(|| Duration::from_millis(10)),
+                first: First::Now,
+                job: Arc::new(Unavailable),
+            }],
+        ));
+        tasks.start().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let view = tasks.view_one("teste").unwrap();
+        assert_eq!(view["proxima"], Value::Null);
+        assert_eq!(view["ultima"], Value::Null);
+        assert_eq!(view["indisponivel"], "cliente de download não configurado");
+    }
+
     #[derive(Debug)]
     struct Fails;
 
@@ -835,7 +1004,7 @@ mod tests {
             vec![Task {
                 id: "falha",
                 name: "Falha",
-                interval: Duration::ZERO,
+                interval: Box::new(|| Duration::ZERO),
                 first: First::Now,
                 job: Arc::new(Fails),
             }],
@@ -873,7 +1042,7 @@ mod tests {
             vec![Task {
                 id: "falha",
                 name: "Falha",
-                interval: Duration::ZERO,
+                interval: Box::new(|| Duration::ZERO),
                 first: First::Now,
                 job: Arc::new(Fails),
             }],

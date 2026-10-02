@@ -1,18 +1,24 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { CircleCheck, CircleDashed, ExternalLink, KeyRound } from 'lucide-react'
-import { useState } from 'react'
+import { type ReactNode, useState } from 'react'
 import { toast } from 'sonner'
 import { PageHeader } from '@/components/PageHeader'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { NotificationsSection } from '@/pages/settings/Notifications'
 import { RulesSection, RulesSkeleton, useRules } from '@/pages/settings/Rules'
+import {
+  CleanupSettings,
+  DownloadClientSettings,
+  JellyfinSettings,
+  LibrarySettings,
+  ServerSettings,
+} from '@/pages/settings/Sections'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Badge, Skeleton } from '@/components/ui/misc'
 import { api } from '@/lib/api'
 
-function GeneralSection() {
+export function TmdbSettings() {
   const queryClient = useQueryClient()
   const settings = useQuery({ queryKey: ['configuracoes'], queryFn: api.configuration })
   const [key, setKey] = useState('')
@@ -133,71 +139,72 @@ function GeneralSection() {
   )
 }
 
-const TABS = [
-  { value: 'geral', label: 'Geral' },
-  { value: 'regras', label: 'Regras' },
-  { value: 'notificacoes', label: 'Notificações' },
-] as const
+/** As telas de configuração, uma por item do menu. */
+export type SettingsView = 'servidor' | 'cliente-download' | 'jellyfin' | 'biblioteca' | 'limpeza' | 'regras' | 'notificacoes' | 'tmdb'
 
-type Tab = (typeof TABS)[number]['value']
-
-const TAB_KEY = 'acervo.configuracoes.aba'
-
-function storedTab(): Tab {
-  try {
-    const value = localStorage.getItem(TAB_KEY)
-    return TABS.some((t) => t.value === value) ? (value as Tab) : 'geral'
-  } catch {
-    return 'geral'
-  }
+const PAGES: Record<SettingsView, { title: string; description: string; body: () => ReactNode }> = {
+  servidor: {
+    title: 'Servidor',
+    description: 'A chave de API, o endereço público e o catálogo de definições. Vale na hora, sem reiniciar.',
+    body: () => <ServerSettings />,
+  },
+  'cliente-download': {
+    title: 'Cliente de download',
+    description: 'O qBittorrent que recebe os torrents do acervo e por onde a limpeza age.',
+    body: () => <DownloadClientSettings />,
+  },
+  jellyfin: {
+    title: 'Jellyfin',
+    description: 'O servidor de mídia que diz o que já foi assistido.',
+    body: () => <JellyfinSettings />,
+  },
+  biblioteca: {
+    title: 'Biblioteca',
+    description: 'Pastas, caminhos e a categoria dos downloads do acervo.',
+    body: () => <LibrarySettings />,
+  },
+  limpeza: {
+    title: 'Limpeza',
+    description: 'As regras e as travas do ciclo que limpa fila e seed.',
+    body: () => <CleanupSettings />,
+  },
+  regras: {
+    title: 'Regras de decisão',
+    description: 'O que vale para todo release na hora de escolher.',
+    body: () => <RulesBody />,
+  },
+  notificacoes: {
+    title: 'Notificações',
+    description: 'Avisos por push do que o acervo faz.',
+    body: () => <NotificationsSection />,
+  },
+  tmdb: {
+    title: 'TMDB',
+    description: 'A fonte dos metadados dos filmes.',
+    body: () => <TmdbSettings />,
+  },
 }
 
-export function SettingsPage() {
+function RulesBody() {
   const rules = useRules()
-  const [tab, setTab] = useState<Tab>(storedTab)
+  return rules.isError ? (
+    <div role="alert" className="flex flex-col items-start gap-3 rounded-lg border border-border bg-surface p-6">
+      <p className="text-sm text-danger">{rules.error.message}</p>
+      <Button onClick={() => void rules.refetch()}>Tentar novamente</Button>
+    </div>
+  ) : rules.data ? (
+    <RulesSection view={rules.data} />
+  ) : (
+    <RulesSkeleton />
+  )
+}
+
+export function SettingsPage({ view }: { view: SettingsView }) {
+  const page = PAGES[view]
   return (
     <>
-      <PageHeader
-        title="Configurações"
-        description="O que o acervo-hub guarda no banco e se muda por aqui, sem reiniciar. Endereços e chaves do cliente de download e dos gerenciadores continuam no config.toml."
-      />
-      <Tabs
-        value={tab}
-        onValueChange={(value) => {
-          setTab(value as Tab)
-          try {
-            localStorage.setItem(TAB_KEY, value)
-          } catch {
-            // Sem armazenamento, a aba só não é lembrada.
-          }
-        }}
-      >
-        <TabsList aria-label="Seções das configurações">
-          {TABS.map((t) => (
-            <TabsTrigger key={t.value} value={t.value}>
-              {t.label}
-            </TabsTrigger>
-          ))}
-        </TabsList>
-        <TabsContent value="geral">
-          <GeneralSection />
-        </TabsContent>
-        <TabsContent value="regras">
-          {rules.isError ? (
-            <div role="alert" className="flex flex-col items-start gap-3 rounded-lg border border-border bg-surface p-6">
-              <p className="text-sm text-danger">{rules.error.message}</p>
-              <Button onClick={() => void rules.refetch()}>Tentar novamente</Button>
-            </div>
-          ) : rules.data ? (
-            <RulesSection view={rules.data} />
-          ) : (
-            <RulesSkeleton />
-          )}
-        </TabsContent>
-        <TabsContent value="notificacoes">
-          <NotificationsSection />
-        </TabsContent>
-      </Tabs>
+      <PageHeader title={page.title} description={page.description} />
+      {page.body()}
     </>
   )
 }

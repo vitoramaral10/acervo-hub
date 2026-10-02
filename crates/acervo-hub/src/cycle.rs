@@ -7,12 +7,12 @@ use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use acervo_janitor::{Action, reconcile};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::config::{self, Config};
+use crate::config::Config;
 use crate::{apply, collect, ledger, report};
 
 #[derive(Debug, Clone, Serialize)]
@@ -188,8 +188,8 @@ fn action_line(action: &Action) -> ActionLine {
 /// # Errors
 ///
 /// Configuração do ciclo incompleta, cliente de download fora do ar ou falha
-/// ao gravar os strikes.
-pub async fn run(config: &Config, print: bool) -> Result<CycleReport> {
+/// ao ler ou gravar os strikes.
+pub async fn run(config: &Config, store: &acervo_store::Store, print: bool) -> Result<CycleReport> {
     let session = collect::collect(config).await?;
     if print {
         report::inventory(&session.inventory);
@@ -197,8 +197,7 @@ pub async fn run(config: &Config, print: bool) -> Result<CycleReport> {
     let mut result = CycleReport::header(&session.inventory);
     let inventory = &session.inventory;
 
-    let ledger_path = config::expand_tilde(&config.state.ledger);
-    let mut strikes = ledger::load(&ledger_path)?;
+    let mut strikes = ledger::load(store).await?;
     let plan = match reconcile(
         inventory,
         &config.policy.to_policy(),
@@ -232,8 +231,7 @@ pub async fn run(config: &Config, print: bool) -> Result<CycleReport> {
         .map(|(motivo, quantos)| SkippedLine { motivo, quantos })
         .collect();
 
-    ledger::save(&ledger_path, &strikes)
-        .with_context(|| format!("gravando os strikes em `{}`", ledger_path.display()))?;
+    ledger::save(store, &strikes).await?;
     let outcome = apply::execute(&session, &plan).await;
     if print {
         println!(

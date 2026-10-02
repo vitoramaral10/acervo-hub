@@ -1,64 +1,47 @@
 //! `serve`: monta o catálogo de indexadores e expõe a superfície Torznab e a
 //! interface web.
+//!
+//! Tudo vem do banco: a configuração ([`Settings`]) e os indexadores
+//! cadastrados (tabela `indexers`). Não há indexador "do arquivo" e "da
+//! tela": todo cadastro se edita e se remove pela interface.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
-use acervo_api::{Accounts, Admin, Catalog, DefinitionView, Entry, SettingView};
+use acervo_api::{Accounts, Admin, ApiKey, Catalog, DefinitionView, Entry, SettingView};
 use acervo_indexers::{
     Capabilities, CardigannClient, CardigannDefinition, SettingInfo, SettingInfoKind, TorznabClient,
 };
+use acervo_store::{IndexerRecord, Store};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::config::{CardigannIndexer, Config, IndexerConfig, TorznabIndexer, expand_tilde};
-use crate::credentials::{self, Overrides};
+use crate::config::{Config, SERVIDOR};
 use crate::decide::Progress;
 use crate::definitions::Definitions;
-use crate::registry::{self, Added, Registry};
+use crate::settings::Settings;
 use crate::tasks::{BUSCA, Tasks};
 
-/// O banco do catálogo e das contas, quando alcançável.
+/// O banco do catálogo e das contas.
 ///
-/// A conexão sobe em segundo plano: Postgres fora do ar não pode derrubar os
-/// indexadores, que os gerenciadores consultam sem precisar dele. Enquanto
-/// ele não responde, só a entrada pela tela e o catálogo de filmes falham.
+/// `serve` só sobe depois de conectar, então em produção ele está sempre
+/// presente; o vazio ([`Default`]) existe para os testes do agendador.
 #[derive(Debug, Clone, Default)]
-pub struct Database(Arc<std::sync::OnceLock<acervo_store::Store>>);
+pub struct Database(Arc<std::sync::OnceLock<Store>>);
 
 impl Database {
-    /// Já conectado, para os testes.
-    #[cfg(test)]
-    pub(crate) fn connected(store: acervo_store::Store) -> Self {
+    #[must_use]
+    pub fn connected(store: Store) -> Self {
         Self(Arc::new(std::sync::OnceLock::from(store)))
     }
 
-    pub(crate) fn get(&self) -> Result<&acervo_store::Store, String> {
+    pub(crate) fn get(&self) -> Result<&Store, String> {
         self.0
             .get()
             .ok_or_else(|| "banco de dados ainda indisponível; tente de novo em instantes".into())
-    }
-
-    /// Tenta conectar até conseguir.
-    async fn connect(self, config: Arc<Config>) {
-        loop {
-            match config.store().await {
-                Ok(store) => {
-                    let _ = self.0.set(store);
-                    tracing::info!("banco de dados conectado");
-                    return;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "banco de dados indisponível, nova tentativa em 30 s: {error:#}"
-                    );
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                }
-            }
-        }
     }
 }
 
@@ -83,8 +66,25 @@ impl Accounts for Database {
     }
 }
 
+/// Conecta ao banco, tentando de novo até conseguir: o Postgres pode subir
+/// depois do serviço, e sem ele não há configuração para servir.
+pub async fn connect(url: &str) -> Store {
+    loop {
+        match Store::connect(url).await {
+            Ok(store) => {
+                tracing::info!("banco de dados conectado");
+                return store;
+            }
+            Err(error) => {
+                tracing::warn!("banco de dados indisponível, nova tentativa em 30 s: {error}");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        }
+    }
+}
+
 /// Os downloads do acervo, do mais novo ao mais velho, com o título do filme.
-async fn downloads_json(store: &acervo_store::Store) -> Result<serde_json::Value> {
+async fn downloads_json(store: &Store) -> Result<serde_json::Value> {
     let (grabs, movies) = tokio::try_join!(store.grabs(), store.movies())?;
     Ok(serde_json::Value::Array(
         grabs
@@ -115,63 +115,69 @@ async fn downloads_json(store: &acervo_store::Store) -> Result<serde_json::Value
 
 /// Nome da "definição" que adiciona um endpoint Torznab qualquer.
 const TORZNAB: &str = "torznab";
+const CARDIGANN: &str = "cardigann";
+/// Como a tela rotula um indexador cadastrado.
+const ORIGIN: &str = "cadastro";
 
 /// Sobe o servidor e só volta no SIGTERM ou no Ctrl-C.
 ///
 /// # Errors
 ///
-/// Configuração incompleta, definição inválida ou endereço ocupado.
-pub async fn run(config: Config) -> Result<()> {
-    let config = Arc::new(config);
-    let server = config.server()?;
-    let bind = server.bind.clone();
-    let api_key = server.api_key.clone();
-    let catalog = Catalog::new(entries(&config).await?)?;
-    let database = Database::default();
+/// Importação pedida que falha, configuração ilegível no banco ou endereço
+/// ocupado.
+pub async fn run(store: Store, bind: &str) -> Result<()> {
+    // A importação do arquivo antigo, se pedida, vem antes de ler a
+    // configuração: é ela que preenche o banco vazio.
+    crate::import_config::run(&store).await?;
+    let settings = Arc::new(Settings::load(store.clone()).await?);
+    let records = store.indexers().await.context("lendo os indexadores")?;
+    let catalog = Catalog::new(entries(&settings.get(), &records).await)?;
+    let database = Database::connected(store);
     // O andamento da busca dos que faltam, que a tela de filmes acompanha.
     let missing = Arc::new(Progress::default());
     let tasks = Arc::new(Tasks::new(
         database.clone(),
-        crate::tasks::service(&config, &database, &catalog, &missing),
+        crate::tasks::service(&settings, &database, &catalog, &missing),
     ));
-    let accounts: Option<Arc<dyn Accounts>> = if config.database.is_some() {
-        Some(Arc::new(database.clone()))
-    } else {
-        tracing::warn!("sem `[database]`: a interface só aceita a chave de API em `X-Api-Key`");
-        None
-    };
-    // As tarefas sobem depois do banco: quase todas precisam dele, e o
-    // histórico mora nele.
+    tasks.start().await;
+    // Configuração salva pela tela: o agendador recalcula os intervalos.
     tokio::spawn({
-        let config = Arc::clone(&config);
-        let database = database.clone();
+        let mut changes = settings.subscribe();
         let tasks = Arc::clone(&tasks);
         async move {
-            if config.database.is_some() {
-                database.connect(config).await;
+            while changes.changed().await.is_ok() {
+                tasks.reschedule();
             }
-            tasks.start().await;
         }
     });
+    let accounts: Option<Arc<dyn Accounts>> = Some(Arc::new(database.clone()));
+    // A chave é lida a cada requisição: trocada na tela, vale na hora.
+    let api_key = ApiKey::dynamic({
+        let settings = Arc::clone(&settings);
+        move || settings.get().server.api_key.clone()
+    });
+    if settings.get().server.api_key.is_empty() {
+        tracing::warn!(
+            "sem chave de API: Torznab e API v3 recusam tudo até gerar uma em Configurações → Servidor"
+        );
+    }
     // A API v3 de filmes, para os apps de pedidos e de legendas.
     let v3 = Arc::new(crate::api_v3::V3 {
-        config: Arc::clone(&config),
+        settings: Arc::clone(&settings),
         database: database.clone(),
         catalog: catalog.clone(),
-        api_key: api_key.clone(),
     });
     let web = Arc::new(crate::web::Web {
-        config: Arc::clone(&config),
+        settings: Arc::clone(&settings),
         database: database.clone(),
         catalog: catalog.clone(),
-        api_key: api_key.clone(),
         accounts: accounts.clone(),
         searches: tokio::sync::Mutex::default(),
     });
-    let admin = HubAdmin::new(config, catalog.clone(), database, missing, tasks)?;
+    let admin = HubAdmin::new(settings, catalog.clone(), database, missing, tasks, records);
     tracing::info!(indexadores = catalog.len(), bind = %bind, "servindo Torznab e a interface web");
 
-    let listener = tokio::net::TcpListener::bind(&bind)
+    let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("abrindo `{bind}`"))?;
     axum::serve(
@@ -186,129 +192,106 @@ pub async fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
-/// Indexadores servidos: os da config e os adicionados pela interface, menos
-/// os desativados e os removidos pela tela.
+/// Os indexadores servidos: os cadastros ativos que sobem.
 ///
-/// Definição Cardigann inválida é erro de configuração e derruba a subida: é
-/// arquivo local, e subir sem ela esconderia o erro atrás de "nenhum
-/// resultado". Endpoint Torznab que não responde `caps` é diferente — é rede,
-/// e um tracker fora do ar não pode tirar os outros do ar junto. Ele fica de
-/// fora, com aviso, até o próximo reinício.
-///
-/// # Errors
-///
-/// Definição Cardigann ilegível ou inválida, ou credenciais e registro
-/// ilegíveis.
-pub async fn entries(config: &Config) -> Result<Vec<Entry>> {
-    let overrides = credentials::load(&expand_tilde(&config.state.credentials))?;
-    let registry = registry::load(&expand_tilde(&config.state.registry))?;
-    let mut specs: Vec<IndexerConfig> = config.indexers.clone();
-    specs.extend(registry.added.iter().map(Added::to_config));
-
+/// Cadastro que não sobe — definição ilegível, endpoint que não responde
+/// `caps` — fica de fora, com o motivo no log, sem derrubar os outros nem a
+/// subida: a tela continua de pé para consertá-lo, e ele aparece lá como
+/// desativado até ser reativado.
+pub async fn entries(config: &Config, records: &[IndexerRecord]) -> Vec<Entry> {
     let mut entries = Vec::new();
-    for spec in &specs {
-        match spec {
-            IndexerConfig::Cardigann(spec) => {
-                let definition = load_definition(spec)?;
-                if registry.disabled.contains(definition.id())
-                    || registry.removed.contains(definition.id())
-                {
-                    continue;
-                }
-                let settings = merged(&spec.settings, overrides.get(definition.id()));
-                entries.push(cardigann(
-                    spec,
-                    definition,
-                    settings,
-                    config.http_timeout(),
-                )?);
-            }
-            IndexerConfig::Torznab(spec) => {
-                if registry.disabled.contains(&spec.name) || registry.removed.contains(&spec.name) {
-                    continue;
-                }
-                let spec = with_key(spec, overrides.get(&spec.name));
-                match torznab(&spec, config.http_timeout()).await {
-                    Ok(entry) => entries.push(entry),
-                    Err(error) => tracing::error!(
-                        indexer = spec.name,
-                        "fora do catálogo até o próximo reinício: {error:#}"
-                    ),
-                }
-            }
+    for record in records.iter().filter(|record| record.enabled) {
+        match build(record, config.http_timeout()).await {
+            Ok(entry) => entries.push(entry),
+            Err(error) => tracing::error!(
+                indexer = record.name,
+                "fora do catálogo até ser reativado: {error:#}"
+            ),
         }
     }
-    Ok(entries)
+    entries
 }
 
-impl Added {
-    fn to_config(&self) -> IndexerConfig {
-        match self {
-            Self::Cardigann { path, .. } => IndexerConfig::Cardigann(CardigannIndexer {
-                definition: path.clone(),
-                link: 0,
-                settings: BTreeMap::new(),
-            }),
-            Self::Torznab(spec) => IndexerConfig::Torznab(spec.clone()),
-        }
-    }
-}
-
-fn load_definition(spec: &CardigannIndexer) -> Result<CardigannDefinition> {
-    let path = expand_tilde(&spec.definition);
-    let yaml = std::fs::read_to_string(&path)
+fn load_definition(path: &Path) -> Result<CardigannDefinition> {
+    let yaml = std::fs::read_to_string(path)
         .with_context(|| format!("lendo a definição `{}`", path.display()))?;
     CardigannDefinition::from_yaml_v11(&yaml)
         .with_context(|| format!("carregando a definição `{}`", path.display()))
 }
 
-/// Settings da config com as credenciais trocadas pela interface por cima.
-fn merged(
-    base: &BTreeMap<String, String>,
-    overrides: Option<&BTreeMap<String, String>>,
-) -> BTreeMap<String, String> {
-    let mut settings = base.clone();
-    if let Some(overrides) = overrides {
-        settings.extend(overrides.iter().map(|(k, v)| (k.clone(), v.clone())));
-    }
-    settings
+fn definition_path(record: &IndexerRecord) -> Result<PathBuf> {
+    record
+        .definition
+        .as_deref()
+        .map(PathBuf::from)
+        .context("cadastro Cardigann sem arquivo de definição")
 }
 
-/// URL e chave de um Torznab trocadas pela tela moram nas credenciais e valem
-/// por cima da config.
-fn with_key(spec: &TorznabIndexer, overrides: Option<&BTreeMap<String, String>>) -> TorznabIndexer {
-    let mut spec = spec.clone();
-    if let Some(url) = overrides.and_then(|values| values.get("url")) {
-        spec.url.clone_from(url);
+/// Monta o cliente de um cadastro, sem olhar se ele está ativo.
+async fn build(record: &IndexerRecord, timeout: Duration) -> Result<Entry> {
+    match record.kind.as_str() {
+        CARDIGANN => {
+            let definition = load_definition(&definition_path(record)?)?;
+            cardigann(record, definition, timeout)
+        }
+        TORZNAB => torznab(record, timeout).await,
+        other => anyhow::bail!("tipo de indexador desconhecido: {other}"),
     }
-    if let Some(key) = overrides.and_then(|values| values.get("api_key")) {
-        spec.api_key = Some(key.clone());
-    }
-    spec
 }
 
 fn cardigann(
-    spec: &CardigannIndexer,
+    record: &IndexerRecord,
     definition: CardigannDefinition,
-    settings: BTreeMap<String, String>,
     timeout: Duration,
 ) -> Result<Entry> {
+    // O nome servido é o id da definição: arquivo trocado por outro com id
+    // diferente não pode servir sob o nome velho.
+    anyhow::ensure!(
+        definition.id() == record.name,
+        "a definição agora tem o id `{}`, e o cadastro é `{}`",
+        definition.id(),
+        record.name
+    );
+    // O link escolhido, guardado como URL; ausente é o primeiro.
+    let link = match &record.url {
+        Some(url) => definition
+            .links()
+            .iter()
+            .position(|link| link.as_str() == url)
+            .with_context(|| format!("o link `{url}` não está mais na definição"))?,
+        None => 0,
+    };
     let capabilities = definition.capabilities().clone();
-    let client = CardigannClient::new(definition, spec.link, settings, timeout)
-        .with_context(|| format!("configurando a definição `{}`", spec.definition.display()))?;
+    let client = CardigannClient::new(definition, link, record.settings.clone(), timeout)
+        .with_context(|| format!("configurando a definição de `{}`", record.name))?;
     Ok(Entry {
         indexer: Arc::new(client),
         capabilities,
     })
 }
 
-async fn torznab(spec: &TorznabIndexer, timeout: Duration) -> Result<Entry> {
+/// Intervalo mínimo entre duas requisições ao mesmo endpoint Torznab.
+fn request_interval(record: &IndexerRecord) -> Result<Duration> {
+    let seconds = match record.settings.get("request_interval_seconds") {
+        Some(text) => text
+            .parse::<f64>()
+            .context("`request_interval_seconds` não é um número")?,
+        None => 2.0,
+    };
+    anyhow::ensure!(
+        seconds.is_finite() && (0.0..=3600.0).contains(&seconds),
+        "`request_interval_seconds` precisa ficar entre 0 e 3600"
+    );
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+async fn torznab(record: &IndexerRecord, timeout: Duration) -> Result<Entry> {
     let client = TorznabClient::new(
-        spec.name.clone(),
-        &spec.url,
-        spec.api_key.clone(),
+        record.name.clone(),
+        record.url.as_deref().unwrap_or_default(),
+        record.settings.get("api_key").cloned(),
         timeout,
-        Duration::from_secs_f64(spec.request_interval_seconds),
+        request_interval(record)?,
     )?;
     let capabilities = client
         .capabilities()
@@ -330,16 +313,14 @@ fn valid_name(name: &str) -> bool {
         && name != "ui"
 }
 
-/// De onde vem um indexador e como montá-lo.
-enum Source {
-    Cardigann(CardigannIndexer, &'static str),
-    Torznab(TorznabIndexer, &'static str),
+fn now() -> String {
+    crate::decide::now_rfc3339()
 }
 
 /// Administração pela interface.
 #[derive(Debug)]
 struct HubAdmin {
-    config: Arc<Config>,
+    settings: Arc<Settings>,
     /// O catálogo servido: a busca dos que faltam passa por ele e divide as consultas com
     /// os gerenciadores.
     catalog: Catalog,
@@ -348,108 +329,114 @@ struct HubAdmin {
     missing: Arc<Progress>,
     /// As tarefas de fundo; o botão de buscar os que faltam dispara a `busca`.
     tasks: Arc<Tasks>,
-    definitions: Definitions,
-    /// Indexadores Cardigann da config, pelo id da definição.
-    config_cardigann: BTreeMap<String, CardigannIndexer>,
-    config_torznab: BTreeMap<String, TorznabIndexer>,
-    credentials: PathBuf,
-    registry: PathBuf,
+    /// Refeito quando os diretórios de catálogo mudam.
+    definitions: RwLock<Definitions>,
+    /// Os cadastros, espelhados em memória: as consultas da tela são
+    /// síncronas, e só este admin grava a tabela enquanto o serviço roda.
+    records: RwLock<BTreeMap<String, IndexerRecord>>,
     /// Serializa as gravações: duas mudanças simultâneas não podem se apagar.
     write: tokio::sync::Mutex<()>,
 }
 
+/// As definições oferecidas: as dos diretórios de catálogo e as dos
+/// cadastros, mesmo fora deles.
+fn scan(config: &Config, records: &BTreeMap<String, IndexerRecord>) -> Definitions {
+    let mut definitions = Definitions::scan(&config.server.catalogs);
+    for record in records.values() {
+        if let Some(path) = &record.definition {
+            definitions.include(Path::new(path));
+        }
+    }
+    definitions
+}
+
 impl HubAdmin {
     fn new(
-        config: Arc<Config>,
+        settings: Arc<Settings>,
         catalog: Catalog,
         database: Database,
         missing: Arc<Progress>,
         tasks: Arc<Tasks>,
-    ) -> Result<Self> {
-        let catalogs: Vec<PathBuf> = config
-            .server
-            .as_ref()
-            .map(|server| {
-                server
-                    .catalogs
-                    .iter()
-                    .map(|dir| expand_tilde(dir))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut definitions = Definitions::scan(&catalogs);
-        let mut config_cardigann = BTreeMap::new();
-        let mut config_torznab = BTreeMap::new();
-        for spec in &config.indexers {
-            match spec {
-                IndexerConfig::Cardigann(spec) => {
-                    definitions.include(&expand_tilde(&spec.definition));
-                    let id = load_definition(spec)?.id().to_owned();
-                    config_cardigann.insert(id, spec.clone());
-                }
-                IndexerConfig::Torznab(spec) => {
-                    config_torznab.insert(spec.name.clone(), spec.clone());
-                }
-            }
-        }
-        Ok(Self {
-            credentials: expand_tilde(&config.state.credentials),
-            registry: expand_tilde(&config.state.registry),
-            config,
+        records: Vec<IndexerRecord>,
+    ) -> Self {
+        let records: BTreeMap<_, _> = records
+            .into_iter()
+            .map(|record| (record.name.clone(), record))
+            .collect();
+        Self {
+            definitions: RwLock::new(scan(&settings.get(), &records)),
+            records: RwLock::new(records),
+            settings,
             catalog,
             database,
             missing,
             tasks,
-            definitions,
-            config_cardigann,
-            config_torznab,
             write: tokio::sync::Mutex::new(()),
-        })
-    }
-
-    fn load_registry(&self) -> Registry {
-        // Registro ilegível já derrubou a subida; aqui, vazio é o seguro.
-        registry::load(&self.registry).unwrap_or_default()
-    }
-
-    fn overrides(&self) -> Overrides {
-        credentials::load(&self.credentials).unwrap_or_default()
-    }
-
-    fn source(&self, name: &str) -> Option<Source> {
-        let registry = self.load_registry();
-        if !registry.removed.contains(name) {
-            if let Some(spec) = self.config_cardigann.get(name) {
-                return Some(Source::Cardigann(spec.clone(), "config"));
-            }
-            if let Some(spec) = self.config_torznab.get(name) {
-                return Some(Source::Torznab(spec.clone(), "config"));
-            }
         }
-        registry
-            .added
-            .iter()
-            .find(|added| added.name() == name)
-            .map(|added| match added.to_config() {
-                IndexerConfig::Cardigann(spec) => Source::Cardigann(spec, "interface"),
-                IndexerConfig::Torznab(spec) => Source::Torznab(spec, "interface"),
-            })
     }
 
-    async fn build(&self, name: &str) -> Result<Entry, String> {
-        let overrides = self.overrides();
-        match self.source(name).ok_or("indexador desconhecido")? {
-            Source::Cardigann(spec, _) => {
-                let definition = load_definition(&spec).map_err(|e| format!("{e:#}"))?;
-                let settings = merged(&spec.settings, overrides.get(name));
-                cardigann(&spec, definition, settings, self.config.http_timeout())
-                    .map_err(|e| format!("{e:#}"))
-            }
-            Source::Torznab(spec, _) => {
-                let spec = with_key(&spec, overrides.get(name));
-                torznab(&spec, self.config.http_timeout())
-                    .await
-                    .map_err(|e| format!("{e:#}"))
+    fn record(&self, name: &str) -> Option<IndexerRecord> {
+        self.records
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+            .cloned()
+    }
+
+    fn store(&self) -> Result<&Store, String> {
+        self.database.get()
+    }
+
+    fn timeout(&self) -> Duration {
+        self.settings.get().http_timeout()
+    }
+
+    /// Grava o cadastro — novo ou alterado — e o espelho.
+    async fn persist(&self, record: IndexerRecord, new: bool) -> Result<(), String> {
+        let store = self.store()?;
+        let done = if new {
+            store.insert_indexer(&record).await
+        } else {
+            store.update_indexer(&record).await
+        }
+        .map_err(|e| e.to_string())?;
+        if !done {
+            return Err(if new {
+                format!("já existe um indexador chamado {}", record.name)
+            } else {
+                "indexador desconhecido".into()
+            });
+        }
+        self.records
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(record.name.clone(), record);
+        Ok(())
+    }
+
+    /// Remonta todos os indexadores servidos — o timeout HTTP mudou, e ele
+    /// mora dentro de cada cliente.
+    async fn reload_catalog(&self) {
+        let records: Vec<_> = self
+            .records
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .filter(|record| record.enabled)
+            .cloned()
+            .collect();
+        let timeout = self.timeout();
+        for record in records {
+            self.catalog.remove(&record.name);
+            match build(&record, timeout).await {
+                Ok(entry) => {
+                    if let Err(error) = self.catalog.insert(entry) {
+                        tracing::error!(indexer = record.name, "fora do catálogo: {error}");
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(indexer = record.name, "fora do catálogo: {error:#}");
+                }
             }
         }
     }
@@ -470,20 +457,6 @@ impl HubAdmin {
             "buscados": done,
             "total": total,
         })
-    }
-
-    fn save(
-        &self,
-        registry: Option<&Registry>,
-        overrides: Option<&Overrides>,
-    ) -> Result<(), String> {
-        if let Some(registry) = registry {
-            registry::save(&self.registry, registry).map_err(|e| format!("{e:#}"))?;
-        }
-        if let Some(overrides) = overrides {
-            credentials::save(&self.credentials, overrides).map_err(|e| format!("{e:#}"))?;
-        }
-        Ok(())
     }
 }
 
@@ -520,27 +493,33 @@ fn plain(name: &str, label: &str, kind: &'static str, value: Option<String>) -> 
     }
 }
 
+fn message(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+}
+
 #[async_trait]
 impl Admin for HubAdmin {
     fn settings(&self, indexer: &str) -> Option<Vec<SettingView>> {
-        match self.source(indexer)? {
-            Source::Cardigann(spec, _) => {
-                let definition = load_definition(&spec).ok()?;
-                let current = merged(&spec.settings, self.overrides().get(indexer));
+        let record = self.record(indexer)?;
+        match record.kind.as_str() {
+            CARDIGANN => {
+                let definition = load_definition(&definition_path(&record).ok()?).ok()?;
                 let views: Vec<_> = definition
                     .settings()
                     .iter()
-                    .map(|info| view(info, current.get(&info.name)))
+                    .map(|info| view(info, record.settings.get(&info.name)))
                     .collect();
                 (!views.is_empty()).then_some(views)
             }
-            Source::Torznab(spec, _) => {
-                let spec = with_key(&spec, self.overrides().get(indexer));
-                Some(vec![
-                    plain("url", "URL do endpoint Torznab", "text", Some(spec.url)),
-                    plain("api_key", "Chave de API", "password", spec.api_key),
-                ])
-            }
+            _ => Some(vec![
+                plain("url", "URL do endpoint Torznab", "text", record.url.clone()),
+                plain(
+                    "api_key",
+                    "Chave de API",
+                    "password",
+                    record.settings.get("api_key").cloned(),
+                ),
+            ]),
         }
     }
 
@@ -550,73 +529,68 @@ impl Admin for HubAdmin {
         values: BTreeMap<String, String>,
     ) -> Result<Entry, String> {
         let _guard = self.write.lock().await;
-        let mut overrides = credentials::load(&self.credentials).map_err(|e| format!("{e:#}"))?;
-        match self
-            .source(indexer)
-            .ok_or("indexador sem settings editáveis")?
-        {
-            Source::Cardigann(spec, _) => {
-                let definition = load_definition(&spec).map_err(|e| format!("{e:#}"))?;
-                let declared = definition.settings();
-                let saved = overrides.entry(indexer.to_owned()).or_default();
-                for (name, value) in values {
-                    let info = declared
-                        .iter()
-                        .find(|info| info.name == name)
-                        .ok_or_else(|| format!("setting desconhecido: {name}"))?;
-                    // Segredo em branco é "manter o atual": ele nunca volta à
-                    // tela, então o campo vazio não pode apagá-lo.
-                    if info.is_secret() && value.is_empty() {
-                        continue;
-                    }
-                    saved.insert(name, value);
+        let mut record = self.record(indexer).ok_or("indexador desconhecido")?;
+        let entry = if record.kind == CARDIGANN {
+            let path = definition_path(&record).map_err(|e| message(&e))?;
+            let definition = load_definition(&path).map_err(|e| message(&e))?;
+            let declared = definition.settings();
+            for (name, value) in values {
+                let info = declared
+                    .iter()
+                    .find(|info| info.name == name)
+                    .ok_or_else(|| format!("setting desconhecido: {name}"))?;
+                // Segredo em branco é "manter o atual": ele nunca volta à
+                // tela, então o campo vazio não pode apagá-lo.
+                if info.is_secret() && value.is_empty() {
+                    continue;
                 }
-                let settings = merged(&spec.settings, overrides.get(indexer));
-                let entry = cardigann(&spec, definition, settings, self.config.http_timeout())
-                    .map_err(|e| format!("{e:#}"))?;
-                self.save(None, Some(&overrides))?;
-                tracing::info!(indexer, "settings atualizados pela interface");
-                Ok(entry)
+                record.settings.insert(name, value);
             }
-            Source::Torznab(spec, _) => {
-                let saved = overrides.entry(indexer.to_owned()).or_default();
-                for (name, value) in values {
-                    if name != "url" && name != "api_key" {
-                        return Err(format!("setting desconhecido: {name}"));
+            cardigann(&record, definition, self.timeout()).map_err(|e| message(&e))?
+        } else {
+            for (name, value) in values {
+                // Em branco mantém o atual, como qualquer segredo.
+                let value = value.trim();
+                match name.as_str() {
+                    _ if value.is_empty() => {}
+                    "url" => record.url = Some(value.to_owned()),
+                    "api_key" => {
+                        record.settings.insert(name, value.to_owned());
                     }
-                    // Em branco mantém o atual, como qualquer segredo.
-                    let value = value.trim();
-                    if !value.is_empty() {
-                        saved.insert(name, value.to_owned());
-                    }
+                    _ => return Err(format!("setting desconhecido: {name}")),
                 }
-                let keyed = with_key(&spec, overrides.get(indexer));
-                let entry = torznab(&keyed, self.config.http_timeout())
-                    .await
-                    .map_err(|e| format!("{e:#}"))?;
-                self.save(None, Some(&overrides))?;
-                tracing::info!(indexer, "Torznab atualizado pela interface");
-                Ok(entry)
             }
-        }
+            torznab(&record, self.timeout())
+                .await
+                .map_err(|e| message(&e))?
+        };
+        // Monta antes de gravar: credencial que não sobe não substitui a boa.
+        self.persist(record, false).await?;
+        tracing::info!(indexer, "settings atualizados pela interface");
+        Ok(entry)
     }
 
     fn origin(&self, indexer: &str) -> Option<&'static str> {
-        self.source(indexer).map(|source| match source {
-            Source::Cardigann(_, origin) | Source::Torznab(_, origin) => origin,
-        })
+        self.record(indexer).map(|_| ORIGIN)
     }
 
     fn disabled(&self) -> Vec<(String, &'static str)> {
-        self.load_registry()
-            .disabled
+        let served: HashSet<String> = self
+            .catalog
+            .views()
             .into_iter()
-            .filter_map(|name| self.origin(&name).map(|origin| (name, origin)))
+            .map(|view| view.name)
+            .collect();
+        self.records
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .filter(|name| !served.contains(*name))
+            .map(|name| (name.clone(), ORIGIN))
             .collect()
     }
 
     fn definitions(&self) -> Vec<DefinitionView> {
-        let exists = |id: &str| self.source(id).is_some();
         let mut list = vec![DefinitionView {
             id: TORZNAB.into(),
             name: "Torznab genérico".into(),
@@ -629,7 +603,11 @@ impl Admin for HubAdmin {
             reason: None,
             added: false,
         }];
-        list.extend(self.definitions.iter().map(|known| DefinitionView {
+        let definitions = self
+            .definitions
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        list.extend(definitions.iter().map(|known| DefinitionView {
             id: known.header.id.clone(),
             name: known.header.name.clone(),
             description: known.header.description.clone(),
@@ -637,7 +615,7 @@ impl Admin for HubAdmin {
             private: known.header.private,
             supported: known.refusal.is_none(),
             reason: known.refusal.clone(),
-            added: exists(&known.header.id),
+            added: self.record(&known.header.id).is_some(),
         }));
         list
     }
@@ -660,12 +638,18 @@ impl Admin for HubAdmin {
                 plain("api_key", "Chave de API", "password", None),
             ]);
         }
-        let known = self.definitions.get(definition)?;
-        if known.refusal.is_some() {
-            return None;
-        }
-        let yaml = std::fs::read_to_string(&known.path).ok()?;
-        let parsed = CardigannDefinition::from_yaml_v11(&yaml).ok()?;
+        let path = {
+            let definitions = self
+                .definitions
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            let known = definitions.get(definition)?;
+            if known.refusal.is_some() {
+                return None;
+            }
+            known.path.clone()
+        };
+        let parsed = load_definition(&path).ok()?;
         Some(
             parsed
                 .settings()
@@ -681,152 +665,119 @@ impl Admin for HubAdmin {
         values: BTreeMap<String, String>,
     ) -> Result<Entry, String> {
         let _guard = self.write.lock().await;
-        let mut registry = registry::load(&self.registry).map_err(|e| format!("{e:#}"))?;
-        let mut overrides = credentials::load(&self.credentials).map_err(|e| format!("{e:#}"))?;
-
         if definition == TORZNAB {
-            let name = values
-                .get("name")
-                .map(|name| name.trim().to_owned())
-                .unwrap_or_default();
+            let field = |name: &str| {
+                values
+                    .get(name)
+                    .map(|value| value.trim().to_owned())
+                    .unwrap_or_default()
+            };
+            let name = field("name");
             if !valid_name(&name) {
                 return Err("nome inválido: use letras minúsculas, números e hífens".into());
             }
-            if self.source(&name).is_some() {
+            if self.record(&name).is_some() {
                 return Err(format!("já existe um indexador chamado {name}"));
             }
-            let url = values
-                .get("url")
-                .map(|url| url.trim().to_owned())
-                .unwrap_or_default();
-            // Mesmo nome de um do config.toml removido pela tela: ele volta,
-            // com a URL e a chave informadas agora por cima das do arquivo.
-            let from_config = self.config_torznab.get(&name).cloned();
-            let saved = overrides.entry(name.clone()).or_default();
-            if let Some(key) = values.get("api_key").filter(|key| !key.is_empty()) {
-                saved.insert("api_key".into(), key.clone());
-            }
-            let spec = if let Some(spec) = &from_config {
-                if !url.is_empty() {
-                    saved.insert("url".into(), url);
-                }
-                spec.clone()
-            } else {
-                TorznabIndexer {
-                    name: name.clone(),
-                    url,
-                    api_key: None,
-                    request_interval_seconds: 2.0,
-                }
+            let mut record = IndexerRecord {
+                name: name.clone(),
+                kind: TORZNAB.into(),
+                definition: None,
+                url: Some(field("url")),
+                settings: BTreeMap::new(),
+                enabled: true,
+                added_at: Some(now()),
             };
-            let keyed = with_key(&spec, overrides.get(&name));
-            let entry = torznab(&keyed, self.config.http_timeout())
+            let key = field("api_key");
+            if !key.is_empty() {
+                record.settings.insert("api_key".into(), key);
+            }
+            let entry = torznab(&record, self.timeout())
                 .await
                 .map_err(|e| format!("o endpoint não respondeu às capacidades: {e:#}"))?;
-            if from_config.is_some() {
-                registry.removed.remove(&name);
-            } else {
-                registry.added.push(Added::Torznab(spec));
-            }
-            registry.disabled.remove(&name);
-            self.save(Some(&registry), Some(&overrides))?;
+            self.persist(record, true).await?;
             tracing::info!(indexer = name, "Torznab adicionado pela interface");
             return Ok(entry);
         }
 
         let known = self
             .definitions
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
             .get(definition)
-            .ok_or("definição desconhecida")?
-            .clone();
+            .cloned()
+            .ok_or("definição desconhecida")?;
         if let Some(reason) = &known.refusal {
             return Err(format!("definição ainda não suportada: {reason}"));
         }
-        if self.source(definition).is_some() {
+        if self.record(definition).is_some() {
             return Err(format!("{definition} já está adicionado"));
         }
-        // Definição do config.toml removida pela tela volta com o bloco do
-        // arquivo, e o que foi preenchido agora vale por cima dele.
-        let from_config = self.config_cardigann.get(definition).cloned();
-        let spec = from_config.clone().unwrap_or_else(|| CardigannIndexer {
-            definition: known.path.clone(),
-            link: 0,
-            settings: BTreeMap::new(),
-        });
-        let parsed = load_definition(&spec).map_err(|e| format!("{e:#}"))?;
+        let parsed = load_definition(&known.path).map_err(|e| message(&e))?;
         let declared = parsed.settings();
-        let mut saved = BTreeMap::new();
+        let mut settings = BTreeMap::new();
         for (name, value) in values {
             if !declared.iter().any(|info| info.name == name) {
                 return Err(format!("setting desconhecido: {name}"));
             }
             if !value.is_empty() {
-                saved.insert(name, value);
+                settings.insert(name, value);
             }
         }
-        let settings = merged(&spec.settings, Some(&saved));
-        let entry = cardigann(&spec, parsed, settings, self.config.http_timeout())
-            .map_err(|e| format!("{e:#}"))?;
-        overrides.insert(definition.to_owned(), saved);
-        if from_config.is_some() {
-            registry.removed.remove(definition);
-        } else {
-            registry.added.push(Added::Cardigann {
-                definition: definition.to_owned(),
-                path: known.path,
-            });
-        }
-        registry.disabled.remove(definition);
-        self.save(Some(&registry), Some(&overrides))?;
+        let record = IndexerRecord {
+            name: definition.to_owned(),
+            kind: CARDIGANN.into(),
+            definition: Some(known.path.display().to_string()),
+            url: None,
+            settings,
+            enabled: true,
+            added_at: Some(now()),
+        };
+        let entry = cardigann(&record, parsed, self.timeout()).map_err(|e| message(&e))?;
+        self.persist(record, true).await?;
         tracing::info!(indexer = definition, "indexador adicionado pela interface");
         Ok(entry)
     }
 
     async fn remove(&self, indexer: &str) -> Result<(), String> {
         let _guard = self.write.lock().await;
-        let origin = self.origin(indexer).ok_or("indexador desconhecido")?;
-        let mut registry = registry::load(&self.registry).map_err(|e| format!("{e:#}"))?;
-        let mut overrides = credentials::load(&self.credentials).map_err(|e| format!("{e:#}"))?;
-        if origin == "config" {
-            // O arquivo é somente leitura: a remoção fica anotada no registro.
-            registry.removed.insert(indexer.to_owned());
-        } else {
-            registry.added.retain(|added| added.name() != indexer);
+        if !self
+            .store()?
+            .delete_indexer(indexer)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return Err("indexador desconhecido".into());
         }
-        registry.disabled.remove(indexer);
-        overrides.remove(indexer);
-        self.save(Some(&registry), Some(&overrides))?;
+        self.records
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(indexer);
         tracing::info!(indexer, "indexador removido pela interface");
         Ok(())
     }
 
     async fn set_enabled(&self, indexer: &str, enabled: bool) -> Result<Option<Entry>, String> {
         let _guard = self.write.lock().await;
-        if self.origin(indexer).is_none() {
-            return Err("indexador desconhecido".into());
-        }
-        let mut registry = registry::load(&self.registry).map_err(|e| format!("{e:#}"))?;
+        let mut record = self.record(indexer).ok_or("indexador desconhecido")?;
+        record.enabled = enabled;
         if !enabled {
-            registry.disabled.insert(indexer.to_owned());
-            self.save(Some(&registry), None)?;
+            self.persist(record, false).await?;
             return Ok(None);
         }
         // Monta antes de gravar: se não sobe, continua desativado.
-        let entry = self.build(indexer).await?;
-        registry.disabled.remove(indexer);
-        self.save(Some(&registry), None)?;
+        let entry = build(&record, self.timeout())
+            .await
+            .map_err(|e| message(&e))?;
+        self.persist(record, false).await?;
         Ok(Some(entry))
     }
 
     fn apps(&self) -> serde_json::Value {
-        let public_url = self
-            .config
-            .server
-            .as_ref()
-            .and_then(|server| server.public_url.clone());
+        let config = self.settings.get();
         json!({
-            "endereco_publico": public_url,
-            "instancias": self.config.instances.iter().map(|instance| json!({
+            "endereco_publico": config.server.public_url,
+            "instancias": config.instances.iter().map(|instance| json!({
                 "nome": instance.name,
                 "tipo": match instance.kind {
                     crate::config::InstanceKind::Series => "series",
@@ -842,9 +793,9 @@ impl Admin for HubAdmin {
         indexers: Vec<(String, Capabilities)>,
         apply: bool,
     ) -> Result<serde_json::Value, String> {
-        let report = crate::sync::execute(&self.config, &indexers, apply, false)
+        let report = crate::sync::execute(&self.settings.get(), &indexers, apply, false)
             .await
-            .map_err(|e| format!("{e:#}"))?;
+            .map_err(|e| message(&e))?;
         serde_json::to_value(report).map_err(|e| e.to_string())
     }
 
@@ -862,15 +813,15 @@ impl Admin for HubAdmin {
     }
 
     async fn movies(&self) -> Result<serde_json::Value, String> {
-        let list = crate::movies::list(&self.config, self.database.get()?)
+        let list = crate::movies::list(&self.settings.get(), self.store()?)
             .await
-            .map_err(|e| format!("{e:#}"))?;
+            .map_err(|e| message(&e))?;
         serde_json::to_value(list).map_err(|e| e.to_string())
     }
 
     async fn search_missing(&self) -> Result<serde_json::Value, String> {
         // Falha logo, na resposta, se o banco ainda não subiu.
-        self.database.get()?;
+        self.store()?;
         let started = self
             .tasks
             .run_now(BUSCA)
@@ -884,35 +835,40 @@ impl Admin for HubAdmin {
 
     async fn grab_movie(&self, movie_id: i64, apply: bool) -> Result<serde_json::Value, String> {
         let report = crate::grab::grab(
-            &self.config,
-            self.database.get()?,
+            &self.settings.get(),
+            self.store()?,
             &self.catalog,
             movie_id,
             apply,
         )
         .await
-        .map_err(|e| format!("{e:#}"))?;
+        .map_err(|e| message(&e))?;
         serde_json::to_value(report).map_err(|e| e.to_string())
     }
 
     async fn downloads(&self, import: bool) -> Result<serde_json::Value, String> {
-        let store = self.database.get()?;
+        let store = self.store()?;
         let imported = if import {
             let _guard = self.write.lock().await;
             Some(
-                crate::grab::import_downloads(&self.config, store, Some(&self.catalog), true)
-                    .await
-                    .map_err(|e| format!("{e:#}"))?,
+                crate::grab::import_downloads(
+                    &self.settings.get(),
+                    store,
+                    Some(&self.catalog),
+                    true,
+                )
+                .await
+                .map_err(|e| message(&e))?,
             )
         } else {
             None
         };
-        let list = downloads_json(store).await.map_err(|e| format!("{e:#}"))?;
+        let list = downloads_json(store).await.map_err(|e| message(&e))?;
         Ok(json!({ "downloads": list, "importacao": imported }))
     }
 
     async fn configuration(&self) -> Result<serde_json::Value, String> {
-        let store = self.database.get()?;
+        let store = self.store()?;
         let key = store
             .setting(crate::metadata::TMDB_KEY)
             .await
@@ -924,22 +880,18 @@ impl Admin for HubAdmin {
         &self,
         values: BTreeMap<String, Option<String>>,
     ) -> Result<serde_json::Value, String> {
-        let store = self.database.get()?;
-        let at = crate::decide::now_rfc3339();
+        let store = self.store()?;
+        let at = now();
         for (name, value) in values {
             match name.as_str() {
                 "tmdb_chave" => {
                     let value = value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
                     if let Some(key) = &value {
-                        acervo_metadata::Tmdb::new(
-                            key,
-                            crate::metadata::LANGUAGE,
-                            self.config.http_timeout(),
-                        )
-                        .map_err(|e| e.to_string())?
-                        .validate()
-                        .await
-                        .map_err(|e| e.to_string())?;
+                        acervo_metadata::Tmdb::new(key, crate::metadata::LANGUAGE, self.timeout())
+                            .map_err(|e| e.to_string())?
+                            .validate()
+                            .await
+                            .map_err(|e| e.to_string())?;
                     }
                     store
                         .set_setting(crate::metadata::TMDB_KEY, value.as_deref(), &at)
@@ -950,6 +902,37 @@ impl Admin for HubAdmin {
             }
         }
         self.configuration().await
+    }
+
+    async fn config_section(&self, section: &str) -> Result<serde_json::Value, String> {
+        self.settings.view(section)
+    }
+
+    async fn save_config_section(
+        &self,
+        section: &str,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let before = self.settings.get();
+        let saved = self.settings.save_section(section, value).await?;
+        if section == SERVIDOR {
+            let after = self.settings.get();
+            if after.server.catalogs != before.server.catalogs {
+                let records = self
+                    .records
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                *self
+                    .definitions
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner) = scan(&after, &records);
+            }
+            if after.server.http_timeout_seconds != before.server.http_timeout_seconds {
+                self.reload_catalog().await;
+            }
+        }
+        Ok(saved)
     }
 }
 
@@ -974,6 +957,10 @@ async fn shutdown() {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+    use wiremock::matchers::{method, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
 
     const CAPS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -982,29 +969,10 @@ mod tests {
           <categories><category id="5000" name="TV" /></categories>
         </caps>"#;
 
-    struct Scratch(PathBuf);
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn scratch(name: &str) -> Scratch {
-        let dir = std::env::temp_dir().join(format!("acervo-serve-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Scratch(dir)
-    }
-
-    fn load_config(dir: &std::path::Path, indexers: &str) -> Config {
-        let text = format!(
-            "{indexers}\n[state]\ncredentials = {:?}\nregistry = {:?}\n",
-            dir.join("credenciais.toml"),
-            dir.join("indexadores.toml"),
-        );
-        toml::from_str(&text).unwrap()
-    }
+    const FIXTURES: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../acervo-indexers/tests/fixtures"
+    );
 
     fn values(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
@@ -1013,120 +981,279 @@ mod tests {
             .collect()
     }
 
-    #[tokio::test]
-    async fn cardigann_do_config_sai_e_volta_pela_tela() {
-        let dir = scratch("cardigann");
-        let definition = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../acervo-indexers/tests/fixtures/cardigann-cookie.yml"
-        );
-        let indexers = format!(
-            "[[indexers]]\nkind = \"cardigann\"\ndefinition = {definition:?}\n\
-             settings = {{ cookie = \"do-arquivo\" }}\n"
-        );
-        let config = load_config(&dir.0, &indexers);
+    /// Um admin sobre o banco de teste, com o diretório de fixtures como
+    /// catálogo de definições.
+    async fn admin(db: &acervo_store::testing::TestDb) -> (HubAdmin, Arc<Settings>) {
+        let settings = Arc::new(Settings::load(db.store.clone()).await.unwrap());
+        settings
+            .save_section(SERVIDOR, json!({ "catalogos": [FIXTURES] }))
+            .await
+            .unwrap();
+        let records = db.store.indexers().await.unwrap();
         let admin = HubAdmin::new(
-            Arc::new(load_config(&dir.0, &indexers)),
+            Arc::clone(&settings),
             Catalog::default(),
-            Database::default(),
+            Database::connected(db.store.clone()),
             Arc::default(),
             Arc::default(),
-        )
-        .unwrap();
-        assert_eq!(admin.origin("cookie-privado"), Some("config"));
-
-        admin.remove("cookie-privado").await.unwrap();
-        assert_eq!(admin.origin("cookie-privado"), None);
-        assert!(entries(&config).await.unwrap().is_empty());
-        let listed = admin.definitions();
-        let known = listed.iter().find(|d| d.id == "cookie-privado").unwrap();
-        assert!(!known.added, "removido volta a aparecer no catálogo");
-
-        admin
-            .add("cookie-privado", values(&[("cookie", "novo")]))
-            .await
-            .unwrap();
-        assert_eq!(admin.origin("cookie-privado"), Some("config"));
-        assert_eq!(entries(&config).await.unwrap().len(), 1);
-        let registry = registry::load(&dir.0.join("indexadores.toml")).unwrap();
-        assert!(registry.removed.is_empty() && registry.added.is_empty());
-
-        admin
-            .update("cookie-privado", values(&[("freeleech", "true")]))
-            .await
-            .unwrap();
-        let settings = admin.settings("cookie-privado").unwrap();
-        let freeleech = settings.iter().find(|s| s.name == "freeleech").unwrap();
-        assert_eq!(freeleech.value.as_deref(), Some("true"));
+            records,
+        );
+        (admin, settings)
     }
 
     #[tokio::test]
-    async fn torznab_do_config_tem_url_e_chave_editaveis() {
-        use wiremock::matchers::{method, query_param};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+    async fn cardigann_cadastrado_edita_desativa_e_sai() {
+        let Some(db) = acervo_store::testing::TestDb::new("serve_cardigann").await else {
+            return;
+        };
+        let (admin, settings) = admin(&db).await;
+        let listed = admin.definitions();
+        let known = listed.iter().find(|d| d.id == "cookie-privado").unwrap();
+        assert!(known.supported && !known.added);
 
-        let velho = MockServer::start().await;
-        let novo = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(query_param("t", "caps"))
-            .and(query_param("apikey", "chave-nova"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(CAPS, "application/xml"))
-            .mount(&novo)
-            .await;
-        let url_nova = format!("{}/api", novo.uri());
+        let entry = admin
+            .add("cookie-privado", values(&[("cookie", "do-cadastro")]))
+            .await
+            .unwrap();
+        admin.catalog.insert(entry).unwrap();
+        assert_eq!(admin.origin("cookie-privado"), Some(ORIGIN));
+        assert!(admin.disabled().is_empty());
+        let stored = db.store.indexers().await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].settings["cookie"], "do-cadastro");
+        assert_eq!(entries(&settings.get(), &stored).await.len(), 1);
 
-        let dir = scratch("torznab");
-        let indexers = format!(
-            "[[indexers]]\nkind = \"torznab\"\nname = \"outro\"\nurl = \"{}/api\"\n\
-             api_key = \"chave-velha\"\n",
-            velho.uri()
-        );
-        let config = load_config(&dir.0, &indexers);
-        let admin = HubAdmin::new(
-            Arc::new(load_config(&dir.0, &indexers)),
-            Catalog::default(),
-            Database::default(),
-            Arc::default(),
-            Arc::default(),
-        )
-        .unwrap();
-        let settings = admin
-            .settings("outro")
-            .expect("Torznab do config é editável");
-        assert!(settings.iter().any(|s| s.name == "api_key" && s.is_set));
-
+        // Segredo em branco mantém; o resto troca, e nada volta com valor.
         admin
             .update(
-                "outro",
-                values(&[("url", &url_nova), ("api_key", "chave-nova")]),
+                "cookie-privado",
+                values(&[("freeleech", "true"), ("cookie", "")]),
             )
             .await
             .unwrap();
-        let settings = admin.settings("outro").unwrap();
-        let url = settings.iter().find(|s| s.name == "url").unwrap();
-        assert_eq!(url.value.as_deref(), Some(url_nova.as_str()));
-        assert_eq!(entries(&config).await.unwrap().len(), 1);
+        let views = admin.settings("cookie-privado").unwrap();
+        let freeleech = views.iter().find(|s| s.name == "freeleech").unwrap();
+        assert_eq!(freeleech.value.as_deref(), Some("true"));
+        let cookie = views.iter().find(|s| s.name == "cookie").unwrap();
+        assert!(cookie.is_set && cookie.value.is_none());
+        assert_eq!(
+            db.store.indexers().await.unwrap()[0].settings["cookie"],
+            "do-cadastro"
+        );
 
-        admin.remove("outro").await.unwrap();
-        assert_eq!(admin.origin("outro"), None);
-        assert!(entries(&config).await.unwrap().is_empty());
+        // Desativado: fora do catálogo servido, ainda listado.
+        assert!(
+            admin
+                .set_enabled("cookie-privado", false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        admin.catalog.remove("cookie-privado");
+        assert_eq!(admin.disabled(), [("cookie-privado".to_owned(), ORIGIN)]);
+        assert!(
+            entries(&settings.get(), &db.store.indexers().await.unwrap())
+                .await
+                .is_empty()
+        );
+
+        admin.remove("cookie-privado").await.unwrap();
+        assert_eq!(admin.origin("cookie-privado"), None);
+        assert!(db.store.indexers().await.unwrap().is_empty());
+        assert!(admin.remove("cookie-privado").await.is_err());
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn torznab_cadastrado_tem_url_e_chave_editaveis() {
+        let Some(db) = acervo_store::testing::TestDb::new("serve_torznab").await else {
+            return;
+        };
+        let velho = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(query_param("t", "caps"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(CAPS, "application/xml"))
+            .mount(&velho)
+            .await;
+        let novo = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(query_param("t", "caps"))
+            .and(query_param("apikey", "chave-velha"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(CAPS, "application/xml"))
+            .mount(&novo)
+            .await;
+        let (admin, _) = admin(&db).await;
         admin
             .add(
                 TORZNAB,
                 values(&[
                     ("name", "outro"),
-                    ("url", &url_nova),
-                    ("api_key", "chave-nova"),
+                    ("url", &format!("{}/api", velho.uri())),
+                    ("api_key", "chave-velha"),
                 ]),
             )
             .await
             .unwrap();
-        assert_eq!(admin.origin("outro"), Some("config"));
         assert!(
-            registry::load(&dir.0.join("indexadores.toml"))
-                .unwrap()
-                .added
-                .is_empty()
+            admin
+                .add(TORZNAB, values(&[("name", "outro"), ("url", "http://x")]))
+                .await
+                .unwrap_err()
+                .contains("já existe")
         );
+
+        // URL nova, chave em branco: a guardada vale contra o endpoint novo.
+        let url_nova = format!("{}/api", novo.uri());
+        admin
+            .update("outro", values(&[("url", &url_nova), ("api_key", "")]))
+            .await
+            .unwrap();
+        let views = admin.settings("outro").unwrap();
+        let url = views.iter().find(|s| s.name == "url").unwrap();
+        assert_eq!(url.value.as_deref(), Some(url_nova.as_str()));
+        let key = views.iter().find(|s| s.name == "api_key").unwrap();
+        assert!(key.is_set && key.value.is_none());
+
+        // Endpoint que não responde: nada muda.
+        assert!(
+            admin
+                .update("outro", values(&[("url", "http://127.0.0.1:9/api")]))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            db.store.indexers().await.unwrap()[0].url.as_deref(),
+            Some(url_nova.as_str())
+        );
+        db.drop().await;
+    }
+
+    async fn call(
+        client: &reqwest::Client,
+        method: reqwest::Method,
+        url: &str,
+        key: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
+        let mut request = client
+            .request(method, url)
+            .header("X-Api-Key", key)
+            .header("X-Acervo", "1");
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        (status, response.json().await.unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn api_de_configuracoes_nunca_devolve_segredo() {
+        let Some(db) = acervo_store::testing::TestDb::new("serve_api_config").await else {
+            return;
+        };
+        let (admin, settings) = admin(&db).await;
+        let first = "chave-inicial-0123456789";
+        settings
+            .save_section(SERVIDOR, json!({ "api_key": first }))
+            .await
+            .unwrap();
+        let api_key = ApiKey::dynamic({
+            let settings = Arc::clone(&settings);
+            move || settings.get().server.api_key.clone()
+        });
+        let app =
+            acervo_api::router_with_admin(Catalog::default(), api_key, Some(Arc::new(admin)), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let client = reqwest::Client::new();
+        let url = |section: &str| format!("{base}/ui/api/configuracoes/{section}");
+
+        let (status, body) = call(
+            &client,
+            reqwest::Method::PUT,
+            &url("qbittorrent"),
+            first,
+            Some(json!({ "url": "http://qbit:8080", "username": "u", "password": "senha-qbit" })),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["password"], json!({ "definida": true }));
+        let (status, body) = call(
+            &client,
+            reqwest::Method::GET,
+            &url("qbittorrent"),
+            first,
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["url"], "http://qbit:8080");
+        assert!(!body.to_string().contains("senha-qbit"));
+
+        // Gerenciador e Jellyfin: chave só como `definida`.
+        let (status, body) = call(
+            &client,
+            reqwest::Method::PUT,
+            &url("gerenciadores"),
+            first,
+            Some(json!([{ "name": "series", "kind": "series", "url": "http://s:8989", "api_key": "chave-sonarr" }])),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert!(!body.to_string().contains("chave-sonarr"));
+        let (status, body) = call(
+            &client,
+            reqwest::Method::PUT,
+            &url("jellyfin"),
+            first,
+            Some(json!({ "url": "http://j:8096" })),
+        )
+        .await;
+        assert_eq!(status, 422);
+        assert!(body["erro"].as_str().unwrap().contains("chave"), "{body}");
+
+        // Validação em português; seção desconhecida.
+        let (status, body) = call(
+            &client,
+            reqwest::Method::PUT,
+            &url("tarefas"),
+            first,
+            Some(json!({ "intervalos": { "rss": 1 } })),
+        )
+        .await;
+        assert_eq!(status, 422);
+        assert!(body["erro"].as_str().unwrap().contains("RSS"), "{body}");
+        let (status, _) = call(&client, reqwest::Method::GET, &url("outra"), first, None).await;
+        assert_eq!(status, 404);
+
+        // A chave do servidor nunca volta; trocada, vale na hora.
+        let (_, body) = call(&client, reqwest::Method::GET, &url("servidor"), first, None).await;
+        assert_eq!(body["api_key"], json!({ "definida": true }));
+        assert!(!body.to_string().contains(first));
+        let second = "chave-nova-abcdefghijklmn";
+        let (status, body) = call(
+            &client,
+            reqwest::Method::PUT,
+            &url("servidor"),
+            first,
+            Some(json!({ "api_key": second })),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert!(!body.to_string().contains(second));
+        let (status, _) = call(&client, reqwest::Method::GET, &url("servidor"), first, None).await;
+        assert_eq!(status, 401);
+        let (status, _) = call(
+            &client,
+            reqwest::Method::GET,
+            &url("servidor"),
+            second,
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        db.drop().await;
     }
 }

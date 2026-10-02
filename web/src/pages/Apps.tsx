@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Badge, Skeleton } from '@/components/ui/misc'
 import { type SyncAction, type SyncReport, api } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { ManagersSettings } from '@/pages/settings/Sections'
 
 const ACTION = {
   criar: { label: 'Criar', tone: 'accent' },
@@ -41,7 +42,7 @@ export function AppsPage() {
     <>
       <PageHeader
         title="Aplicativos"
-        description="Os gerenciadores que usam os indexadores daqui. Sincronizar cadastra, atualiza e remove os indexadores (acervo-hub) neles — os de outras origens ficam intocados."
+        description="Os gerenciadores que usam os indexadores daqui: cadastre-os embaixo. Sincronizar cadastra, atualiza e remove os indexadores (acervo-hub) neles — os de outras origens ficam intocados."
         action={
           <div className="flex gap-2">
             <Button onClick={() => void preview.refetch()} loading={preview.isFetching && !apply.isPending}>
@@ -70,7 +71,7 @@ export function AppsPage() {
         <p className="mb-6 text-sm text-content-muted">
           Endereço cadastrado nos gerenciadores:{' '}
           <code className="rounded-sm bg-surface-raised px-1.5 py-0.5 font-mono text-xs text-content">
-            {apps.data.aplicativos.endereco_publico ?? 'não configurado (server.public_url)'}
+            {apps.data.aplicativos.endereco_publico ?? 'não configurado (Configurações → Servidor)'}
           </code>
         </p>
       )}
@@ -91,10 +92,7 @@ export function AppsPage() {
         <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed border-border-strong px-6 py-16 text-center">
           <Unplug className="size-8 text-content-subtle" aria-hidden="true" />
           <p className="font-medium">Nenhum gerenciador configurado</p>
-          <p className="max-w-md text-sm text-content-muted">
-            Liste o Sonarr em <code className="font-mono">[[instances]]</code> no{' '}
-            <code className="font-mono">config.toml</code>.
-          </p>
+          <p className="max-w-md text-sm text-content-muted">Adicione o Sonarr ou o Radarr em Gerenciadores, logo abaixo.</p>
         </div>
       ) : (
         <ul className="grid gap-4 lg:grid-cols-2">
@@ -105,6 +103,10 @@ export function AppsPage() {
           ))}
         </ul>
       )}
+
+      <div className="mt-10">
+        <ManagersSettings />
+      </div>
     </>
   )
 }
