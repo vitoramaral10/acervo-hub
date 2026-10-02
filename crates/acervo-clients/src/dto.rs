@@ -34,6 +34,9 @@ pub struct TorrentInfo {
     pub size: u64,
     #[serde(default)]
     pub num_seeds: u32,
+    /// Separadas por vírgula e espaço.
+    #[serde(default)]
+    pub tags: String,
 }
 
 impl TorrentInfo {
@@ -45,6 +48,11 @@ impl TorrentInfo {
     #[must_use]
     pub fn is_private(&self) -> bool {
         self.private.unwrap_or(true)
+    }
+
+    #[must_use]
+    pub fn has_tag(&self, tag: &str) -> bool {
+        self.tags.split(',').any(|t| t.trim() == tag)
     }
 
     /// Tempo de seed, saturando negativo em zero.
@@ -60,4 +68,23 @@ pub struct TorrentFile {
     pub name: String,
     #[serde(default)]
     pub size: u64,
+}
+
+/// O pedaço de `sync/maindata` que interessa: o estado do servidor.
+#[derive(Debug, Deserialize)]
+pub(crate) struct MainData {
+    pub server_state: ServerState,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ServerState {
+    #[serde(default)]
+    pub free_space_on_disk: u64,
+}
+
+/// O pedaço de `app/preferences` que o acervo lê.
+#[derive(Debug, Deserialize)]
+pub(crate) struct Preferences {
+    #[serde(default)]
+    pub preallocate_all: bool,
 }

@@ -11,6 +11,7 @@
 //! importação (arquivo no caminho, disco diferente) não é culpa do release:
 //! o download fica na fila, com o aviso, até dar certo.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use acervo_api::Catalog;
@@ -47,6 +48,84 @@ pub struct GrabReport {
     /// Motivo de rejeição e quantos releases ele barrou.
     pub motivos: Vec<(String, usize)>,
     pub aplicado: bool,
+}
+
+/// Tag dos torrents que o acervo pôs na fila: só esses ele inicia.
+const QUEUE_TAG: &str = "acervo:fila";
+const QUEUED: &str = "na fila: aguardando espaço";
+
+/// Estados em que o torrent já foi iniciado mas ainda não pré-alocou: o
+/// espaço livre ainda não desconta o que ele vai ocupar.
+const UNALLOCATED: &[&str] = &["metaDL", "forcedMetaDL", "queuedDL", "allocating"];
+
+/// Uma rodada da fila por vez: duas lendo o mesmo espaço livre iniciariam
+/// torrents para o mesmo buraco.
+static QUEUE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Inicia os torrents da fila que cabem no disco, do menor para o maior,
+/// pulando quem não cabe. Com a pré-alocação ligada, todo torrent ativo já ocupa o tamanho
+/// inteiro, então o espaço livre basta; só quem ainda não alocou é
+/// descontado à mão.
+///
+/// # Errors
+///
+/// Cliente inalcançável ou que recusou um comando.
+pub(crate) async fn start_queued(store: &Store, client: &QbitClient) -> Result<Vec<String>> {
+    let _guard = QUEUE_LOCK.lock().await;
+    if !client.preallocates().await? {
+        client.enable_preallocation().await?;
+        tracing::info!("pré-alocação ligada no qBittorrent");
+    }
+    // Magnet parado não tem metadados: o tamanho vem do indexador.
+    let known: HashMap<String, u64> = store
+        .grabs()
+        .await?
+        .into_iter()
+        .filter(|g| g.state == GrabState::Downloading)
+        .map(|g| (g.hash, g.size))
+        .collect();
+    let size = |t: &acervo_clients::TorrentInfo| {
+        if t.size > 0 {
+            t.size
+        } else {
+            known.get(&t.hash).copied().unwrap_or(0)
+        }
+    };
+    let torrents = client.torrents().await?;
+    let pending: u64 = torrents
+        .iter()
+        .filter(|t| UNALLOCATED.contains(&t.state.as_str()))
+        .map(|t| left(size(t), t.progress))
+        .sum();
+    let mut budget = client.free_space().await?.saturating_sub(pending);
+    let mut queue: Vec<_> = torrents
+        .iter()
+        .filter(|t| t.has_tag(QUEUE_TAG) && size(t) > 0)
+        .map(|t| (left(size(t), t.progress), t))
+        .collect();
+    queue.sort_by_key(|(need, _)| *need);
+    let mut started = Vec::new();
+    for (need, torrent) in queue {
+        if need > budget {
+            continue;
+        }
+        client.start(&[&torrent.hash]).await?;
+        client.remove_tag(&[&torrent.hash], QUEUE_TAG).await?;
+        budget -= need;
+        tracing::info!(torrent = %torrent.name, bytes = need, "iniciado da fila");
+        started.push(torrent.name.clone());
+    }
+    Ok(started)
+}
+
+/// Bytes que faltam baixar.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn left(size: u64, progress: f64) -> u64 {
+    (size as f64 * (1.0 - progress.clamp(0.0, 1.0))) as u64
 }
 
 pub(crate) async fn qbit(config: &Config) -> Result<QbitClient> {
@@ -102,6 +181,8 @@ pub async fn send(
             &AddOptions {
                 category: config.movies.category.clone(),
                 save_path: None,
+                stopped: true,
+                tags: vec![QUEUE_TAG.into()],
             },
         )
         .await
@@ -117,13 +198,17 @@ pub async fn send(
             size: release.size,
             grabbed_at: now_rfc3339(),
             state: GrabState::Downloading,
-            message: None,
+            message: Some(QUEUED.into()),
             imported_path: None,
             finished_at: None,
             replaces,
         })
         .await
         .context("registrando o grab")?;
+    // Já registrado: a fila sabe o tamanho mesmo de um magnet sem metadados.
+    if let Err(error) = start_queued(store, &client).await {
+        tracing::warn!("fila de downloads: {error:#}");
+    }
     let movie = store.movies().await?.into_iter().find(|m| m.id == movie_id);
     events::record(
         store,
@@ -517,6 +602,10 @@ pub async fn import_downloads(
         return Ok(Vec::new());
     }
     let client = qbit(config).await?;
+    if apply && let Err(error) = start_queued(store, &client).await {
+        tracing::warn!("fila de downloads: {error:#}");
+    }
+    let free_space = client.free_space().await.ok();
     let movies = store.movies().await?;
     let map = config.path_map();
     let mut lines = Vec::new();
@@ -542,6 +631,28 @@ pub async fn import_downloads(
                 .await
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| Failure::Download("o torrent sumiu do cliente".into()))?;
+            // Disco cheio não é culpa do release: bloquear e buscar outro só
+            // empilha torrents que dão o mesmo erro. Volta para a fila, com
+            // o que já baixou.
+            if torrent.state == "error" {
+                // Sem saber o espaço não dá para culpar o release: tenta de
+                // novo na próxima rodada.
+                let free = free_space.ok_or("erro no cliente e espaço livre ilegível")?;
+                if free < left(torrent.size, torrent.progress) {
+                    if apply {
+                        client
+                            .stop(&[&grab.hash])
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        client
+                            .add_tag(&[&grab.hash], QUEUE_TAG)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                    line.detalhe = Some(QUEUED.into());
+                    return Ok(None);
+                }
+            }
             if matches!(torrent.state.as_str(), "error" | "missingFiles") {
                 return Err(Failure::Download(format!(
                     "o cliente marcou o torrent com `{}`",
@@ -549,7 +660,13 @@ pub async fn import_downloads(
                 )));
             }
             if torrent.progress < 1.0 {
-                line.detalhe = Some(format!("{:.0}%", torrent.progress * 100.0));
+                line.detalhe = Some(if torrent.has_tag(QUEUE_TAG) {
+                    QUEUED.into()
+                } else if matches!(torrent.state.as_str(), "pausedDL" | "stoppedDL") {
+                    format!("parado, {:.0}%", torrent.progress * 100.0)
+                } else {
+                    format!("{:.0}%", torrent.progress * 100.0)
+                });
                 return Ok(None);
             }
             // Arquivo que não é o que o grab ia trocar: alguém importou por

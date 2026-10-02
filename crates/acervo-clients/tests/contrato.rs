@@ -321,6 +321,8 @@ async fn adicionar_manda_arquivo_e_categoria_e_reconhece_recusa() {
     let options = AddOptions {
         category: "acervo".into(),
         save_path: None,
+        stopped: false,
+        tags: Vec::new(),
     };
 
     cliente
@@ -365,4 +367,90 @@ async fn categoria_existente_nao_e_erro_e_torrent_por_hash() {
     let achado = cliente.torrent("a1b2c3d4e5f6").await.unwrap().unwrap();
     assert_eq!(achado.save_path, "/media/downloads/acervo");
     assert!(cliente.torrent("ausente").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn adicionar_na_fila_manda_parado_e_tag() {
+    use acervo_clients::{AddOptions, NewTorrent};
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/add"))
+        .and(body_string_contains("name=\"paused\"\r\n\r\ntrue"))
+        .and(body_string_contains("name=\"stopped\"\r\n\r\ntrue"))
+        .and(body_string_contains("name=\"tags\"\r\n\r\nacervo:fila"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+        .mount(&server)
+        .await;
+    let options = AddOptions {
+        category: "acervo".into(),
+        save_path: None,
+        stopped: true,
+        tags: vec!["acervo:fila".into()],
+    };
+
+    cliente
+        .add(NewTorrent::Magnet("magnet:?xt=urn:btih:x".into()), &options)
+        .await
+        .expect("aceito parado");
+}
+
+#[tokio::test]
+async fn espaco_livre_vem_do_server_state() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/sync/maindata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "rid": 1,
+            "server_state": { "free_space_on_disk": 1_234_567_u64, "dl_info_speed": 0 }
+        })))
+        .mount(&server)
+        .await;
+
+    assert_eq!(cliente.free_space().await.expect("lido"), 1_234_567);
+}
+
+#[tokio::test]
+async fn iniciar_cai_no_resume_do_4x() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/start"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/resume"))
+        .and(body_string_contains("hashes=aa%7Cbb"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    cliente
+        .start(&["aa", "bb"])
+        .await
+        .expect("iniciado pelo resume");
+}
+
+#[tokio::test]
+async fn preferencia_de_preallocacao_lida_e_ligada() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/app/preferences"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "preallocate_all": false })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/app/setPreferences"))
+        .and(body_string_contains("preallocate_all%22%3Atrue"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    assert!(!cliente.preallocates().await.expect("lida"));
+    cliente.enable_preallocation().await.expect("ligada");
 }

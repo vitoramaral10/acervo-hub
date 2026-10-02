@@ -46,6 +46,9 @@ pub struct AddOptions {
     pub category: String,
     /// Pasta de download como o cliente a vê; sem ela, a da categoria.
     pub save_path: Option<String>,
+    /// Entra parado, sem alocar nem baixar nada.
+    pub stopped: bool,
+    pub tags: Vec<String>,
 }
 
 /// Sessão autenticada no qBittorrent.
@@ -135,6 +138,86 @@ impl QbitClient {
         Ok(found.into_iter().next())
     }
 
+    /// Espaço livre, em bytes, no disco da pasta de download padrão.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status não-2xx.
+    pub async fn free_space(&self) -> Result<u64, QbitError> {
+        let main: dto::MainData = self.get("api/v2/sync/maindata", &[]).await?;
+        Ok(main.server_state.free_space_on_disk)
+    }
+
+    /// Se o cliente reserva o arquivo inteiro no disco ao iniciar.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status não-2xx.
+    pub async fn preallocates(&self) -> Result<bool, QbitError> {
+        let preferences: dto::Preferences = self.get("api/v2/app/preferences", &[]).await?;
+        Ok(preferences.preallocate_all)
+    }
+
+    /// Liga a pré-alocação: torrent iniciado já ocupa o tamanho inteiro.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status não-2xx.
+    pub async fn enable_preallocation(&self) -> Result<(), QbitError> {
+        self.post(
+            "api/v2/app/setPreferences",
+            &[("json", r#"{"preallocate_all":true}"#)],
+        )
+        .await
+    }
+
+    /// Inicia torrents parados.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status não-2xx.
+    pub async fn start(&self, hashes: &[&str]) -> Result<(), QbitError> {
+        // `resume` até a 4.x, `start` da 5.0 em diante.
+        self.post_either("api/v2/torrents/start", "api/v2/torrents/resume", hashes)
+            .await
+    }
+
+    /// Para torrents.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status não-2xx.
+    pub async fn stop(&self, hashes: &[&str]) -> Result<(), QbitError> {
+        self.post_either("api/v2/torrents/stop", "api/v2/torrents/pause", hashes)
+            .await
+    }
+
+    /// Põe uma tag em torrents; a tag é criada se não existir.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status não-2xx.
+    pub async fn add_tag(&self, hashes: &[&str], tag: &str) -> Result<(), QbitError> {
+        self.post(
+            "api/v2/torrents/addTags",
+            &[("hashes", &hashes.join("|")), ("tags", tag)],
+        )
+        .await
+    }
+
+    /// Tira uma tag de torrents.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status não-2xx.
+    pub async fn remove_tag(&self, hashes: &[&str], tag: &str) -> Result<(), QbitError> {
+        self.post(
+            "api/v2/torrents/removeTags",
+            &[("hashes", &hashes.join("|")), ("tags", tag)],
+        )
+        .await
+    }
+
     /// Cria a categoria; já existir não é erro.
     ///
     /// # Errors
@@ -171,6 +254,14 @@ impl QbitClient {
         let mut form = reqwest::multipart::Form::new().text("category", options.category.clone());
         if let Some(save_path) = &options.save_path {
             form = form.text("savepath", save_path.clone());
+        }
+        if options.stopped {
+            // `paused` até a 4.x, `stopped` da 5.0 em diante; cada versão
+            // ignora o campo da outra.
+            form = form.text("paused", "true").text("stopped", "true");
+        }
+        if !options.tags.is_empty() {
+            form = form.text("tags", options.tags.join(","));
         }
         form = match torrent {
             NewTorrent::File(bytes) => form.part(
@@ -255,6 +346,53 @@ impl QbitClient {
                 path: "api/v2/torrents/delete".into(),
             })
         }
+    }
+
+    async fn post(&self, path: &str, form: &[(&str, &str)]) -> Result<(), QbitError> {
+        let status = self.post_status(path, form).await?;
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(QbitError::Status {
+                status,
+                path: path.into(),
+            })
+        }
+    }
+
+    /// Manda para `current`; se a versão do cliente não o conhece (404),
+    /// para `legacy`.
+    async fn post_either(
+        &self,
+        current: &str,
+        legacy: &str,
+        hashes: &[&str],
+    ) -> Result<(), QbitError> {
+        let joined = hashes.join("|");
+        let form = [("hashes", joined.as_str())];
+        match self.post_status(current, &form).await? {
+            reqwest::StatusCode::NOT_FOUND => self.post(legacy, &form).await,
+            status if status.is_success() => Ok(()),
+            status => Err(QbitError::Status {
+                status,
+                path: current.into(),
+            }),
+        }
+    }
+
+    async fn post_status(
+        &self,
+        path: &str,
+        form: &[(&str, &str)],
+    ) -> Result<reqwest::StatusCode, QbitError> {
+        Ok(self
+            .http
+            .post(self.base.join(path)?)
+            .header(reqwest::header::REFERER, self.base.as_str())
+            .form(form)
+            .send()
+            .await?
+            .status())
     }
 
     async fn get<T: serde::de::DeserializeOwned>(

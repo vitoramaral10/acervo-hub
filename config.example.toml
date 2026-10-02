@@ -94,6 +94,9 @@ root_folders = ["/media/movies"]
 # Com a busca automática ligada (Configurações, na interface), de quanto em
 # quanto tempo ler os releases recentes de todos os indexadores.
 rss_interval_minutes = 30
+# Todo torrent entra parado, com a tag `acervo:fila`; o acervo liga a
+# pré-alocação no qBittorrent e inicia da fila, do menor para o maior, os que
+# cabem no espaço livre.
 
 # --- Superfície Torznab (`acervo-hub serve`) --------------------------------
 #
