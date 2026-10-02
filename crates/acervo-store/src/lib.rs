@@ -863,6 +863,13 @@ impl Store {
                 "INSERT INTO grabs (movie_id, hash, title, indexer, quality, size, grabbed_at,
                      state, message, replaces)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 ON CONFLICT (hash) DO UPDATE SET movie_id = EXCLUDED.movie_id,
+                     title = EXCLUDED.title, indexer = EXCLUDED.indexer,
+                     quality = EXCLUDED.quality, size = EXCLUDED.size,
+                     grabbed_at = EXCLUDED.grabbed_at, state = EXCLUDED.state,
+                     message = EXCLUDED.message, replaces = EXCLUDED.replaces,
+                     imported_path = NULL, finished_at = NULL
+                 WHERE grabs.state = 'failed'
                  RETURNING id",
                 &[
                     &grab.movie_id,
@@ -1448,6 +1455,19 @@ mod tests {
         assert_eq!(store.grabs().await.unwrap(), [grab.clone()]);
         // O mesmo torrent duas vezes é recusado.
         assert!(store.record_grab(&grab).await.is_err());
+        // Já o que falhou dá lugar ao mesmo release pego de novo.
+        store
+            .update_grab(
+                grab.id,
+                GrabState::Failed,
+                Some("erro"),
+                None,
+                "2026-01-01T01:00:00Z",
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.record_grab(&grab).await.unwrap(), grab.id);
+        assert_eq!(store.grabs().await.unwrap(), [grab.clone()]);
 
         store
             .update_grab(

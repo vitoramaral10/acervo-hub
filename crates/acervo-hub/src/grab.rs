@@ -15,7 +15,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use acervo_api::Catalog;
-use acervo_clients::{AddOptions, NewTorrent, QbitClient, client_path, info_hash, magnet_hash};
+use acervo_clients::{
+    AddOptions, NewTorrent, QbitClient, QbitError, client_path, info_hash, magnet_hash,
+};
 use acervo_store::{Grab, GrabState, MovieFile, Store};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -175,7 +177,7 @@ pub async fn send(
         .ensure_category(&config.movies.category)
         .await
         .context("criando a categoria no qBittorrent")?;
-    client
+    let added = client
         .add(
             torrent,
             &AddOptions {
@@ -185,8 +187,13 @@ pub async fn send(
                 tags: vec![QUEUE_TAG.into()],
             },
         )
-        .await
-        .context("mandando o torrent ao qBittorrent")?;
+        .await;
+    match added {
+        // O mesmo release de um grab que falhou, ou de um registro que não
+        // chegou ao banco: o torrent já está no cliente, só falta o grab.
+        Err(QbitError::AddRefused) if client.torrent(&hash).await?.is_some() => {}
+        added => added.context("mandando o torrent ao qBittorrent")?,
+    }
     store
         .record_grab(&Grab {
             id: 0,
