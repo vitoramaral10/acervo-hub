@@ -1,10 +1,12 @@
 //! A decisão: o [`Decider`] carrega a biblioteca, as regras de
 //! [`crate::rules`] e os downloads do acervo em andamento (que contam como
 //! fila), e escolhe entre os releases. Aqui também mora a busca dos filmes
-//! que faltam: sem `grab`, só registra o que pegaria; com, pega.
+//! que faltam, que pega o escolhido de cada um.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use acervo_api::{ALL, Catalog};
 use acervo_decision::{
@@ -13,7 +15,7 @@ use acervo_decision::{
 };
 use acervo_indexers::SearchQuery;
 use acervo_parser::{Language, QualityModel, Revision, clean_movie_title};
-use acervo_store::{CatalogMovie, ShadowPick, ShadowRun, Store};
+use acervo_store::{CatalogMovie, SearchPick, SearchRun, Store};
 use anyhow::{Result, bail};
 use serde::Serialize;
 
@@ -100,10 +102,6 @@ fn target(entry: &CatalogMovie, remote: &Remote, now: time::OffsetDateTime) -> T
         profile,
         // A fila é a dos grabs do acervo, somada em `Decider::load`.
         queued: Vec::new(),
-        // Espaço não trava o grab: com o disco cheio, o qBittorrent pausa o
-        // download e a limpeza libera espaço; recusar deixaria o filme sem
-        // nada na fila.
-        free_space: None,
     }
 }
 
@@ -128,7 +126,7 @@ fn indexers(served: &[String], remote: &Remote) -> Vec<Indexer> {
 pub struct MissingLine {
     pub filme: String,
     pub releases: usize,
-    pub pegaria: Option<String>,
+    pub escolhido: Option<String>,
     pub motivos: Vec<(String, usize)>,
     pub erro: Option<String>,
 }
@@ -346,59 +344,119 @@ pub(crate) fn label(movie: &Target) -> String {
     }
 }
 
-/// Busca em sombra até `limit` filmes que faltam, começando pelos que estão
-/// há mais tempo sem sombra. `catalog` é o dos indexadores servidos: dentro
-/// do serviço, a sombra divide sessão e consultas guardadas com os
-/// gerenciadores.
-///
-/// # Errors
-///
-/// Catálogo vazio, gerenciador de filmes inalcançável ou nenhum indexador.
-pub async fn run(
-    config: &Config,
-    store: &Store,
-    catalog: &Catalog,
-    limit: usize,
-    print: bool,
-) -> Result<Vec<MissingLine>> {
-    search(config, store, catalog, limit, print, false).await
+/// Estado da busca dos que faltam, dividido entre a rodada automática e o
+/// botão da tela: só uma roda por vez, e a tela lê o andamento daqui.
+#[derive(Debug, Default)]
+pub struct Progress {
+    running: AtomicBool,
+    done: AtomicUsize,
+    total: AtomicUsize,
 }
 
-/// Como [`run`]; com `grab`, o escolhido de cada filme vai ao cliente — é a
-/// busca automática dos filmes que faltam.
+/// Instantâneo de [`Progress`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ProgressView {
+    pub rodando: bool,
+    pub buscados: usize,
+    pub total: usize,
+}
+
+/// Posse da vez de buscar; solta ao sair de escopo, inclusive em pânico.
+#[derive(Debug)]
+pub struct Turn(Arc<Progress>);
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Progress {
+    /// Toma a vez de buscar; `None` se já há uma busca rodando.
+    #[must_use]
+    pub fn start(self: &Arc<Self>) -> Option<Turn> {
+        self.running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        self.done.store(0, Ordering::SeqCst);
+        self.total.store(0, Ordering::SeqCst);
+        Some(Turn(Arc::clone(self)))
+    }
+
+    #[must_use]
+    pub fn view(&self) -> ProgressView {
+        ProgressView {
+            rodando: self.running.load(Ordering::SeqCst),
+            buscados: self.done.load(Ordering::SeqCst),
+            total: self.total.load(Ordering::SeqCst),
+        }
+    }
+}
+
+/// Busca até `limit` filmes que faltam (todos, sem `limit`), começando pelos
+/// que estão há mais tempo sem busca, e pega o escolhido de cada um.
+/// `catalog` é o dos indexadores servidos: dentro do serviço, a busca divide
+/// sessão e consultas guardadas com os gerenciadores. Filme com download em
+/// andamento não entra: já tem o que esperar.
+///
+/// `turn` prova que quem chama tomou a vez em [`Progress::start`]; o
+/// andamento sai do mesmo `Progress`.
 ///
 /// # Errors
 ///
 /// Catálogo vazio ou nenhum indexador.
+#[allow(clippy::too_many_lines)]
 pub async fn search(
     config: &Config,
     store: &Store,
     catalog: &Catalog,
-    limit: usize,
-    print: bool,
-    grab: bool,
+    limit: Option<usize>,
+    turn: &Turn,
 ) -> Result<Vec<MissingLine>> {
+    let progress = &turn.0;
     let (decider, latest) = tokio::try_join!(Decider::load(store, catalog), async {
-        Ok(store.latest_shadow_runs().await?)
+        Ok(store.latest_searches().await?)
     },)?;
     let last_run: BTreeMap<i64, &str> =
         latest.iter().map(|r| (r.movie_id, r.at.as_str())).collect();
+    // Download em andamento não entra: já tem o que esperar. O que só está
+    // parado na fila, sem ter baixado nada, entra: se a decisão escolher outro
+    // release, ele é melhor (a decisão recusa o que não supera a fila), e a
+    // troca não custa nada.
+    let mut downloading: HashMap<i64, Vec<acervo_store::Grab>> = HashMap::new();
+    for grab in store.grabs().await? {
+        if grab.state == acervo_store::GrabState::Downloading {
+            downloading.entry(grab.movie_id).or_default().push(grab);
+        }
+    }
+    let waiting = if downloading.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        crate::grab::waiting(config).await
+    };
     let mut wanted: Vec<&Target> = decider
         .library
         .iter()
         .filter(|t| t.monitored && t.available && t.file.is_none())
+        .filter(|t| {
+            downloading
+                .get(&t.id)
+                .is_none_or(|olds| olds.iter().all(|g| waiting.contains(&g.hash)))
+        })
         .collect();
     // Nunca buscados primeiro; depois, o que está há mais tempo sem busca.
     wanted.sort_by_key(|t| last_run.get(&t.id).copied().unwrap_or(""));
-    wanted.truncate(limit);
+    if let Some(limit) = limit {
+        wanted.truncate(limit);
+    }
+    progress.total.store(wanted.len(), Ordering::SeqCst);
 
     let mut lines = Vec::new();
-    let mut runs = Vec::new();
     for movie in wanted {
         let at = now_rfc3339();
         let (run, line) = match decider.decide(catalog, movie).await {
             Err(error) => (
-                ShadowRun {
+                SearchRun {
                     movie_id: movie.id,
                     at,
                     releases: 0,
@@ -409,13 +467,13 @@ pub async fn search(
                 MissingLine {
                     filme: label(movie),
                     releases: 0,
-                    pegaria: None,
+                    escolhido: None,
                     motivos: Vec::new(),
                     erro: Some(error),
                 },
             ),
             Ok(outcome) => {
-                if grab && let Some((decision, release)) = outcome.pick() {
+                if let Some((decision, release)) = outcome.pick() {
                     let quality = decision
                         .parsed
                         .as_ref()
@@ -427,9 +485,15 @@ pub async fn search(
                         tracing::warn!(filme = label(movie), "grab automático falhou: {error:#}");
                     } else {
                         tracing::info!(filme = label(movie), release = release.title, "pegou");
+                        let olds = downloading.get(&movie.id).map_or(&[][..], Vec::as_slice);
+                        if let Err(error) =
+                            crate::grab::swap_out(config, store, olds, &release.title).await
+                        {
+                            tracing::warn!(filme = label(movie), "troca na fila: {error:#}");
+                        }
                     }
                 }
-                let pick = outcome.pick().map(|(decision, release)| ShadowPick {
+                let pick = outcome.pick().map(|(decision, release)| SearchPick {
                     title: release.title.clone(),
                     indexer: release.indexer.clone(),
                     quality: decision
@@ -440,7 +504,7 @@ pub async fn search(
                 });
                 let reasons = summarize(&outcome.decisions, movie.id);
                 (
-                    ShadowRun {
+                    SearchRun {
                         movie_id: movie.id,
                         at,
                         releases: outcome.releases.len(),
@@ -451,22 +515,18 @@ pub async fn search(
                     MissingLine {
                         filme: label(movie),
                         releases: outcome.releases.len(),
-                        pegaria: pick.map(|p| p.title),
+                        escolhido: pick.map(|p| p.title),
                         motivos: reasons,
                         erro: None,
                     },
                 )
             }
         };
-        if print {
-            print_line(&line);
-        }
-        runs.push(run);
+        // Grava a cada filme: numa busca longa, a tela já mostra o que saiu e
+        // um reinício no meio não perde o que foi feito.
+        store.record_search(&run).await?;
         lines.push(line);
-    }
-
-    for run in &runs {
-        store.record_shadow(run).await?;
+        progress.done.fetch_add(1, Ordering::SeqCst);
     }
     Ok(lines)
 }
@@ -475,21 +535,4 @@ pub(crate) fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default()
-}
-
-fn print_line(line: &MissingLine) {
-    match (&line.erro, &line.pegaria) {
-        (Some(error), _) => println!("{}: busca falhou — {error}", line.filme),
-        (None, Some(pick)) => println!("{}: pegaria {pick}", line.filme),
-        (None, None) => println!(
-            "{}: nada entre {} releases — {}",
-            line.filme,
-            line.releases,
-            line.motivos
-                .iter()
-                .map(|(reason, n)| format!("{reason} {n}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
 }

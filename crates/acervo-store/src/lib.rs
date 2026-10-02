@@ -157,23 +157,23 @@ pub struct QualityDefinition {
     pub preferred_size: Option<f64>,
 }
 
-/// O que a decisão em sombra pegaria.
+/// O que a busca pegou.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShadowPick {
+pub struct SearchPick {
     pub title: String,
     pub indexer: String,
     pub quality: Quality,
     pub size: u64,
 }
 
-/// Uma busca em sombra por um filme: o que pegaria, ou por que não.
+/// Uma busca por um filme: o que pegou, ou por que não.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShadowRun {
+pub struct SearchRun {
     pub movie_id: i64,
     /// RFC 3339, em UTC.
     pub at: String,
     pub releases: usize,
-    pub pick: Option<ShadowPick>,
+    pub pick: Option<SearchPick>,
     /// Motivo de rejeição e quantos releases ele barrou.
     pub rejections: Vec<(String, usize)>,
     /// A busca falhou antes de decidir.
@@ -438,6 +438,14 @@ const MIGRATIONS: &[&str] = &[
         last_error TEXT
     );
 ",
+    // A busca dos que faltam deixou de ser simulação: a tabela vira `searches`.
+    r"
+    ALTER TABLE shadow_runs RENAME TO searches;
+    ALTER SEQUENCE shadow_runs_id_seq RENAME TO searches_id_seq;
+    ALTER INDEX shadow_runs_pkey RENAME TO searches_pkey;
+    ALTER INDEX shadow_runs_by_movie RENAME TO searches_by_movie;
+    ALTER TABLE searches RENAME CONSTRAINT shadow_runs_movie_id_fkey TO searches_movie_id_fkey;
+",
 ];
 
 /// Chave do lock consultivo que serializa as migrações: o serviço e um
@@ -602,19 +610,19 @@ impl Store {
             .collect()
     }
 
-    /// Grava uma busca em sombra.
+    /// Grava uma busca.
     ///
     /// # Errors
     ///
     /// Falha de escrita, ou filme que não está no catálogo.
-    pub async fn record_shadow(&self, run: &ShadowRun) -> Result<()> {
+    pub async fn record_search(&self, run: &SearchRun) -> Result<()> {
         let client = self.pool.get().await?;
         let rejections = serde_json::to_value(&run.rejections)
-            .map_err(|e| StoreError::Corrupt(format!("rejeições da sombra: {e}")))?;
+            .map_err(|e| StoreError::Corrupt(format!("rejeições da busca: {e}")))?;
         let pick = run.pick.as_ref();
         client
             .execute(
-                "INSERT INTO shadow_runs (movie_id, at, releases, pick_title, pick_indexer,
+                "INSERT INTO searches (movie_id, at, releases, pick_title, pick_indexer,
                      pick_quality, pick_size, rejections, error)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 &[
@@ -633,18 +641,18 @@ impl Store {
         Ok(())
     }
 
-    /// A busca em sombra mais recente de cada filme.
+    /// A busca mais recente de cada filme.
     ///
     /// # Errors
     ///
     /// Falha de leitura ou registro inconsistente.
-    pub async fn latest_shadow_runs(&self) -> Result<Vec<ShadowRun>> {
+    pub async fn latest_searches(&self) -> Result<Vec<SearchRun>> {
         let client = self.pool.get().await?;
         let rows = client
             .query(
                 "SELECT DISTINCT ON (movie_id) movie_id, at, releases, pick_title, pick_indexer,
                         pick_quality, pick_size, rejections, error
-                 FROM shadow_runs
+                 FROM searches
                  ORDER BY movie_id, at DESC, id DESC",
                 &[],
             )
@@ -656,7 +664,7 @@ impl Store {
                     row.try_get::<_, Option<String>>(3)?,
                     row.try_get::<_, Option<i16>>(5)?,
                 ) {
-                    (Some(title), Some(id)) => Some(ShadowPick {
+                    (Some(title), Some(id)) => Some(SearchPick {
                         title,
                         indexer: row.try_get::<_, Option<String>>(4)?.unwrap_or_default(),
                         quality: quality(id)?,
@@ -666,13 +674,13 @@ impl Store {
                     _ => None,
                 };
                 let rejections: serde_json::Value = row.try_get(7)?;
-                Ok(ShadowRun {
+                Ok(SearchRun {
                     movie_id: row.try_get(0)?,
                     at: row.try_get(1)?,
                     releases: usize::try_from(row.try_get::<_, i64>(2)?).unwrap_or(0),
                     pick,
                     rejections: serde_json::from_value(rejections)
-                        .map_err(|e| StoreError::Corrupt(format!("rejeições da sombra: {e}")))?,
+                        .map_err(|e| StoreError::Corrupt(format!("rejeições da busca: {e}")))?,
                     error: row.try_get(8)?,
                 })
             })
@@ -744,7 +752,7 @@ impl Store {
         write_extras(&self.pool.get().await?, id, extras).await
     }
 
-    /// Tira um filme do catálogo, com o registro do arquivo, títulos, sombra
+    /// Tira um filme do catálogo, com o registro do arquivo, títulos, buscas
     /// e grabs. O arquivo no disco não é tocado aqui. `false` se não existia.
     ///
     /// # Errors
@@ -1347,6 +1355,8 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::testing::TestDb;
     use super::*;
 
@@ -1490,17 +1500,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sombra_guarda_a_ultima_de_cada_filme() {
-        let Some(db) = TestDb::new("sombra").await else {
+    async fn busca_guarda_a_ultima_de_cada_filme() {
+        let Some(db) = TestDb::new("buscas").await else {
             return;
         };
         let store = &db.store;
         let id = added(store, movie(10, "Um", false)).await;
-        let run = |at: &str, pick: bool| ShadowRun {
+        let run = |at: &str, pick: bool| SearchRun {
             movie_id: id,
             at: at.into(),
             releases: 3,
-            pick: pick.then(|| ShadowPick {
+            pick: pick.then(|| SearchPick {
                 title: "Um.2020.1080p.WEB-DL-GRUPO".into(),
                 indexer: "tracker".into(),
                 quality: Quality::WebDl1080p,
@@ -1510,18 +1520,68 @@ mod tests {
             error: None,
         };
         store
-            .record_shadow(&run("2026-01-01T00:00:00Z", false))
+            .record_search(&run("2026-01-01T00:00:00Z", false))
             .await
             .unwrap();
         store
-            .record_shadow(&run("2026-01-02T00:00:00Z", true))
+            .record_search(&run("2026-01-02T00:00:00Z", true))
             .await
             .unwrap();
         assert_eq!(
-            store.latest_shadow_runs().await.unwrap(),
+            store.latest_searches().await.unwrap(),
             [run("2026-01-02T00:00:00Z", true)]
         );
         db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn migracao_renomeia_as_buscas_sem_perder_dados() {
+        let Some(url) = std::env::var("ACERVO_TEST_DATABASE_URL").ok() else {
+            eprintln!("ACERVO_TEST_DATABASE_URL ausente: teste de banco pulado");
+            return;
+        };
+        let schema = format!("teste_renomeia_{}", std::process::id());
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        // Banco parado na versão anterior à migração, com uma busca gravada.
+        let before = MIGRATIONS.len() - 1;
+        let mut setup = format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path = {schema};"
+        );
+        for migration in &MIGRATIONS[..before] {
+            setup.push_str(migration);
+        }
+        let _ = write!(
+            setup,
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES ({before});
+             INSERT INTO movies (tmdb_id, title, path, monitored, minimum_availability)
+                 VALUES (1, 'Um', '/filmes/Um', true, 'released');
+             INSERT INTO shadow_runs (movie_id, at, releases, rejections)
+                 SELECT id, '2026-01-01T00:00:00Z', 7, '[]' FROM movies;"
+        );
+        client.batch_execute(&setup).await.unwrap();
+
+        let mut config: tokio_postgres::Config = url.parse().unwrap();
+        config.options(format!("-c search_path={schema}"));
+        let store = Store::with_config(config).await.unwrap();
+        let searches = store.latest_searches().await.unwrap();
+        assert_eq!(searches.len(), 1);
+        assert_eq!(searches[0].releases, 7);
+        let old = client
+            .query_one(
+                &format!("SELECT to_regclass('{schema}.shadow_runs')::text"),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(old.get::<_, Option<String>>(0), None);
+        client
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

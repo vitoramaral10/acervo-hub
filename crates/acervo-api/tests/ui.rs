@@ -219,8 +219,12 @@ impl Admin for FakeAdmin {
         Ok(json!([{ "titulo": "Filme", "ano": 2020 }]))
     }
 
-    async fn search_missing(&self, limit: usize) -> Result<Value, String> {
-        Ok(json!([{ "filme": "Filme (2020)", "limite": limit }]))
+    async fn search_missing(&self) -> Result<Value, String> {
+        Ok(json!({ "iniciada": true, "rodando": true, "buscados": 0, "total": 3 }))
+    }
+
+    fn missing_status(&self) -> Value {
+        json!({ "iniciada": false, "rodando": true, "buscados": 1, "total": 3 })
     }
 
     async fn grab_movie(&self, movie_id: i64, apply: bool) -> Result<Value, String> {
@@ -688,12 +692,17 @@ async fn filmes_lista_e_busca() {
         reqwest::Method::POST,
         "/ui/api/filmes/buscar",
         &cookie,
-        json!({ "limite": 500 }),
+        json!({}),
     )
     .await;
     assert_eq!(status, 200);
-    // O limite tem teto: cada filme é uma busca nos trackers.
-    assert_eq!(body["filmes"][0]["limite"], 20);
+    assert_eq!(body["iniciada"], true);
+    assert_eq!(body["total"], 3);
+
+    let (status, body) = get(&base, "/ui/api/filmes/buscar", &cookie).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["rodando"], true);
+    assert_eq!(body["buscados"], 1);
 
     let (status, body) = send(
         &base,

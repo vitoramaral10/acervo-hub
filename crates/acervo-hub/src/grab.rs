@@ -11,7 +11,7 @@
 //! importação (arquivo no caminho, disco diferente) não é culpa do release:
 //! o download fica na fila, com o aviso, até dar certo.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use acervo_api::Catalog;
@@ -125,6 +125,63 @@ pub(crate) async fn start_queued(store: &Store, client: &QbitClient) -> Result<V
         started.push(torrent.name.clone());
     }
     Ok(started)
+}
+
+/// Hashes dos torrents que ainda esperam na fila do acervo, sem nunca terem
+/// começado. Vazio se o cliente não responde: aí nada é trocado.
+pub(crate) async fn waiting(config: &Config) -> HashSet<String> {
+    let torrents = match qbit(config).await {
+        Ok(client) => client.torrents().await.map_err(anyhow::Error::from),
+        Err(error) => Err(error),
+    };
+    match torrents {
+        Ok(torrents) => torrents
+            .into_iter()
+            .filter(|t| t.has_tag(QUEUE_TAG))
+            .map(|t| t.hash)
+            .collect(),
+        Err(error) => {
+            tracing::warn!("lendo a fila do cliente: {error:#}");
+            HashSet::new()
+        }
+    }
+}
+
+/// Tira da fila os grabs que deram lugar a um release melhor: apaga o
+/// torrent, que nunca baixou nada, e encerra o grab sem bloquear o release.
+///
+/// # Errors
+///
+/// Cliente inalcançável ou falha de escrita.
+pub(crate) async fn swap_out(
+    config: &Config,
+    store: &Store,
+    olds: &[Grab],
+    by: &str,
+) -> Result<()> {
+    let Some(first) = olds.first() else {
+        return Ok(());
+    };
+    let movie = store
+        .movies()
+        .await?
+        .into_iter()
+        .find(|m| m.id == first.movie_id)
+        .context("o filme saiu do catálogo")?;
+    let hashes: Vec<_> = olds
+        .iter()
+        .map(|g| acervo_core::DownloadHash::new(g.hash.clone()))
+        .collect();
+    qbit(config)
+        .await?
+        .delete(&hashes, true)
+        .await
+        .context("apagando da fila do qBittorrent")?;
+    let reason = format!("trocado na fila por {by}");
+    for grab in olds {
+        give_up(store, grab, &movie, &reason, false, Kind::Ignored).await?;
+    }
+    Ok(())
 }
 
 /// Bytes que faltam baixar.
@@ -524,15 +581,11 @@ pub async fn give_up(
     Ok(())
 }
 
-/// Busca o filme de novo depois de uma falha, se a busca automática estiver
-/// ligada.
+/// Busca o filme de novo depois de uma falha.
 async fn search_again(config: &Config, store: &Store, catalog: Option<&Catalog>, movie_id: i64) {
     let Some(catalog) = catalog else {
         return;
     };
-    if !crate::automatic::enabled(store).await.unwrap_or(false) {
-        return;
-    }
     match grab(config, store, catalog, movie_id, true).await {
         Ok(report) => tracing::info!(
             filme = report.filme,

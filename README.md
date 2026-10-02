@@ -97,8 +97,9 @@ cargo run --bin acervo-hub -- -c config.toml search "termo" [-i indexador] [-k 5
   outro), o histórico de tudo e a lista de bloqueio.
 - **Aplicativos** — o `sync` na tela: mostra o que mudaria no gerenciador de séries e aplica.
 - **Limpeza** — o último ciclo (gravado ao lado do ledger) e uma simulação na hora.
-- **Configurações** — TMDB e busca automática, regras de decisão (teto de tamanho,
-  propers, legenda embutida, carência, prioridade e seeders por indexador, espera) e
+- **Configurações** — TMDB, regras de decisão (teto de tamanho,
+  propers, legenda embutida, carência, prioridade e seeders por indexador, espera, espaço
+  livre reservado) e
   notificações (Gotify).
 
 A qualidade não se configura: todo filme usa o **perfil automático**, da melhor qualidade de
@@ -280,10 +281,10 @@ A migração é *strangler*, na ordem do risco. Cada fase é reversível e entre
         da referência — contra 293 filmes reais, batem em todos.
   - [x] **API v3 de filmes** para o app de pedidos: status, perfis, pastas raiz, tags,
         filmes (listar, procurar, adicionar, atualizar, remover), fila, comandos e histórico.
-  - [x] **Busca automática**, ligada nas Configurações: o RSS de todos os indexadores é
+  - [x] **Busca automática**, sempre ligada: o RSS de todos os indexadores é
         decidido contra a biblioteca inteira, e os filmes que faltam são buscados em rodadas
-        (`search_interval_minutes`, `search_limit`). Desligada, a busca só registra o que
-        pegaria — a "última busca" de cada filme na tela.
+        (`search_interval_minutes`, `search_limit`); o botão "Buscar os que faltam" busca todos, em
+        segundo plano. A "última busca" de cada filme aparece na tela.
   - [x] **O corte**. O gerenciador de filmes foi desligado: o acervo adotou os filmes com
         os ids dele (que o app de pedidos guarda), e o app de pedidos passou a falar com a API
         v3 daqui. O código que só servia à convivência saiu junto — importação, migração,

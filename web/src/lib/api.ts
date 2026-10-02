@@ -176,7 +176,14 @@ export interface MovieDownload {
 
 export interface Configuration {
   tmdb: { definida: boolean }
-  busca_automatica: boolean
+}
+
+/** Andamento da busca dos filmes que faltam; `iniciada` só vale na resposta do POST. */
+export interface MissingSearch {
+  iniciada: boolean
+  rodando: boolean
+  buscados: number
+  total: number
 }
 
 export interface GrabReport {
@@ -190,7 +197,7 @@ export interface GrabReport {
 export interface LastSearch {
   quando: string
   releases: number
-  pegaria: string | null
+  escolhido: string | null
   qualidade: string | null
   motivos: [string, number][]
   erro: string | null
@@ -229,7 +236,8 @@ export const api = {
   lastCycle: () => request<{ ultimo: CycleReport | null }>('GET', '/ui/api/limpeza'),
   simulateCycle: () => request<CycleReport>('POST', '/ui/api/limpeza/simular'),
   movies: () => request<{ filmes: Movie[] }>('GET', '/ui/api/filmes'),
-  searchMissing: (limite: number) => request<{ filmes: unknown[] }>('POST', '/ui/api/filmes/buscar', { limite }),
+  searchMissing: () => request<MissingSearch>('POST', '/ui/api/filmes/buscar'),
+  missingSearch: () => request<MissingSearch>('GET', '/ui/api/filmes/buscar'),
   grab: (id: number, aplicar: boolean) =>
     request<GrabReport>('POST', `/ui/api/filmes/${id}/pegar`, { aplicar }),
   importDownloads: () => request<{ downloads: unknown[] }>('POST', '/ui/api/downloads/importar'),
@@ -364,7 +372,6 @@ export interface DecisionRules {
   propers: 'preferir_e_atualizar' | 'nao_atualizar' | 'nao_preferir'
   preferir_flags_do_indexador: boolean
   folga_minima_mb: number
-  pular_checagem_de_espaco: boolean
   carencia_dias: number
   indexadores: Record<string, IndexerRules>
   atraso: { minutos: number; pular_se_melhor_qualidade: boolean }

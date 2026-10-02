@@ -320,11 +320,6 @@ pub(crate) fn evaluate(
         }
         delay_check(engine, candidate, movie, &mut out);
     }
-
-    // Prioridade "disco": só roda quando todo o resto aprovou.
-    if out.is_empty() {
-        free_space_check(engine, release, movie, &mut out);
-    }
     out
 }
 
@@ -390,26 +385,5 @@ fn queue_check(
             out.push(Rejection::QueuePropersDisabled);
             return;
         }
-    }
-}
-
-fn free_space_check(
-    engine: &Engine<'_>,
-    release: &Release,
-    movie: &Target,
-    out: &mut Vec<Rejection>,
-) {
-    if engine.settings.skip_free_space_check {
-        return;
-    }
-    let Some(free) = movie.free_space else {
-        return;
-    };
-    let minimum =
-        i64::try_from(engine.settings.minimum_free_space_mb).unwrap_or(i64::MAX) * 1024 * 1024;
-    let remaining =
-        i64::try_from(free).unwrap_or(i64::MAX) - i64::try_from(release.size).unwrap_or(i64::MAX);
-    if remaining <= 0 || remaining < minimum {
-        out.push(Rejection::MinimumFreeSpace { remaining });
     }
 }

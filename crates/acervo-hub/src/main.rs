@@ -97,13 +97,6 @@ enum Command {
 enum MoviesAction {
     /// Confere cada arquivo do catálogo contra o disco.
     Check,
-    /// Busca os filmes que faltam nos indexadores daqui e decide o que
-    /// pegaria, sem pegar nada.
-    Missing {
-        /// Quantos filmes buscar nesta rodada.
-        #[arg(long, default_value_t = 5)]
-        limit: usize,
-    },
     /// Busca um filme que falta, decide e, com `--apply`, manda o escolhido
     /// ao qBittorrent.
     Grab {
@@ -340,13 +333,6 @@ async fn movies_command(config: &config::Config, action: MoviesAction) -> Result
                 );
             }
             grabs.iter().any(|g| g.erro.is_some())
-        }
-        MoviesAction::Missing { limit } => {
-            let catalog = acervo_api::Catalog::new(serve::entries(config).await?)?;
-            decide::run(config, &store, &catalog, limit, true)
-                .await?
-                .iter()
-                .any(|line| line.erro.is_some())
         }
     })
 }

@@ -17,6 +17,7 @@ use serde_json::json;
 
 use crate::config::{CardigannIndexer, Config, IndexerConfig, TorznabIndexer, expand_tilde};
 use crate::credentials::{self, Overrides};
+use crate::decide::Progress;
 use crate::definitions::Definitions;
 use crate::registry::{self, Added, Registry};
 
@@ -78,11 +79,13 @@ impl Accounts for Database {
 
 /// Busca os filmes que faltam de tempos em tempos, com o
 /// catálogo de indexadores servido. Erro numa rodada fica no log e a próxima
-/// tenta de novo.
+/// tenta de novo; se o botão da tela já está buscando, a rodada espera a
+/// próxima.
 async fn missing_loop(
     config: Arc<Config>,
     database: Database,
     catalog: Catalog,
+    progress: Arc<Progress>,
     minutes: u64,
     limit: usize,
 ) {
@@ -100,13 +103,14 @@ async fn missing_loop(
                 continue;
             }
         };
-        // Com a busca automática ligada, pega o que escolher.
-        let grab = crate::automatic::enabled(store).await.unwrap_or(false);
-        match crate::decide::search(&config, store, &catalog, limit, false, grab).await {
+        let Some(turn) = progress.start() else {
+            tracing::info!("busca dos que faltam adiada: já há uma rodando");
+            continue;
+        };
+        match crate::decide::search(&config, store, &catalog, Some(limit), &turn).await {
             Ok(lines) => tracing::info!(
                 filmes = lines.len(),
-                pegaria = lines.iter().filter(|l| l.pegaria.is_some()).count(),
-                pegando = grab,
+                escolhidos = lines.iter().filter(|l| l.escolhido.is_some()).count(),
                 "busca dos que faltam"
             ),
             Err(error) => tracing::warn!("busca dos que faltam falhou: {error:#}"),
@@ -170,7 +174,7 @@ async fn metadata_loop(config: Arc<Config>, database: Database) {
     }
 }
 
-/// Sincronização de RSS, quando a busca automática está ligada.
+/// Sincronização de RSS: pega o que serve à biblioteca.
 async fn rss_loop(config: Arc<Config>, database: Database, catalog: Catalog, minutes: u64) {
     let mut every = tokio::time::interval(Duration::from_secs(minutes * 60));
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -179,9 +183,6 @@ async fn rss_loop(config: Arc<Config>, database: Database, catalog: Catalog, min
         let Ok(store) = database.get() else {
             continue;
         };
-        if !crate::automatic::enabled(store).await.unwrap_or(false) {
-            continue;
-        }
         match crate::automatic::rss(&config, store, &catalog, true).await {
             Ok(grabs) => {
                 for grab in &grabs {
@@ -196,6 +197,17 @@ async fn rss_loop(config: Arc<Config>, database: Database, catalog: Catalog, min
             Err(error) => tracing::warn!("RSS falhou: {error:#}"),
         }
     }
+}
+
+/// O andamento da busca dos que faltam, como a tela o lê; `iniciada` diz se
+/// este pedido disparou a busca (falso: já havia uma rodando).
+fn missing_json(started: bool, view: crate::decide::ProgressView) -> serde_json::Value {
+    json!({
+        "iniciada": started,
+        "rodando": view.rodando,
+        "buscados": view.buscados,
+        "total": view.total,
+    })
 }
 
 /// Os downloads do acervo, do mais novo ao mais velho, com o título do filme.
@@ -243,6 +255,8 @@ pub async fn run(config: Config) -> Result<()> {
     let api_key = server.api_key.clone();
     let catalog = Catalog::new(entries(&config).await?)?;
     let database = Database::default();
+    // Uma busca dos que faltam por vez: a rodada automática e o botão da tela.
+    let missing = Arc::new(Progress::default());
     let accounts: Option<Arc<dyn Accounts>> = if config.database.is_some() {
         tokio::spawn(database.clone().connect(Arc::clone(&config)));
         Some(Arc::new(database.clone()))
@@ -275,6 +289,7 @@ pub async fn run(config: Config) -> Result<()> {
             Arc::clone(&config),
             database.clone(),
             catalog.clone(),
+            Arc::clone(&missing),
             minutes,
             server.search_limit,
         ));
@@ -294,7 +309,7 @@ pub async fn run(config: Config) -> Result<()> {
         accounts: accounts.clone(),
         searches: tokio::sync::Mutex::default(),
     });
-    let admin = HubAdmin::new(config, catalog.clone(), database)?;
+    let admin = HubAdmin::new(config, catalog.clone(), database, missing)?;
     tracing::info!(indexadores = catalog.len(), bind = %bind, "servindo Torznab e a interface web");
 
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -470,6 +485,8 @@ struct HubAdmin {
     /// os gerenciadores.
     catalog: Catalog,
     database: Database,
+    /// Andamento da busca dos que faltam, dividido com a rodada automática.
+    missing: Arc<Progress>,
     definitions: Definitions,
     /// Indexadores Cardigann da config, pelo id da definição.
     config_cardigann: BTreeMap<String, CardigannIndexer>,
@@ -481,7 +498,12 @@ struct HubAdmin {
 }
 
 impl HubAdmin {
-    fn new(config: Arc<Config>, catalog: Catalog, database: Database) -> Result<Self> {
+    fn new(
+        config: Arc<Config>,
+        catalog: Catalog,
+        database: Database,
+        missing: Arc<Progress>,
+    ) -> Result<Self> {
         let catalogs: Vec<PathBuf> = config
             .server
             .as_ref()
@@ -514,6 +536,7 @@ impl HubAdmin {
             config,
             catalog,
             database,
+            missing,
             definitions,
             config_cardigann,
             config_torznab,
@@ -964,17 +987,33 @@ impl Admin for HubAdmin {
         serde_json::to_value(list).map_err(|e| e.to_string())
     }
 
-    async fn search_missing(&self, limit: usize) -> Result<serde_json::Value, String> {
-        let lines = crate::decide::run(
-            &self.config,
-            self.database.get()?,
-            &self.catalog,
-            limit,
-            false,
-        )
-        .await
-        .map_err(|e| format!("{e:#}"))?;
-        serde_json::to_value(lines).map_err(|e| e.to_string())
+    async fn search_missing(&self) -> Result<serde_json::Value, String> {
+        // Falha logo, na resposta, se o banco ainda não subiu.
+        self.database.get()?;
+        let Some(turn) = self.missing.start() else {
+            return Ok(missing_json(false, self.missing.view()));
+        };
+        let config = Arc::clone(&self.config);
+        let database = self.database.clone();
+        let catalog = self.catalog.clone();
+        tokio::spawn(async move {
+            let Ok(store) = database.get() else {
+                return;
+            };
+            match crate::decide::search(&config, store, &catalog, None, &turn).await {
+                Ok(lines) => tracing::info!(
+                    filmes = lines.len(),
+                    escolhidos = lines.iter().filter(|l| l.escolhido.is_some()).count(),
+                    "busca de todos os que faltam"
+                ),
+                Err(error) => tracing::warn!("busca de todos os que faltam falhou: {error:#}"),
+            }
+        });
+        Ok(missing_json(true, self.missing.view()))
+    }
+
+    fn missing_status(&self) -> serde_json::Value {
+        missing_json(false, self.missing.view())
     }
 
     async fn grab_movie(&self, movie_id: i64, apply: bool) -> Result<serde_json::Value, String> {
@@ -1012,13 +1051,7 @@ impl Admin for HubAdmin {
             .setting(crate::metadata::TMDB_KEY)
             .await
             .map_err(|e| e.to_string())?;
-        let automatic = crate::automatic::enabled(store)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(json!({
-            "tmdb": { "definida": key.is_some() },
-            "busca_automatica": automatic,
-        }))
+        Ok(json!({ "tmdb": { "definida": key.is_some() } }))
     }
 
     async fn save_configuration(
@@ -1044,17 +1077,6 @@ impl Admin for HubAdmin {
                     }
                     store
                         .set_setting(crate::metadata::TMDB_KEY, value.as_deref(), &at)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
-                "busca_automatica" => {
-                    let on = value.as_deref() == Some("true");
-                    store
-                        .set_setting(
-                            crate::automatic::KEY,
-                            Some(if on { "true" } else { "false" }),
-                            &at,
-                        )
                         .await
                         .map_err(|e| e.to_string())?;
                 }
@@ -1141,6 +1163,7 @@ mod tests {
             Arc::new(load_config(&dir.0, &indexers)),
             Catalog::default(),
             Database::default(),
+            Arc::default(),
         )
         .unwrap();
         assert_eq!(admin.origin("cookie-privado"), Some("config"));
@@ -1196,6 +1219,7 @@ mod tests {
             Arc::new(load_config(&dir.0, &indexers)),
             Catalog::default(),
             Database::default(),
+            Arc::default(),
         )
         .unwrap();
         let settings = admin

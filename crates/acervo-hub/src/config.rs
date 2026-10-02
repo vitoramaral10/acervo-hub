@@ -132,10 +132,10 @@ pub struct ServerConfig {
     /// De quantos em quantos minutos o serviço busca os filmes que faltam.
     /// Sem valor, não busca sozinho. Roda aqui, e não num processo à parte,
     /// para dividir sessão e consultas guardadas com o Sonarr.
-    #[serde(default, alias = "shadow_interval_minutes")]
+    #[serde(default)]
     pub search_interval_minutes: Option<u64>,
     /// Quantos filmes cada rodada busca.
-    #[serde(default = "default_search_limit", alias = "shadow_limit")]
+    #[serde(default = "default_search_limit")]
     pub search_limit: usize,
 }
 
@@ -573,26 +573,18 @@ mod tests {
     }
 
     #[test]
-    fn nomes_antigos_da_busca_continuam_aceitos() {
+    fn busca_dos_que_faltam_le_intervalo_e_limite() {
         let exemplo = include_str!("../../../config.example.toml");
-        let novos = exemplo
+        let texto = exemplo
             .replace(
                 "# search_interval_minutes = 120",
                 "search_interval_minutes = 60",
             )
             .replace("# search_limit = 5", "search_limit = 3");
-        let antigos = exemplo
-            .replace(
-                "# search_interval_minutes = 120",
-                "shadow_interval_minutes = 60",
-            )
-            .replace("# search_limit = 5", "shadow_limit = 3");
-        for texto in [novos, antigos] {
-            let config = load(&texto).unwrap();
-            let server = config.server().unwrap();
-            assert_eq!(server.search_interval_minutes, Some(60));
-            assert_eq!(server.search_limit, 3);
-        }
+        let config = load(&texto).unwrap();
+        let server = config.server().unwrap();
+        assert_eq!(server.search_interval_minutes, Some(60));
+        assert_eq!(server.search_limit, 3);
     }
 
     #[test]

@@ -125,13 +125,17 @@ pub trait Admin: Send + Sync + std::fmt::Debug {
     /// Catálogo ilegível.
     async fn movies(&self) -> Result<serde_json::Value, String>;
 
-    /// Uma rodada da busca dos que faltam: busca até `limit` filmes que faltam e
-    /// grava o que pegaria, sem pegar nada.
+    /// Dispara em segundo plano a busca de todos os filmes que faltam, e pega
+    /// o escolhido de cada um. Responde na hora; com uma busca já rodando,
+    /// não dispara outra.
     ///
     /// # Errors
     ///
-    /// Catálogo vazio ou gerenciador de filmes inalcançável.
-    async fn search_missing(&self, limit: usize) -> Result<serde_json::Value, String>;
+    /// Banco inalcançável.
+    async fn search_missing(&self) -> Result<serde_json::Value, String>;
+
+    /// O andamento da busca dos que faltam: se roda, quantos de quantos.
+    fn missing_status(&self) -> serde_json::Value;
 
     /// Busca e decide um filme do catálogo; com `apply`, manda o escolhido
     /// ao cliente de download.
@@ -265,7 +269,10 @@ pub(crate) fn routes() -> Router<Arc<Server>> {
         .route("/ui/api/limpeza", get(last_cycle))
         .route("/ui/api/limpeza/simular", post(simulate_cycle))
         .route("/ui/api/filmes", get(movies))
-        .route("/ui/api/filmes/buscar", post(search_missing))
+        .route(
+            "/ui/api/filmes/buscar",
+            get(missing_status).post(search_missing),
+        )
         .route("/ui/api/filmes/{id}/pegar", post(grab_movie))
         .route("/ui/api/downloads", get(downloads))
         .route(
@@ -734,27 +741,24 @@ async fn movies(
     Ok(ok(json!({ "filmes": list })))
 }
 
-#[derive(Deserialize)]
-struct SearchBody {
-    #[serde(default = "default_search_limit")]
-    limite: usize,
-}
-
-const fn default_search_limit() -> usize {
-    5
-}
-
 async fn search_missing(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
-    Json(body): Json<SearchBody>,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::POST).await?;
-    let report = admin(&server)?
-        .search_missing(body.limite.clamp(1, 20))
+    let started = admin(&server)?
+        .search_missing()
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
-    Ok(ok(json!({ "filmes": report })))
+    Ok(ok(started))
+}
+
+async fn missing_status(
+    State(server): State<Arc<Server>>,
+    headers: HeaderMap,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::GET).await?;
+    Ok(ok(admin(&server)?.missing_status()))
 }
 
 async fn grab_movie(

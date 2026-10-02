@@ -2,9 +2,6 @@
 //! filmes fazia. Duas frentes, iguais às da referência — releases recentes
 //! (RSS) casados com a biblioteca inteira, que também trazem os upgrades; e a
 //! busca rotativa dos filmes que faltam.
-//!
-//! Desligada por padrão: enquanto o gerenciador estiver pegando, ligá-la
-//! baixaria tudo duas vezes. Liga-se nas Configurações, no corte.
 
 use std::collections::BTreeSet;
 
@@ -17,20 +14,8 @@ use serde::Serialize;
 use crate::config::Config;
 use crate::decide::Decider;
 
-/// Onde a chave liga-desliga fica na tabela de configurações.
-pub const KEY: &str = "busca.automatica";
-
 /// Categoria Newznab de filmes.
 const MOVIES: u32 = 2000;
-
-/// A busca automática está ligada?
-///
-/// # Errors
-///
-/// Banco inalcançável.
-pub async fn enabled(store: &Store) -> Result<bool> {
-    Ok(store.setting(KEY).await?.as_deref() == Some("true"))
-}
 
 /// Um grab da sincronização de RSS.
 #[derive(Debug, Serialize)]

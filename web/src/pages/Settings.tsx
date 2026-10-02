@@ -9,7 +9,7 @@ import { RulesSection, RulesSkeleton, useRules } from '@/pages/settings/Rules'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Badge, Skeleton, Switch } from '@/components/ui/misc'
+import { Badge, Skeleton } from '@/components/ui/misc'
 import { api } from '@/lib/api'
 
 function GeneralSection() {
@@ -30,16 +30,6 @@ function GeneralSection() {
   })
 
   const defined = settings.data?.tmdb.definida ?? false
-  const automatic = settings.data?.busca_automatica ?? false
-
-  const toggle = useMutation({
-    mutationFn: (on: boolean) => api.saveConfiguration({ busca_automatica: on ? 'true' : 'false' }),
-    onSuccess: (data) => {
-      queryClient.setQueryData(['configuracoes'], data)
-      toast.success(data.busca_automatica ? 'Busca automática ligada' : 'Busca automática desligada')
-    },
-    onError: (error: Error) => toast.error(error.message),
-  })
 
   return (
     <>
@@ -138,35 +128,6 @@ function GeneralSection() {
             </div>
           </form>
         )}
-      </section>
-
-      <section
-        aria-labelledby="automatica-titulo"
-        className="mt-6 max-w-2xl rounded-lg border border-border bg-surface p-6"
-      >
-        <div className="flex items-start justify-between gap-6">
-          <div>
-            <h2 id="automatica-titulo" className="text-lg font-semibold">
-              Busca automática
-            </h2>
-            <p id="automatica-ajuda" className="mt-1 max-w-[60ch] text-sm text-content-muted">
-              O acervo-hub lê os releases recentes a cada meia hora e busca os filmes que faltam, e pega sozinho o
-              melhor de cada um. Desligada, ele só busca e mostra o que pegaria.
-            </p>
-          </div>
-          {settings.isPending ? (
-            <Skeleton className="h-5 w-9 shrink-0" />
-          ) : (
-            <Switch
-              checked={automatic}
-              disabled={toggle.isPending || settings.isError}
-              onCheckedChange={(on) => toggle.mutate(on)}
-              aria-labelledby="automatica-titulo"
-              aria-describedby="automatica-ajuda"
-              className="mt-1"
-            />
-          )}
-        </div>
       </section>
     </>
   )

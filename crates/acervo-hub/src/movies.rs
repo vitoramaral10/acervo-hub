@@ -42,7 +42,7 @@ pub struct FileView {
 pub struct LastSearchView {
     pub quando: String,
     pub releases: usize,
-    pub pegaria: Option<String>,
+    pub escolhido: Option<String>,
     pub qualidade: Option<&'static str>,
     pub motivos: Vec<(String, usize)>,
     pub erro: Option<String>,
@@ -104,7 +104,7 @@ fn disk(path: &Path, expected: u64, map: &acervo_fs::PathMap) -> (Disk, Option<S
 fn view(
     entry: CatalogMovie,
     map: &acervo_fs::PathMap,
-    shadow: Option<acervo_store::ShadowRun>,
+    search: Option<acervo_store::SearchRun>,
     download: Option<DownloadView>,
 ) -> MovieView {
     let movie = entry.movie;
@@ -145,11 +145,11 @@ fn view(
         pasta: movie.path,
         adicionado: movie.added,
         arquivo,
-        ultima_busca: shadow.map(|run| LastSearchView {
+        ultima_busca: search.map(|run| LastSearchView {
             quando: run.at,
             releases: run.releases,
             qualidade: run.pick.as_ref().map(|p| p.quality.name()),
-            pegaria: run.pick.map(|p| p.title),
+            escolhido: run.pick.map(|p| p.title),
             motivos: run.rejections,
             erro: run.error,
         }),
@@ -164,8 +164,8 @@ fn view(
 /// Catálogo ilegível.
 pub async fn list(config: &Config, store: &Store) -> Result<Vec<MovieView>> {
     let map = config.path_map();
-    let mut shadows: HashMap<i64, acervo_store::ShadowRun> = store
-        .latest_shadow_runs()
+    let mut searches: HashMap<i64, acervo_store::SearchRun> = store
+        .latest_searches()
         .await?
         .into_iter()
         .map(|run| (run.movie_id, run))
@@ -186,9 +186,9 @@ pub async fn list(config: &Config, store: &Store) -> Result<Vec<MovieView>> {
         Ok(movies
             .into_iter()
             .map(|entry| {
-                let shadow = shadows.remove(&entry.id);
+                let search = searches.remove(&entry.id);
                 let download = downloads.remove(&entry.id);
-                view(entry, &map, shadow, download)
+                view(entry, &map, search, download)
             })
             .collect())
     })

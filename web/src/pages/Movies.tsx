@@ -14,7 +14,7 @@ import {
   SearchX,
   Trash2,
 } from 'lucide-react'
-import { type ReactNode, useMemo, useState } from 'react'
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { AVAILABILITIES, AddMovieDialog } from '@/components/AddMovieDialog'
 import { HistoryList } from '@/components/HistoryList'
@@ -76,7 +76,6 @@ const REASONS: Record<string, string> = {
   AboveMaximumSize: 'grande demais',
   MaximumSizeExceeded: 'acima do teto',
   MinimumSeeders: 'poucos seeders',
-  MinimumFreeSpace: 'disco sem espaço',
   Raw: 'disco bruto',
   HardcodeSubtitles: 'legenda embutida',
   Sample: 'amostra',
@@ -97,12 +96,12 @@ function LastSearchLine({ search }: { search: LastSearch }) {
       </p>
     )
   }
-  if (search.pegaria) {
+  if (search.escolhido) {
     return (
-      <p className="mt-1 flex items-center gap-1.5 text-xs text-accent" title={search.pegaria}>
+      <p className="mt-1 flex items-center gap-1.5 text-xs text-accent" title={search.escolhido}>
         <Radar className="size-3.5 shrink-0" aria-hidden="true" />
         <span className="truncate">
-          Última busca {when}: pegaria <span className="font-mono">{search.pegaria}</span>
+          Última busca {when}: escolheu <span className="font-mono">{search.escolhido}</span>
         </span>
       </p>
     )
@@ -279,11 +278,29 @@ export function MoviesPage() {
   const [selected, setSelected] = useState<number | null>(null)
   const [adding, setAdding] = useState(false)
 
+  // A busca dos que faltam roda no servidor; a tela só acompanha enquanto ela dura.
+  const progress = useQuery({
+    queryKey: ['filmes-busca'],
+    queryFn: api.missingSearch,
+    refetchInterval: (state) => (state.state.data?.rodando ? 2000 : false),
+  })
+  const searching = progress.data?.rodando ?? false
+  const searched = progress.data?.buscados ?? 0
+  const wasSearching = useRef(false)
+  useEffect(() => {
+    // Cada filme buscado grava a "última busca" dele: recarrega a lista no caminho e ao fim.
+    if (searching || wasSearching.current) void queryClient.invalidateQueries({ queryKey: ['filmes'] })
+    if (wasSearching.current && !searching) toast.success('Busca dos que faltam concluída')
+    wasSearching.current = searching
+  }, [searching, searched, queryClient])
+
   const missing = useMutation({
-    mutationFn: () => api.searchMissing(5),
-    onSuccess: ({ filmes }) => toast.success(`${filmes.length} filmes buscados`),
+    mutationFn: api.searchMissing,
+    onSuccess: (status) => {
+      queryClient.setQueryData(['filmes-busca'], status)
+      if (!status.iniciada) toast.info('Já há uma busca dos que faltam em andamento')
+    },
     onError: (error: Error) => toast.error(error.message),
-    onSettled: () => void queryClient.invalidateQueries({ queryKey: ['filmes'] }),
   })
 
   const list = movies.data?.filmes
@@ -330,11 +347,13 @@ export function MoviesPage() {
             <Button
               variant="ghost"
               onClick={() => missing.mutate()}
-              loading={missing.isPending}
+              loading={missing.isPending || searching}
               disabled={counts.total === 0}
             >
-              {!missing.isPending && <Radar aria-hidden="true" />}
-              Buscar os que faltam
+              {!(missing.isPending || searching) && <Radar aria-hidden="true" />}
+              {searching && (progress.data?.total ?? 0) > 0
+                ? `Buscando ${progress.data?.buscados} de ${progress.data?.total}`
+                : 'Buscar os que faltam'}
             </Button>
             <Button variant="primary" onClick={() => setAdding(true)}>
               <Plus aria-hidden="true" />

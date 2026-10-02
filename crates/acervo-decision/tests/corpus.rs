@@ -151,17 +151,6 @@ fn target(movie: &Value, profiles: &BTreeMap<i64, Profile>, library: &Value) -> 
                 quality: quality_model(&q["quality"]),
             })
             .collect(),
-        free_space: library["raiz"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|root| {
-                movie["path"]
-                    .as_str()
-                    .zip(root["path"].as_str())
-                    .is_some_and(|(path, root)| path.starts_with(root))
-            })
-            .and_then(|root| root["freeSpace"].as_u64()),
     }
 }
 
@@ -216,7 +205,7 @@ fn release(value: &Value) -> Release {
 /// Motivo da referência a partir da mensagem. `None` para os que dependem do
 /// estado do gerenciador (fila, histórico, bloqueio), que o motor não vê.
 fn reference_reason(message: &str) -> Option<&'static str> {
-    const TABLE: [(&str, &str); 30] = [
+    const TABLE: [(&str, &str); 28] = [
         (
             "Quality for release in queue already meets cutoff",
             "QueueCutoffMet",
@@ -238,11 +227,6 @@ fn reference_reason(message: &str) -> Option<&'static str> {
             "Release in queue and Quality Profile",
             "QueueUpgradesNotAllowed",
         ),
-        (
-            "Importing after download will exceed available disk space",
-            "MinimumFreeSpace",
-        ),
-        ("Not enough free space", "MinimumFreeSpace"),
         ("Unknown Movie", "UnknownMovie"),
         ("Unable to parse", "UnableToParse"),
         ("Wrong movie", "WrongMovie"),
@@ -340,12 +324,6 @@ fn corpus() {
             _ => Propers::PreferAndUpgrade,
         },
         prefer_indexer_flags: config["preferIndexerFlags"].as_bool().unwrap_or(false),
-        minimum_free_space_mb: library_json["midia"]["minimumFreeSpaceWhenImporting"]
-            .as_u64()
-            .unwrap_or(100),
-        skip_free_space_check: library_json["midia"]["skipFreeSpaceCheckWhenImporting"]
-            .as_bool()
-            .unwrap_or(false),
     };
     let indexers: Vec<Indexer> = corpus["indexadores"]
         .as_array()

@@ -67,6 +67,9 @@ export function RulesSection({ view }: { view: RulesView }) {
     onError: (error: Error) => toast.error(error.message),
     onSettled: () => void queryClient.invalidateQueries({ queryKey: ['regras'] }),
   })
+  // Na tela a folga é em GB; no banco, em MB. O texto fica à parte para não brigar com a digitação.
+  const [reserve, setReserve] = useState(String(view.regras.folga_minima_mb / 1024))
+  useEffect(() => setReserve(String(view.regras.folga_minima_mb / 1024)), [view.regras.folga_minima_mb])
   const set = <K extends keyof DecisionRules>(key: K, value: DecisionRules[K]) =>
     setRules((current) => ({ ...current, [key]: value }))
   const indexers = Array.from(new Set([...view.indexadores, ...Object.keys(rules.indexadores)])).sort()
@@ -179,6 +182,35 @@ export function RulesSection({ view }: { view: RulesView }) {
               onChange={(on) => set('atraso', { ...rules.atraso, pular_se_melhor_qualidade: on })}
             />
           </div>
+        </fieldset>
+
+        <fieldset className="grid gap-4 sm:grid-cols-2">
+          <legend className="mb-2 text-sm font-semibold">Disco</legend>
+          <Field
+            id="folga"
+            label="Espaço livre reservado"
+            help="A fila de downloads não inicia torrent que deixaria o disco com menos que isso."
+          >
+            <div className="flex items-center gap-2">
+              <Input
+                id="folga"
+                type="number"
+                min={0}
+                step={0.5}
+                value={reserve}
+                onChange={(e) => {
+                  setReserve(e.target.value)
+                  const gb = Number(e.target.value)
+                  if (e.target.value.trim() !== '' && Number.isFinite(gb) && gb >= 0) {
+                    set('folga_minima_mb', Math.round(gb * 1024))
+                  }
+                }}
+                aria-describedby="folga-ajuda"
+                className="max-w-32"
+              />
+              <span className="text-sm text-content-muted">GB</span>
+            </div>
+          </Field>
         </fieldset>
 
         {indexers.length > 0 && (

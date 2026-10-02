@@ -52,7 +52,6 @@ pub struct DecisionRules {
     pub preferir_flags_do_indexador: bool,
     /// Folga que a fila de downloads deixa sempre livre no disco do cliente.
     pub folga_minima_mb: u64,
-    pub pular_checagem_de_espaco: bool,
     /// Dias depois da data de disponibilidade.
     pub carencia_dias: i64,
     /// Pelo nome do indexador.
@@ -69,7 +68,6 @@ impl Default for DecisionRules {
             propers: "preferir_e_atualizar".into(),
             preferir_flags_do_indexador: false,
             folga_minima_mb: 100,
-            pular_checagem_de_espaco: false,
             carencia_dias: 0,
             indexadores: BTreeMap::new(),
             atraso: DelayRules::default(),
@@ -106,8 +104,6 @@ impl DecisionRules {
                 _ => Propers::PreferAndUpgrade,
             },
             prefer_indexer_flags: self.preferir_flags_do_indexador,
-            minimum_free_space_mb: self.folga_minima_mb,
-            skip_free_space_check: self.pular_checagem_de_espaco,
         }
     }
 
@@ -149,4 +145,18 @@ pub async fn save(store: &Store, rules: &DecisionRules) -> Result<()> {
         .set_setting(RULES_KEY, Some(&text), &now_rfc3339())
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn regras_gravadas_com_campo_aposentado_ainda_leem() {
+        // `pular_checagem_de_espaco` existia nas regras antigas.
+        let rules =
+            DecisionRules::parse(r#"{"folga_minima_mb": 2048, "pular_checagem_de_espaco": true}"#)
+                .expect("lê");
+        assert_eq!(rules.folga_minima_mb, 2048);
+    }
 }

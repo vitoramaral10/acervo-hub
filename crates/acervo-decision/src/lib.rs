@@ -46,9 +46,6 @@ pub struct Settings {
     pub whitelisted_hardcoded_subs: String,
     pub propers: Propers,
     pub prefer_indexer_flags: bool,
-    /// Folga que precisa sobrar no disco depois do download, em megabytes.
-    pub minimum_free_space_mb: u64,
-    pub skip_free_space_check: bool,
 }
 
 impl Default for Settings {
@@ -60,8 +57,6 @@ impl Default for Settings {
             whitelisted_hardcoded_subs: String::new(),
             propers: Propers::PreferAndUpgrade,
             prefer_indexer_flags: false,
-            minimum_free_space_mb: 100,
-            skip_free_space_check: false,
         }
     }
 }
@@ -227,8 +222,6 @@ pub struct Target {
     pub file: Option<ExistingFile>,
     /// Cada download deste filme já na fila.
     pub queued: Vec<Queued>,
-    /// Espaço livre onde o filme mora, em bytes; `None` pula a verificação.
-    pub free_space: Option<u64>,
 }
 
 /// Um indexador, com o que pesa na decisão.
@@ -311,9 +304,6 @@ pub enum Rejection {
     QueueHigherRevision,
     QueueUpgradesNotAllowed,
     QueuePropersDisabled,
-    MinimumFreeSpace {
-        remaining: i64,
-    },
     Blocklisted,
     /// Esperando o atraso do perfil de espera.
     Delayed {
@@ -356,7 +346,6 @@ impl Rejection {
             Self::QueueHigherRevision => "QueueHigherRevision",
             Self::QueueUpgradesNotAllowed => "QueueUpgradesNotAllowed",
             Self::QueuePropersDisabled => "QueuePropersDisabled",
-            Self::MinimumFreeSpace { .. } => "MinimumFreeSpace",
             Self::Blocklisted => "Blocklisted",
             Self::Delayed { .. } => "Delayed",
         }
@@ -415,12 +404,6 @@ impl std::fmt::Display for Rejection {
             }
             Self::QueueUpgradesNotAllowed => {
                 write!(f, "já há download na fila e o perfil não permite upgrade")
-            }
-            Self::MinimumFreeSpace { remaining } => {
-                write!(
-                    f,
-                    "sobrariam {remaining} bytes no disco, abaixo da folga mínima"
-                )
             }
             Self::Blocklisted => write!(f, "está na lista de bloqueio"),
             Self::Delayed { minutes } => {
@@ -643,7 +626,6 @@ mod tests {
             profile: profile(),
             file: None,
             queued: Vec::new(),
-            free_space: None,
         }
     }
 
@@ -786,15 +768,13 @@ mod tests {
     }
 
     #[test]
-    fn poucos_seeders_e_disco_cheio() {
-        let mut target = movie(1, "The Housemaid", "tt0000001");
-        target.free_space = Some(1_000_000_000);
+    fn poucos_seeders_barra_so_o_release_fraco() {
+        let target = movie(1, "The Housemaid", "tt0000001");
         let mut few = release("The Housemaid 2025 1080p WEB-DL");
         few.seeders = Some(0);
         let decisions = decide(&[target], &[few, release("The Housemaid 2025 720p WEB-DL")]);
         let by = |i: usize| decisions.iter().find(|d| d.release == i).unwrap();
-        // Espaço livre só é olhado quando o resto aprovou.
         assert_eq!(reasons(by(0)), ["MinimumSeeders"]);
-        assert_eq!(reasons(by(1)), ["MinimumFreeSpace"]);
+        assert!(by(1).approved());
     }
 }

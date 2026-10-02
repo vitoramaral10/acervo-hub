@@ -91,8 +91,8 @@ import_interval_minutes = 5
 # Pastas raiz dos filmes, como os gerenciadores as veem: a API v3 as oferece
 # aos apps de pedidos, com o espaço livre de cada uma.
 root_folders = ["/media/movies"]
-# Com a busca automática ligada (Configurações, na interface), de quanto em
-# quanto tempo ler os releases recentes de todos os indexadores.
+# De quanto em quanto tempo ler os releases recentes de todos os indexadores
+# e pegar o que serve à biblioteca.
 rss_interval_minutes = 30
 # Todo torrent entra parado, com a tag `acervo:fila`; o acervo liga a
 # pré-alocação no qBittorrent e inicia da fila, do menor para o maior, os que
@@ -120,8 +120,8 @@ public_url = "http://acervo-hub-indexadores:9797"
 # executor ainda não roda aparecem com o motivo.
 catalogs = ["/etc/acervo-hub/definicoes", "/etc/acervo-hub/catalogo"]
 # Busca dos filmes que faltam: a cada tantos minutos, busca `search_limit`
-# filmes sem arquivo (os há mais tempo sem busca primeiro). Com a busca
-# automática ligada na tela, pega o escolhido; desligada, só registra. Roda
+# filmes sem arquivo (os há mais tempo sem busca primeiro) e pega o escolhido.
+# O botão "Buscar os que faltam" da tela busca todos de uma vez. Roda
 # aqui, e não num processo à parte, para dividir com o gerenciador de séries a
 # sessão e as consultas guardadas (cada tracker vê uma requisição por consulta).
 # search_interval_minutes = 120
