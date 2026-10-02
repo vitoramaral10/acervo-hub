@@ -17,16 +17,6 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// As seções, na ordem da tela.
-pub const SECTIONS: [&str; 7] = [
-    SERVIDOR,
-    QBITTORRENT,
-    JELLYFIN,
-    GERENCIADORES,
-    BIBLIOTECA,
-    LIMPEZA,
-    TAREFAS,
-];
 pub const SERVIDOR: &str = "servidor";
 pub const QBITTORRENT: &str = "qbittorrent";
 pub const JELLYFIN: &str = "jellyfin";
@@ -628,7 +618,15 @@ mod tests {
     fn ida_e_volta_de_cada_secao() {
         let config = valid();
         let mut back = Config::default();
-        for name in SECTIONS {
+        for name in [
+            SERVIDOR,
+            QBITTORRENT,
+            JELLYFIN,
+            GERENCIADORES,
+            BIBLIOTECA,
+            LIMPEZA,
+            TAREFAS,
+        ] {
             back = back
                 .with_section(name, config.section(name).unwrap())
                 .unwrap();

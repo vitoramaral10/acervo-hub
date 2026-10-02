@@ -91,13 +91,6 @@ decisão, Notificações, TMDB e Servidor (onde se gera a chave de API). Os gere
 (Sonarr, Radarr) se cadastram em **Aplicativos**; os intervalos das tarefas, na própria tela
 **Tarefas**. Sem chave de API definida, o Torznab recusa tudo.
 
-**Vindo do `config.toml`?** Uma vez só, aponte `ACERVO_IMPORT_CONFIG` para o arquivo antigo
-e suba o `serve`: com o banco ainda sem configuração, ele lê o arquivo e os arquivos de
-`[state]` (credenciais, indexadores adicionados/desativados/removidos e strikes) e grava tudo
-numa transação, logando quantas seções, indexadores e strikes entraram. Com o banco já
-configurado, a variável é ignorada — tire-a do ambiente depois. `[database]` e
-`server.bind` do arquivo são ignorados: vêm das variáveis acima.
-
 ### Interface web
 
 `serve` também serve uma interface em `/`, com o que se fazia pela tela do agregador atual:

@@ -123,12 +123,8 @@ const ORIGIN: &str = "cadastro";
 ///
 /// # Errors
 ///
-/// Importação pedida que falha, configuração ilegível no banco ou endereço
-/// ocupado.
+/// Configuração ilegível no banco ou endereço ocupado.
 pub async fn run(store: Store, bind: &str) -> Result<()> {
-    // A importação do arquivo antigo, se pedida, vem antes de ler a
-    // configuração: é ela que preenche o banco vazio.
-    crate::import_config::run(&store).await?;
     let settings = Arc::new(Settings::load(store.clone()).await?);
     let records = store.indexers().await.context("lendo os indexadores")?;
     let catalog = Catalog::new(entries(&settings.get(), &records).await)?;

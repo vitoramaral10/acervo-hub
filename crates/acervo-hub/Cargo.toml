@@ -32,7 +32,6 @@ fancy-regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "signal", "process", "sync", "time"] }
-toml.workspace = true
 tracing.workspace = true
 time = { workspace = true, features = ["formatting", "macros"] }
 tracing-subscriber.workspace = true

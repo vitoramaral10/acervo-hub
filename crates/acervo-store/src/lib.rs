@@ -13,7 +13,7 @@ use serde::Serialize;
 use tokio_postgres::{NoTls, Row};
 
 pub use accounts::SESSION_DAYS;
-pub use config::{Imported, IndexerRecord};
+pub use config::IndexerRecord;
 pub use manage::{Blocked, HistoryEvent, HistoryPage, NewHistory};
 pub use tasks::{NewTaskRun, TaskRun};
 

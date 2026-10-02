@@ -41,20 +41,11 @@ services:
       # Padrão `0.0.0.0:9797`: dentro do container, `127.0.0.1` não seria
       # alcançável pelos vizinhos.
       # ACERVO_BIND: 0.0.0.0:9797
-      #
-      # Migração, uma vez só: com o banco ainda sem configuração, o serviço
-      # importa o `config.toml` antigo e os arquivos de `[state]` que ele
-      # aponta. Monte os dois (somente leitura, nos mesmos caminhos do
-      # arquivo) e, depois da primeira subida, tire a variável e as montagens.
-      # ACERVO_IMPORT_CONFIG: /etc/acervo-hub/config.toml
 
     volumes:
       # Definições Cardigann, se houver: o diretório vai em Configurações →
       # Servidor → "Diretórios de definições".
       - ./definicoes:/etc/acervo-hub/definicoes:ro
-      # Só durante a migração (veja ACERVO_IMPORT_CONFIG):
-      # - ./config.toml:/etc/acervo-hub/config.toml:ro
-      # - ./state:/var/lib/acervo-hub:ro
 
     command: ["serve"]
 

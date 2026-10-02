@@ -43,14 +43,6 @@ impl std::fmt::Debug for IndexerRecord {
     }
 }
 
-/// O que uma importação gravou.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Imported {
-    pub sections: usize,
-    pub indexers: usize,
-    pub strikes: usize,
-}
-
 fn settings_value(settings: &BTreeMap<String, String>) -> Value {
     Value::Object(
         settings
@@ -250,75 +242,6 @@ impl Store {
         tx.commit().await?;
         Ok(())
     }
-
-    /// Grava de uma vez a configuração importada, se ainda não há nenhuma
-    /// seção no banco. `None` quando já havia — aí nada é gravado.
-    ///
-    /// Indexador ou strike que já exista com o mesmo nome fica como está.
-    ///
-    /// # Errors
-    ///
-    /// Falha de escrita; nesse caso nada fica gravado.
-    pub async fn import_config(
-        &self,
-        sections: &[(String, Value)],
-        indexers: &[IndexerRecord],
-        strikes: &[(String, u32)],
-        at: &str,
-    ) -> Result<Option<Imported>> {
-        let mut client = self.pool.get().await?;
-        let tx = client.transaction().await?;
-        // Dois processos subindo juntos não importam duas vezes.
-        tx.batch_execute("LOCK TABLE config_sections IN EXCLUSIVE MODE")
-            .await?;
-        if tx
-            .query_opt("SELECT 1 FROM config_sections LIMIT 1", &[])
-            .await?
-            .is_some()
-        {
-            return Ok(None);
-        }
-        let mut imported = Imported::default();
-        for (name, value) in sections {
-            tx.execute(
-                "INSERT INTO config_sections (name, value, updated_at) VALUES ($1, $2, $3)",
-                &[name, value, &at],
-            )
-            .await?;
-            imported.sections += 1;
-        }
-        for record in indexers {
-            imported.indexers += usize::try_from(
-                tx.execute(
-                    INSERT_INDEXER,
-                    &[
-                        &record.name,
-                        &record.kind,
-                        &record.definition,
-                        &record.url,
-                        &settings_value(&record.settings),
-                        &record.enabled,
-                        &record.added_at,
-                    ],
-                )
-                .await?,
-            )
-            .unwrap_or(0);
-        }
-        for (key, value) in strikes.iter().filter(|(_, value)| *value > 0) {
-            imported.strikes += usize::try_from(
-                tx.execute(
-                    "INSERT INTO strikes (key, count) VALUES ($1, $2)
-                     ON CONFLICT (key) DO NOTHING",
-                    &[key, &count(*value)],
-                )
-                .await?,
-            )
-            .unwrap_or(0);
-        }
-        tx.commit().await?;
-        Ok(Some(imported))
-    }
 }
 
 #[cfg(test)]
@@ -377,34 +300,6 @@ mod tests {
             .unwrap();
         store.replace_strikes(&[("b".into(), 3)]).await.unwrap();
         assert_eq!(store.strikes().await.unwrap(), [("b".to_owned(), 3)]);
-        db.drop().await;
-    }
-
-    #[tokio::test]
-    async fn importacao_so_grava_com_a_tabela_vazia() {
-        let Some(db) = TestDb::new("importacao_store").await else {
-            return;
-        };
-        let store = &db.store;
-        let sections = [("tarefas".to_owned(), json!({}))];
-        let done = store
-            .import_config(&sections, &[record("um")], &[("k".into(), 2)], "t")
-            .await
-            .unwrap();
-        assert_eq!(
-            done,
-            Some(Imported {
-                sections: 1,
-                indexers: 1,
-                strikes: 1
-            })
-        );
-        let again = store
-            .import_config(&sections, &[record("dois")], &[], "t")
-            .await
-            .unwrap();
-        assert_eq!(again, None);
-        assert_eq!(store.indexers().await.unwrap().len(), 1);
         db.drop().await;
     }
 }
