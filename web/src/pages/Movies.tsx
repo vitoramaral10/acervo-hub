@@ -463,12 +463,26 @@ const CLEARED = {
 }
 
 const CHIP =
-  'inline-flex h-8 items-center gap-1 rounded-sm px-2.5 text-xs font-medium whitespace-nowrap text-content-muted transition-colors hover:text-content focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring'
+  'inline-flex h-7 items-center gap-1 rounded-sm px-2 text-xs font-medium whitespace-nowrap text-content-muted transition-colors hover:text-content focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring'
 
 /** Grupo de opções num contorno só; `single` vira radiogroup, o resto são botões de alternar. */
-function ChipGroup({ label, children, single = false }: { label: string; children: ReactNode; single?: boolean }) {
+function ChipGroup({
+  label,
+  children,
+  single = false,
+  nowrap = false,
+}: {
+  label: string
+  children: ReactNode
+  single?: boolean
+  nowrap?: boolean
+}) {
   return (
-    <div role={single ? 'radiogroup' : 'group'} aria-label={label} className="flex flex-wrap rounded-md border border-border p-0.5">
+    <div
+      role={single ? 'radiogroup' : 'group'}
+      aria-label={label}
+      className={cn('inline-flex rounded-md border border-border p-0.5', nowrap ? 'flex-nowrap' : 'flex-wrap')}
+    >
       {children}
     </div>
   )
@@ -478,16 +492,19 @@ function Chip({
   active,
   single = false,
   onClick,
+  title,
   children,
 }: {
   active: boolean
   single?: boolean
   onClick: () => void
+  title?: string
   children: ReactNode
 }) {
   return (
     <button
       type="button"
+      title={title}
       role={single ? 'radio' : undefined}
       aria-checked={single ? active : undefined}
       aria-pressed={single ? undefined : active}
@@ -516,113 +533,160 @@ function MovieToolbar({
   onChange: (change: Partial<MovieListPrefs>) => void
   stateTotals: Record<(typeof STATES)[number]['value'], number>
 }) {
-  const filtered = hasActiveFilters(prefs)
   const DirIcon = prefs.dir === 'asc' ? ArrowUp : ArrowDown
   return (
-    <div className="mb-6 flex flex-col gap-4">
-      <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-end">
-        <label className="sm:w-80">
+    <div className="mb-5 flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <label className="min-w-0 flex-1 basis-56 sm:max-w-xs">
           <span className="sr-only">Buscar na biblioteca</span>
           <Input
             type="search"
             value={query}
             onChange={(event) => onQuery(event.target.value)}
             placeholder="Buscar por título, ano ou IMDb"
+            className="h-8"
           />
         </label>
-        <div className="flex items-end gap-2 sm:ml-auto">
-          <div className="flex min-w-0 flex-1 flex-col gap-1.5 sm:w-52 sm:flex-none">
-            <Label htmlFor="filmes-ordem" className="text-xs text-content-muted">
-              Ordenar por
-            </Label>
-            <Select
-              value={prefs.sort}
-              onValueChange={(value) => onChange({ sort: value as SortKey, dir: defaultDir(value as SortKey) })}
-            >
-              <SelectTrigger id="filmes-ordem">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {SORTS.map(({ value, label }) => (
-                  <SelectItem key={value} value={value}>
-                    {label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
+        <div className="flex items-center gap-1.5 sm:ml-auto">
+          <Select
+            value={prefs.sort}
+            onValueChange={(value) => onChange({ sort: value as SortKey, dir: defaultDir(value as SortKey) })}
+          >
+            <SelectTrigger aria-label="Ordenar por" className="h-8 w-40">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {SORTS.map(({ value, label }) => (
+                <SelectItem key={value} value={value}>
+                  {label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
           <Button
             variant="secondary"
-            size="icon"
+            size="icon-sm"
             onClick={() => onChange({ dir: prefs.dir === 'asc' ? 'desc' : 'asc' })}
             aria-label={`Inverter a ordem (agora ${prefs.dir === 'asc' ? 'crescente' : 'decrescente'})`}
             title={prefs.dir === 'asc' ? 'Crescente' : 'Decrescente'}
           >
             <DirIcon aria-hidden="true" />
           </Button>
+          <FilterMenu prefs={prefs} onChange={onChange} />
           <ChipGroup label="Visualização" single>
-            <Chip single active={prefs.view === 'poster'} onClick={() => onChange({ view: 'poster' })}>
+            <Chip single active={prefs.view === 'poster'} onClick={() => onChange({ view: 'poster' })} title="Pôster">
               <LayoutGrid className="size-4" aria-hidden="true" />
-              Pôster
+              <span className="sr-only">Pôster</span>
             </Chip>
-            <Chip single active={prefs.view === 'tabela'} onClick={() => onChange({ view: 'tabela' })}>
+            <Chip single active={prefs.view === 'tabela'} onClick={() => onChange({ view: 'tabela' })} title="Tabela">
               <Table2 className="size-4" aria-hidden="true" />
-              Tabela
+              <span className="sr-only">Tabela</span>
             </Chip>
           </ChipGroup>
         </div>
       </div>
-
-      <div className="flex flex-col gap-3">
-        <ChipGroup label="Estado" single>
+      <div className="-mx-1 overflow-x-auto px-1">
+        <ChipGroup label="Estado" single nowrap>
           {STATES.filter((s) => s.value !== 'problemas' || stateTotals.problemas > 0 || prefs.state === 'problemas').map(
             ({ value, label }) => (
               <Chip key={value} single active={prefs.state === value} onClick={() => onChange({ state: value })}>
                 {label}
                 <span className={cn('tabular-nums', value === 'problemas' && stateTotals[value] > 0 ? 'text-danger' : 'text-content-subtle')}>
-                  ({formatCount(stateTotals[value])})
+                  {formatCount(stateTotals[value])}
                 </span>
               </Chip>
             ),
           )}
         </ChipGroup>
-        <div className="flex flex-wrap items-center gap-3">
-          <ChipGroup label="Qualidade">
+      </div>
+    </div>
+  )
+}
+
+/** Qualidade, áudio e monitoramento num painel só, aberto por um botão: os
+ * filtros menos usados não ocupam linha na tela. */
+function FilterMenu({
+  prefs,
+  onChange,
+}: {
+  prefs: MovieListPrefs
+  onChange: (change: Partial<MovieListPrefs>) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const root = useRef<HTMLDivElement>(null)
+  const active = prefs.qualities.length + prefs.audio.length + (prefs.monitored === 'todos' ? 0 : 1)
+  useEffect(() => {
+    if (!open) return
+    const outside = (event: PointerEvent) => {
+      if (root.current && !root.current.contains(event.target as Node)) setOpen(false)
+    }
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('pointerdown', outside)
+    document.addEventListener('keydown', escape)
+    return () => {
+      document.removeEventListener('pointerdown', outside)
+      document.removeEventListener('keydown', escape)
+    }
+  }, [open])
+  return (
+    <div ref={root} className="relative">
+      <Button
+        variant="secondary"
+        size="sm"
+        aria-expanded={open}
+        aria-controls="filmes-filtros"
+        onClick={() => setOpen((value) => !value)}
+      >
+        <ListFilter aria-hidden="true" />
+        Filtros
+        {active > 0 && <span className="rounded-full bg-accent px-1.5 text-xs text-accent-fg tabular-nums">{active}</span>}
+      </Button>
+      {open && (
+        <div
+          id="filmes-filtros"
+          className="absolute right-0 z-20 mt-1 flex w-72 flex-col gap-3 rounded-md border border-border bg-surface-raised p-3 shadow-lg"
+        >
+          <FilterRow label="Qualidade">
             {QUALITIES.map(({ value, label }) => (
-              <Chip
-                key={value}
-                active={prefs.qualities.includes(value)}
-                onClick={() => onChange({ qualities: toggle(prefs.qualities, value) })}
-              >
+              <Chip key={value} active={prefs.qualities.includes(value)} onClick={() => onChange({ qualities: toggle(prefs.qualities, value) })}>
                 {label}
               </Chip>
             ))}
-          </ChipGroup>
-          <ChipGroup label="Áudio">
+          </FilterRow>
+          <FilterRow label="Áudio">
             {AUDIOS.map(({ value, label }) => (
-              <Chip
-                key={value}
-                active={prefs.audio.includes(value)}
-                onClick={() => onChange({ audio: toggle(prefs.audio, value) })}
-              >
+              <Chip key={value} active={prefs.audio.includes(value)} onClick={() => onChange({ audio: toggle(prefs.audio, value) })}>
                 {label}
               </Chip>
             ))}
-          </ChipGroup>
-          <ChipGroup label="Monitoramento" single>
+          </FilterRow>
+          <FilterRow label="Monitoramento" single>
             {MONITORED.map(({ value, label }) => (
               <Chip key={value} single active={prefs.monitored === value} onClick={() => onChange({ monitored: value })}>
                 {label}
               </Chip>
             ))}
-          </ChipGroup>
-          {filtered && (
-            <Button variant="ghost" size="sm" onClick={() => onChange({ ...CLEARED })}>
+          </FilterRow>
+          {hasActiveFilters(prefs) && (
+            <Button variant="ghost" size="sm" className="self-start" onClick={() => onChange({ ...CLEARED })}>
               Limpar filtros
             </Button>
           )}
         </div>
-      </div>
+      )}
+    </div>
+  )
+}
+
+function FilterRow({ label, single = false, children }: { label: string; single?: boolean; children: ReactNode }) {
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-xs text-content-subtle">{label}</span>
+      <ChipGroup label={label} single={single}>
+        {children}
+      </ChipGroup>
     </div>
   )
 }
