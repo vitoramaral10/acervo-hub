@@ -1,12 +1,12 @@
 //! Um ciclo de limpeza completo, com relatório estruturado.
 //!
-//! A CLI imprime; a interface mostra o mesmo relatório. O caminho de código é
-//! um só nos dois modos — o modo só decide se o último passo acontece.
+//! A CLI imprime; no serviço, o relatório vira o detalhe da execução da
+//! tarefa `limpeza` no histórico.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
-use acervo_janitor::{Action, Mode, reconcile};
+use acervo_janitor::{Action, reconcile};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use time::OffsetDateTime;
@@ -18,7 +18,6 @@ use crate::{apply, collect, ledger, report};
 #[derive(Debug, Clone, Serialize)]
 pub struct CycleReport {
     pub quando: String,
-    pub modo: &'static str,
     pub instancias: Vec<InstanceLine>,
     pub torrents: usize,
     pub ilegiveis: Vec<Unreadable>,
@@ -70,11 +69,35 @@ impl CycleReport {
             u8::from(self.falharam.unwrap_or(0) > 0)
         }
     }
+
+    /// Uma linha para a lista de tarefas, e se o ciclo terminou bem. Ciclo
+    /// abortado conta como erro na tela: nada falhou, mas a leitura do mundo
+    /// não era confiável e alguém precisa olhar.
+    #[must_use]
+    pub fn summary(&self) -> (bool, String) {
+        if let Some(reason) = &self.abortado {
+            return (false, format!("abortado por trava: {reason}"));
+        }
+        if self.acoes.is_empty() {
+            return (true, "nada a limpar".into());
+        }
+        let actions = match self.acoes.len() {
+            1 => "1 ação".to_owned(),
+            n => format!("{n} ações"),
+        };
+        let failed = self.falharam.unwrap_or(0);
+        let line = if failed > 0 {
+            format!("{actions}, {} liberados, {failed} falharam", self.espaco)
+        } else {
+            format!("{actions}, {} liberados", self.espaco)
+        };
+        (failed == 0, line)
+    }
 }
 
 impl CycleReport {
     /// O que foi lido, antes de qualquer decisão.
-    fn header(inventory: &acervo_core::Inventory, mode: Mode) -> Self {
+    fn header(inventory: &acervo_core::Inventory) -> Self {
         let mut instancias: Vec<InstanceLine> = inventory
             .snapshots
             .iter()
@@ -100,11 +123,6 @@ impl CycleReport {
             quando: OffsetDateTime::now_utc()
                 .format(&Rfc3339)
                 .unwrap_or_default(),
-            modo: if mode == Mode::DryRun {
-                "simulacao"
-            } else {
-                "aplicado"
-            },
             instancias,
             torrents: inventory.downloads.len(),
             ilegiveis: inventory
@@ -164,25 +182,26 @@ fn action_line(action: &Action) -> ActionLine {
     }
 }
 
-/// Roda um ciclo. `print` imprime o relato como a CLI sempre fez.
+/// Roda um ciclo e aplica o plano. `print` imprime o relato como a CLI
+/// sempre fez.
 ///
 /// # Errors
 ///
 /// Configuração do ciclo incompleta, cliente de download fora do ar ou falha
 /// ao gravar os strikes.
-pub async fn run(config: &Config, mode: Mode, print: bool) -> Result<CycleReport> {
+pub async fn run(config: &Config, print: bool) -> Result<CycleReport> {
     let session = collect::collect(config).await?;
     if print {
         report::inventory(&session.inventory);
     }
-    let mut result = CycleReport::header(&session.inventory, mode);
+    let mut result = CycleReport::header(&session.inventory);
     let inventory = &session.inventory;
 
     let ledger_path = config::expand_tilde(&config.state.ledger);
     let mut strikes = ledger::load(&ledger_path)?;
     let plan = match reconcile(
         inventory,
-        &config.policy.to_policy(mode),
+        &config.policy.to_policy(),
         &mut strikes,
         SystemTime::now(),
     ) {
@@ -213,15 +232,6 @@ pub async fn run(config: &Config, mode: Mode, print: bool) -> Result<CycleReport
         .map(|(motivo, quantos)| SkippedLine { motivo, quantos })
         .collect();
 
-    if mode == Mode::DryRun {
-        // Simulação não avança strike: se avançasse, repetir a simulação
-        // levaria o item ao limite sem ninguém ter decidido nada.
-        if print {
-            println!("Simulação: strikes não foram gravados.");
-        }
-        return Ok(result);
-    }
-
     ledger::save(&ledger_path, &strikes)
         .with_context(|| format!("gravando os strikes em `{}`", ledger_path.display()))?;
     let outcome = apply::execute(&session, &plan).await;
@@ -234,16 +244,4 @@ pub async fn run(config: &Config, mode: Mode, print: bool) -> Result<CycleReport
     result.executadas = Some(outcome.done);
     result.falharam = Some(outcome.failed);
     Ok(result)
-}
-
-/// Grava o relatório como o "último ciclo" que a interface mostra. Falha aqui
-/// não derruba o ciclo: o trabalho já foi feito, só o relato ficou sem cópia.
-pub fn record(config: &Config, report: &CycleReport) {
-    let path = config.state.last_cycle();
-    let written = serde_json::to_string_pretty(report)
-        .map_err(anyhow::Error::from)
-        .and_then(|text| crate::credentials::write_atomic(&path, &text));
-    if let Err(error) = written {
-        tracing::warn!(path = %path.display(), "relatório do ciclo não gravado: {error:#}");
-    }
 }

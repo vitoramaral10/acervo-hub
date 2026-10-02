@@ -119,7 +119,6 @@ export interface Apps {
 
 export interface CycleReport {
   quando: string
-  modo: 'simulacao' | 'aplicado'
   instancias: { nome: string; fila: number | null; obras: number | null; erro: string | null }[]
   torrents: number
   ilegiveis: { nome: string; motivo: string }[]
@@ -130,6 +129,36 @@ export interface CycleReport {
   pulados: { motivo: string; quantos: number }[]
   executadas: number | null
   falharam: number | null
+}
+
+/** Como uma execução de tarefa terminou. */
+export interface TaskLastRun {
+  inicio: string
+  fim: string
+  duracao_ms: number
+  ok: boolean
+  resumo: string
+}
+
+/** Uma tarefa de fundo do serviço; `intervalo_minutos` 0 é desligada no agendamento. */
+export interface Task {
+  id: string
+  nome: string
+  intervalo_minutos: number
+  rodando: boolean
+  iniciada_em: string | null
+  /** Quanto falta, como "3 de 10", quando a tarefa sabe dizer. */
+  andamento: string | null
+  proxima: string | null
+  ultima: TaskLastRun | null
+}
+
+/** Uma execução no histórico; `detalhe` é o relatório dela (na limpeza, um `CycleReport`). */
+export interface TaskRun extends TaskLastRun {
+  id: number
+  tarefa: string
+  nome: string
+  detalhe: unknown
 }
 
 export interface MovieFile {
@@ -233,8 +262,10 @@ export const api = {
     request<{ ok: boolean }>('PUT', `/ui/api/indexadores/${encodeURIComponent(name)}/ativo`, { ativo }),
   apps: () => request<{ aplicativos: Apps }>('GET', '/ui/api/aplicativos'),
   sync: (aplicar: boolean) => request<SyncReport>('POST', '/ui/api/aplicativos/sincronizar', { aplicar }),
-  lastCycle: () => request<{ ultimo: CycleReport | null }>('GET', '/ui/api/limpeza'),
-  simulateCycle: () => request<CycleReport>('POST', '/ui/api/limpeza/simular'),
+  tasks: () => request<{ tarefas: Task[] }>('GET', '/ui/api/tarefas'),
+  taskHistory: () => request<{ historico: TaskRun[] }>('GET', '/ui/api/tarefas/historico'),
+  runTask: (id: string) =>
+    request<{ iniciada: boolean; tarefa: Task | null }>('POST', `/ui/api/tarefas/${encodeURIComponent(id)}/rodar`),
   movies: () => request<{ filmes: Movie[] }>('GET', '/ui/api/filmes'),
   searchMissing: () => request<MissingSearch>('POST', '/ui/api/filmes/buscar'),
   missingSearch: () => request<MissingSearch>('GET', '/ui/api/filmes/buscar'),

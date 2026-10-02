@@ -1,14 +1,11 @@
 //! O plano de um ciclo: o que fazer, o que pular, e por quê.
 //!
 //! Nada aqui executa. O planejador devolve uma descrição; quem aplica é o
-//! adaptador. Isso é o que permite `DryRun` ser o mesmo código do caminho real
-//! em vez de um ramo paralelo que diverge com o tempo.
+//! adaptador. Isso é o que permite testar a decisão sem tocar em nada.
 
 use std::fmt;
 
 use acervo_core::{Allocated, DownloadHash, InstanceName, QueueItemId};
-
-use crate::policy::Mode;
 
 /// Uma ação a executar.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,7 +135,6 @@ impl std::error::Error for Abort {}
 /// O resultado de um ciclo bem-sucedido.
 #[derive(Debug, Clone)]
 pub struct Plan {
-    pub mode: Mode,
     pub actions: Vec<Action>,
     pub skipped: Vec<Skipped>,
     /// Espaço que as ações liberam. Conta só arquivo sem outro link.

@@ -34,7 +34,7 @@ const SCRIPT: &str = include_str!("ui/dist/app.js");
 const ICON: &str = include_str!("ui/dist/icone.svg");
 
 /// O que a interface administra e só o binário sabe fazer: a configuração,
-/// o catálogo de definições, os gerenciadores e o ciclo de limpeza.
+/// o catálogo de definições, os gerenciadores e as tarefas de fundo.
 ///
 /// Mensagens de erro vão para a tela e não podem conter valor de setting.
 #[async_trait]
@@ -108,15 +108,21 @@ pub trait Admin: Send + Sync + std::fmt::Debug {
         apply: bool,
     ) -> Result<serde_json::Value, String>;
 
-    /// Resultado do último ciclo de limpeza, se houver.
-    fn last_cycle(&self) -> Option<serde_json::Value>;
+    /// As tarefas de fundo do serviço — busca, RSS, importação, metadados,
+    /// limpeza —, com intervalo, última e próxima execução de cada uma.
+    fn tasks(&self) -> serde_json::Value;
 
-    /// Roda o ciclo de limpeza em simulação, agora.
+    /// As últimas execuções das tarefas, da mais nova para a mais velha, com
+    /// o detalhe de cada uma.
     ///
     /// # Errors
     ///
-    /// Configuração do ciclo ausente ou falha de leitura.
-    async fn simulate_cycle(&self) -> Result<serde_json::Value, String>;
+    /// Banco inalcançável.
+    async fn task_history(&self) -> Result<serde_json::Value, String>;
+
+    /// "Rodar agora": dispara a tarefa e responde na hora. Com ela já
+    /// rodando, não dispara outra. `None` se a tarefa não existe.
+    fn run_task(&self, id: &str) -> Option<serde_json::Value>;
 
     /// O catálogo de filmes, com o estado de cada arquivo no disco.
     ///
@@ -266,8 +272,9 @@ pub(crate) fn routes() -> Router<Arc<Server>> {
         )
         .route("/ui/api/aplicativos", get(apps))
         .route("/ui/api/aplicativos/sincronizar", post(sync))
-        .route("/ui/api/limpeza", get(last_cycle))
-        .route("/ui/api/limpeza/simular", post(simulate_cycle))
+        .route("/ui/api/tarefas", get(tasks))
+        .route("/ui/api/tarefas/historico", get(task_history))
+        .route("/ui/api/tarefas/{id}/rodar", post(run_task))
         .route("/ui/api/filmes", get(movies))
         .route(
             "/ui/api/filmes/buscar",
@@ -709,24 +716,33 @@ async fn sync(
     Ok(ok(report))
 }
 
-async fn last_cycle(
+async fn tasks(State(server): State<Arc<Server>>, headers: HeaderMap) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::GET).await?;
+    Ok(ok(json!({ "tarefas": admin(&server)?.tasks() })))
+}
+
+async fn task_history(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::GET).await?;
-    Ok(ok(json!({ "ultimo": admin(&server)?.last_cycle() })))
+    let history = admin(&server)?
+        .task_history()
+        .await
+        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    Ok(ok(json!({ "historico": history })))
 }
 
-async fn simulate_cycle(
+async fn run_task(
     State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::POST).await?;
-    let report = admin(&server)?
-        .simulate_cycle()
-        .await
-        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
-    Ok(ok(report))
+    let started = admin(&server)?
+        .run_task(&id)
+        .ok_or_else(|| UiError(StatusCode::NOT_FOUND, "tarefa desconhecida".into()))?;
+    Ok(ok(started))
 }
 
 async fn movies(

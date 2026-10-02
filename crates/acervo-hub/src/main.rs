@@ -1,9 +1,9 @@
 //! Binário do `acervo-hub`.
 //!
-//! Um ciclo é sempre a mesma sequência: ler o mundo, planejar, relatar e — só
-//! com `apply` — executar. O modo não muda o caminho de código, só o que
-//! acontece no último passo. `serve` é o outro modo de vida do binário: um
-//! processo longo que responde buscas Torznab.
+//! `serve` é o modo de vida principal: um processo longo que responde buscas
+//! Torznab, serve a interface e roda as tarefas de fundo — a limpeza entre
+//! elas. `apply` roda um ciclo de limpeza à mão: ler o mundo, planejar,
+//! relatar e executar.
 
 // O filme da API v3 é um `json!` de ~50 campos, um nível de macro por campo.
 #![recursion_limit = "256"]
@@ -11,7 +11,6 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use acervo_janitor::Mode;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -38,6 +37,7 @@ mod rules;
 mod search;
 mod serve;
 mod sync;
+mod tasks;
 mod web;
 
 #[derive(Debug, Parser)]
@@ -57,9 +57,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Lê, planeja e relata. Não altera nada.
-    Plan,
-    /// Lê, planeja, relata e executa.
+    /// Um ciclo de limpeza à mão: lê, planeja, relata e executa.
     Apply,
     /// Serve os indexadores configurados pela API Torznab.
     Serve,
@@ -360,48 +358,30 @@ async fn main() -> ExitCode {
 async fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
     let config = config::Config::load(&config::expand_tilde(&cli.config))?;
-    let mode = match cli.command {
-        Command::Plan => Mode::DryRun,
-        Command::Apply => Mode::Apply,
+    let failed = match cli.command {
+        Command::Apply => {
+            let report = cycle::run(&config, true).await?;
+            return Ok(ExitCode::from(report.exit_code()));
+        }
         Command::Serve => {
             serve::run(config).await?;
-            return Ok(ExitCode::SUCCESS);
+            false
         }
         Command::Search {
             term,
             indexer,
             categories,
-        } => {
-            let failures = search::run(&config, &term, indexer.as_deref(), &categories).await?;
-            return Ok(if failures > 0 {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
-            });
-        }
+        } => search::run(&config, &term, indexer.as_deref(), &categories).await? > 0,
         Command::Users { action } => {
             users(&config, action).await?;
-            return Ok(ExitCode::SUCCESS);
+            false
         }
-        Command::Movies { action } => {
-            let failed = movies_command(&config, action).await?;
-            return Ok(if failed {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
-            });
-        }
-        Command::Sync { apply } => {
-            let failures = sync::run(&config, apply).await?;
-            return Ok(if failures > 0 {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
-            });
-        }
+        Command::Movies { action } => movies_command(&config, action).await?,
+        Command::Sync { apply } => sync::run(&config, apply).await? > 0,
     };
-
-    let report = cycle::run(&config, mode, true).await?;
-    cycle::record(&config, &report);
-    Ok(ExitCode::from(report.exit_code()))
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }

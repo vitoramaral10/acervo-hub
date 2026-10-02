@@ -2,9 +2,9 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Activity,
   Blocks,
-  Brush,
   Film,
   Library,
+  ListChecks,
   LogOut,
   Monitor,
   Moon,
@@ -21,16 +21,16 @@ import { type Theme, saveTheme, storedTheme } from '@/lib/theme'
 import { cn } from '@/lib/utils'
 import { ActivityPage } from '@/pages/Activity'
 import { AppsPage } from '@/pages/Apps'
-import { CleanupPage } from '@/pages/Cleanup'
 import { IndexersPage } from '@/pages/Indexers'
 import { LoginPage } from '@/pages/Login'
 import { MoviesPage } from '@/pages/Movies'
 import { SearchPage } from '@/pages/Search'
 import { SettingsPage } from '@/pages/Settings'
+import { TasksPage } from '@/pages/Tasks'
 
-type View = 'filmes' | 'atividade' | 'busca' | 'indexadores' | 'aplicativos' | 'limpeza' | 'configuracoes'
+type View = 'filmes' | 'atividade' | 'busca' | 'indexadores' | 'aplicativos' | 'tarefas' | 'configuracoes'
 
-const VIEWS: View[] = ['filmes', 'atividade', 'busca', 'indexadores', 'aplicativos', 'limpeza', 'configuracoes']
+const VIEWS: View[] = ['filmes', 'atividade', 'busca', 'indexadores', 'aplicativos', 'tarefas', 'configuracoes']
 
 function viewFromHash(): View {
   const hash = window.location.hash.slice(1) as View
@@ -43,7 +43,7 @@ const NAV: { view: View; label: string; icon: typeof Server }[] = [
   { view: 'busca', label: 'Busca', icon: Search },
   { view: 'indexadores', label: 'Indexadores', icon: Server },
   { view: 'aplicativos', label: 'Aplicativos', icon: Blocks },
-  { view: 'limpeza', label: 'Limpeza', icon: Brush },
+  { view: 'tarefas', label: 'Tarefas', icon: ListChecks },
   { view: 'configuracoes', label: 'Configurações', icon: SlidersHorizontal },
 ]
 
@@ -145,8 +145,8 @@ export function App() {
             <ActivityPage />
           ) : view === 'aplicativos' ? (
             <AppsPage />
-          ) : view === 'limpeza' ? (
-            <CleanupPage />
+          ) : view === 'tarefas' ? (
+            <TasksPage />
           ) : view === 'configuracoes' ? (
             <SettingsPage />
           ) : (

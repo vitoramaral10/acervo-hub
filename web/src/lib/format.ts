@@ -54,3 +54,23 @@ export function safeHref(value: string | null | undefined): string | undefined {
     return undefined
   }
 }
+
+/** "850 ms", "12 s", "3 min 20 s", "1 h 5 min". */
+export function formatDuration(ms: number | null | undefined): string {
+  if (ms == null) return '—'
+  if (ms < 1000) return `${integer.format(Math.round(ms))} ms`
+  const seconds = Math.round(ms / 1000)
+  if (seconds < 60) return `${seconds} s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return seconds % 60 ? `${minutes} min ${seconds % 60} s` : `${minutes} min`
+  const hours = Math.floor(minutes / 60)
+  return minutes % 60 ? `${hours} h ${minutes % 60} min` : `${hours} h`
+}
+
+/** Intervalo de agendamento: "a cada 5 min", "a cada 6 h"; zero é "só manual". */
+export function formatInterval(minutes: number): string {
+  if (minutes <= 0) return 'só manual'
+  if (minutes % 1440 === 0) return minutes === 1440 ? 'diária' : `a cada ${minutes / 1440} dias`
+  if (minutes % 60 === 0) return `a cada ${minutes / 60} h`
+  return `a cada ${minutes} min`
+}

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use acervo_arr::ArrKind;
 use acervo_core::Allocated;
-use acervo_janitor::{Guards, Mode, Policy};
+use acervo_janitor::{Guards, Policy};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
@@ -137,10 +137,18 @@ pub struct ServerConfig {
     /// Quantos filmes cada rodada busca.
     #[serde(default = "default_search_limit")]
     pub search_limit: usize,
+    /// De quantos em quantos minutos o serviço roda o ciclo de limpeza. Zero
+    /// desliga o agendamento; "rodar agora" na tela continua valendo.
+    #[serde(default = "default_cleanup_interval")]
+    pub cleanup_interval_minutes: u64,
 }
 
 fn default_search_limit() -> usize {
     5
+}
+
+fn default_cleanup_interval() -> u64 {
+    60
 }
 
 /// Um indexador servido. `kind` decide de onde vêm as capacidades: a
@@ -244,14 +252,6 @@ impl Default for StateConfig {
     }
 }
 
-impl StateConfig {
-    /// Resultado do último ciclo de limpeza, ao lado do ledger de strikes.
-    #[must_use]
-    pub fn last_cycle(&self) -> PathBuf {
-        expand_tilde(&self.ledger).with_file_name("ultimo-ciclo.json")
-    }
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
@@ -293,9 +293,8 @@ impl Default for PolicyConfig {
 
 impl PolicyConfig {
     #[must_use]
-    pub fn to_policy(&self, mode: Mode) -> Policy {
+    pub fn to_policy(&self) -> Policy {
         Policy {
-            mode,
             orphan_strikes: self.orphan_strikes,
             delete_private_orphans: self.delete_private_orphans,
             skip_orphan_if_missing_in_client: self.skip_orphan_if_missing_in_client,
@@ -588,6 +587,32 @@ mod tests {
     }
 
     #[test]
+    fn limpeza_roda_de_hora_em_hora_por_padrao() {
+        assert_eq!(
+            load(SERVIDOR)
+                .unwrap()
+                .server()
+                .unwrap()
+                .cleanup_interval_minutes,
+            60
+        );
+        let exemplo = include_str!("../../../config.example.toml");
+        let texto = exemplo.replace(
+            "cleanup_interval_minutes = 60",
+            "cleanup_interval_minutes = 0",
+        );
+        assert_ne!(texto, exemplo, "o exemplo documenta o intervalo da limpeza");
+        assert_eq!(
+            load(&texto)
+                .unwrap()
+                .server()
+                .unwrap()
+                .cleanup_interval_minutes,
+            0
+        );
+    }
+
+    #[test]
     fn sync_exige_endereco_publico_valido() {
         let exemplo = include_str!("../../../config.example.toml");
         let sem = exemplo.replace("public_url = \"http://acervo-hub-indexadores:9797\"\n", "");
@@ -624,7 +649,7 @@ mod tests {
     #[test]
     fn configuracao_minima_assume_padroes_conservadores() {
         let c = parse(MINIMA).unwrap();
-        let p = c.policy.to_policy(Mode::DryRun);
+        let p = c.policy.to_policy();
 
         assert_eq!(p.orphan_strikes, 3);
         assert!(!p.delete_private_orphans);
@@ -654,7 +679,7 @@ mod tests {
     #[test]
     fn carencia_zero_desliga_a_carencia() {
         let texto = MINIMA.to_string() + "\n[policy]\nprivate_seed_grace_hours = 0\n";
-        let p = parse(&texto).unwrap().policy.to_policy(Mode::Apply);
+        let p = parse(&texto).unwrap().policy.to_policy();
         assert!(p.private_seed_grace.is_none());
     }
 

@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use acervo_core::Inventory;
-use acervo_janitor::{Action, Mode, Plan};
+use acervo_janitor::{Action, Plan};
 
 /// Imprime o que foi lido, antes de qualquer decisão.
 pub fn inventory(inv: &Inventory) {
@@ -39,12 +39,7 @@ pub fn inventory(inv: &Inventory) {
 
 /// Imprime o plano.
 pub fn plan(plan: &Plan) {
-    let rotulo = if plan.mode == Mode::DryRun {
-        "Plano (simulação — nada será alterado)"
-    } else {
-        "Plano (será aplicado)"
-    };
-    println!("{rotulo}");
+    println!("Plano (será aplicado)");
 
     if plan.actions.is_empty() {
         println!("  nada a fazer");

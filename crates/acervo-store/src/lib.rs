@@ -8,6 +8,7 @@
 
 mod accounts;
 mod manage;
+mod tasks;
 
 use acervo_parser::{Quality, QualityModel, Revision};
 use deadpool_postgres::{GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod};
@@ -16,6 +17,7 @@ use tokio_postgres::{NoTls, Row};
 
 pub use accounts::SESSION_DAYS;
 pub use manage::{Blocked, HistoryEvent, HistoryPage, NewHistory};
+pub use tasks::{NewTaskRun, TaskRun};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -445,6 +447,20 @@ const MIGRATIONS: &[&str] = &[
     ALTER INDEX shadow_runs_pkey RENAME TO searches_pkey;
     ALTER INDEX shadow_runs_by_movie RENAME TO searches_by_movie;
     ALTER TABLE searches RENAME CONSTRAINT shadow_runs_movie_id_fkey TO searches_movie_id_fkey;
+",
+    // Histórico das tarefas de fundo do serviço. Grava-se no fim de cada
+    // execução; `detail` é o relatório dela, quando a tarefa tem um.
+    r"
+    CREATE TABLE task_runs (
+        id BIGSERIAL PRIMARY KEY,
+        task TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        finished_at TEXT NOT NULL,
+        ok BOOLEAN NOT NULL,
+        summary TEXT NOT NULL,
+        detail JSONB
+    );
+    CREATE INDEX task_runs_by_task ON task_runs(task, id);
 ",
 ];
 
@@ -1546,7 +1562,10 @@ mod tests {
             .unwrap();
         tokio::spawn(connection);
         // Banco parado na versão anterior à migração, com uma busca gravada.
-        let before = MIGRATIONS.len() - 1;
+        let before = MIGRATIONS
+            .iter()
+            .position(|m| m.contains("RENAME TO searches"))
+            .unwrap();
         let mut setup = format!(
             "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path = {schema};"
         );

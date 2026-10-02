@@ -20,7 +20,6 @@
 //! .expect("inventário vazio não dispara trava");
 //!
 //! assert!(plano.is_empty());
-//! assert!(plano.mode.is_dry_run());
 //! ```
 
 pub mod plan;
@@ -29,6 +28,6 @@ pub mod reconcile;
 pub mod strike;
 
 pub use plan::{Abort, Action, Plan, SkipReason, Skipped};
-pub use policy::{Guards, Mode, Policy};
+pub use policy::{Guards, Policy};
 pub use reconcile::reconcile;
 pub use strike::{StrikeKey, StrikeLedger};

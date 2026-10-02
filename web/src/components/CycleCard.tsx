@@ -1,70 +1,10 @@
-import { useMutation, useQuery } from '@tanstack/react-query'
-import { CircleAlert, Clock, FlaskConical, Sparkles } from 'lucide-react'
-import { toast } from 'sonner'
-import { PageHeader } from '@/components/PageHeader'
-import { Button } from '@/components/ui/button'
-import { Badge, Skeleton } from '@/components/ui/misc'
-import { type CycleReport, api } from '@/lib/api'
+import { CircleAlert, Sparkles } from 'lucide-react'
+import { Badge } from '@/components/ui/misc'
+import type { CycleReport } from '@/lib/api'
 import { formatAgo, formatCount } from '@/lib/format'
 
-export function CleanupPage() {
-  const last = useQuery({ queryKey: ['limpeza'], queryFn: api.lastCycle, refetchInterval: 60_000 })
-  const simulate = useMutation({
-    mutationFn: api.simulateCycle,
-    onError: (error: Error) => toast.error(error.message),
-  })
-
-  return (
-    <>
-      <PageHeader
-        title="Limpeza"
-        description="O ciclo roda de hora em hora: tira da fila o que o gerenciador esqueceu e apaga o seed que perdeu o hardlink com a biblioteca — só nas categorias dos gerenciadores, com carência para tracker privado."
-        action={
-          <Button onClick={() => simulate.mutate()} loading={simulate.isPending}>
-            {!simulate.isPending && <FlaskConical aria-hidden="true" />}
-            {simulate.isPending ? 'Simulando…' : 'Simular agora'}
-          </Button>
-        }
-      />
-
-      {simulate.data && (
-        <section className="mb-8" aria-labelledby="titulo-simulacao">
-          <h2 id="titulo-simulacao" className="mb-3 text-sm font-semibold text-content-muted">
-            Simulação de agora — nada foi alterado
-          </h2>
-          <CycleCard report={simulate.data} />
-        </section>
-      )}
-
-      <section aria-labelledby="titulo-ultimo">
-        <h2 id="titulo-ultimo" className="mb-3 text-sm font-semibold text-content-muted">
-          Último ciclo
-        </h2>
-        {last.isPending ? (
-          <Skeleton className="h-64 rounded-lg" />
-        ) : last.isError ? (
-          <div role="alert" className="flex flex-col items-start gap-3 rounded-lg border border-border bg-surface p-6">
-            <p className="font-medium">Não foi possível ler o último ciclo.</p>
-            <p className="text-sm text-content-muted">{last.error.message}</p>
-            <Button onClick={() => void last.refetch()}>Tentar novamente</Button>
-          </div>
-        ) : last.data.ultimo ? (
-          <CycleCard report={last.data.ultimo} />
-        ) : (
-          <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed border-border-strong px-6 py-16 text-center">
-            <Clock className="size-8 text-content-subtle" aria-hidden="true" />
-            <p className="font-medium">Nenhum ciclo registrado ainda</p>
-            <p className="max-w-md text-sm text-content-muted">
-              O primeiro aparece aqui depois que o timer rodar. Enquanto isso, simule para ver o que ele faria.
-            </p>
-          </div>
-        )}
-      </section>
-    </>
-  )
-}
-
-function CycleCard({ report }: { report: CycleReport }) {
+/** O relatório de um ciclo de limpeza: o que foi lido, o que se fez e o que ficou de fora. */
+export function CycleCard({ report }: { report: CycleReport }) {
   const destructive = report.acoes.filter((action) => action.tipo !== 'strike')
   return (
     <article className="grid gap-5 rounded-lg border border-border bg-surface p-5">
@@ -73,7 +13,6 @@ function CycleCard({ report }: { report: CycleReport }) {
           <time dateTime={report.quando} title={new Date(report.quando).toLocaleString('pt-BR')} className="font-medium">
             {formatAgo(report.quando)}
           </time>
-          <Badge>{report.modo === 'simulacao' ? 'simulação' : 'aplicado'}</Badge>
         </div>
         {report.abortado ? (
           <Badge tone="warning" className="py-1">

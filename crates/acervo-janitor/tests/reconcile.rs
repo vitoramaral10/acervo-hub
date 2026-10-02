@@ -10,7 +10,7 @@ use acervo_core::{
     Allocated, Apparent, Download, DownloadHash, DownloadState, FileFacts, InstanceName,
     InstanceSnapshot, Inventory, QueueItem, QueueItemId, UnreachableInstance,
 };
-use acervo_janitor::{Abort, Action, Mode, Policy, SkipReason, StrikeLedger, reconcile};
+use acervo_janitor::{Abort, Action, Policy, SkipReason, StrikeLedger, reconcile};
 
 const HORA: Duration = Duration::from_secs(3600);
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -63,7 +63,6 @@ fn item(id: i64, instancia: &str, hash: Option<&str>, obra: Option<i64>) -> Queu
 
 fn politica_aplicando() -> Policy {
     Policy {
-        mode: Mode::Apply,
         private_seed_grace: None,
         managed_categories: vec!["tv-sonarr".into(), "radarr".into()],
         ..Policy::default()
@@ -278,38 +277,6 @@ fn lote_grande_demais_aborta_em_vez_de_apagar_parte() {
     .expect_err("lote acima do teto tem de abortar");
 
     assert!(matches!(erro, Abort::BatchFractionTooLarge { .. }));
-}
-
-#[test]
-fn dry_run_produz_o_mesmo_plano_do_modo_real() {
-    // O modo não é um ramo de código: é um campo do plano. Se divergisse, o
-    // dry run deixaria de valer como validação.
-    let mut inv = Inventory::new(Allocated::from_bytes(1000 * GIB));
-    inv.snapshots.push(snapshot("filmes", vec![]));
-    inv.downloads = vec![seed("aa", 1, 40 * GIB)];
-
-    let seco = reconcile(
-        &inv,
-        &Policy {
-            mode: Mode::DryRun,
-            ..politica_aplicando()
-        },
-        &mut StrikeLedger::new(),
-        agora(),
-    )
-    .expect("sem abort");
-    let real = reconcile(
-        &inv,
-        &politica_aplicando(),
-        &mut StrikeLedger::new(),
-        agora(),
-    )
-    .expect("sem abort");
-
-    assert_eq!(seco.actions, real.actions);
-    assert_eq!(seco.reclaim, real.reclaim);
-    assert!(seco.mode.is_dry_run());
-    assert!(!real.mode.is_dry_run());
 }
 
 #[test]

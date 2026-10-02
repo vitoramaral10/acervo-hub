@@ -100,8 +100,8 @@ rss_interval_minutes = 30
 
 # --- Superfície Torznab (`acervo-hub serve`) --------------------------------
 #
-# Nada abaixo é lido por `plan`/`apply`, e nada acima é exigido por `serve`:
-# um arquivo só pode servir aos dois, ou cada modo ter o seu.
+# Nada abaixo é lido por `apply`, e nada acima é exigido por `serve` — sem o
+# que está acima, `serve` só não roda a limpeza. Um arquivo só serve aos dois.
 #
 # `acervo-hub sync --apply` cadastra cada indexador nas `[[instances]]` acima,
 # com as categorias certas para cada uma. À mão, seria um indexador Torznab
@@ -126,6 +126,11 @@ catalogs = ["/etc/acervo-hub/definicoes", "/etc/acervo-hub/catalogo"]
 # sessão e as consultas guardadas (cada tracker vê uma requisição por consulta).
 # search_interval_minutes = 120
 # search_limit = 5
+# Ciclo de limpeza (tudo de `[qbittorrent]` a `[policy]` acima), rodado pelo
+# próprio serviço como a tarefa "Limpeza": a cada tantos minutos, e no
+# "rodar agora" da tela Tarefas. 0 desliga o agendamento. A primeira volta
+# espera um intervalo inteiro: reiniciar o serviço não conta como ciclo.
+cleanup_interval_minutes = 60
 
 # Endpoint Torznab existente — por exemplo, o feed de um indexador no agregador
 # atual. As capacidades são lidas no início; se ele não responder, fica fora do

@@ -71,9 +71,8 @@ no lugar errado.
 cp config.example.toml config.toml   # preencha urls, chaves e caminhos
 chmod 600 config.toml                # guarda segredo em texto puro
 
-cargo run --bin acervo-hub -- -c config.toml plan    # lê, planeja, relata
-cargo run --bin acervo-hub -- -c config.toml apply   # ... e executa
-cargo run --bin acervo-hub -- -c config.toml serve   # serve os indexadores
+cargo run --bin acervo-hub -- -c config.toml serve   # indexadores, interface e tarefas
+cargo run --bin acervo-hub -- -c config.toml apply   # um ciclo de limpeza à mão
 cargo run --bin acervo-hub -- -c config.toml sync    # planeja o cadastro nos *arr
 cargo run --bin acervo-hub -- -c config.toml sync --apply
 cargo run --bin acervo-hub -- -c config.toml search "termo" [-i indexador] [-k 5000]
@@ -96,7 +95,9 @@ cargo run --bin acervo-hub -- -c config.toml search "termo" [-i indexador] [-k 5
 - **Atividade** — a fila com o progresso do qBittorrent (tirar da fila, bloquear, buscar
   outro), o histórico de tudo e a lista de bloqueio.
 - **Aplicativos** — o `sync` na tela: mostra o que mudaria no gerenciador de séries e aplica.
-- **Limpeza** — o último ciclo (gravado ao lado do ledger) e uma simulação na hora.
+- **Tarefas** — as rotinas de fundo do serviço (busca dos que faltam, RSS, importação,
+  metadados e a limpeza), com intervalo, última e próxima execução e "rodar agora"; e o
+  histórico das últimas execuções, gravado no banco — o da limpeza abre o relatório do ciclo.
 - **Configurações** — TMDB, regras de decisão (teto de tamanho,
   propers, legenda embutida, carência, prioridade e seeders por indexador, espera, espaço
   livre reservado) e
@@ -156,9 +157,10 @@ filme cadastram essa URL como cadastrariam o agregador atual. Três escolhas do 
   resposta é erro Torznab `900`: "nada encontrado" e "tracker fora do ar" pedem reações
   opostas de quem consulta.
 
-`plan` nunca altera nada, nem grava strikes — repetir a simulação não leva um item ao
-limite sem ninguém ter decidido. O modo não é um ramo de código separado: é um campo do
-plano, para que o que se valida em seco seja exatamente o que roda de verdade.
+A limpeza roda dentro de `serve`, como a tarefa "Limpeza", a cada
+`server.cleanup_interval_minutes` (padrão 60). Não há modo de simulação: cada ciclo avança
+os strikes e executa o plano, e as travas abortam o ciclo inteiro quando a leitura do mundo
+não é confiável.
 
 Códigos de saída: `0` sucesso, `1` falha de execução, `3` ciclo abortado por trava. O `3`
 é próprio para que um agendador distinga "a leitura do mundo não era confiável" de "algo
@@ -175,17 +177,12 @@ Multi-stage com alvo musl e distroless `static` como base: o binário estático 
 do que o acervo importa. Sem shell, sem gerenciador de pacotes, sem `curl` — o que não está
 lá não precisa ser corrigido nem serve a quem entrar.
 
-`deploy/` traz o serviço para um stack Compose existente e as unidades systemd que agendam
-o ciclo. Três pontos do desenho que valem atenção:
+`deploy/` traz o serviço para um stack Compose existente. Dois pontos do desenho que
+valem atenção:
 
-**O acervo é montado somente leitura, e isso é trava, não zelo.** O janitor só precisa de
-`stat(2)` para checar hardlink; toda remoção passa pela API do cliente de download. O
-container, portanto, não consegue apagar arquivo do acervo nem se a lógica de decisão
-estiver errada.
-
-**O ciclo é one-shot, não daemon.** Fica sob um `profile` do Compose para não subir junto
-com o resto do stack; quem dispara é o timer. O padrão do container é `plan` — executar de
-verdade exige dizer `apply`.
+**O ciclo roda dentro do serviço**, agendado com as outras tarefas, e só remove pela API do
+cliente de download: o acervo é montado com escrita porque a importação cria o hardlink do
+filme, então a garantia de não apagar arquivo da biblioteca fica no código do janitor.
 
 **O diretório de estado precisa ser do UID 65532**, senão os strikes não sobrevivem ao fim
 do container e três strikes nunca se completam:

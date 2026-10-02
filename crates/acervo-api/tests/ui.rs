@@ -207,12 +207,16 @@ impl Admin for FakeAdmin {
         Ok(json!({ "aplicado": apply, "indexadores": indexers.len() }))
     }
 
-    fn last_cycle(&self) -> Option<Value> {
-        None
+    fn tasks(&self) -> Value {
+        json!([{ "id": "limpeza", "nome": "Limpeza", "rodando": false }])
     }
 
-    async fn simulate_cycle(&self) -> Result<Value, String> {
-        Ok(json!({ "modo": "simulacao" }))
+    async fn task_history(&self) -> Result<Value, String> {
+        Ok(json!([{ "tarefa": "limpeza", "ok": true, "resumo": "nada a limpar" }]))
+    }
+
+    fn run_task(&self, id: &str) -> Option<Value> {
+        (id == "limpeza").then(|| json!({ "iniciada": true }))
     }
 
     async fn movies(&self) -> Result<Value, String> {
@@ -677,6 +681,43 @@ async fn credencial_de_indexador_desativado_e_salva_sem_erro() {
             .unwrap()
             .contains("desativado")
     );
+}
+
+#[tokio::test]
+async fn tarefas_lista_historico_e_rodar_agora() {
+    let base = serve().await;
+    let cookie = login(&base).await;
+    let (status, body) = get(&base, "/ui/api/tarefas", &cookie).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["tarefas"][0]["id"], "limpeza");
+
+    let (status, body) = get(&base, "/ui/api/tarefas/historico", &cookie).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["historico"][0]["resumo"], "nada a limpar");
+
+    let (status, body) = send(
+        &base,
+        reqwest::Method::POST,
+        "/ui/api/tarefas/limpeza/rodar",
+        &cookie,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["iniciada"], true);
+
+    let (status, _) = send(
+        &base,
+        reqwest::Method::POST,
+        "/ui/api/tarefas/outra/rodar",
+        &cookie,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 404);
+    // As rotas da tela antiga de limpeza saíram.
+    let (status, _) = get(&base, "/ui/api/limpeza", &cookie).await;
+    assert_eq!(status, 404);
 }
 
 #[tokio::test]

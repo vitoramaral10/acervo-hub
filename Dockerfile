@@ -44,5 +44,5 @@ USER 65532:65532
 # (e a distroless nem tem shell).
 ENTRYPOINT ["/usr/local/bin/acervo-hub"]
 
-# Padrão seguro: simular. Executar de verdade exige dizer `apply`.
-CMD ["plan"]
+# O serviço: indexadores, interface e tarefas de fundo, a limpeza entre elas.
+CMD ["serve"]

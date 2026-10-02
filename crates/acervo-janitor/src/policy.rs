@@ -1,26 +1,9 @@
-//! Política de limpeza. O padrão é conservador e não apaga nada.
+//! Política de limpeza. O padrão é conservador: não apaga seed nem arquivo
+//! de tracker privado sem que a configuração diga.
 
 use std::time::Duration;
 
 use acervo_core::Allocated;
-
-/// Se o plano pode ser executado ou só relatado.
-///
-/// `DryRun` é o padrão do [`Default`] de propósito: toda regra nova se valida
-/// em seco antes de ligar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Mode {
-    #[default]
-    DryRun,
-    Apply,
-}
-
-impl Mode {
-    #[must_use]
-    pub const fn is_dry_run(self) -> bool {
-        matches!(self, Self::DryRun)
-    }
-}
 
 /// Travas que abortam o ciclo inteiro sem apagar nada.
 ///
@@ -50,7 +33,6 @@ impl Default for Guards {
 /// A política completa de um ciclo.
 #[derive(Debug, Clone)]
 pub struct Policy {
-    pub mode: Mode,
     /// Quantas execuções consecutivas um item precisa aparecer como órfão
     /// antes de sair. Um strike por ciclo, sem janela de espera.
     pub orphan_strikes: u32,
@@ -72,7 +54,6 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            mode: Mode::DryRun,
             orphan_strikes: 3,
             delete_private_orphans: false,
             skip_orphan_if_missing_in_client: true,
@@ -90,7 +71,8 @@ mod tests {
     #[test]
     fn o_padrao_nao_apaga_nada() {
         let p = Policy::default();
-        assert!(p.mode.is_dry_run());
         assert!(!p.delete_private_orphans);
+        // Sem categoria gerenciada, a regra de hardlink perdido não apaga nada.
+        assert!(p.managed_categories.is_empty());
     }
 }

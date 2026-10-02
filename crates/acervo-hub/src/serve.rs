@@ -10,7 +10,6 @@ use acervo_api::{Accounts, Admin, Catalog, DefinitionView, Entry, SettingView};
 use acervo_indexers::{
     Capabilities, CardigannClient, CardigannDefinition, SettingInfo, SettingInfoKind, TorznabClient,
 };
-use acervo_janitor::Mode;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::json;
@@ -20,6 +19,7 @@ use crate::credentials::{self, Overrides};
 use crate::decide::Progress;
 use crate::definitions::Definitions;
 use crate::registry::{self, Added, Registry};
+use crate::tasks::{BUSCA, Tasks};
 
 /// O banco do catálogo e das contas, quando alcançável.
 ///
@@ -30,6 +30,12 @@ use crate::registry::{self, Added, Registry};
 pub struct Database(Arc<std::sync::OnceLock<acervo_store::Store>>);
 
 impl Database {
+    /// Já conectado, para os testes.
+    #[cfg(test)]
+    pub(crate) fn connected(store: acervo_store::Store) -> Self {
+        Self(Arc::new(std::sync::OnceLock::from(store)))
+    }
+
     pub(crate) fn get(&self) -> Result<&acervo_store::Store, String> {
         self.0
             .get()
@@ -77,139 +83,6 @@ impl Accounts for Database {
     }
 }
 
-/// Busca os filmes que faltam de tempos em tempos, com o
-/// catálogo de indexadores servido. Erro numa rodada fica no log e a próxima
-/// tenta de novo; se o botão da tela já está buscando, a rodada espera a
-/// próxima.
-async fn missing_loop(
-    config: Arc<Config>,
-    database: Database,
-    catalog: Catalog,
-    progress: Arc<Progress>,
-    minutes: u64,
-    limit: usize,
-) {
-    let mut every = tokio::time::interval(Duration::from_secs(minutes * 60));
-    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // A primeira batida é imediata; espera um ciclo para não somar a busca
-    // à subida do serviço.
-    every.tick().await;
-    loop {
-        every.tick().await;
-        let store = match database.get() {
-            Ok(store) => store,
-            Err(error) => {
-                tracing::warn!("busca dos que faltam adiada: {error}");
-                continue;
-            }
-        };
-        let Some(turn) = progress.start() else {
-            tracing::info!("busca dos que faltam adiada: já há uma rodando");
-            continue;
-        };
-        match crate::decide::search(&config, store, &catalog, Some(limit), &turn).await {
-            Ok(lines) => tracing::info!(
-                filmes = lines.len(),
-                escolhidos = lines.iter().filter(|l| l.escolhido.is_some()).count(),
-                "busca dos que faltam"
-            ),
-            Err(error) => tracing::warn!("busca dos que faltam falhou: {error:#}"),
-        }
-    }
-}
-
-/// Importa de tempos em tempos os downloads do acervo que terminaram.
-async fn import_loop(config: Arc<Config>, database: Database, catalog: Catalog, minutes: u64) {
-    let mut every = tokio::time::interval(Duration::from_secs(minutes * 60));
-    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        every.tick().await;
-        let Ok(store) = database.get() else {
-            continue;
-        };
-        match crate::grab::import_downloads(&config, store, Some(&catalog), true).await {
-            Ok(lines) => {
-                for line in lines.iter().filter(|l| l.estado != "baixando") {
-                    tracing::info!(
-                        filme = line.filme,
-                        estado = line.estado,
-                        destino = line.destino,
-                        detalhe = line.detalhe,
-                        "importação de download"
-                    );
-                }
-            }
-            Err(error) => tracing::warn!("importação de downloads falhou: {error:#}"),
-        }
-    }
-}
-
-/// Mantém os metadados em dia: a cada seis horas, os filmes conferidos há
-/// mais de um dia. Sem chave do TMDB, espera.
-async fn metadata_loop(config: Arc<Config>, database: Database) {
-    let mut every = tokio::time::interval(Duration::from_secs(6 * 3600));
-    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        every.tick().await;
-        let Ok(store) = database.get() else {
-            continue;
-        };
-        let tmdb = match crate::metadata::tmdb(&config, store).await {
-            Ok(Some(tmdb)) => tmdb,
-            Ok(None) => continue,
-            Err(error) => {
-                tracing::warn!("metadados: {error:#}");
-                continue;
-            }
-        };
-        match crate::library::refresh(store, &tmdb, 24).await {
-            Ok(report) => tracing::info!(
-                conferidos = report.conferidos,
-                atualizados = report.atualizados.len(),
-                falhas = report.falhas.len(),
-                "metadados"
-            ),
-            Err(error) => tracing::warn!("metadados: {error:#}"),
-        }
-    }
-}
-
-/// Sincronização de RSS: pega o que serve à biblioteca.
-async fn rss_loop(config: Arc<Config>, database: Database, catalog: Catalog, minutes: u64) {
-    let mut every = tokio::time::interval(Duration::from_secs(minutes * 60));
-    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        every.tick().await;
-        let Ok(store) = database.get() else {
-            continue;
-        };
-        match crate::automatic::rss(&config, store, &catalog, true).await {
-            Ok(grabs) => {
-                for grab in &grabs {
-                    tracing::info!(
-                        filme = grab.filme,
-                        release = grab.release,
-                        erro = grab.erro,
-                        "RSS pegou"
-                    );
-                }
-            }
-            Err(error) => tracing::warn!("RSS falhou: {error:#}"),
-        }
-    }
-}
-
-/// O andamento da busca dos que faltam, como a tela o lê; `iniciada` diz se
-/// este pedido disparou a busca (falso: já havia uma rodando).
-fn missing_json(started: bool, view: crate::decide::ProgressView) -> serde_json::Value {
-    json!({
-        "iniciada": started,
-        "rodando": view.rodando,
-        "buscados": view.buscados,
-        "total": view.total,
-    })
-}
-
 /// Os downloads do acervo, do mais novo ao mais velho, com o título do filme.
 async fn downloads_json(store: &acervo_store::Store) -> Result<serde_json::Value> {
     let (grabs, movies) = tokio::try_join!(store.grabs(), store.movies())?;
@@ -255,45 +128,31 @@ pub async fn run(config: Config) -> Result<()> {
     let api_key = server.api_key.clone();
     let catalog = Catalog::new(entries(&config).await?)?;
     let database = Database::default();
-    // Uma busca dos que faltam por vez: a rodada automática e o botão da tela.
+    // O andamento da busca dos que faltam, que a tela de filmes acompanha.
     let missing = Arc::new(Progress::default());
+    let tasks = Arc::new(Tasks::new(
+        database.clone(),
+        crate::tasks::service(&config, &database, &catalog, &missing),
+    ));
     let accounts: Option<Arc<dyn Accounts>> = if config.database.is_some() {
-        tokio::spawn(database.clone().connect(Arc::clone(&config)));
         Some(Arc::new(database.clone()))
     } else {
         tracing::warn!("sem `[database]`: a interface só aceita a chave de API em `X-Api-Key`");
         None
     };
-    if config.database.is_some() {
-        tokio::spawn(metadata_loop(Arc::clone(&config), database.clone()));
-    }
-    if config.database.is_some() && config.qbittorrent.is_some() {
-        tokio::spawn(rss_loop(
-            Arc::clone(&config),
-            database.clone(),
-            catalog.clone(),
-            config.movies.rss_interval_minutes.max(5),
-        ));
-    }
-    let import_minutes = config.movies.import_interval_minutes;
-    if import_minutes > 0 && config.database.is_some() && config.qbittorrent.is_some() {
-        tokio::spawn(import_loop(
-            Arc::clone(&config),
-            database.clone(),
-            catalog.clone(),
-            import_minutes,
-        ));
-    }
-    if let Some(minutes) = server.search_interval_minutes.filter(|m| *m > 0) {
-        tokio::spawn(missing_loop(
-            Arc::clone(&config),
-            database.clone(),
-            catalog.clone(),
-            Arc::clone(&missing),
-            minutes,
-            server.search_limit,
-        ));
-    }
+    // As tarefas sobem depois do banco: quase todas precisam dele, e o
+    // histórico mora nele.
+    tokio::spawn({
+        let config = Arc::clone(&config);
+        let database = database.clone();
+        let tasks = Arc::clone(&tasks);
+        async move {
+            if config.database.is_some() {
+                database.connect(config).await;
+            }
+            tasks.start().await;
+        }
+    });
     // A API v3 de filmes, para os apps de pedidos e de legendas.
     let v3 = Arc::new(crate::api_v3::V3 {
         config: Arc::clone(&config),
@@ -309,7 +168,7 @@ pub async fn run(config: Config) -> Result<()> {
         accounts: accounts.clone(),
         searches: tokio::sync::Mutex::default(),
     });
-    let admin = HubAdmin::new(config, catalog.clone(), database, missing)?;
+    let admin = HubAdmin::new(config, catalog.clone(), database, missing, tasks)?;
     tracing::info!(indexadores = catalog.len(), bind = %bind, "servindo Torznab e a interface web");
 
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -485,8 +344,10 @@ struct HubAdmin {
     /// os gerenciadores.
     catalog: Catalog,
     database: Database,
-    /// Andamento da busca dos que faltam, dividido com a rodada automática.
+    /// Andamento da busca dos que faltam.
     missing: Arc<Progress>,
+    /// As tarefas de fundo; o botão de buscar os que faltam dispara a `busca`.
+    tasks: Arc<Tasks>,
     definitions: Definitions,
     /// Indexadores Cardigann da config, pelo id da definição.
     config_cardigann: BTreeMap<String, CardigannIndexer>,
@@ -503,6 +364,7 @@ impl HubAdmin {
         catalog: Catalog,
         database: Database,
         missing: Arc<Progress>,
+        tasks: Arc<Tasks>,
     ) -> Result<Self> {
         let catalogs: Vec<PathBuf> = config
             .server
@@ -537,6 +399,7 @@ impl HubAdmin {
             catalog,
             database,
             missing,
+            tasks,
             definitions,
             config_cardigann,
             config_torznab,
@@ -589,6 +452,24 @@ impl HubAdmin {
                     .map_err(|e| format!("{e:#}"))
             }
         }
+    }
+
+    /// O andamento da busca dos que faltam, como a tela de filmes o lê;
+    /// `iniciada` diz se este pedido disparou a busca (falso: já havia uma).
+    fn missing_json(&self, started: bool) -> serde_json::Value {
+        let view = self.missing.view();
+        // Pedida e ainda não começada: o andamento é o da busca anterior.
+        let (done, total) = if view.rodando {
+            (view.buscados, view.total)
+        } else {
+            (0, 0)
+        };
+        json!({
+            "iniciada": started,
+            "rodando": view.rodando || self.tasks.is_running(BUSCA),
+            "buscados": done,
+            "total": total,
+        })
     }
 
     fn save(
@@ -967,17 +848,17 @@ impl Admin for HubAdmin {
         serde_json::to_value(report).map_err(|e| e.to_string())
     }
 
-    fn last_cycle(&self) -> Option<serde_json::Value> {
-        let text = std::fs::read_to_string(self.config.state.last_cycle()).ok()?;
-        serde_json::from_str(&text).ok()
+    fn tasks(&self) -> serde_json::Value {
+        self.tasks.view()
     }
 
-    async fn simulate_cycle(&self) -> Result<serde_json::Value, String> {
-        self.config.janitor().map_err(|e| format!("{e:#}"))?;
-        let report = crate::cycle::run(&self.config, Mode::DryRun, false)
-            .await
-            .map_err(|e| format!("{e:#}"))?;
-        serde_json::to_value(report).map_err(|e| e.to_string())
+    async fn task_history(&self) -> Result<serde_json::Value, String> {
+        self.tasks.history().await
+    }
+
+    fn run_task(&self, id: &str) -> Option<serde_json::Value> {
+        let started = self.tasks.run_now(id)?;
+        Some(json!({ "iniciada": started, "tarefa": self.tasks.view_one(id) }))
     }
 
     async fn movies(&self) -> Result<serde_json::Value, String> {
@@ -990,30 +871,15 @@ impl Admin for HubAdmin {
     async fn search_missing(&self) -> Result<serde_json::Value, String> {
         // Falha logo, na resposta, se o banco ainda não subiu.
         self.database.get()?;
-        let Some(turn) = self.missing.start() else {
-            return Ok(missing_json(false, self.missing.view()));
-        };
-        let config = Arc::clone(&self.config);
-        let database = self.database.clone();
-        let catalog = self.catalog.clone();
-        tokio::spawn(async move {
-            let Ok(store) = database.get() else {
-                return;
-            };
-            match crate::decide::search(&config, store, &catalog, None, &turn).await {
-                Ok(lines) => tracing::info!(
-                    filmes = lines.len(),
-                    escolhidos = lines.iter().filter(|l| l.escolhido.is_some()).count(),
-                    "busca de todos os que faltam"
-                ),
-                Err(error) => tracing::warn!("busca de todos os que faltam falhou: {error:#}"),
-            }
-        });
-        Ok(missing_json(true, self.missing.view()))
+        let started = self
+            .tasks
+            .run_now(BUSCA)
+            .ok_or("a busca dos que faltam precisa do banco de dados")?;
+        Ok(self.missing_json(started))
     }
 
     fn missing_status(&self) -> serde_json::Value {
-        missing_json(false, self.missing.view())
+        self.missing_json(false)
     }
 
     async fn grab_movie(&self, movie_id: i64, apply: bool) -> Result<serde_json::Value, String> {
@@ -1164,6 +1030,7 @@ mod tests {
             Catalog::default(),
             Database::default(),
             Arc::default(),
+            Arc::default(),
         )
         .unwrap();
         assert_eq!(admin.origin("cookie-privado"), Some("config"));
@@ -1219,6 +1086,7 @@ mod tests {
             Arc::new(load_config(&dir.0, &indexers)),
             Catalog::default(),
             Database::default(),
+            Arc::default(),
             Arc::default(),
         )
         .unwrap();

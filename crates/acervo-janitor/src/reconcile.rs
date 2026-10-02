@@ -44,7 +44,6 @@ pub fn reconcile(
     check_batch_is_within_limits(reclaim, inv.library_size, policy)?;
 
     Ok(Plan {
-        mode: policy.mode,
         actions,
         skipped,
         reclaim,

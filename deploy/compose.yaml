@@ -1,59 +1,11 @@
-# Serviço do acervo-hub para um stack Compose existente.
+# Serviço do acervo-hub para um stack Compose existente. Um processo só: serve
+# o Torznab e a interface e agenda as tarefas, inclusive o ciclo de limpeza.
 #
-# O ciclo é one-shot, não um daemon: `profiles` impede que `docker compose up`
-# o levante junto com o resto. Quem dispara é o timer do systemd (ver
-# `acervo-hub-ciclo.timer`) ou a mão, com `docker compose run`.
-#
-#   docker compose --profile ciclo run --rm acervo-hub   # simula (padrão)
-#   docker compose --profile ciclo run --rm acervo-hub \
-#       -c /etc/acervo-hub/config.toml apply             # executa
+# A tag `main` acompanha o último build da branch principal. `latest` só nasce
+# em tag semver (`v*`). Para fixar uma versão, troque por `:vX.Y.Z` ou digest.
 
 services:
-  acervo-hub:
-    # A tag `main` acompanha o último build da branch principal. `latest` só
-    # nasce em tag semver (`v*`), então apontar para ela aqui deixaria a
-    # referência pendurada até o primeiro release. Para fixar uma versão,
-    # troque por `:vX.Y.Z` ou pelo digest.
-    image: ghcr.io/vitoramaral10/acervo-hub:main
-    profiles: ["ciclo"]
-    user: "65532:65532"
-
-    # Rootfs somente leitura: o processo não reescreve o próprio binário, então
-    # uma escrita arbitrária não vira persistência.
-    read_only: true
-    tmpfs:
-      - /tmp
-
-    cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
-
-    # Sem limite, um processo em loop derruba o host. O ciclo cabe folgado aqui.
-    mem_limit: 128m
-    pids_limit: 64
-    cpus: "0.50"
-
-    volumes:
-      # Segredo entra montado, nunca assado na imagem. `chmod 600` no host.
-      - ./config.toml:/etc/acervo-hub/config.toml:ro
-
-      # Os strikes precisam sobreviver ao fim do container: sem isso, três
-      # strikes nunca se completam. O diretório precisa ser do UID 65532:
-      #   mkdir -p state && sudo chown 65532:65532 state
-      - ./state:/var/lib/acervo-hub
-
-      # O acervo entra SOMENTE LEITURA, e isso é uma trava de verdade, não
-      # zelo: o janitor só precisa de `stat(2)` para checar hardlink. Toda
-      # remoção acontece pela API do cliente de download, então o container
-      # fisicamente não consegue apagar arquivo do acervo — nem se a lógica
-      # de decisão estiver errada.
-      - /mnt/acervo:/mnt/acervo:ro
-
-    command: ["-c", "/etc/acervo-hub/config.toml", "plan"]
-
-    networks: [media]
-
-  # Superfície Torznab: processo longo, ao contrário do ciclo. Sobe com o resto
-  # do stack. Os gerenciadores o alcançam pela rede `media` em
+  # Sobe com o resto do stack. Os gerenciadores o alcançam pela rede `media` em
   # `http://acervo-hub-indexadores:9797/<indexador>`; nenhuma porta vai para o
   # host, porque a chave dá acesso a links com passkey.
   #
