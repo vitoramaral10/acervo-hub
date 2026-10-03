@@ -609,6 +609,46 @@ fn imported_file(
     }
 }
 
+/// Quanto tempo um download ativo pode ficar sem seed e sem transferir antes
+/// de ser trocado.
+const STALL: time::Duration = time::Duration::minutes(30);
+
+/// A mensagem da falha por falta de seeds. Marca a expiração do bloqueio:
+/// não mude sem migrar as linhas que já a guardam.
+pub(crate) const NO_SEEDS: &str = "sem seeds há 30 min";
+
+/// Por quanto tempo o bloqueio por falta de seeds vale: o release pode só
+/// ter estado sem seeds naquela hora.
+const NO_SEEDS_BLOCK: time::Duration = time::Duration::days(7);
+
+/// Download ativo que não anda: sem seed algum, sem transferir nada e já há
+/// 30 min ativo. Parado, na fila, verificando ou com erro não conta.
+pub(crate) fn stalled(torrent: &acervo_clients::TorrentInfo, now: time::OffsetDateTime) -> bool {
+    let limit = STALL.whole_seconds();
+    let quiet = torrent.last_activity == 0 || now.unix_timestamp() - torrent.last_activity >= limit;
+    matches!(
+        torrent.state.as_str(),
+        "downloading" | "stalledDL" | "metaDL" | "forcedDL"
+    ) && torrent.progress < 1.0
+        && torrent.time_active >= limit
+        && torrent.num_complete <= 0
+        && torrent.num_seeds == 0
+        && quiet
+}
+
+/// O bloqueio ainda vale? O de "sem seeds" expira em 7 dias; qualquer outro
+/// é para sempre. A linha fica, para a tela de bloqueados.
+pub(crate) fn still_blocks(blocked: &acervo_store::Blocked, now: time::OffsetDateTime) -> bool {
+    if blocked.message.as_deref() != Some(NO_SEEDS) {
+        return true;
+    }
+    // Data ilegível: na dúvida, bloqueia.
+    match time::OffsetDateTime::parse(&blocked.at, &time::format_description::well_known::Rfc3339) {
+        Ok(at) => now - at < NO_SEEDS_BLOCK,
+        Err(_) => true,
+    }
+}
+
 /// Por que um download não importou.
 /// Por quanto tempo um torrent recém-mandado pode ainda não aparecer no
 /// cliente: o qBittorrent 5 responde ao `add` antes de listá-lo, e a nova
@@ -849,6 +889,22 @@ pub async fn import_downloads(
                     torrent.state
                 )));
             }
+            if stalled(&torrent, time::OffsetDateTime::now_utc()) {
+                tracing::info!(
+                    filme = line.filme,
+                    release = grab.title,
+                    "trocando release sem seeds"
+                );
+                // O bloqueio e a nova busca vêm do `Failure::Download`; o
+                // torrent travado, porém, ocuparia vaga e reserva.
+                if apply {
+                    client
+                        .delete(&[acervo_core::DownloadHash::new(grab.hash.clone())], true)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                return Err(Failure::Download(NO_SEEDS.into()));
+            }
             if torrent.progress < 1.0 {
                 line.detalhe = Some(if torrent.has_tag(QUEUE_TAG) {
                     QUEUED.into()
@@ -1030,6 +1086,93 @@ mod tests {
         assert_eq!(picked, ["h5", "h30", "h40"]);
         let picked = pick_starts(&queue(&[95, 20]), &[], 100, 10, 10);
         assert_eq!(picked, ["h20"]);
+    }
+
+    fn at(text: &str) -> time::OffsetDateTime {
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).unwrap()
+    }
+
+    /// Torrent travado no limite: ativo há 30 min, sem seed, sem transferir.
+    fn travado(now: time::OffsetDateTime) -> acervo_clients::TorrentInfo {
+        serde_json::from_value(serde_json::json!({
+            "hash": "h", "name": "n", "state": "stalledDL", "save_path": "/",
+            "progress": 0.4, "time_active": 1800, "num_complete": 0, "num_seeds": 0,
+            "last_activity": now.unix_timestamp() - 1800,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn sem_seeds_so_com_todas_as_condicoes() {
+        let now = at("2026-10-03T12:00:00Z");
+        assert!(stalled(&travado(now), now));
+        // Nunca transferiu: zero conta como nunca.
+        let mut t = travado(now);
+        t.last_activity = 0;
+        assert!(stalled(&t, now));
+        // Estados ativos de download.
+        for state in ["downloading", "stalledDL", "metaDL", "forcedDL"] {
+            let mut t = travado(now);
+            state.clone_into(&mut t.state);
+            assert!(stalled(&t, now), "{state}");
+        }
+        // Estados que não são download ativo.
+        for state in [
+            "queuedDL",
+            "stoppedDL",
+            "pausedDL",
+            "checkingDL",
+            "checkingResumeData",
+            "error",
+            "missingFiles",
+            "stalledUP",
+            "uploading",
+        ] {
+            let mut t = travado(now);
+            state.clone_into(&mut t.state);
+            assert!(!stalled(&t, now), "{state}");
+        }
+        let mut t = travado(now);
+        t.progress = 1.0;
+        assert!(!stalled(&t, now));
+        // Ativo há 29 min59.
+        let mut t = travado(now);
+        t.time_active = 1799;
+        assert!(!stalled(&t, now));
+        // Seed no enxame ou conectado.
+        let mut t = travado(now);
+        t.num_complete = 1;
+        assert!(!stalled(&t, now));
+        let mut t = travado(now);
+        t.num_seeds = 1;
+        assert!(!stalled(&t, now));
+        // Transferiu há 29 min59.
+        let mut t = travado(now);
+        t.last_activity = now.unix_timestamp() - 1799;
+        assert!(!stalled(&t, now));
+    }
+
+    #[test]
+    fn bloqueio_sem_seeds_expira_em_sete_dias() {
+        let blocked = |message: Option<&str>| acervo_store::Blocked {
+            id: 1,
+            movie_id: Some(1),
+            series_id: None,
+            source_title: "Filme.2020.1080p".into(),
+            indexer: None,
+            quality: None,
+            size: None,
+            hash: None,
+            at: "2026-10-01T00:00:00Z".into(),
+            message: message.map(str::to_owned),
+        };
+        let sem_seeds = blocked(Some(NO_SEEDS));
+        assert!(still_blocks(&sem_seeds, at("2026-10-07T23:59:59Z")));
+        assert!(!still_blocks(&sem_seeds, at("2026-10-08T00:00:00Z")));
+        // Outra mensagem, ou nenhuma, nunca expira.
+        let outra = blocked(Some("o torrent sumiu do cliente"));
+        assert!(still_blocks(&outra, at("2027-10-01T00:00:00Z")));
+        assert!(still_blocks(&blocked(None), at("2027-10-01T00:00:00Z")));
     }
 
     #[test]

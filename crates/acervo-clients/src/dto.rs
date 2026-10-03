@@ -35,8 +35,18 @@ pub struct TorrentInfo {
     /// Bytes que faltam baixar.
     #[serde(default)]
     pub amount_left: u64,
+    /// Seeds conectados agora.
     #[serde(default)]
     pub num_seeds: u32,
+    /// Seeds no enxame, segundo o tracker; zero ou negativo é "não sei".
+    #[serde(default)]
+    pub num_complete: i64,
+    /// Epoch da última transferência; zero é nunca.
+    #[serde(default)]
+    pub last_activity: i64,
+    /// Segundos ativo (baixando ou semeando).
+    #[serde(default)]
+    pub time_active: i64,
     /// Separadas por vírgula e espaço.
     #[serde(default)]
     pub tags: String,

@@ -223,8 +223,10 @@ impl Decider {
             indexers: indexers(&served, &remote.rules),
             settings: remote.rules.settings(definitions),
             delay: remote.rules.delay(),
+            // Bloqueio por falta de seeds expira; a linha fica na tela.
             blocklist: blocked
                 .into_iter()
+                .filter(|b| crate::grab::still_blocks(b, now))
                 .map(|b| BlockedRelease {
                     movie: b.movie_id,
                     title: b.source_title,

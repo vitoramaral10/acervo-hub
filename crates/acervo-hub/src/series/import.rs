@@ -22,7 +22,7 @@ use super::naming::{TBA, episode_path};
 use crate::config::Config;
 use crate::decide::now_rfc3339;
 use crate::events::{self, Event, Kind};
-use crate::grab::{QUEUE_TAG, QUEUED, install, left, qbit};
+use crate::grab::{NO_SEEDS, QUEUE_TAG, QUEUED, install, left, qbit, stalled};
 
 /// Quanto se espera pelo título do episódio depois da exibição.
 const TITLE_WAIT: Duration = Duration::hours(48);
@@ -181,6 +181,29 @@ impl Importer<'_> {
                 "o cliente marcou o torrent com `{}`",
                 torrent.state
             )));
+        }
+        if stalled(&torrent, OffsetDateTime::now_utc()) {
+            tracing::info!(
+                serie = entry.series.title,
+                release = grab.title,
+                "trocando release sem seeds"
+            );
+            // O bloqueio e a nova busca vêm do `Failure::Download`; o torrent
+            // travado ocuparia vaga e reserva. Só sai se é só deste grab.
+            if self.apply {
+                if super::grab::owns(self.config, self.store, &self.client, grab, &torrent).await {
+                    self.client
+                        .delete(&[DownloadHash::new(grab.hash.clone())], true)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                } else {
+                    tracing::warn!(
+                        release = grab.title,
+                        "torrent sem seeds, mas não é só deste grab: fica no cliente"
+                    );
+                }
+            }
+            return Err(Failure::Download(NO_SEEDS.into()));
         }
         let Some(selection) = apply_selection(
             &self.client,

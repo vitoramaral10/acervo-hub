@@ -119,6 +119,8 @@ impl Parts {
             blocklist: blocked
                 .into_iter()
                 .filter(|b| b.movie_id.is_none())
+                // Bloqueio por falta de seeds expira; a linha fica na tela.
+                .filter(|b| crate::grab::still_blocks(b, time::OffsetDateTime::now_utc()))
                 .map(|b| BlockedEpisode {
                     series: b.series_id,
                     title: b.source_title,
