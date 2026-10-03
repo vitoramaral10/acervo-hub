@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
-use acervo_core::{Allocated, Download, Inventory, QueueItem};
+use acervo_core::{Allocated, Download, DownloadState, Inventory, QueueItem};
 
 use crate::plan::{Abort, Action, Plan, SkipReason, Skipped};
 use crate::policy::Policy;
@@ -31,7 +31,7 @@ pub fn reconcile(
     let mut skipped = Vec::new();
     let mut reclaim = Allocated::ZERO;
 
-    plan_orphaned_queue(
+    let mut seen = plan_orphaned_queue(
         inv,
         policy,
         ledger,
@@ -40,6 +40,19 @@ pub fn reconcile(
         &mut reclaim,
     );
     plan_unlinked_downloads(inv, policy, now, &mut actions, &mut skipped, &mut reclaim);
+    seen.extend(plan_unowned_downloads(
+        inv,
+        policy,
+        ledger,
+        now,
+        &mut actions,
+        &mut skipped,
+        &mut reclaim,
+    ));
+
+    // Uma poda só, sobre as chaves das duas regras com strike: cada uma
+    // apagaria os strikes da outra se podasse sozinha.
+    ledger.retain_only(&seen);
 
     check_batch_is_within_limits(reclaim, inv.library_size, policy)?;
 
@@ -98,7 +111,7 @@ fn check_batch_is_within_limits(
     Ok(())
 }
 
-/// Passo 1: item de fila sem obra dona.
+/// Passo 1: item de fila sem obra dona. Devolve as chaves de strike vistas.
 fn plan_orphaned_queue(
     inv: &Inventory,
     policy: &Policy,
@@ -106,7 +119,7 @@ fn plan_orphaned_queue(
     actions: &mut Vec<Action>,
     skipped: &mut Vec<Skipped>,
     reclaim: &mut Allocated,
-) {
+) -> Vec<StrikeKey> {
     let by_hash = inv.downloads_by_hash();
     let mut seen = Vec::new();
 
@@ -144,7 +157,7 @@ fn plan_orphaned_queue(
         }
     }
 
-    ledger.retain_only(&seen);
+    seen
 }
 
 fn removal_for(item: &QueueItem, download: Option<&Download>, policy: &Policy) -> Action {
@@ -193,6 +206,83 @@ fn plan_unlinked_downloads(
             reclaim: download.reclaimable(),
         });
     }
+}
+
+/// Passo 3: download fora de fila, sem seed e sem hardlink: ninguém o quer.
+///
+/// Cobre o que sobra quando o dono sai de cena (grab desistido, obra apagada):
+/// incompleto, parado ou com erro. O seed é do passo 2. Um strike por ciclo,
+/// com chave pelo hash; só no limite vira remoção. Devolve as chaves vistas.
+///
+/// Os motivos de pulo que o passo 2 já registra (fila, categoria, estado) não
+/// se repetem aqui, para o relatório não contar o mesmo torrent duas vezes.
+fn plan_unowned_downloads(
+    inv: &Inventory,
+    policy: &Policy,
+    ledger: &mut StrikeLedger,
+    now: SystemTime,
+    actions: &mut Vec<Action>,
+    skipped: &mut Vec<Skipped>,
+    reclaim: &mut Allocated,
+) -> Vec<StrikeKey> {
+    let queued: HashSet<_> = inv.hashes_in_any_queue().into_iter().collect();
+    let mut seen = Vec::new();
+
+    for download in &inv.downloads {
+        // `Unknown` é "não sei", não "parado": não vira candidato.
+        if queued.contains(&download.hash)
+            || !policy.managed_categories.contains(&download.category)
+            || download.state.is_seeding()
+            || download.state == DownloadState::Unknown
+        {
+            continue;
+        }
+        if download.has_library_link() {
+            skipped.push(Skipped {
+                what: download.name.clone(),
+                reason: SkipReason::StillLinked,
+            });
+            continue;
+        }
+        if modified_within(download, now, policy.guards.recent_change_grace) {
+            skipped.push(Skipped {
+                what: download.name.clone(),
+                reason: SkipReason::RecentlyModified,
+            });
+            continue;
+        }
+
+        let key = StrikeKey::for_download(&download.hash);
+        let strikes = ledger.strike(key.clone());
+        seen.push(key);
+
+        if strikes < policy.orphan_strikes {
+            actions.push(Action::StrikeUnowned {
+                download: download.hash.clone(),
+                name: download.name.clone(),
+                strikes,
+                limit: policy.orphan_strikes,
+            });
+            continue;
+        }
+
+        // Sem apagar arquivo, nada é liberado: o `reclaim` fica zero.
+        let delete_files = delete_files_for(download, policy);
+        let freed = if delete_files {
+            download.reclaimable()
+        } else {
+            Allocated::ZERO
+        };
+        *reclaim = *reclaim + freed;
+        actions.push(Action::DeleteUnowned {
+            download: download.hash.clone(),
+            name: download.name.clone(),
+            delete_files,
+            reclaim: freed,
+        });
+    }
+
+    seen
 }
 
 /// `None` significa "pode apagar".

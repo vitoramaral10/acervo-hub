@@ -70,6 +70,25 @@ pub fn plan(plan: &Plan) {
             Action::DeleteUnlinked { name, reclaim, .. } => {
                 println!("  apaga torrent   {name} — libera {reclaim}");
             }
+            Action::StrikeUnowned {
+                name,
+                strikes,
+                limit,
+                ..
+            } => println!("  strike {strikes}/{limit}  [sem dono] {name}"),
+            Action::DeleteUnowned {
+                name,
+                delete_files,
+                reclaim,
+                ..
+            } => {
+                let sufixo = if *delete_files {
+                    format!("e apaga os arquivos, libera {reclaim}")
+                } else {
+                    "e preserva os arquivos".into()
+                };
+                println!("  apaga torrent   {name} (sem dono) — {sufixo}");
+            }
         }
     }
 

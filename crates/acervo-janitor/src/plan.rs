@@ -32,6 +32,21 @@ pub enum Action {
         name: String,
         reclaim: Allocated,
     },
+    /// Download fora de fila e sem hardlink, ainda abaixo do limite de strikes.
+    StrikeUnowned {
+        download: DownloadHash,
+        name: String,
+        strikes: u32,
+        limit: u32,
+    },
+    /// Download sem dono que bateu o limite de strikes: sai do cliente e,
+    /// conforme a política, leva os arquivos.
+    DeleteUnowned {
+        download: DownloadHash,
+        name: String,
+        delete_files: bool,
+        reclaim: Allocated,
+    },
 }
 
 /// Por que um candidato não virou ação.
@@ -152,7 +167,9 @@ impl Plan {
         self.actions.iter().filter(|a| {
             matches!(
                 a,
-                Action::DeleteUnlinked { .. } | Action::RemoveOrphan { .. }
+                Action::DeleteUnlinked { .. }
+                    | Action::DeleteUnowned { .. }
+                    | Action::RemoveOrphan { .. }
             )
         })
     }

@@ -500,17 +500,13 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Sem cliente de download, sem instância ou sem raiz de biblioteca.
+    /// Sem cliente de download ou sem raiz de biblioteca. Gerenciador *arr é
+    /// opcional: a fila interna do acervo cobre o que ele cobriria.
     pub fn janitor(&self) -> Result<&QbitConfig> {
         let qbit = self.qbittorrent().context(
             "cliente de download não configurado: o ciclo age pelo qBittorrent \
              (Configurações → Cliente de download)",
         )?;
-        anyhow::ensure!(
-            !self.instances.is_empty(),
-            "nenhum gerenciador configurado: sem fila para cruzar, todo download \
-             pareceria fora de fila"
-        );
         anyhow::ensure!(
             !self.library.roots.is_empty(),
             "nenhuma raiz de biblioteca configurada: sem medir a biblioteca, a \
@@ -643,14 +639,14 @@ mod tests {
     }
 
     #[test]
-    fn limpeza_exige_cliente_gerenciador_e_raiz() {
+    fn limpeza_exige_cliente_e_raiz_mas_nao_gerenciador() {
         assert!(valid().janitor().is_ok());
         let mut sem_raiz = valid();
         sem_raiz.library.roots.clear();
         assert!(sem_raiz.janitor().is_err());
         let mut sem_instancia = valid();
         sem_instancia.instances.clear();
-        assert!(sem_instancia.janitor().is_err());
+        assert!(sem_instancia.janitor().is_ok());
     }
 
     #[test]

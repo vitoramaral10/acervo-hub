@@ -179,6 +179,32 @@ fn action_line(action: &Action) -> ActionLine {
             titulo: name.clone(),
             detalhe: format!("libera {reclaim}"),
         },
+        Action::StrikeUnowned {
+            name,
+            strikes,
+            limit,
+            ..
+        } => ActionLine {
+            tipo: "strike-sem-dono",
+            instancia: None,
+            titulo: name.clone(),
+            detalhe: format!("strike {strikes}/{limit}"),
+        },
+        Action::DeleteUnowned {
+            name,
+            delete_files,
+            reclaim,
+            ..
+        } => ActionLine {
+            tipo: "apagar-sem-dono",
+            instancia: None,
+            titulo: name.clone(),
+            detalhe: if *delete_files {
+                format!("remove do cliente e apaga os arquivos, libera {reclaim}")
+            } else {
+                "remove do cliente e preserva os arquivos".into()
+            },
+        },
     }
 }
 
@@ -190,7 +216,7 @@ fn action_line(action: &Action) -> ActionLine {
 /// Configuração do ciclo incompleta, cliente de download fora do ar ou falha
 /// ao ler ou gravar os strikes.
 pub async fn run(config: &Config, store: &acervo_store::Store, print: bool) -> Result<CycleReport> {
-    let session = collect::collect(config).await?;
+    let session = collect::collect(config, store).await?;
     if print {
         report::inventory(&session.inventory);
     }

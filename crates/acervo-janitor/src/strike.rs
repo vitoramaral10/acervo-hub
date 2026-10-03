@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use acervo_core::QueueItem;
+use acervo_core::{DownloadHash, QueueItem};
 use serde::{Deserialize, Serialize};
 
 /// Chave estável de um item entre ciclos.
@@ -26,6 +26,13 @@ impl StrikeKey {
             .as_ref()
             .map_or_else(|| format!("titulo:{}", item.title), |h| format!("hash:{h}"));
         Self(format!("{}/{tail}", item.instance))
+    }
+
+    /// Chave de um download sem dono, que não tem item de fila: o prefixo
+    /// `download/` o separa das chaves de fila, que começam pela instância.
+    #[must_use]
+    pub fn for_download(hash: &DownloadHash) -> Self {
+        Self(format!("download/hash:{hash}"))
     }
 
     #[must_use]
@@ -126,6 +133,15 @@ mod tests {
         assert_eq!(l.count(&sumiu), 0);
         assert_eq!(l.count(&ficou), 1);
         assert_eq!(l.len(), 1);
+    }
+
+    #[test]
+    fn download_sem_dono_nao_colide_com_item_de_fila() {
+        let h = DownloadHash::new("aa");
+        assert_ne!(
+            StrikeKey::for_download(&h),
+            StrikeKey::for_item(&item(1, Some("aa")))
+        );
     }
 
     #[test]

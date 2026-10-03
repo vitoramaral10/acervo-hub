@@ -335,3 +335,204 @@ fn sem_categorias_gerenciadas_a_regra_de_hardlink_nao_apaga_nada() {
 
     assert!(plano.actions.is_empty());
 }
+
+/// Download incompleto, sem fila e sem hardlink: o que sobra quando o dono sai
+/// de cena. Antigo o bastante para passar da carência.
+fn sem_dono(hash: &str, bytes: u64) -> Download {
+    Download {
+        state: DownloadState::Paused,
+        seeded_for: Duration::ZERO,
+        ..seed(hash, 1, bytes)
+    }
+}
+
+fn inventario_com(downloads: Vec<Download>, fila: Vec<QueueItem>) -> Inventory {
+    let mut inv = Inventory::new(Allocated::from_bytes(1000 * GIB));
+    inv.snapshots.push(snapshot("acervo", fila));
+    inv.downloads = downloads;
+    inv
+}
+
+fn strikes_de_sem_dono(plano: &acervo_janitor::Plan) -> Vec<u32> {
+    plano
+        .actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::StrikeUnowned { strikes, .. } => Some(*strikes),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn torrent_de_grab_em_andamento_nunca_e_candidato_nem_parado() {
+    // O incidente a evitar: grab em andamento parado no cliente (sem espaço,
+    // tag da fila) lido como "sem dono" e apagado no terceiro ciclo.
+    let inv = inventario_com(
+        vec![sem_dono("emandamento", 10 * GIB)],
+        vec![item(1, "acervo", Some("emandamento"), Some(7))],
+    );
+    let mut ledger = StrikeLedger::new();
+
+    for _ in 0..5 {
+        let plano = reconcile(&inv, &politica_aplicando(), &mut ledger, agora())
+            .expect("inventário íntegro não aborta");
+        assert!(plano.actions.is_empty());
+    }
+    assert!(ledger.is_empty());
+}
+
+#[test]
+fn incompleto_sem_grab_leva_strike_e_so_sai_no_enesimo_ciclo() {
+    let inv = inventario_com(vec![sem_dono("largado", 10 * GIB)], vec![]);
+    let politica = politica_aplicando();
+    let mut ledger = StrikeLedger::new();
+
+    for ciclo in 1..politica.orphan_strikes {
+        let plano = reconcile(&inv, &politica, &mut ledger, agora()).unwrap();
+        assert_eq!(strikes_de_sem_dono(&plano), [ciclo]);
+        assert_eq!(plano.destructive().count(), 0);
+        assert_eq!(plano.reclaim, Allocated::ZERO);
+    }
+
+    let plano = reconcile(&inv, &politica, &mut ledger, agora()).unwrap();
+    assert!(matches!(
+        plano.actions.as_slice(),
+        [Action::DeleteUnowned {
+            delete_files: true,
+            ..
+        }]
+    ));
+    assert_eq!(plano.reclaim, Allocated::from_bytes(10 * GIB));
+}
+
+#[test]
+fn incompleto_que_volta_a_ter_grab_perde_os_strikes() {
+    let politica = politica_aplicando();
+    let mut ledger = StrikeLedger::new();
+    let solto = inventario_com(vec![sem_dono("volta", GIB)], vec![]);
+    let dono = inventario_com(
+        vec![sem_dono("volta", GIB)],
+        vec![item(1, "acervo", Some("volta"), Some(7))],
+    );
+
+    reconcile(&solto, &politica, &mut ledger, agora()).unwrap();
+    reconcile(&solto, &politica, &mut ledger, agora()).unwrap();
+    reconcile(&dono, &politica, &mut ledger, agora()).unwrap();
+    assert!(ledger.is_empty());
+
+    // Recomeça do um: os dois strikes de antes não valem mais.
+    let plano = reconcile(&solto, &politica, &mut ledger, agora()).unwrap();
+    assert_eq!(strikes_de_sem_dono(&plano), [1]);
+}
+
+#[test]
+fn strikes_de_fila_e_de_download_sem_dono_nao_se_apagam_entre_si() {
+    // Cada regra poda o ledger pelas próprias chaves: sem a poda única, a
+    // segunda zeraria os strikes da primeira a cada ciclo e nada sairia.
+    let mut inv = inventario_com(vec![sem_dono("largado", GIB)], vec![]);
+    inv.snapshots.push(snapshot(
+        "filmes",
+        vec![item(1, "filmes", Some("fila"), None)],
+    ));
+    inv.downloads.push(Download {
+        state: DownloadState::Paused,
+        ..seed("fila", 1, GIB)
+    });
+    let mut ledger = StrikeLedger::new();
+
+    reconcile(&inv, &politica_aplicando(), &mut ledger, agora()).unwrap();
+    assert_eq!(ledger.len(), 2);
+    reconcile(&inv, &politica_aplicando(), &mut ledger, agora()).unwrap();
+    assert_eq!(ledger.len(), 2);
+}
+
+#[test]
+fn categoria_fora_das_gerenciadas_nunca_e_candidata() {
+    let mut manual = sem_dono("manual", 10 * GIB);
+    manual.category = "manual".into();
+    let inv = inventario_com(vec![manual], vec![]);
+    let mut ledger = StrikeLedger::new();
+
+    for _ in 0..5 {
+        let plano = reconcile(&inv, &politica_aplicando(), &mut ledger, agora()).unwrap();
+        assert!(plano.actions.is_empty());
+    }
+    assert!(ledger.is_empty());
+}
+
+#[test]
+fn incompleto_com_hardlink_nunca_e_candidato() {
+    let mut ligado = sem_dono("ligado", 10 * GIB);
+    ligado.files = vec![arquivo(2, 10 * GIB, 90 * HORA)];
+    let inv = inventario_com(vec![ligado], vec![]);
+    let mut ledger = StrikeLedger::new();
+
+    for _ in 0..5 {
+        let plano = reconcile(&inv, &politica_aplicando(), &mut ledger, agora()).unwrap();
+        assert!(plano.actions.is_empty());
+        assert!(
+            plano
+                .skipped
+                .iter()
+                .any(|s| s.reason == SkipReason::StillLinked)
+        );
+    }
+    assert!(ledger.is_empty());
+}
+
+#[test]
+fn incompleto_mexido_na_janela_de_carencia_e_intocavel() {
+    let mut recente = sem_dono("recente", 10 * GIB);
+    recente.files = vec![arquivo(1, 10 * GIB, HORA)];
+    let inv = inventario_com(vec![recente], vec![]);
+    let mut ledger = StrikeLedger::new();
+
+    let plano = reconcile(&inv, &politica_aplicando(), &mut ledger, agora()).unwrap();
+    assert!(plano.actions.is_empty());
+    assert!(ledger.is_empty());
+}
+
+#[test]
+fn privado_sem_dono_sai_do_cliente_sem_apagar_arquivo() {
+    let mut privado = sem_dono("privado", 10 * GIB);
+    privado.private = true;
+    let inv = inventario_com(vec![privado], vec![]);
+    let politica = Policy {
+        orphan_strikes: 1,
+        delete_private_orphans: false,
+        ..politica_aplicando()
+    };
+
+    let plano = reconcile(&inv, &politica, &mut StrikeLedger::new(), agora()).unwrap();
+
+    assert!(matches!(
+        plano.actions.as_slice(),
+        [Action::DeleteUnowned {
+            delete_files: false,
+            ..
+        }]
+    ));
+    // Sem apagar arquivo, nada é liberado e nada entra na conta das travas.
+    assert_eq!(plano.reclaim, Allocated::ZERO);
+}
+
+#[test]
+fn lote_de_downloads_sem_dono_grande_demais_aborta() {
+    // 20 incompletos de 20 GiB: 400 GiB passam do teto absoluto de 300 GiB.
+    let inv = inventario_com(
+        (0..20)
+            .map(|i| sem_dono(&format!("h{i}"), 20 * GIB))
+            .collect(),
+        vec![],
+    );
+    let politica = Policy {
+        orphan_strikes: 1,
+        ..politica_aplicando()
+    };
+
+    let erro = reconcile(&inv, &politica, &mut StrikeLedger::new(), agora())
+        .expect_err("lote acima do teto tem de abortar");
+
+    assert!(matches!(erro, Abort::BatchTooLarge { .. }));
+}

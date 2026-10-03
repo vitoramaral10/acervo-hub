@@ -17,14 +17,14 @@ pub struct Outcome {
 /// validado pelas travas, e parar no meio deixaria o acervo num estado parcial
 /// que o próximo ciclo teria de redescobrir. Cada falha é registrada e contada.
 ///
-/// `StrikeOrphan` não aparece aqui: strike não é ação remota, é estado local,
-/// e já foi persistido pelo ledger.
+/// `StrikeOrphan` e `StrikeUnowned` não aparecem aqui: strike não é ação
+/// remota, é estado local, e já foi persistido pelo ledger.
 pub async fn execute(session: &Session, plan: &Plan) -> Outcome {
     let mut outcome = Outcome::default();
 
     for action in &plan.actions {
         let result = match action {
-            Action::StrikeOrphan { .. } => continue,
+            Action::StrikeOrphan { .. } | Action::StrikeUnowned { .. } => continue,
             Action::RemoveOrphan {
                 item,
                 instance,
@@ -51,6 +51,24 @@ pub async fn execute(session: &Session, plan: &Plan) -> Outcome {
                 session
                     .qbit
                     .delete(std::slice::from_ref(download), true)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            Action::DeleteUnowned {
+                download,
+                name,
+                delete_files,
+                reclaim,
+            } => {
+                tracing::info!(
+                    torrent = %name,
+                    apaga_arquivos = delete_files,
+                    libera = %reclaim,
+                    "apagando torrent sem dono"
+                );
+                session
+                    .qbit
+                    .delete(std::slice::from_ref(download), *delete_files)
                     .await
                     .map_err(|e| e.to_string())
             }
