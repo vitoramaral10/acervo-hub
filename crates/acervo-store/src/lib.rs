@@ -892,7 +892,7 @@ impl Store {
     pub async fn record_grab(&self, grab: &Grab) -> Result<i64> {
         let client = self.pool.get().await?;
         let row = client
-            .query_one(
+            .query_opt(
                 "INSERT INTO grabs (movie_id, hash, title, indexer, quality, size, grabbed_at,
                      state, message, replaces)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -902,7 +902,7 @@ impl Store {
                      grabbed_at = EXCLUDED.grabbed_at, state = EXCLUDED.state,
                      message = EXCLUDED.message, replaces = EXCLUDED.replaces,
                      imported_path = NULL, finished_at = NULL
-                 WHERE grabs.state = 'failed'
+                 WHERE grabs.state <> 'downloading'
                  RETURNING id",
                 &[
                     &grab.movie_id,
@@ -917,7 +917,10 @@ impl Store {
                     &grab.replaces,
                 ],
             )
-            .await?;
+            .await?
+            .ok_or_else(|| {
+                StoreError::Corrupt(format!("o release {} já está baixando", grab.hash))
+            })?;
         Ok(row.try_get(0)?)
     }
 
@@ -1434,6 +1437,13 @@ mod tests {
             Some("/filmes/Um (2020)/Um (2020).mkv")
         );
         assert_eq!(done.finished_at.as_deref(), Some("2026-01-01T02:00:00Z"));
+        // Importado também dá lugar: o filme perdeu o arquivo e o mesmo
+        // release voltou a ser o escolhido.
+        assert_eq!(store.record_grab(&grab).await.unwrap(), grab.id);
+        assert_eq!(
+            store.grabs().await.unwrap()[0].state,
+            GrabState::Downloading
+        );
         db.drop().await;
     }
 

@@ -469,16 +469,24 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Hash repetido, episódio de outra série ou falha de escrita.
+    /// Hash de um grab ainda em andamento, episódio de outra série ou falha
+    /// de escrita. Hash de um grab que já acabou (importado ou falho) é
+    /// reaproveitado.
     pub async fn record_series_grab(&self, grab: &SeriesGrab) -> Result<i64> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
         episodes_of_series(&tx, grab.series_id, &grab.episode_ids).await?;
         let id: i64 = tx
-            .query_one(
+            .query_opt(
                 "INSERT INTO series_grabs (series_id, hash, title, indexer, quality, size,
                      grabbed_at, state, message, finished_at)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 ON CONFLICT (hash) DO UPDATE SET series_id = EXCLUDED.series_id,
+                     title = EXCLUDED.title, indexer = EXCLUDED.indexer,
+                     quality = EXCLUDED.quality, size = EXCLUDED.size,
+                     grabbed_at = EXCLUDED.grabbed_at, state = EXCLUDED.state,
+                     message = EXCLUDED.message, finished_at = EXCLUDED.finished_at
+                 WHERE series_grabs.state <> 'downloading'
                  RETURNING id",
                 &[
                     &grab.series_id,
@@ -494,7 +502,18 @@ impl Store {
                 ],
             )
             .await?
+            .ok_or_else(|| {
+                StoreError::Corrupt(format!("o release {} já está baixando", grab.hash))
+            })?
             .try_get(0)?;
+        // Hash repetido de um grab que já acabou (importado ou falho) é o
+        // mesmo release pego de novo: o registro é reaproveitado, com os
+        // episódios de agora.
+        tx.execute(
+            "DELETE FROM series_grab_episodes WHERE grab_id = $1",
+            &[&id],
+        )
+        .await?;
         tx.execute(
             "INSERT INTO series_grab_episodes (grab_id, episode_id)
              SELECT $1, unnest($2::BIGINT[]) ON CONFLICT DO NOTHING",
@@ -1652,6 +1671,23 @@ mod tests {
             grabs[1].finished_at.as_deref(),
             Some("2026-01-04T00:00:00Z")
         );
+
+        // O mesmo release pego de novo depois de acabar reaproveita o registro,
+        // com os episódios de agora.
+        let again = store
+            .record_series_grab(&grab(id, "aaaa", ids[1..].to_vec(), "2026-01-05T00:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(again, old);
+        let reused = store
+            .series_grabs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|g| g.id == old)
+            .unwrap();
+        assert_eq!(reused.state, GrabState::Downloading);
+        assert_eq!(reused.episode_ids, ids[1..]);
 
         db.drop().await;
     }
