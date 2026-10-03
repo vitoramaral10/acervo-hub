@@ -5,10 +5,12 @@
 use std::cmp::Ordering;
 use std::sync::LazyLock;
 
-use acervo_parser::{Language, ParsedMovie, QualityModel, Revision};
+use acervo_parser::{Language, ParsedMovie, Quality, QualityModel, Revision};
 use fancy_regex::Regex;
 
-use crate::{Engine, ExistingFile, Mode, Profile, Propers, Rejection, Release, Target};
+use crate::{
+    Engine, ExistingFile, Indexer, Mode, Profile, Propers, Rejection, Release, Settings, Target,
+};
 
 const MEGABYTE: f64 = 1024.0 * 1024.0;
 
@@ -101,6 +103,52 @@ fn is_upgrade_allowed(profile: &Profile, current: QualityModel, new: QualityMode
     !quality_upgrade || profile.upgrade_allowed
 }
 
+/// Recusas de tamanho de um arquivo: `size` em bytes contra a definição da
+/// qualidade e o teto global, para `minutes` de vídeo.
+pub(crate) fn size_rejections(
+    settings: &Settings,
+    quality: Quality,
+    size: u64,
+    minutes: i64,
+    out: &mut Vec<Rejection>,
+) {
+    let bytes = i64::try_from(size).unwrap_or(i64::MAX);
+    if bytes > 0
+        && let Some(definition) = settings.definition(quality)
+    {
+        if let Some(min) = definition.min_size {
+            let minimum = megabytes(min) * minutes;
+            if bytes < minimum {
+                out.push(Rejection::BelowMinimumSize {
+                    size,
+                    minimum: u64::try_from(minimum).unwrap_or(0),
+                });
+            }
+        }
+        if let Some(max) = definition.max_size.filter(|m| *m != 0.0) {
+            let maximum = megabytes(max) * minutes;
+            if bytes > maximum {
+                out.push(Rejection::AboveMaximumSize {
+                    size,
+                    maximum: u64::try_from(maximum).unwrap_or(0),
+                });
+            }
+        }
+    }
+    let ceiling = settings.maximum_size_mb;
+    if ceiling > 0 && size > 0 {
+        let maximum = ceiling * 1024 * 1024;
+        if size > maximum {
+            out.push(Rejection::MaximumSizeExceeded { size, maximum });
+        }
+    }
+}
+
+pub(crate) fn is_sample(release: &Release) -> bool {
+    let size = i64::try_from(release.size).unwrap_or(i64::MAX);
+    release.title.to_lowercase().contains("sample") && size < megabytes(70.0)
+}
+
 fn size_checks(
     engine: &Engine<'_>,
     release: &Release,
@@ -108,43 +156,49 @@ fn size_checks(
     movie: &Target,
     out: &mut Vec<Rejection>,
 ) {
-    let size = i64::try_from(release.size).unwrap_or(i64::MAX);
-    if size > 0
-        && let Some(definition) = engine.settings.definition(parsed.quality.quality)
-    {
-        let minutes = runtime(movie);
-        if let Some(min) = definition.min_size {
-            let minimum = megabytes(min) * minutes;
-            if size < minimum {
-                out.push(Rejection::BelowMinimumSize {
-                    size: release.size,
-                    minimum: u64::try_from(minimum).unwrap_or(0),
-                });
-            }
-        }
-        if let Some(max) = definition.max_size.filter(|m| *m != 0.0) {
-            let maximum = megabytes(max) * minutes;
-            if size > maximum {
-                out.push(Rejection::AboveMaximumSize {
-                    size: release.size,
-                    maximum: u64::try_from(maximum).unwrap_or(0),
-                });
-            }
-        }
-    }
-    let ceiling = engine.settings.maximum_size_mb;
-    if ceiling > 0 && release.size > 0 {
-        let maximum = ceiling * 1024 * 1024;
-        if release.size > maximum {
-            out.push(Rejection::MaximumSizeExceeded {
-                size: release.size,
-                maximum,
-            });
-        }
-    }
-    if release.title.to_lowercase().contains("sample") && size < megabytes(70.0) {
+    size_rejections(
+        engine.settings,
+        parsed.quality.quality,
+        release.size,
+        runtime(movie),
+        out,
+    );
+    if is_sample(release) {
         out.push(Rejection::Sample);
     }
+}
+
+/// Legenda embutida que as configurações não liberam.
+pub(crate) fn hardcoded_rejection(settings: &Settings, subs: Option<&str>) -> Option<Rejection> {
+    let subs = subs.filter(|s| !s.trim().is_empty())?;
+    if settings.allow_hardcoded_subs {
+        return None;
+    }
+    let allowed = settings
+        .whitelisted_hardcoded_subs
+        .split(',')
+        .any(|term| !term.trim().is_empty() && subs.to_lowercase().contains(&term.to_lowercase()));
+    (!allowed).then(|| Rejection::HardcodeSubtitles(subs.to_owned()))
+}
+
+/// Disco inteiro ou contêiner de disco, pelo nome ou pelo contêiner.
+pub(crate) fn is_raw(release: &Release) -> bool {
+    let title = DISC
+        .iter()
+        .any(|r| r.is_match(&release.title).unwrap_or(false));
+    let container = release
+        .container
+        .as_deref()
+        .is_some_and(|c| ["vob", "iso", "m2ts"].contains(&c.to_lowercase().as_str()));
+    title || container
+}
+
+pub(crate) fn seeders_rejection(indexer: Option<&Indexer>, release: &Release) -> Option<Rejection> {
+    let (indexer, seeders) = (indexer?, release.seeders?);
+    (seeders < indexer.minimum_seeders).then_some(Rejection::MinimumSeeders {
+        seeders,
+        minimum: indexer.minimum_seeders,
+    })
 }
 
 fn file_checks(
@@ -247,41 +301,16 @@ pub(crate) fn evaluate(
 
     size_checks(engine, release, parsed, movie, &mut out);
 
-    if let Some(subs) = &parsed.hardcoded_subs
-        && !subs.trim().is_empty()
-        && !engine.settings.allow_hardcoded_subs
-    {
-        let allowed = engine
-            .settings
-            .whitelisted_hardcoded_subs
-            .split(',')
-            .any(|term| {
-                !term.trim().is_empty() && subs.to_lowercase().contains(&term.to_lowercase())
-            });
-        if !allowed {
-            out.push(Rejection::HardcodeSubtitles(subs.clone()));
-        }
-    }
+    out.extend(hardcoded_rejection(
+        engine.settings,
+        parsed.hardcoded_subs.as_deref(),
+    ));
 
-    let raw_title = DISC
-        .iter()
-        .any(|r| r.is_match(&release.title).unwrap_or(false));
-    let raw_container = release
-        .container
-        .as_deref()
-        .is_some_and(|c| ["vob", "iso", "m2ts"].contains(&c.to_lowercase().as_str()));
-    if raw_title || raw_container {
+    if is_raw(release) {
         out.push(Rejection::Raw);
     }
 
-    if let (Some(indexer), Some(seeders)) = (engine.indexer(&release.indexer), release.seeders)
-        && seeders < indexer.minimum_seeders
-    {
-        out.push(Rejection::MinimumSeeders {
-            seeders,
-            minimum: indexer.minimum_seeders,
-        });
-    }
+    out.extend(seeders_rejection(engine.indexer(&release.indexer), release));
 
     if let Some(file) = &movie.file {
         file_checks(

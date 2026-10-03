@@ -10,7 +10,9 @@
 use std::cmp::Ordering;
 
 use crate::specs::{megabytes, runtime};
-use crate::{Decision, Engine, Propers, Release};
+use acervo_parser::{ParsedMovie, QualityModel};
+
+use crate::{Decision, Engine, Indexer, Profile, Propers, Release, Settings};
 
 const DEFAULT_PRIORITY: i32 = 25;
 
@@ -45,22 +47,28 @@ fn truncate_to(value: i64, level: i64) -> i64 {
     value / level * level
 }
 
-fn size_score(engine: &Engine<'_>, decision: &Decision, release: &Release) -> i64 {
+/// Quão perto o tamanho fica do preferido, em degraus de 200 MB; sem
+/// preferido ou sem duração, só o tamanho truncado.
+pub(crate) fn size_score(preferred: Option<f64>, size: u64, minutes: Option<i64>) -> i64 {
     let level = megabytes(200.0);
-    let size = i64::try_from(release.size).unwrap_or(i64::MAX);
+    let size = i64::try_from(size).unwrap_or(i64::MAX);
+    match (preferred, minutes) {
+        (Some(preferred), Some(minutes)) => {
+            let target = minutes * megabytes(preferred);
+            -truncate_to(size - target, level).abs()
+        }
+        _ => truncate_to(size, level),
+    }
+}
+
+fn movie_size_score(engine: &Engine<'_>, decision: &Decision, release: &Release) -> i64 {
     let preferred = decision
         .parsed
         .as_ref()
         .and_then(|p| engine.settings.definition(p.quality.quality))
         .and_then(|d| d.preferred_size);
     let movie = decision.movie.and_then(|id| engine.movie(id));
-    match (preferred, movie) {
-        (Some(preferred), Some(movie)) => {
-            let target = runtime(movie) * megabytes(preferred);
-            -truncate_to(size - target, level).abs()
-        }
-        _ => truncate_to(size, level),
-    }
+    size_score(preferred, release.size, movie.map(runtime))
 }
 
 /// Faixa de saúde: 2 com seeders suficientes, 1 com algum (ou sem contagem),
@@ -70,6 +78,52 @@ fn health(seeders: Option<u32>, healthy: u32) -> u8 {
         Some(0) => 0,
         Some(count) if count >= healthy => 2,
         _ => 1,
+    }
+}
+
+/// Os critérios de preferência de um release, já na ordem em que decidem:
+/// comparar duas chaves é o `compare`. Maior é melhor.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Key {
+    health: u8,
+    quality: i64,
+    version: u8,
+    real: u8,
+    /// Negativo: prioridade menor do indexador é melhor.
+    priority: i64,
+    flags: i32,
+    seeders: i64,
+    peers: i64,
+    size: i64,
+}
+
+pub(crate) fn key(
+    settings: &Settings,
+    indexers: &[Indexer],
+    profile: &Profile,
+    quality: QualityModel,
+    release: &Release,
+    size: i64,
+) -> Key {
+    let propers = settings.propers != Propers::DoNotPrefer;
+    let priority =
+        crate::find_indexer(indexers, &release.indexer).map_or(DEFAULT_PRIORITY, |i| i.priority);
+    Key {
+        health: profile
+            .healthy_seeders
+            .map_or(0, |healthy| health(release.seeders, healthy)),
+        quality: profile.index(quality.quality),
+        version: if propers { quality.revision.version } else { 0 },
+        real: if propers { quality.revision.real } else { 0 },
+        priority: -i64::from(priority),
+        flags: if settings.prefer_indexer_flags {
+            flag_score(release.flags)
+        } else {
+            0
+        },
+        seeders: magnitude(release.seeders),
+        peers: magnitude(release.peers),
+        size,
     }
 }
 
@@ -83,40 +137,17 @@ pub fn compare(engine: &Engine<'_>, releases: &[Release], a: &Decision, b: &Deci
         return Ordering::Equal;
     };
     let (ra, rb) = (&releases[a.release], &releases[b.release]);
-    let profile = &movie.profile;
-
-    let mut quality = profile
-        .index(pa.quality.quality)
-        .cmp(&profile.index(pb.quality.quality));
-    if engine.settings.propers != Propers::DoNotPrefer {
-        quality = quality.then(
-            pa.quality
-                .revision
-                .version
-                .cmp(&pb.quality.revision.version)
-                .then(pa.quality.revision.real.cmp(&pb.quality.revision.real)),
-        );
-    }
-    let priority = |r: &Release| {
-        engine
-            .indexer(&r.indexer)
-            .map_or(DEFAULT_PRIORITY, |i| i.priority)
+    let key = |parsed: &ParsedMovie, release: &Release, decision: &Decision| {
+        key(
+            engine.settings,
+            engine.indexers,
+            &movie.profile,
+            parsed.quality,
+            release,
+            movie_size_score(engine, decision, release),
+        )
     };
-    let flags = if engine.settings.prefer_indexer_flags {
-        flag_score(ra.flags).cmp(&flag_score(rb.flags))
-    } else {
-        Ordering::Equal
-    };
-    let health = profile.healthy_seeders.map_or(Ordering::Equal, |healthy| {
-        health(ra.seeders, healthy).cmp(&health(rb.seeders, healthy))
-    });
-    health
-        .then(quality)
-        .then(priority(rb).cmp(&priority(ra)))
-        .then(flags)
-        .then(magnitude(ra.seeders).cmp(&magnitude(rb.seeders)))
-        .then(magnitude(ra.peers).cmp(&magnitude(rb.peers)))
-        .then(size_score(engine, a, ra).cmp(&size_score(engine, b, rb)))
+    key(pa, ra, a).cmp(&key(pb, rb, b))
 }
 
 /// Agrupa por filme, na ordem em que cada filme aparece, e ordena cada grupo

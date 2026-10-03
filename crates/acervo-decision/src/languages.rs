@@ -68,6 +68,17 @@ pub(crate) fn aggregate(
         languages.clone_from(&release.languages);
     }
 
+    finish(languages, release, indexer, movie.original_language)
+}
+
+/// Os passos finais, iguais para filme e série: "MULTI" do indexador, idioma
+/// ausente que vira o original e "Original" explícito.
+pub(crate) fn finish(
+    mut languages: Vec<Language>,
+    release: &Release,
+    indexer: Option<&Indexer>,
+    original: Language,
+) -> Vec<Language> {
     if let Some(indexer) = indexer.filter(|i| !i.multi_languages.is_empty())
         && MULTI.is_match(&release.title).unwrap_or(false)
     {
@@ -83,14 +94,14 @@ pub(crate) fn aggregate(
     }
 
     if languages.is_empty() || languages == [Language::Unknown] {
-        languages = vec![movie.original_language];
+        languages = vec![original];
     }
     if let Some(at) = languages.iter().position(|l| *l == Language::Original) {
         languages.remove(at);
-        if languages.contains(&movie.original_language) {
+        if languages.contains(&original) {
             languages.push(Language::Unknown);
         } else {
-            languages.push(movie.original_language);
+            languages.push(original);
         }
     }
     languages

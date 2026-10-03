@@ -195,6 +195,7 @@ fn release(value: &Value) -> Release {
         peers: seeders.map(|s| s + leechers.unwrap_or(0)),
         imdb_id: number(&value["imdbId"]).filter(|id: &u32| *id != 0),
         tmdb_id: number(&value["tmdbId"]).filter(|id: &u32| *id != 0),
+        tvdb_id: None,
         languages: Vec::new(),
         container: None,
         flags: flags(&value["indexerFlags"]),

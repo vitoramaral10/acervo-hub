@@ -12,11 +12,16 @@
 
 use acervo_parser::{Language, ParsedMovie, Quality, QualityModel, parse_movie_title};
 
+mod episodes;
 mod languages;
 mod mapping;
 mod rank;
 mod specs;
 
+pub use episodes::{
+    BlockedEpisode, EpisodeDecision, EpisodeEngine, EpisodeState, EpisodeTarget, Scope,
+    SeriesTarget, pick,
+};
 pub use rank::compare;
 
 /// Tamanhos por minuto de filme, em megabytes, de uma qualidade.
@@ -224,6 +229,10 @@ pub struct Target {
     pub queued: Vec<Queued>,
 }
 
+fn find_indexer<'a>(indexers: &'a [Indexer], name: &str) -> Option<&'a Indexer> {
+    indexers.iter().find(|i| i.name == name)
+}
+
 /// Um indexador, com o que pesa na decisão.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Indexer {
@@ -246,6 +255,8 @@ pub struct Release {
     pub peers: Option<u32>,
     pub imdb_id: Option<u32>,
     pub tmdb_id: Option<u32>,
+    /// Só séries; filme deixa `None`.
+    pub tvdb_id: Option<u32>,
     /// Idiomas que o indexador informa, se informa.
     pub languages: Vec<Language>,
     pub container: Option<String>,
@@ -299,6 +310,13 @@ pub enum Rejection {
     ProperForOldFile,
     MovieNotMonitored,
     Availability,
+    UnknownSeries,
+    WrongSeries,
+    UnknownEpisode,
+    UnparsableEpisode,
+    NothingWanted,
+    NotAired,
+    AlreadyQueued,
     QueueCutoffMet,
     QueueHigherPreference,
     QueueHigherRevision,
@@ -341,6 +359,13 @@ impl Rejection {
             Self::ProperForOldFile => "ProperForOldFile",
             Self::MovieNotMonitored => "MovieNotMonitored",
             Self::Availability => "Availability",
+            Self::UnknownSeries => "UnknownSeries",
+            Self::WrongSeries => "WrongSeries",
+            Self::UnknownEpisode => "UnknownEpisode",
+            Self::UnparsableEpisode => "UnparsableEpisode",
+            Self::NothingWanted => "NothingWanted",
+            Self::NotAired => "NotAired",
+            Self::AlreadyQueued => "AlreadyQueued",
             Self::QueueCutoffMet => "QueueCutoffMet",
             Self::QueueHigherPreference => "QueueHigherPreference",
             Self::QueueHigherRevision => "QueueHigherRevision",
@@ -397,6 +422,13 @@ impl std::fmt::Display for Rejection {
             Self::ProperForOldFile => write!(f, "proper para arquivo antigo"),
             Self::MovieNotMonitored => write!(f, "filme não monitorado"),
             Self::Availability => write!(f, "filme ainda não disponível"),
+            Self::UnknownSeries => write!(f, "não casa com nenhuma série da biblioteca"),
+            Self::WrongSeries => write!(f, "é de outra série"),
+            Self::UnknownEpisode => write!(f, "não cobre nenhum episódio da série"),
+            Self::UnparsableEpisode => write!(f, "o nome não diz temporada nem episódio"),
+            Self::NothingWanted => write!(f, "nenhum episódio coberto está em Quero"),
+            Self::NotAired => write!(f, "os episódios que faltam ainda não foram ao ar"),
+            Self::AlreadyQueued => write!(f, "os episódios que faltam já estão em download"),
             Self::QueueCutoffMet => write!(f, "o que já está na fila atinge o corte"),
             Self::QueueHigherPreference => write!(f, "o que já está na fila é igual ou melhor"),
             Self::QueueHigherRevision => {
@@ -473,7 +505,7 @@ impl Engine<'_> {
     }
 
     fn indexer(&self, name: &str) -> Option<&Indexer> {
-        self.indexers.iter().find(|i| i.name == name)
+        find_indexer(self.indexers, name)
     }
 
     /// Decide os resultados de uma busca pelo filme `movie`, já na ordem de
@@ -638,6 +670,7 @@ mod tests {
             peers: Some(12),
             imdb_id: None,
             tmdb_id: None,
+            tvdb_id: None,
             languages: Vec::new(),
             container: None,
             flags: 0,
