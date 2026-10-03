@@ -10,6 +10,10 @@ use std::time::Duration;
 use serde::Deserialize;
 use url::Url;
 
+mod tv;
+
+pub use tv::{EpisodeMetadata, SeriesMetadata, SeriesSummary};
+
 const BASE: &str = "https://api.themoviedb.org/3/";
 const IMAGES: &str = "https://image.tmdb.org/t/p/original";
 
@@ -20,6 +24,9 @@ pub enum MetadataError {
 
     #[error("filme {0} não existe no TMDB")]
     NotFound(u32),
+
+    #[error("série {0} não existe no TMDB")]
+    SeriesNotFound(u32),
 
     #[error("TMDB respondeu {0}")]
     Status(reqwest::StatusCode),
