@@ -43,7 +43,15 @@ pub struct Policy {
     /// Carência de seed para torrent privado que perdeu o vínculo com a
     /// biblioteca. `None` apaga assim que o vínculo cai — rápido, mas expõe a
     /// hit&run se o torrent for recente.
+    ///
+    /// É o teto: as duas condições abaixo antecipam a saída, nunca a atrasam.
     pub private_seed_grace: Option<Duration>,
+    /// Ratio a partir do qual o seed privado sem vínculo já cumpriu o que o
+    /// tracker espera. `None` desliga a condição.
+    pub private_seed_ratio: Option<f64>,
+    /// Tempo sem nenhuma transferência a partir do qual ninguém mais está
+    /// baixando e o seed só prende disco. `None` desliga a condição.
+    pub private_seed_idle: Option<Duration>,
     /// Categorias do cliente cujos seeds a limpeza pode apagar por perda de
     /// hardlink. Fora delas é download manual e nunca é tocado. Vazia, a
     /// regra não apaga nada: o padrão seguro é não saber o que é de quem.
@@ -58,6 +66,8 @@ impl Default for Policy {
             delete_private_orphans: false,
             skip_orphan_if_missing_in_client: true,
             private_seed_grace: Some(Duration::from_secs(120 * 60 * 60)),
+            private_seed_ratio: Some(1.0),
+            private_seed_idle: Some(Duration::from_secs(24 * 60 * 60)),
             managed_categories: Vec::new(),
             guards: Guards::default(),
         }

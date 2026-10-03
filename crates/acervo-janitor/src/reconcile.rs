@@ -307,13 +307,27 @@ fn evaluate_download(
     if modified_within(download, now, policy.guards.recent_change_grace) {
         return Some(SkipReason::RecentlyModified);
     }
-    if let Some(grace) = policy.private_seed_grace
-        && download.private
-        && download.seeded_for < grace
-    {
+    if download.private && !private_seed_done(download, policy) {
         return Some(SkipReason::SeedGrace);
     }
     None
+}
+
+/// O seed privado sem vínculo já pode sair: basta uma de três condições —
+/// ratio alvo, ociosidade ou o teto de tempo de seed. Sem teto configurado a
+/// carência inteira está desligada e sai logo.
+fn private_seed_done(download: &Download, policy: &Policy) -> bool {
+    let Some(ceiling) = policy.private_seed_grace else {
+        return true;
+    };
+    policy
+        .private_seed_ratio
+        .is_some_and(|alvo| download.ratio >= alvo)
+        || policy
+            .private_seed_idle
+            .zip(download.idle_for)
+            .is_some_and(|(limite, ocioso)| ocioso >= limite)
+        || download.seeded_for >= ceiling
 }
 
 /// Arquivo com data no futuro conta como recente: relógio torto não autoriza

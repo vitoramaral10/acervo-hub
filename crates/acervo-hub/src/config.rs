@@ -225,6 +225,11 @@ pub struct PolicyConfig {
     pub skip_orphan_if_missing_in_client: bool,
     /// Zero apaga sem carência de seed.
     pub private_seed_grace_hours: u64,
+    /// Ratio que libera o seed privado sem vínculo antes do teto. Zero desliga.
+    pub seed_ratio_alvo: f64,
+    /// Horas sem transferência que liberam o seed privado sem vínculo antes do
+    /// teto. Zero desliga.
+    pub seed_ocioso_horas: u64,
     pub recent_change_grace_hours: u64,
     pub max_batch_gib: u64,
     pub max_batch_fraction: f64,
@@ -240,6 +245,8 @@ impl Default for PolicyConfig {
             delete_private_orphans: false,
             skip_orphan_if_missing_in_client: true,
             private_seed_grace_hours: 120,
+            seed_ratio_alvo: 1.0,
+            seed_ocioso_horas: 24,
             recent_change_grace_hours: 24,
             max_batch_gib: 300,
             max_batch_fraction: 0.30,
@@ -257,6 +264,9 @@ impl PolicyConfig {
             skip_orphan_if_missing_in_client: self.skip_orphan_if_missing_in_client,
             private_seed_grace: (self.private_seed_grace_hours > 0)
                 .then(|| Duration::from_secs(self.private_seed_grace_hours * 3600)),
+            private_seed_ratio: (self.seed_ratio_alvo > 0.0).then_some(self.seed_ratio_alvo),
+            private_seed_idle: (self.seed_ocioso_horas > 0)
+                .then(|| Duration::from_secs(self.seed_ocioso_horas * 3600)),
             managed_categories: self.managed_categories.clone(),
             guards: Guards {
                 recent_change_grace: Duration::from_secs(self.recent_change_grace_hours * 3600),
@@ -460,6 +470,9 @@ impl Config {
         if !(0.0..=1.0).contains(&policy.max_batch_fraction) {
             return Err("limpeza: a fração máxima do lote precisa ficar entre 0 e 1".into());
         }
+        if !policy.seed_ratio_alvo.is_finite() || policy.seed_ratio_alvo < 0.0 {
+            return Err("limpeza: o ratio alvo não pode ser negativo".into());
+        }
         if policy.orphan_strikes == 0 {
             return Err("limpeza: são precisos ao menos 1 strike".into());
         }
@@ -650,6 +663,23 @@ mod tests {
     }
 
     #[test]
+    fn limpeza_antiga_sem_os_campos_de_seed_carrega_com_padroes() {
+        let antiga = serde_json::json!({
+            "orphan_strikes": 2,
+            "private_seed_grace_hours": 72,
+            "managed_categories": ["tv-sonarr"],
+        });
+        let config = Config::from_sections([("limpeza".to_string(), antiga)]).unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.policy.private_seed_grace_hours, 72);
+        assert!((config.policy.seed_ratio_alvo - 1.0).abs() < f64::EPSILON);
+        assert_eq!(config.policy.seed_ocioso_horas, 24);
+        let p = config.policy.to_policy();
+        assert_eq!(p.private_seed_ratio, Some(1.0));
+        assert_eq!(p.private_seed_idle, Some(Duration::from_secs(24 * 3600)));
+    }
+
+    #[test]
     fn validacao_recusa_com_mensagem() {
         let erro = |change: fn(&mut Config)| {
             let mut config = valid();
@@ -658,6 +688,7 @@ mod tests {
         };
         assert!(erro(|c| c.server.api_key = "curta".into()).contains("16"));
         assert!(erro(|c| c.policy.max_batch_fraction = 1.5).contains("fração"));
+        assert!(erro(|c| c.policy.seed_ratio_alvo = -1.0).contains("ratio"));
         assert!(erro(|c| c.server.public_url = Some("http://u:p@x".into())).contains("usuário"));
         assert!(erro(|c| c.qbittorrent.url = "nada".into()).contains("URL"));
         assert!(erro(|c| c.instances[0].api_key.clear()).contains("chave"));

@@ -293,6 +293,8 @@ export interface CleanupSection {
   delete_private_orphans: boolean
   skip_orphan_if_missing_in_client: boolean
   private_seed_grace_hours: number
+  seed_ratio_alvo: number
+  seed_ocioso_horas: number
   recent_change_grace_hours: number
   max_batch_gib: number
   max_batch_fraction: number

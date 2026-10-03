@@ -76,6 +76,19 @@ impl TorrentInfo {
     pub fn seeded_for(&self) -> Duration {
         Duration::from_secs(u64::try_from(self.seeding_time).unwrap_or(0))
     }
+
+    /// Tempo desde a última transferência, dado o epoch de agora.
+    ///
+    /// `last_activity` zero é "nunca transferiu": o torrent está parado desde
+    /// que completou, então a ociosidade é o tempo de seed. Atividade no futuro
+    /// (relógio torto) satura em zero, nunca em "muito ocioso".
+    #[must_use]
+    pub fn idle_for(&self, now_epoch: i64) -> Duration {
+        if self.last_activity <= 0 {
+            return self.seeded_for();
+        }
+        Duration::from_secs(u64::try_from(now_epoch - self.last_activity).unwrap_or(0))
+    }
 }
 
 /// Um arquivo do torrent. `name` é relativo ao `save_path` do torrent.

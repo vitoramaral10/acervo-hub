@@ -39,6 +39,7 @@ fn seed(hash: &str, links: u64, bytes: u64) -> Download {
         category: "tv-sonarr".into(),
         ratio: 0.0,
         seeded_for: 500 * HORA,
+        idle_for: None,
         files: vec![arquivo(links, bytes, 90 * HORA)],
     }
 }
@@ -535,4 +536,108 @@ fn lote_de_downloads_sem_dono_grande_demais_aborta() {
         .expect_err("lote acima do teto tem de abortar");
 
     assert!(matches!(erro, Abort::BatchTooLarge { .. }));
+}
+
+// ---- seed privado sem vínculo: ratio alvo, ociosidade ou teto
+
+fn horas(n: u64) -> Duration {
+    Duration::from_secs(n * 3600)
+}
+
+/// Privado, sem hardlink, com os números de seed que o teste quer.
+fn privado(ratio: f64, seeded_h: u64, idle_h: Option<u64>) -> Download {
+    Download {
+        private: true,
+        ratio,
+        seeded_for: horas(seeded_h),
+        idle_for: idle_h.map(horas),
+        ..seed("pv", 1, 4 * GIB)
+    }
+}
+
+/// Política com os padrões de seed (ratio 1.0, 24 h ocioso, teto de 120 h).
+fn politica_de_seed() -> Policy {
+    Policy {
+        managed_categories: vec!["tv-sonarr".into()],
+        ..Policy::default()
+    }
+}
+
+/// Roda a limpeza e diz se o seed saiu.
+fn sai(download: Download, politica: &Policy) -> bool {
+    let mut inv = Inventory::new(Allocated::from_bytes(100 * GIB));
+    inv.snapshots.push(snapshot("filmes", vec![]));
+    inv.downloads = vec![download];
+    let plano = reconcile(&inv, politica, &mut StrikeLedger::new(), agora()).expect("sem abort");
+    if plano.actions.is_empty() {
+        assert!(
+            plano
+                .skipped
+                .iter()
+                .any(|s| s.reason == SkipReason::SeedGrace),
+            "ficou por outro motivo: {:?}",
+            plano.skipped
+        );
+        false
+    } else {
+        true
+    }
+}
+
+#[test]
+fn privado_com_ratio_alvo_sai_mesmo_com_uma_hora_de_seed() {
+    assert!(sai(privado(1.0, 1, Some(0)), &politica_de_seed()));
+}
+
+#[test]
+fn privado_ocioso_ha_25_horas_sai() {
+    assert!(sai(privado(0.1, 30, Some(25)), &politica_de_seed()));
+}
+
+#[test]
+fn privado_ocioso_ha_23_horas_com_ratio_baixo_fica() {
+    assert!(!sai(privado(0.5, 30, Some(23)), &politica_de_seed()));
+}
+
+#[test]
+fn ociosidade_desconhecida_nao_conta_como_ociosa() {
+    assert!(!sai(privado(0.5, 30, None), &politica_de_seed()));
+}
+
+#[test]
+fn privado_no_teto_de_120_horas_sai() {
+    assert!(sai(privado(0.1, 120, Some(0)), &politica_de_seed()));
+}
+
+#[test]
+fn com_as_duas_condicoes_desligadas_so_o_teto_vale() {
+    let politica = Policy {
+        private_seed_ratio: None,
+        private_seed_idle: None,
+        ..politica_de_seed()
+    };
+    assert!(!sai(privado(5.0, 119, Some(100)), &politica));
+    assert!(sai(privado(0.0, 120, Some(0)), &politica));
+}
+
+#[test]
+fn publico_continua_sem_carencia() {
+    let publico = Download {
+        private: false,
+        ..privado(0.0, 0, Some(0))
+    };
+    assert!(sai(publico, &politica_de_seed()));
+}
+
+#[test]
+fn privado_com_hardlink_nunca_sai() {
+    let mut inv = Inventory::new(Allocated::from_bytes(100 * GIB));
+    inv.snapshots.push(snapshot("filmes", vec![]));
+    inv.downloads = vec![Download {
+        files: vec![arquivo(2, 4 * GIB, 90 * HORA)],
+        ..privado(9.0, 500, Some(500))
+    }];
+    let plano =
+        reconcile(&inv, &politica_de_seed(), &mut StrikeLedger::new(), agora()).expect("sem abort");
+    assert!(plano.actions.is_empty());
 }

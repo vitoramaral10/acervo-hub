@@ -64,6 +64,9 @@ pub struct Download {
     pub category: String,
     pub ratio: f64,
     pub seeded_for: Duration,
+    /// Tempo desde a última transferência. `None` é desconhecido, e
+    /// desconhecido nunca conta como ocioso.
+    pub idle_for: Option<Duration>,
     pub files: Vec<FileFacts>,
 }
 
@@ -118,6 +121,7 @@ mod tests {
             category: "tv-sonarr".into(),
             ratio: 0.0,
             seeded_for: Duration::ZERO,
+            idle_for: None,
             files,
         }
     }

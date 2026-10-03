@@ -195,6 +195,9 @@ async fn read_download(
     map: &PathMap,
 ) -> Result<Download, UnreadableDownload> {
     let hash = DownloadHash::new(&torrent.hash);
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
 
     let files = qbit.files(&hash).await.map_err(|err| UnreadableDownload {
         hash: hash.clone(),
@@ -238,6 +241,7 @@ async fn read_download(
         category: torrent.category.clone(),
         ratio: torrent.ratio,
         seeded_for: torrent.seeded_for(),
+        idle_for: Some(torrent.idle_for(now_epoch)),
         files: facts,
     })
 }

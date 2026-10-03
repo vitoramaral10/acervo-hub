@@ -691,6 +691,7 @@ function CleanupForm({ data, save, saving }: FormProps<'limpeza'>) {
   const [policy, setPolicy] = useState<CleanupSection>(data)
   const [categories, setCategories] = useState(data.managed_categories.join('\n'))
   const [fraction, setFraction] = useState(String(Math.round(data.max_batch_fraction * 100)))
+  const [ratio, setRatio] = useState(String(data.seed_ratio_alvo))
   const set = <K extends keyof CleanupSection>(key: K, value: CleanupSection[K]) =>
     setPolicy((current) => ({ ...current, [key]: value }))
   const number = (id: string, key: keyof CleanupSection, label: string, help?: string) => (
@@ -716,6 +717,7 @@ function CleanupForm({ data, save, saving }: FormProps<'limpeza'>) {
           ...policy,
           managed_categories: lines(categories),
           max_batch_fraction: Math.min(100, whole(fraction)) / 100,
+          seed_ratio_alvo: Math.max(0, Number(ratio.replace(',', '.')) || 0),
         })
       }}
     >
@@ -744,7 +746,29 @@ function CleanupForm({ data, save, saving }: FormProps<'limpeza'>) {
           'limpeza-seed',
           'private_seed_grace_hours',
           'Seed em privado sem vínculo (horas)',
-          'Zero apaga no ciclo seguinte — rápido, mas expõe a hit&run.',
+          'Teto: sai de qualquer jeito depois disso. Zero apaga no ciclo seguinte — expõe a hit&run.',
+        )}
+        <Field
+          id="limpeza-ratio"
+          label="Ratio que libera o seed privado"
+          help="Sai ao atingir este ratio, antes do teto. Zero desliga."
+        >
+          <Input
+            id="limpeza-ratio"
+            type="number"
+            min={0}
+            step={0.1}
+            value={ratio}
+            onChange={(event) => setRatio(event.target.value)}
+            aria-describedby="limpeza-ratio-ajuda"
+            className="w-32 tabular-nums"
+          />
+        </Field>
+        {number(
+          'limpeza-ocioso',
+          'seed_ocioso_horas',
+          'Seed privado sem envio há (horas)',
+          'Sai se ninguém baixou nesse tempo, antes do teto. Zero desliga.',
         )}
         {number('limpeza-recente', 'recent_change_grace_hours', 'Arquivo mexido há menos de (horas)', 'Nunca é apagado.')}
       </fieldset>

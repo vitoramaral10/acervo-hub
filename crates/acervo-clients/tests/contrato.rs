@@ -152,6 +152,14 @@ async fn listagem_traz_o_que_a_decisao_precisa() {
     assert_eq!(state_from_qbit(&torrents[0].state), DownloadState::Seeding);
     assert_eq!(state_from_qbit(&torrents[1].state), DownloadState::Paused);
     assert_eq!(torrents[0].seeded_for(), Duration::from_secs(432_000));
+    // Ociosidade a partir da última transferência; zero cai no tempo de seed.
+    assert_eq!(
+        torrents[0].idle_for(1_757_900_000 + 3600),
+        Duration::from_secs(3600)
+    );
+    let mut nunca = torrents[0].clone();
+    nunca.last_activity = 0;
+    assert_eq!(nunca.idle_for(1_800_000_000), nunca.seeded_for());
     // Quando entrou: é por ele que a série sabe se o torrent é do grab.
     assert_eq!(torrents[0].added_on, 1_757_800_000);
 
