@@ -33,6 +33,9 @@ pub enum QbitError {
 
     #[error("o qBittorrent recusou o torrent (já existe ou arquivo inválido)")]
     AddRefused,
+
+    #[error("o qBittorrent não sabe o espaço livre: a pasta de download existe?")]
+    FreeSpaceUnknown,
 }
 
 /// O que mandar ao cliente: o arquivo `.torrent` ou um link magnet.
@@ -148,10 +151,11 @@ impl QbitClient {
     ///
     /// # Errors
     ///
-    /// Falha de transporte ou status não-2xx.
+    /// Falha de transporte, status não-2xx ou espaço desconhecido: o
+    /// qBittorrent responde `-1` quando a pasta de download não existe.
     pub async fn free_space(&self) -> Result<u64, QbitError> {
         let main: dto::MainData = self.get("api/v2/sync/maindata", &[]).await?;
-        Ok(main.server_state.free_space_on_disk)
+        u64::try_from(main.server_state.free_space_on_disk).map_err(|_| QbitError::FreeSpaceUnknown)
     }
 
     /// Se o cliente reserva o arquivo inteiro no disco ao iniciar.

@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use acervo_clients::{QbitClient, client_path, state_from_qbit};
+use acervo_clients::{QbitClient, QbitError, client_path, state_from_qbit};
 use acervo_core::{DownloadHash, DownloadState};
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, header, method, path, query_param};
@@ -441,6 +441,28 @@ async fn espaco_livre_vem_do_server_state() {
         .await;
 
     assert_eq!(cliente.free_space().await.expect("lido"), 1_234_567);
+}
+
+#[tokio::test]
+async fn espaco_livre_menos_um_e_erro_claro_e_nao_falha_de_desserializacao() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/sync/maindata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "rid": 1,
+            "server_state": { "free_space_on_disk": -1, "dl_info_speed": 0 }
+        })))
+        .mount(&server)
+        .await;
+
+    let error = cliente.free_space().await.expect_err("espaço desconhecido");
+
+    assert!(matches!(error, QbitError::FreeSpaceUnknown));
+    assert_eq!(
+        error.to_string(),
+        "o qBittorrent não sabe o espaço livre: a pasta de download existe?"
+    );
 }
 
 #[tokio::test]

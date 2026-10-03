@@ -94,8 +94,10 @@ pub(crate) struct MainData {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ServerState {
+    /// `-1` quando o qBittorrent não consegue medir (pasta de download
+    /// inexistente), por isso com sinal.
     #[serde(default)]
-    pub free_space_on_disk: u64,
+    pub free_space_on_disk: i64,
 }
 
 /// O pedaço de `app/preferences` que o acervo lê.
@@ -103,4 +105,16 @@ pub(crate) struct ServerState {
 pub(crate) struct Preferences {
     #[serde(default)]
     pub preallocate_all: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn espaco_livre_menos_um_desserializa() {
+        let main: MainData =
+            serde_json::from_str(r#"{"server_state": {"free_space_on_disk": -1}}"#).unwrap();
+        assert_eq!(main.server_state.free_space_on_disk, -1);
+    }
 }
