@@ -535,9 +535,8 @@ function MovieToolbar({
 }) {
   const DirIcon = prefs.dir === 'asc' ? ArrowUp : ArrowDown
   return (
-    <div className="mb-5 flex flex-col gap-2">
-      <div className="flex flex-wrap items-center gap-2">
-        <label className="min-w-0 flex-1 basis-56 sm:max-w-xs">
+    <div className="mb-5 flex flex-wrap items-center gap-2 lg:flex-nowrap">
+        <label className="min-w-0 flex-1 basis-56 sm:max-w-xs lg:w-64 lg:flex-none">
           <span className="sr-only">Buscar na biblioteca</span>
           <Input
             type="search"
@@ -547,7 +546,21 @@ function MovieToolbar({
             className="h-8"
           />
         </label>
-        <div className="flex items-center gap-1.5 sm:ml-auto">
+        <div className="min-w-0 flex-1 overflow-x-auto">
+          <ChipGroup label="Estado" single nowrap>
+            {STATES.filter((s) => s.value !== 'problemas' || stateTotals.problemas > 0 || prefs.state === 'problemas').map(
+              ({ value, label }) => (
+                <Chip key={value} single active={prefs.state === value} onClick={() => onChange({ state: value })}>
+                  {label}
+                  <span className={cn('tabular-nums', value === 'problemas' && stateTotals[value] > 0 ? 'text-danger' : 'text-content-subtle')}>
+                    {formatCount(stateTotals[value])}
+                  </span>
+                </Chip>
+              ),
+            )}
+          </ChipGroup>
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
           <Select
             value={prefs.sort}
             onValueChange={(value) => onChange({ sort: value as SortKey, dir: defaultDir(value as SortKey) })}
@@ -584,21 +597,6 @@ function MovieToolbar({
             </Chip>
           </ChipGroup>
         </div>
-      </div>
-      <div className="-mx-1 overflow-x-auto px-1">
-        <ChipGroup label="Estado" single nowrap>
-          {STATES.filter((s) => s.value !== 'problemas' || stateTotals.problemas > 0 || prefs.state === 'problemas').map(
-            ({ value, label }) => (
-              <Chip key={value} single active={prefs.state === value} onClick={() => onChange({ state: value })}>
-                {label}
-                <span className={cn('tabular-nums', value === 'problemas' && stateTotals[value] > 0 ? 'text-danger' : 'text-content-subtle')}>
-                  {formatCount(stateTotals[value])}
-                </span>
-              </Chip>
-            ),
-          )}
-        </ChipGroup>
-      </div>
     </div>
   )
 }
