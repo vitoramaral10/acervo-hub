@@ -143,19 +143,39 @@ static FILE_EXTENSION: LazyLock<Regex> = LazyLock::new(|| regex(r"(?i)\.[a-z0-9]
 /// Tira a extensão só se ela for de mídia (ou de usenet): "Filme.2020.DUAL"
 /// não perde o "DUAL".
 pub(crate) fn remove_file_extension(title: &str) -> String {
+    remove_extension_if(title, |extension| {
+        MEDIA_EXTENSIONS.iter().any(|(e, _)| *e == extension)
+    })
+}
+
+/// O mesmo para o gerenciador de séries, que não conhece `.mk3d`.
+pub(crate) fn remove_episode_file_extension(title: &str) -> String {
+    remove_extension_if(title, |extension| {
+        extension != ".mk3d" && MEDIA_EXTENSIONS.iter().any(|(e, _)| *e == extension)
+    })
+}
+
+fn remove_extension_if(title: &str, is_media: impl Fn(&str) -> bool) -> String {
     FILE_EXTENSION
         .replace_all(title, |captures: &Captures<'_, str>| {
             let extension = captures[0].to_lowercase();
-            let known = MEDIA_EXTENSIONS.iter().any(|(e, _)| *e == extension)
-                || extension == ".par2"
-                || extension == ".nzb";
-            if known {
+            if is_media(&extension) || extension == ".par2" || extension == ".nzb" {
                 String::new()
             } else {
                 captures[0].to_owned()
             }
         })
         .into_owned()
+}
+
+/// Qualidade sugerida pela extensão no gerenciador de séries: o contêiner
+/// Matroska e o MPEG-TS valem 720p ali, e `.mk3d` não é extensão de mídia.
+pub(crate) fn episode_quality_for_extension(extension: &str) -> crate::Quality {
+    match extension.to_lowercase().as_str() {
+        ".mkv" | ".ts" | ".wtv" => crate::Quality::Hdtv720p,
+        ".mk3d" => crate::Quality::Unknown,
+        _ => quality_for_extension(extension),
+    }
 }
 
 #[cfg(test)]

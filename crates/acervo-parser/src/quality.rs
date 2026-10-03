@@ -237,7 +237,7 @@ pub struct QualityModel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Resolution {
+pub(crate) enum Resolution {
     Unknown,
     R360p,
     R480p,
@@ -273,9 +273,10 @@ static SOURCE: LazyLock<Regex> = LazyLock::new(|| {
     ))
 });
 
-static RAW_HD: LazyLock<Regex> = LazyLock::new(|| regex(r"(?i)\b(?<rawhd>RawHD|Raw[-_. ]HD)\b"));
+pub(crate) static RAW_HD: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"(?i)\b(?<rawhd>RawHD|Raw[-_. ]HD)\b"));
 
-static MPEG2: LazyLock<Regex> = LazyLock::new(|| regex(r"\b(?<mpeg2>MPEG[-_. ]?2)\b"));
+pub(crate) static MPEG2: LazyLock<Regex> = LazyLock::new(|| regex(r"\b(?<mpeg2>MPEG[-_. ]?2)\b"));
 
 static BR_DISK: LazyLock<Regex> = LazyLock::new(|| {
     regex(concat!(
@@ -285,15 +286,16 @@ static BR_DISK: LazyLock<Regex> = LazyLock::new(|| {
     ))
 });
 
-static PROPER: LazyLock<Regex> = LazyLock::new(|| regex(r"(?i)\b(?<proper>proper)\b"));
+pub(crate) static PROPER: LazyLock<Regex> = LazyLock::new(|| regex(r"(?i)\b(?<proper>proper)\b"));
 
-static REPACK: LazyLock<Regex> = LazyLock::new(|| regex(r"(?i)\b(?<repack>repack\d?|rerip\d?)\b"));
+pub(crate) static REPACK: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"(?i)\b(?<repack>repack\d?|rerip\d?)\b"));
 
 static VERSION: LazyLock<Regex> = LazyLock::new(|| {
     regex(r"(?i)\d[-._ ]?v(?<v1>\d)[-._ ]|\[v(?<v2>\d)\]|repack(?<v3>\d)|rerip(?<v4>\d)")
 });
 
-static REAL: LazyLock<Regex> = LazyLock::new(|| regex(r"\b(?<real>REAL)\b"));
+pub(crate) static REAL: LazyLock<Regex> = LazyLock::new(|| regex(r"\b(?<real>REAL)\b"));
 
 static RESOLUTION: LazyLock<Regex> = LazyLock::new(|| {
     regex(
@@ -301,7 +303,7 @@ static RESOLUTION: LazyLock<Regex> = LazyLock::new(|| {
     )
 });
 
-static ALTERNATIVE_RESOLUTION: LazyLock<Regex> =
+pub(crate) static ALTERNATIVE_RESOLUTION: LazyLock<Regex> =
     LazyLock::new(|| regex(r"(?i)\b(?<a>UHD)\b|(?<b>\[4K\])"));
 
 static CODEC: LazyLock<Regex> = LazyLock::new(|| {
@@ -310,15 +312,16 @@ static CODEC: LazyLock<Regex> = LazyLock::new(|| {
     )
 });
 
-static OTHER_SOURCE: LazyLock<Regex> =
+pub(crate) static OTHER_SOURCE: LazyLock<Regex> =
     LazyLock::new(|| regex(r"(?i)(?<hdtv>HD[-_. ]TV)|(?<sdtv>SD[-_. ]TV)"));
 
-static ANIME_BLURAY: LazyLock<Regex> =
+pub(crate) static ANIME_BLURAY: LazyLock<Regex> =
     LazyLock::new(|| regex(r"(?i)bd(?:720|1080|2160)|(?<=[-_. (\[])bd(?=[-_. )\]])"));
 
-static ANIME_WEB_DL: LazyLock<Regex> = LazyLock::new(|| regex(r"(?i)\[WEB\]|[\[\(]WEB[ .]"));
+pub(crate) static ANIME_WEB_DL: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"(?i)\[WEB\]|[\[\(]WEB[ .]"));
 
-static HIGH_DEF_PDTV: LazyLock<Regex> = LazyLock::new(|| regex(r"(?i)hr[-_. ]ws"));
+pub(crate) static HIGH_DEF_PDTV: LazyLock<Regex> = LazyLock::new(|| regex(r"(?i)hr[-_. ]ws"));
 
 static REMUX: LazyLock<Regex> = LazyLock::new(|| {
     regex(
@@ -332,7 +335,7 @@ static GERMAN_REMUX: LazyLock<Regex> = LazyLock::new(|| {
     )
 });
 
-fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+pub(crate) fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
     haystack.to_lowercase().contains(&needle.to_lowercase())
 }
 

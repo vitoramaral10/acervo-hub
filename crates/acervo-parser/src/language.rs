@@ -2,9 +2,9 @@
 
 use std::sync::LazyLock;
 
-use fancy_regex::Regex;
+use fancy_regex::{Captures, Regex};
 
-use crate::common::{is_match, regex};
+use crate::common::{captures, is_match, regex};
 
 /// Idiomas com o id e o nome que a API v3 usa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -503,6 +503,85 @@ fn from_groups(regex: &Regex, title: &str, groups: &[(&str, Language)], into: &m
     }
 }
 
+/// Palavra por extenso em qualquer ponto do título, na ordem do gerenciador
+/// de séries (a lista de filmes é outra).
+const EPISODE_WORDS: &[(&[&str], Language)] = &[
+    (&["spanish"], Language::Spanish),
+    (&["danish"], Language::Danish),
+    (&["dutch"], Language::Dutch),
+    (&["japanese"], Language::Japanese),
+    (&["icelandic"], Language::Icelandic),
+    (&["mandarin", "cantonese", "chinese"], Language::Chinese),
+    (&["korean"], Language::Korean),
+    (&["russian"], Language::Russian),
+    (&["polish"], Language::Polish),
+    (&["vietnamese"], Language::Vietnamese),
+    (&["swedish"], Language::Swedish),
+    (&["norwegian"], Language::Norwegian),
+    (&["finnish"], Language::Finnish),
+    (&["turkish"], Language::Turkish),
+    (&["portuguese"], Language::Portuguese),
+    (&["hungarian"], Language::Hungarian),
+    (&["hebrew"], Language::Hebrew),
+    (&["arabic"], Language::Arabic),
+    (&["hindi"], Language::Hindi),
+    (&["malayalam"], Language::Malayalam),
+    (&["ukrainian"], Language::Ukrainian),
+    (&["bulgarian"], Language::Bulgarian),
+    (&["slovak"], Language::Slovak),
+    (&["brazilian", "dublado"], Language::PortugueseBr),
+    (&["latino"], Language::SpanishLatino),
+    (&["latvian"], Language::Latvian),
+];
+
+/// Corta o que vem antes de "S01E02 " (ou "S01 "): só o resto é lido.
+static EPISODE_CLEAN_TITLE: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"(?i).*?[_. ](S\d{2}(?:E\d{2,4})*[_. ].*)"));
+
+static EPISODE_CASE_SENSITIVE: LazyLock<Regex> = LazyLock::new(|| {
+    regex(
+        r"(?:(?i)(?<!SUB[\W|_|^]))(?:(?<lithuanian>\bLT\b)|(?<czech>\bCZ\b)|(?<polish>\bPL\b)|(?<bulgarian>\bBG\b)|(?<slovak>\bSK\b))(?:(?i)(?![\W|_|^]SUB))",
+    )
+});
+
+static EPISODE_CASE_INSENSITIVE: LazyLock<Regex> = LazyLock::new(|| {
+    regex(
+        r"(?i)(?:\W|_)(?<english>\b(?:ing|eng)\b)|(?<italian>\b(?:ita|italian)\b)|(?<german>german\b|videomann|ger[. ]dub)|(?<flemish>flemish)|(?<greek>greek)|(?<french>(?:\W|_)(?:FR|VF|VF2|VFF|VFI|VFQ|TRUEFRENCH|FRENCH)(?:\W|_))|(?<russian>\b(?:rus|ru)\b)|(?<hungarian>\b(?:HUNDUB|HUN)\b)|(?<hebrew>\bHebDub\b)|(?<polish>\b(?:PL\W?DUB|DUB\W?PL|LEK\W?PL|PL\W?LEK)\b)|(?<chinese>\[(?:CH[ST]|BIG5|GB)\]|简|繁|字幕)|(?<bulgarian>\bbgaudio\b)|(?<spanish>\b(?:español|castellano|esp|spa(?!\(Latino\)))\b)|(?<ukrainian>\b(?:\dx?)?(?:ukr))|(?<thai>\b(?:THAI)\b)|(?<romanian>\b(?:RoDubbed|ROMANIAN)\b)|(?<catalan>[-,. ]cat[. ](?:DD|subs)|\b(?:catalan|catalán)\b)|(?<latvian>\b(?:lat|lav|lv)\b)|(?<turkish>\b(?:tur)\b)|(?<original>\b(?:orig|original)\b)",
+    )
+});
+
+const EPISODE_CASE_SENSITIVE_GROUPS: &[(&str, Language)] = &[
+    ("lithuanian", Language::Lithuanian),
+    ("czech", Language::Czech),
+    ("polish", Language::Polish),
+    ("bulgarian", Language::Bulgarian),
+    ("slovak", Language::Slovak),
+];
+
+/// Na ordem em que o original confere os grupos de cada casamento.
+const EPISODE_CASE_INSENSITIVE_GROUPS: &[(&str, Language)] = &[
+    ("english", Language::English),
+    ("italian", Language::Italian),
+    ("german", Language::German),
+    ("flemish", Language::Flemish),
+    ("greek", Language::Greek),
+    ("french", Language::French),
+    ("russian", Language::Russian),
+    ("hungarian", Language::Hungarian),
+    ("hebrew", Language::Hebrew),
+    ("polish", Language::Polish),
+    ("chinese", Language::Chinese),
+    ("bulgarian", Language::Bulgarian),
+    ("ukrainian", Language::Ukrainian),
+    ("spanish", Language::Spanish),
+    ("thai", Language::Thai),
+    ("romanian", Language::Romanian),
+    ("catalan", Language::Catalan),
+    ("latvian", Language::Latvian),
+    ("turkish", Language::Turkish),
+    ("original", Language::Original),
+];
+
 /// Idiomas do título, sem repetição, na ordem em que foram achados.
 /// Nenhum achado é `[Unknown]`.
 #[must_use]
@@ -533,6 +612,61 @@ pub fn parse_languages(title: &str) -> Vec<Language> {
         if is_match(&GERMAN_DUAL, title) {
             languages.push(Language::Original);
         } else if is_match(&GERMAN_MULTI, title) {
+            languages.push(Language::Original);
+            languages.push(Language::English);
+        }
+    }
+    let mut seen = Vec::with_capacity(languages.len());
+    languages.retain(|language| {
+        let new = !seen.contains(language);
+        seen.push(*language);
+        new
+    });
+    languages
+}
+
+/// Idiomas do release de episódio, como o gerenciador de séries os lê: outra
+/// lista de palavras, outros padrões e outra ordem que a de filmes. Recebe os
+/// "tokens" do release, o que sobra depois da temporada e do episódio.
+#[must_use]
+pub fn parse_episode_languages(title: &str) -> Vec<Language> {
+    let title = EPISODE_CLEAN_TITLE
+        .replace_all(title, |found: &Captures<'_, str>| found[1].to_owned())
+        .into_owned();
+    let lower = title.to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|word| lower.contains(word));
+
+    let mut languages: Vec<Language> = EPISODE_WORDS
+        .iter()
+        .filter(|(words, _)| has(words))
+        .map(|(_, language)| *language)
+        .collect();
+
+    // Só o primeiro casamento do padrão sensível a maiúsculas.
+    if let Some(found) = captures(&EPISODE_CASE_SENSITIVE, &title) {
+        for (name, language) in EPISODE_CASE_SENSITIVE_GROUPS {
+            if found.name(name).is_some() {
+                languages.push(*language);
+            }
+        }
+    }
+    from_groups(
+        &EPISODE_CASE_INSENSITIVE,
+        &title,
+        EPISODE_CASE_INSENSITIVE_GROUPS,
+        &mut languages,
+    );
+    if lower.contains("english") {
+        languages.push(Language::English);
+    }
+
+    if languages.is_empty() {
+        languages.push(Language::Unknown);
+    }
+    if languages == [Language::German] {
+        if is_match(&GERMAN_DUAL, &title) {
+            languages.push(Language::Original);
+        } else if is_match(&GERMAN_MULTI, &title) {
             languages.push(Language::Original);
             languages.push(Language::English);
         }

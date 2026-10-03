@@ -16,6 +16,13 @@ static NORMALIZE: LazyLock<Regex> = LazyLock::new(|| {
     )
 });
 
+/// Como `NORMALIZE`, na versão do gerenciador de séries: sem as guardas de
+/// artigo no começo e no fim do título.
+static NORMALIZE_SERIES: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"(?i)((?:\b|_)(?<!^)([aà](?!$)|an|the|and|or|of)(?!$)(?:\b|_))|\W|_"));
+
+static PERCENT: LazyLock<Regex> = LazyLock::new(|| regex(r"(?<=\b\d+)%"));
+
 static SPECIAL_WORD: LazyLock<Regex> =
     LazyLock::new(|| regex(r"(?i)\b(part|special|edition|christmas)\b\s?"));
 
@@ -58,6 +65,17 @@ pub fn clean_movie_title(title: &str) -> String {
     ))
 }
 
+/// O título limpo com que release e série são comparados. "3%" vira "3percent"
+/// para não colidir com "3".
+#[must_use]
+pub fn clean_series_title(title: &str) -> String {
+    if title.trim().is_empty() || title.trim().parse::<i64>().is_ok() {
+        return title.to_owned();
+    }
+    let title = replace_all(&PERCENT, title, "percent");
+    remove_accents(&replace_all(&NORMALIZE_SERIES, &title, "").to_lowercase())
+}
+
 /// Título em palavras minúsculas, sem pontuação: a forma que a agregação de
 /// idiomas procura dentro do nome do release.
 #[must_use]
@@ -84,6 +102,15 @@ mod tests {
             clean_movie_title("Mission: Impossible"),
             "missionimpossible"
         );
+    }
+
+    #[test]
+    fn titulo_limpo_de_serie() {
+        assert_eq!(clean_series_title("The Walking Dead"), "thewalkingdead");
+        assert_eq!(clean_series_title("Lord of the Rings"), "lordrings");
+        assert_eq!(clean_series_title("3%"), "3percent");
+        assert_eq!(clean_series_title("Pokémon"), "pokemon");
+        assert_eq!(clean_series_title("1917"), "1917");
     }
 
     #[test]
