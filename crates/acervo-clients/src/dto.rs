@@ -32,6 +32,9 @@ pub struct TorrentInfo {
     pub eta: i64,
     #[serde(default)]
     pub size: u64,
+    /// Bytes que faltam baixar.
+    #[serde(default)]
+    pub amount_left: u64,
     #[serde(default)]
     pub num_seeds: u32,
     /// Separadas por vírgula e espaço.

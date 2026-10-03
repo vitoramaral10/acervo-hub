@@ -685,6 +685,9 @@ async fn save_rules(
     {
         return Err(fail(bad("valor de propers inválido")));
     }
+    if rules.downloads_simultaneos < 1 {
+        return Err(fail(bad("downloads simultâneos: o mínimo é 1")));
+    }
     crate::rules::save(store, &rules)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;

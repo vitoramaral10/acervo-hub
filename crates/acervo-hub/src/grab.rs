@@ -56,20 +56,61 @@ pub struct GrabReport {
 pub(crate) const QUEUE_TAG: &str = "acervo:fila";
 pub(crate) const QUEUED: &str = "na fila: aguardando espaço";
 
-/// Estados em que o torrent já foi iniciado mas ainda não pré-alocou: o
-/// espaço livre ainda não desconta o que ele vai ocupar.
-const UNALLOCATED: &[&str] = &["metaDL", "forcedMetaDL", "queuedDL", "allocating"];
-
 /// Uma rodada da fila por vez: duas lendo o mesmo espaço livre iniciariam
 /// torrents para o mesmo buraco.
 static QUEUE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Torrent do acervo que está baixando de verdade: não parado e incompleto.
+fn is_active(torrent: &acervo_clients::TorrentInfo) -> bool {
+    !torrent.state.starts_with("stopped")
+        && !torrent.state.starts_with("paused")
+        && torrent.progress < 1.0
+}
+
+/// Quem sai da fila agora: do menor para o maior, pulando quem não cabe, e
+/// no máximo até o limite de downloads ativos.
+///
+/// `candidates` são (hash, bytes que faltam); `active_left`, o que falta de
+/// cada torrent ativo e incompleto do acervo. O orçamento é o espaço livre
+/// menos a folga menos tudo o que falta dos ativos. O qBittorrent reserva o
+/// espaço aos poucos depois de iniciar, então o livre lido logo em seguida
+/// ainda sobra; quem já pré-alocou é descontado duas vezes, de propósito:
+/// errar para menos nunca enche o disco.
+fn pick_starts(
+    candidates: &[(String, u64)],
+    active_left: &[u64],
+    free: u64,
+    reserve: u64,
+    limit: usize,
+) -> Vec<String> {
+    let mut budget = free
+        .saturating_sub(active_left.iter().sum())
+        .saturating_sub(reserve);
+    let mut slots = limit.saturating_sub(active_left.len());
+    let mut sorted: Vec<&(String, u64)> = candidates.iter().collect();
+    sorted.sort_by_key(|(_, need)| *need);
+    let mut picked = Vec::new();
+    for (hash, need) in sorted {
+        if slots == 0 {
+            break;
+        }
+        if *need > budget {
+            continue;
+        }
+        budget -= need;
+        slots -= 1;
+        picked.push(hash.clone());
+    }
+    picked
+}
+
 /// Inicia os torrents da fila que cabem no disco, do menor para o maior,
-/// pulando quem não cabe. Com a pré-alocação ligada, todo torrent ativo já
-/// ocupa o tamanho inteiro, então o espaço livre basta; só quem ainda não
-/// alocou é descontado à mão. A folga mínima das regras fica sempre livre: a
-/// importação cria a pasta do filme e o servidor de mídia grava miniaturas
-/// no mesmo disco.
+/// pulando quem não cabe, sem passar do limite de downloads simultâneos das
+/// regras (disco mecânico não aguenta dezenas de escritas aleatórias). O
+/// espaço livre não basta: o qBittorrent reserva aos poucos, então se
+/// desconta o que falta de todo torrent ativo do acervo. A folga mínima das
+/// regras fica sempre livre: a importação cria a pasta do filme e o servidor
+/// de mídia grava miniaturas no mesmo disco.
 ///
 /// # Errors
 ///
@@ -103,17 +144,26 @@ pub(crate) async fn start_queued(store: &Store, client: &QbitClient) -> Result<V
         }
     };
     let torrents = client.torrents().await?;
-    let pending: u64 = torrents
+    // Só os do acervo: grab em andamento, filme ou série. Sem `amount_left`
+    // (cliente antigo), cai na conta pelo tamanho.
+    let active_left: Vec<u64> = torrents
         .iter()
-        .filter(|t| UNALLOCATED.contains(&t.state.as_str()))
-        .map(|t| left(size(t), t.progress))
-        .sum();
-    let reserve = crate::rules::stored(store).await?.folga_minima_mb << 20;
-    let mut budget = client
-        .free_space()
-        .await?
-        .saturating_sub(pending)
-        .saturating_sub(reserve);
+        .filter(|t| known.contains_key(&t.hash) && is_active(t))
+        .map(|t| {
+            if t.amount_left > 0 {
+                t.amount_left
+            } else {
+                left(size(t), t.progress)
+            }
+        })
+        .collect();
+    let rules = crate::rules::stored(store).await?;
+    let limit = rules.max_downloads();
+    if active_left.len() >= limit {
+        return Ok(Vec::new());
+    }
+    let reserve = rules.folga_minima_mb << 20;
+    let free = client.free_space().await?;
     let mut queue = Vec::new();
     for torrent in torrents
         .iter()
@@ -132,18 +182,16 @@ pub(crate) async fn start_queued(store: &Store, client: &QbitClient) -> Result<V
             },
             None => left(size(torrent), torrent.progress),
         };
-        queue.push((need, torrent));
+        queue.push((torrent.hash.clone(), need));
     }
-    queue.sort_by_key(|(need, _)| *need);
     let mut started = Vec::new();
-    for (need, torrent) in queue {
-        if need > budget {
+    for hash in pick_starts(&queue, &active_left, free, reserve, limit) {
+        let Some(torrent) = torrents.iter().find(|t| t.hash == hash) else {
             continue;
-        }
-        client.start(&[&torrent.hash]).await?;
-        client.remove_tag(&[&torrent.hash], QUEUE_TAG).await?;
-        budget -= need;
-        tracing::info!(torrent = %torrent.name, bytes = need, "iniciado da fila");
+        };
+        client.start(&[&hash]).await?;
+        client.remove_tag(&[&hash], QUEUE_TAG).await?;
+        tracing::info!(torrent = %torrent.name, "iniciado da fila");
         started.push(torrent.name.clone());
     }
     Ok(started)
@@ -918,6 +966,54 @@ mod tests {
 
     fn file(name: &str, size: u64) -> acervo_clients::TorrentFile {
         serde_json::from_value(serde_json::json!({ "name": name, "size": size })).unwrap()
+    }
+
+    fn queue(needs: &[u64]) -> Vec<(String, u64)> {
+        needs.iter().map(|n| (format!("h{n}"), *n)).collect()
+    }
+
+    #[test]
+    fn limite_segura_a_fila_mesmo_com_espaco_sobrando() {
+        // Dois ativos de limite 3: só uma vaga, apesar do disco enorme.
+        let picked = pick_starts(&queue(&[10, 20, 30]), &[1, 1], 1_000_000, 0, 3);
+        assert_eq!(picked, ["h10"]);
+        // Limite já atingido: nada inicia.
+        assert!(pick_starts(&queue(&[10]), &[1, 1, 1], 1_000_000, 0, 3).is_empty());
+    }
+
+    #[test]
+    fn conta_desconta_o_que_falta_dos_ativos() {
+        // 100 livres, 30 faltam nos ativos, folga 10: sobram 60.
+        let picked = pick_starts(&queue(&[50, 70]), &[10, 20], 100, 10, 10);
+        assert_eq!(picked, ["h50"]);
+        // Sem ativos, o orçamento é 90: o de 50 cabe e o de 70 não, depois dele.
+        assert_eq!(pick_starts(&queue(&[50, 70]), &[], 100, 10, 10), ["h50"]);
+        assert!(pick_starts(&queue(&[50]), &[60], 100, 10, 10).is_empty());
+    }
+
+    #[test]
+    fn menor_primeiro_pulando_quem_nao_cabe() {
+        let picked = pick_starts(&queue(&[80, 5, 40, 30]), &[], 100, 10, 10);
+        // Orçamento 90: 5, 30, 40 (soma 75); o de 80 não cabe mais.
+        assert_eq!(picked, ["h5", "h30", "h40"]);
+        let picked = pick_starts(&queue(&[95, 20]), &[], 100, 10, 10);
+        assert_eq!(picked, ["h20"]);
+    }
+
+    #[test]
+    fn so_conta_como_ativo_o_que_baixa_de_verdade() {
+        let torrent = |state: &str, progress: f64| -> acervo_clients::TorrentInfo {
+            serde_json::from_value(serde_json::json!({
+                "hash": "h", "name": "n", "state": state, "save_path": "/",
+                "progress": progress,
+            }))
+            .unwrap()
+        };
+        assert!(is_active(&torrent("downloading", 0.5)));
+        assert!(is_active(&torrent("metaDL", 0.0)));
+        assert!(!is_active(&torrent("stoppedDL", 0.0)));
+        assert!(!is_active(&torrent("pausedDL", 0.3)));
+        assert!(!is_active(&torrent("stalledUP", 1.0)));
     }
 
     #[test]

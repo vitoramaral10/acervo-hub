@@ -211,6 +211,22 @@ export function RulesSection({ view }: { view: RulesView }) {
               <span className="text-sm text-content-muted">GB</span>
             </div>
           </Field>
+          <Field
+            id="simultaneos"
+            label="Downloads simultâneos"
+            help="Quantos torrents do acervo baixam ao mesmo tempo; os demais esperam na fila. Mínimo 1."
+          >
+            <Input
+              id="simultaneos"
+              type="number"
+              min={1}
+              step={1}
+              value={rules.downloads_simultaneos}
+              onChange={(e) => set('downloads_simultaneos', Math.max(1, number(e.target.value)))}
+              aria-describedby="simultaneos-ajuda"
+              className="max-w-32"
+            />
+          </Field>
         </fieldset>
 
         {indexers.length > 0 && (

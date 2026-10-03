@@ -52,6 +52,8 @@ pub struct DecisionRules {
     pub preferir_flags_do_indexador: bool,
     /// Folga que a fila de downloads deixa sempre livre no disco do cliente.
     pub folga_minima_mb: u64,
+    /// Quantos torrents do acervo baixam ao mesmo tempo; no mínimo 1.
+    pub downloads_simultaneos: u32,
     /// Dias depois da data de disponibilidade.
     pub carencia_dias: i64,
     /// Pelo nome do indexador.
@@ -68,6 +70,7 @@ impl Default for DecisionRules {
             propers: "preferir_e_atualizar".into(),
             preferir_flags_do_indexador: false,
             folga_minima_mb: 100,
+            downloads_simultaneos: 5,
             carencia_dias: 0,
             indexadores: BTreeMap::new(),
             atraso: DelayRules::default(),
@@ -115,6 +118,12 @@ impl DecisionRules {
         }
     }
 
+    /// O limite de downloads simultâneos, nunca abaixo de 1.
+    #[must_use]
+    pub fn max_downloads(&self) -> usize {
+        self.downloads_simultaneos.max(1) as usize
+    }
+
     /// Prioridade e seeders de um indexador; padrão se não houver regra.
     #[must_use]
     pub fn indexer(&self, name: &str) -> IndexerRules {
@@ -158,5 +167,13 @@ mod tests {
             DecisionRules::parse(r#"{"folga_minima_mb": 2048, "pular_checagem_de_espaco": true}"#)
                 .expect("lê");
         assert_eq!(rules.folga_minima_mb, 2048);
+    }
+
+    #[test]
+    fn limite_de_downloads_tem_padrao_e_minimo() {
+        let rules = DecisionRules::parse(r#"{"folga_minima_mb": 2048}"#).expect("lê");
+        assert_eq!(rules.max_downloads(), 5);
+        let rules = DecisionRules::parse(r#"{"downloads_simultaneos": 0}"#).expect("lê");
+        assert_eq!(rules.max_downloads(), 1);
     }
 }

@@ -498,6 +498,7 @@ export interface DecisionRules {
   propers: 'preferir_e_atualizar' | 'nao_atualizar' | 'nao_preferir'
   preferir_flags_do_indexador: boolean
   folga_minima_mb: number
+  downloads_simultaneos: number
   carencia_dias: number
   indexadores: Record<string, IndexerRules>
   atraso: { minutos: number; pular_se_melhor_qualidade: boolean }
