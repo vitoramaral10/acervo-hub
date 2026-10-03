@@ -1,5 +1,5 @@
-//! Cliente mínimo do Jellyfin: usuários, filmes com o que cada um assistiu
-//! e o pedido de varredura da biblioteca.
+//! Cliente mínimo do Jellyfin: usuários, filmes e episódios com o que cada
+//! um assistiu e o pedido de varredura da biblioteca.
 //!
 //! A chave vai no cabeçalho `Authorization` no esquema `MediaBrowser`, e
 //! nunca na URL: URL aparece em erro de transporte e em log.
@@ -49,6 +49,27 @@ pub struct JellyfinMovie {
     pub favorite: bool,
 }
 
+/// Um episódio, visto por um usuário, com os dados da série a que pertence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JellyfinEpisode {
+    /// `ProviderIds.Tmdb` da série, quando ela tem um id numérico.
+    pub series_tmdb_id: Option<u32>,
+    /// `ProviderIds.Tvdb` da série, quando ela tem um id numérico.
+    pub series_tvdb_id: Option<u32>,
+    /// `ParentIndexNumber`: a temporada.
+    pub season: Option<u16>,
+    /// `IndexNumber`: o episódio; no multi-episódio, o primeiro.
+    pub number: Option<u16>,
+    /// `IndexNumberEnd`: o último episódio de um arquivo multi-episódio.
+    pub index_end: Option<u16>,
+    pub played: bool,
+    /// Como o servidor manda (ISO 8601, UTC); quem usa interpreta.
+    pub last_played: Option<String>,
+    pub favorite: bool,
+    /// A série está nos favoritos do usuário.
+    pub series_favorite: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct RawUser {
@@ -67,7 +88,18 @@ struct RawItems {
 #[serde(rename_all = "PascalCase")]
 struct RawItem {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
     name: String,
+    /// Só o episódio traz: o id da série dona.
+    #[serde(default)]
+    series_id: Option<String>,
+    #[serde(default)]
+    parent_index_number: Option<u16>,
+    #[serde(default)]
+    index_number: Option<u16>,
+    #[serde(default)]
+    index_number_end: Option<u16>,
     #[serde(default)]
     production_year: Option<u16>,
     #[serde(default)]
@@ -110,6 +142,21 @@ impl From<RawItem> for JellyfinMovie {
             favorite: data.is_favorite,
         }
     }
+}
+
+/// Id numérico de um provedor; a chave é comparada sem caixa, como no filme.
+fn provider_id(ids: Option<&HashMap<String, Option<String>>>, key: &str) -> Option<u32> {
+    ids?.iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        .and_then(|(_, value)| value.as_deref()?.trim().parse().ok())
+}
+
+/// O que se sabe de uma série para preencher seus episódios.
+#[derive(Clone, Copy)]
+struct SeriesInfo {
+    tmdb_id: Option<u32>,
+    tvdb_id: Option<u32>,
+    favorite: bool,
 }
 
 /// Cliente autenticado por chave de API.
@@ -189,6 +236,80 @@ impl JellyfinClient {
             )
             .await?;
         Ok(page.items.into_iter().map(JellyfinMovie::from).collect())
+    }
+
+    /// Todos os episódios, com os dados de quem é `user_id`, e com os ids e o
+    /// favorito da série a que cada um pertence.
+    ///
+    /// O episódio não traz os `ProviderIds` da série: são duas buscas, a das
+    /// séries e a dos episódios, juntadas pelo `SeriesId`. Episódio cuja
+    /// série não veio na busca fica sem ids e sem favorito. Como em
+    /// [`Self::movies`], não há paginação.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte, chave recusada ou resposta ilegível.
+    pub async fn episodes(&self, user_id: &str) -> Result<Vec<JellyfinEpisode>, JellyfinError> {
+        let series: RawItems = self
+            .get(
+                "Items",
+                &[
+                    ("userId", user_id),
+                    ("includeItemTypes", "Series"),
+                    ("recursive", "true"),
+                    ("fields", "ProviderIds"),
+                    ("enableUserData", "true"),
+                ],
+            )
+            .await?;
+        let series: HashMap<String, SeriesInfo> = series
+            .items
+            .into_iter()
+            .map(|item| {
+                let info = SeriesInfo {
+                    tmdb_id: provider_id(item.provider_ids.as_ref(), "tmdb"),
+                    tvdb_id: provider_id(item.provider_ids.as_ref(), "tvdb"),
+                    favorite: item.user_data.is_some_and(|data| data.is_favorite),
+                };
+                (item.id, info)
+            })
+            .collect();
+
+        let page: RawItems = self
+            .get(
+                "Items",
+                &[
+                    ("userId", user_id),
+                    ("includeItemTypes", "Episode"),
+                    ("recursive", "true"),
+                    ("fields", "ProviderIds"),
+                    ("enableUserData", "true"),
+                ],
+            )
+            .await?;
+        Ok(page
+            .items
+            .into_iter()
+            .map(|item| {
+                let info = item.series_id.as_ref().and_then(|id| series.get(id));
+                let data = item.user_data.unwrap_or(RawUserData {
+                    played: false,
+                    last_played_date: None,
+                    is_favorite: false,
+                });
+                JellyfinEpisode {
+                    series_tmdb_id: info.and_then(|s| s.tmdb_id),
+                    series_tvdb_id: info.and_then(|s| s.tvdb_id),
+                    season: item.parent_index_number,
+                    number: item.index_number,
+                    index_end: item.index_number_end,
+                    played: data.played,
+                    last_played: data.last_played_date.filter(|d| !d.trim().is_empty()),
+                    favorite: data.is_favorite,
+                    series_favorite: info.is_some_and(|s| s.favorite),
+                }
+            })
+            .collect())
     }
 
     /// Pede a varredura de todas as bibliotecas; o servidor responde antes

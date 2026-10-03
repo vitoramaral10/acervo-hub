@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use acervo_clients::jellyfin::{JellyfinClient, JellyfinError, JellyfinMovie};
+use acervo_clients::jellyfin::{JellyfinClient, JellyfinEpisode, JellyfinError, JellyfinMovie};
 use serde_json::{Value, json};
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -141,6 +141,193 @@ async fn filmes_do_usuario_com_assistido_data_favorito_e_tmdb() {
                 favorite: false,
             },
         ]
+    );
+}
+
+/// Uma série como o `/Items` manda.
+fn serie(id: &str, provedores: &Value, favorita: bool) -> Value {
+    json!({
+        "Name": "Uma Série",
+        "ServerId": "f1e2d3c4b5a6",
+        "Id": id,
+        "IsFolder": true,
+        "Type": "Series",
+        "ProviderIds": provedores,
+        "UserData": { "PlayCount": 0, "IsFavorite": favorita, "Played": false, "Key": "k" }
+    })
+}
+
+/// Um episódio como o `/Items` manda; sem `ProviderIds` da série.
+fn episodio(serie_id: &str, temporada: u16, numero: u16, fim: Option<u16>, dados: &Value) -> Value {
+    let mut item = json!({
+        "Name": "Episódio",
+        "ServerId": "f1e2d3c4b5a6",
+        "Id": format!("e{temporada}{numero}"),
+        "Container": "mkv",
+        "RunTimeTicks": 27_000_000_000_i64,
+        "IndexNumber": numero,
+        "ParentIndexNumber": temporada,
+        "IsFolder": false,
+        "Type": "Episode",
+        "SeriesName": "Uma Série",
+        "SeriesId": serie_id,
+        "SeasonId": "s1",
+        "UserData": dados,
+        "MediaType": "Video"
+    });
+    if let Some(fim) = fim {
+        item["IndexNumberEnd"] = json!(fim);
+    }
+    item
+}
+
+async fn monta_series_e_episodios(server: &MockServer, series: Value, episodios: Value) {
+    for (tipo, itens) in [("Series", series), ("Episode", episodios)] {
+        Mock::given(method("GET"))
+            .and(path("/Items"))
+            .and(header("authorization", AUTH))
+            .and(query_param("userId", "u1"))
+            .and(query_param("includeItemTypes", tipo))
+            .and(query_param("recursive", "true"))
+            .and(query_param("fields", "ProviderIds"))
+            .and(query_param("enableUserData", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Items": itens,
+                "TotalRecordCount": 2,
+                "StartIndex": 0
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn episodios_juntam_com_a_serie_pelo_series_id() {
+    let server = MockServer::start().await;
+    monta_series_e_episodios(
+        &server,
+        json!([
+            serie("sa", &json!({ "Tmdb": "1396", "Tvdb": "81189" }), false),
+            serie("sb", &json!({ "Tmdb": "2316" }), true),
+        ]),
+        json!([
+            episodio(
+                "sa",
+                1,
+                2,
+                None,
+                &json!({
+                    "PlayCount": 1, "IsFavorite": true,
+                    "LastPlayedDate": "2026-09-30T21:14:08.1234567Z", "Played": true
+                }),
+            ),
+            episodio(
+                "sb",
+                3,
+                4,
+                None,
+                &json!({ "Played": false, "IsFavorite": false })
+            ),
+            // Série que a busca não trouxe.
+            episodio("sumida", 1, 1, None, &json!({ "Played": true })),
+        ]),
+    )
+    .await;
+
+    let episodes = cliente(&server).episodes("u1").await.unwrap();
+    assert_eq!(
+        episodes,
+        [
+            JellyfinEpisode {
+                series_tmdb_id: Some(1396),
+                series_tvdb_id: Some(81189),
+                season: Some(1),
+                number: Some(2),
+                index_end: None,
+                played: true,
+                last_played: Some("2026-09-30T21:14:08.1234567Z".into()),
+                favorite: true,
+                series_favorite: false,
+            },
+            JellyfinEpisode {
+                series_tmdb_id: Some(2316),
+                series_tvdb_id: None,
+                season: Some(3),
+                number: Some(4),
+                index_end: None,
+                played: false,
+                last_played: None,
+                favorite: false,
+                series_favorite: true,
+            },
+            JellyfinEpisode {
+                series_tmdb_id: None,
+                series_tvdb_id: None,
+                season: Some(1),
+                number: Some(1),
+                index_end: None,
+                played: true,
+                last_played: None,
+                favorite: false,
+                series_favorite: false,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn episodio_multi_episodio_traz_o_fim_do_intervalo() {
+    let server = MockServer::start().await;
+    monta_series_e_episodios(
+        &server,
+        json!([serie("sa", &json!({ "Tvdb": "81189" }), false)]),
+        json!([episodio("sa", 2, 5, Some(6), &json!({ "Played": true }))]),
+    )
+    .await;
+
+    let episodes = cliente(&server).episodes("u1").await.unwrap();
+    assert_eq!(episodes.len(), 1);
+    assert_eq!(
+        (
+            episodes[0].season,
+            episodes[0].number,
+            episodes[0].index_end
+        ),
+        (Some(2), Some(5), Some(6))
+    );
+    assert_eq!(episodes[0].series_tvdb_id, Some(81189));
+}
+
+#[tokio::test]
+async fn episodio_de_serie_sem_provider_ids_fica_sem_ids() {
+    let server = MockServer::start().await;
+    // Uma série sem o campo e outra com `ProviderIds` vazio.
+    let mut sem_campo = serie("sa", &json!({}), true);
+    sem_campo.as_object_mut().unwrap().remove("ProviderIds");
+    monta_series_e_episodios(
+        &server,
+        json!([sem_campo, serie("sb", &json!({}), false)]),
+        json!([
+            episodio("sa", 1, 1, None, &json!({ "Played": false })),
+            episodio("sb", 1, 1, None, &json!({ "Played": false })),
+        ]),
+    )
+    .await;
+
+    let episodes = cliente(&server).episodes("u1").await.unwrap();
+    assert!(
+        episodes
+            .iter()
+            .all(|e| e.series_tmdb_id.is_none() && e.series_tvdb_id.is_none())
+    );
+    // O favorito da série não depende dos ids.
+    assert_eq!(
+        episodes
+            .iter()
+            .map(|e| e.series_favorite)
+            .collect::<Vec<_>>(),
+        [true, false]
     );
 }
 
