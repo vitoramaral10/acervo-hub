@@ -37,6 +37,9 @@ pub struct TorrentInfo {
     /// Separadas por vírgula e espaço.
     #[serde(default)]
     pub tags: String,
+    /// Quando entrou no cliente, em segundos Unix; zero se não veio.
+    #[serde(default)]
+    pub added_on: i64,
 }
 
 impl TorrentInfo {
@@ -65,9 +68,22 @@ impl TorrentInfo {
 /// Um arquivo do torrent. `name` é relativo ao `save_path` do torrent.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TorrentFile {
+    /// Posição no torrent: é por ela que a prioridade se muda.
+    #[serde(default)]
+    pub index: usize,
     pub name: String,
     #[serde(default)]
     pub size: u64,
+    /// `0` não baixa; `1`, `6` e `7` baixam (normal, alta, máxima).
+    #[serde(default = "normal_priority")]
+    pub priority: u8,
+    /// De 0 a 1.
+    #[serde(default)]
+    pub progress: f64,
+}
+
+fn normal_priority() -> u8 {
+    1
 }
 
 /// O pedaço de `sync/maindata` que interessa: o estado do servidor.

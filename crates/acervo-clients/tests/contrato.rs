@@ -152,6 +152,8 @@ async fn listagem_traz_o_que_a_decisao_precisa() {
     assert_eq!(state_from_qbit(&torrents[0].state), DownloadState::Seeding);
     assert_eq!(state_from_qbit(&torrents[1].state), DownloadState::Paused);
     assert_eq!(torrents[0].seeded_for(), Duration::from_secs(432_000));
+    // Quando entrou: é por ele que a série sabe se o torrent é do grab.
+    assert_eq!(torrents[0].added_on, 1_757_800_000);
 
     // Versão sem o campo: privado por omissão. A assimetria custa disco; a
     // inversa custa hit&run.
@@ -322,6 +324,7 @@ async fn adicionar_manda_arquivo_e_categoria_e_reconhece_recusa() {
         category: "acervo".into(),
         save_path: None,
         stopped: false,
+        stop_after_metadata: false,
         tags: Vec::new(),
     };
 
@@ -386,6 +389,7 @@ async fn adicionar_na_fila_manda_parado_e_tag() {
         category: "acervo".into(),
         save_path: None,
         stopped: true,
+        stop_after_metadata: false,
         tags: vec!["acervo:fila".into()],
     };
 
@@ -393,6 +397,34 @@ async fn adicionar_na_fila_manda_parado_e_tag() {
         .add(NewTorrent::Magnet("magnet:?xt=urn:btih:x".into()), &options)
         .await
         .expect("aceito parado");
+}
+
+#[tokio::test]
+async fn magnet_de_pacote_anda_so_ate_os_metadados() {
+    use acervo_clients::{AddOptions, NewTorrent};
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/add"))
+        .and(body_string_contains(
+            "name=\"stopCondition\"\r\n\r\nMetadataReceived",
+        ))
+        .and(body_string_contains("name=\"tags\"\r\n\r\nacervo:fila"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+        .mount(&server)
+        .await;
+    let options = AddOptions {
+        category: "acervo".into(),
+        save_path: None,
+        stopped: false,
+        stop_after_metadata: true,
+        tags: vec!["acervo:fila".into()],
+    };
+
+    cliente
+        .add(NewTorrent::Magnet("magnet:?xt=urn:btih:x".into()), &options)
+        .await
+        .expect("aceito com condição de parada");
 }
 
 #[tokio::test]
@@ -453,4 +485,39 @@ async fn preferencia_de_preallocacao_lida_e_ligada() {
 
     assert!(!cliente.preallocates().await.expect("lida"));
     cliente.enable_preallocation().await.expect("ligada");
+}
+
+#[tokio::test]
+async fn arquivos_trazem_indice_e_prioridade_e_a_prioridade_se_muda() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+    let hash = DownloadHash::new("a1b2c3d4e5f6");
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrents/files"))
+        .and(query_param("hash", "a1b2c3d4e5f6"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"index": 0, "name": "Serie.S01/Serie.S01E01.mkv", "size": 10, "priority": 1, "progress": 1.0},
+            {"index": 1, "name": "Serie.S01/Serie.S01E02.mkv", "size": 20, "priority": 0, "progress": 0.0},
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/filePrio"))
+        .and(body_string_contains("hash=a1b2c3d4e5f6"))
+        .and(body_string_contains("id=0%7C2"))
+        .and(body_string_contains("priority=0"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let files = cliente.files(&hash).await.unwrap();
+    assert_eq!(files[1].index, 1);
+    assert_eq!(files[1].priority, 0);
+    assert_eq!(files[0].priority, 1);
+
+    cliente.set_file_priority(&hash, &[0, 2], 0).await.unwrap();
+    // Lista vazia não chama o cliente.
+    cliente.set_file_priority(&hash, &[], 0).await.unwrap();
 }

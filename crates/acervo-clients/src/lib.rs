@@ -50,6 +50,10 @@ pub struct AddOptions {
     pub save_path: Option<String>,
     /// Entra parado, sem alocar nem baixar nada.
     pub stopped: bool,
+    /// Entra andando só até ter os metadados, e para (`stopCondition`, da
+    /// 4.5 em diante): o magnet de um pacote precisa da lista de arquivos
+    /// antes de baixar qualquer um. Ignorado com `stopped`.
+    pub stop_after_metadata: bool,
     pub tags: Vec<String>,
 }
 
@@ -261,6 +265,8 @@ impl QbitClient {
             // `paused` até a 4.x, `stopped` da 5.0 em diante; cada versão
             // ignora o campo da outra.
             form = form.text("paused", "true").text("stopped", "true");
+        } else if options.stop_after_metadata {
+            form = form.text("stopCondition", "MetadataReceived");
         }
         if !options.tags.is_empty() {
             form = form.text("tags", options.tags.join(","));
@@ -306,6 +312,38 @@ impl QbitClient {
     pub async fn files(&self, hash: &DownloadHash) -> Result<Vec<TorrentFile>, QbitError> {
         self.get("api/v2/torrents/files", &[("hash", hash.as_str())])
             .await
+    }
+
+    /// Muda a prioridade de arquivos do torrent, pelo `index` de
+    /// [`TorrentFile`]. Prioridade `0` faz o cliente não baixar o arquivo: é
+    /// assim que de um pacote de temporada sai só o episódio que falta.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status não-2xx.
+    pub async fn set_file_priority(
+        &self,
+        hash: &DownloadHash,
+        indexes: &[usize],
+        priority: u8,
+    ) -> Result<(), QbitError> {
+        if indexes.is_empty() {
+            return Ok(());
+        }
+        let ids = indexes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("|");
+        self.post(
+            "api/v2/torrents/filePrio",
+            &[
+                ("hash", hash.as_str()),
+                ("id", &ids),
+                ("priority", &priority.to_string()),
+            ],
+        )
+        .await
     }
 
     /// Apaga torrents, opcionalmente com os arquivos.
