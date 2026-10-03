@@ -5,6 +5,7 @@
 mod accounts;
 mod config;
 mod manage;
+mod series;
 mod tasks;
 
 use acervo_parser::{Quality, QualityModel, Revision};
@@ -15,6 +16,10 @@ use tokio_postgres::{NoTls, Row};
 pub use accounts::SESSION_DAYS;
 pub use config::IndexerRecord;
 pub use manage::{Blocked, HistoryEvent, HistoryPage, NewHistory};
+pub use series::{
+    CatalogEpisode, CatalogEpisodeFile, CatalogSeries, Episode, EpisodeFile, EpisodeSync, Series,
+    SeriesGrab, SeriesPick, SeriesSearch, Skip, default_skip,
+};
 pub use tasks::{NewTaskRun, TaskRun};
 
 #[derive(Debug, thiserror::Error)]
@@ -148,7 +153,7 @@ pub enum GrabState {
 }
 
 impl GrabState {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Downloading => "downloading",
             Self::Imported => "imported",
@@ -156,7 +161,7 @@ impl GrabState {
         }
     }
 
-    fn parse(text: &str) -> Result<Self> {
+    pub(crate) fn parse(text: &str) -> Result<Self> {
         match text {
             "downloading" => Ok(Self::Downloading),
             "imported" => Ok(Self::Imported),
@@ -460,6 +465,113 @@ const MIGRATIONS: &[&str] = &[
     DROP TABLE tags;
     ALTER TABLE movie_files DROP COLUMN file_id, DROP COLUMN media_info;
     DROP SEQUENCE movie_file_ids;
+",
+    // Séries. O episódio não tem `monitored`: tem `skip`, o motivo de não
+    // ser buscado (`unwanted`, `deleted`, `watched`). Sem arquivo e sem
+    // `skip`, ele é procurado assim que vai ao ar. Um arquivo pode cobrir
+    // vários episódios (multi-episódio); um grab, vários arquivos (pacote).
+    r"
+    CREATE TABLE series (
+        id BIGSERIAL PRIMARY KEY,
+        tmdb_id BIGINT NOT NULL UNIQUE,
+        tvdb_id BIGINT,
+        imdb_id TEXT,
+        title TEXT NOT NULL,
+        original_title TEXT,
+        metadata_title TEXT,
+        original_language TEXT,
+        year INTEGER,
+        status TEXT,
+        overview TEXT,
+        network TEXT,
+        runtime INTEGER NOT NULL DEFAULT 0,
+        poster TEXT,
+        fanart TEXT,
+        path TEXT NOT NULL,
+        season_folder BOOLEAN NOT NULL,
+        monitor_new BOOLEAN NOT NULL,
+        added TEXT,
+        refreshed_at TEXT
+    );
+    CREATE TABLE series_titles (
+        id BIGSERIAL PRIMARY KEY,
+        series_id BIGINT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+        title TEXT NOT NULL
+    );
+    CREATE INDEX series_titles_by_series ON series_titles(series_id);
+    CREATE TABLE episode_files (
+        id BIGSERIAL PRIMARY KEY,
+        series_id BIGINT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+        relative_path TEXT NOT NULL,
+        size BIGINT NOT NULL,
+        quality SMALLINT NOT NULL,
+        revision_version SMALLINT NOT NULL,
+        revision_real SMALLINT NOT NULL,
+        is_repack BOOLEAN NOT NULL,
+        languages JSONB NOT NULL,
+        release_group TEXT,
+        scene_name TEXT,
+        date_added TEXT,
+        UNIQUE (series_id, relative_path)
+    );
+    CREATE TABLE episodes (
+        id BIGSERIAL PRIMARY KEY,
+        series_id BIGINT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+        season INTEGER NOT NULL,
+        number INTEGER NOT NULL,
+        tmdb_id BIGINT,
+        title TEXT,
+        air_date TEXT,
+        overview TEXT,
+        runtime INTEGER NOT NULL DEFAULT 0,
+        skip TEXT CHECK (skip IN ('unwanted', 'deleted', 'watched')),
+        skipped_at TEXT,
+        file_id BIGINT REFERENCES episode_files(id) ON DELETE SET NULL,
+        UNIQUE (series_id, season, number)
+    );
+    CREATE INDEX episodes_by_file ON episodes(file_id);
+    CREATE TABLE series_grabs (
+        id BIGSERIAL PRIMARY KEY,
+        series_id BIGINT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+        hash TEXT NOT NULL UNIQUE,
+        title TEXT NOT NULL,
+        indexer TEXT NOT NULL,
+        quality SMALLINT NOT NULL,
+        size BIGINT NOT NULL,
+        grabbed_at TEXT NOT NULL,
+        state TEXT NOT NULL,
+        message TEXT,
+        finished_at TEXT
+    );
+    CREATE INDEX series_grabs_by_series ON series_grabs(series_id, grabbed_at);
+    CREATE TABLE series_grab_episodes (
+        grab_id BIGINT NOT NULL REFERENCES series_grabs(id) ON DELETE CASCADE,
+        episode_id BIGINT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+        PRIMARY KEY (grab_id, episode_id)
+    );
+    CREATE INDEX series_grab_episodes_by_episode ON series_grab_episodes(episode_id);
+    ALTER TABLE history
+        ADD COLUMN series_id BIGINT REFERENCES series(id) ON DELETE SET NULL,
+        ADD COLUMN episode_ids JSONB NOT NULL DEFAULT '[]';
+    CREATE INDEX history_by_series ON history(series_id, at);
+    ALTER TABLE blocklist
+        ADD COLUMN series_id BIGINT REFERENCES series(id) ON DELETE CASCADE;
+    CREATE INDEX blocklist_by_series ON blocklist(series_id);
+",
+    // A busca de cada série: o que se consultou, o que se pegou (uma busca
+    // de série pode pegar vários releases) e por que o resto ficou.
+    r"
+    CREATE TABLE series_searches (
+        id BIGSERIAL PRIMARY KEY,
+        series_id BIGINT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+        at TEXT NOT NULL,
+        queries JSONB NOT NULL,
+        releases BIGINT NOT NULL,
+        picks JSONB NOT NULL,
+        rejections JSONB NOT NULL,
+        error TEXT
+    );
+    CREATE INDEX series_searches_by_series ON series_searches(series_id, at);
 ",
 ];
 
@@ -1555,7 +1667,7 @@ mod tests {
         let columns = client
             .query(
                 "SELECT table_name || '.' || column_name FROM information_schema.columns
-                 WHERE table_schema = $1 AND column_name IN
+                 WHERE table_schema = $1 AND table_name <> 'episodes' AND column_name IN
                      ('quality_profile_id', 'tags', 'source', 'source_id', 'file_id', 'media_info')",
                 &[&schema],
             )
@@ -1585,6 +1697,8 @@ mod tests {
 
         let event = |at: &str| NewHistory {
             movie_id: Some(movie_id),
+            series_id: None,
+            episode_ids: vec![],
             movie_title: "Um (2020)".into(),
             event: "grabbed".into(),
             at: at.into(),
@@ -1615,6 +1729,7 @@ mod tests {
             .block(&Blocked {
                 id: 0,
                 movie_id: None,
+                series_id: None,
                 source_title: "Ruim.2020.CAM".into(),
                 indexer: None,
                 quality: None,
