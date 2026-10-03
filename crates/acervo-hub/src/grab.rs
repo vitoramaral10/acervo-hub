@@ -28,7 +28,7 @@ use crate::events::{self, Event, Kind};
 use crate::naming::movie_file_stem;
 
 /// Extensões de vídeo que a importação aceita.
-const VIDEO: &[&str] = &[
+pub(crate) const VIDEO: &[&str] = &[
     "mkv", "mp4", "avi", "m4v", "ts", "m2ts", "wmv", "mov", "webm",
 ];
 
@@ -53,8 +53,8 @@ pub struct GrabReport {
 }
 
 /// Tag dos torrents que o acervo pôs na fila: só esses ele inicia.
-const QUEUE_TAG: &str = "acervo:fila";
-const QUEUED: &str = "na fila: aguardando espaço";
+pub(crate) const QUEUE_TAG: &str = "acervo:fila";
+pub(crate) const QUEUED: &str = "na fila: aguardando espaço";
 
 /// Estados em que o torrent já foi iniciado mas ainda não pré-alocou: o
 /// espaço livre ainda não desconta o que ele vai ocupar.
@@ -81,13 +81,20 @@ pub(crate) async fn start_queued(store: &Store, client: &QbitClient) -> Result<V
         tracing::info!("pré-alocação ligada no qBittorrent");
     }
     // Magnet parado não tem metadados: o tamanho vem do indexador.
-    let known: HashMap<String, u64> = store
+    let mut known: HashMap<String, u64> = store
         .grabs()
         .await?
         .into_iter()
         .filter(|g| g.state == GrabState::Downloading)
         .map(|g| (g.hash, g.size))
         .collect();
+    let series: Vec<acervo_store::SeriesGrab> = store
+        .series_grabs()
+        .await?
+        .into_iter()
+        .filter(|g| g.state == GrabState::Downloading)
+        .collect();
+    known.extend(series.iter().map(|g| (g.hash.clone(), g.size)));
     let size = |t: &acervo_clients::TorrentInfo| {
         if t.size > 0 {
             t.size
@@ -107,11 +114,26 @@ pub(crate) async fn start_queued(store: &Store, client: &QbitClient) -> Result<V
         .await?
         .saturating_sub(pending)
         .saturating_sub(reserve);
-    let mut queue: Vec<_> = torrents
+    let mut queue = Vec::new();
+    for torrent in torrents
         .iter()
         .filter(|t| t.has_tag(QUEUE_TAG) && size(t) > 0)
-        .map(|t| (left(size(t), t.progress), t))
-        .collect();
+    {
+        // De série, só sai da fila com os arquivos escolhidos; e o que falta
+        // baixar é só o deles.
+        let need = match series.iter().find(|g| g.hash == torrent.hash) {
+            Some(grab) => match crate::series::grab::prepare(store, client, grab).await {
+                Ok(Some(need)) => need,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(torrent = %torrent.name, "escolha de arquivos: {error:#}");
+                    continue;
+                }
+            },
+            None => left(size(torrent), torrent.progress),
+        };
+        queue.push((need, torrent));
+    }
     queue.sort_by_key(|(need, _)| *need);
     let mut started = Vec::new();
     for (need, torrent) in queue {
@@ -190,7 +212,7 @@ pub(crate) async fn swap_out(
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
-fn left(size: u64, progress: f64) -> u64 {
+pub(crate) fn left(size: u64, progress: f64) -> u64 {
     (size as f64 * (1.0 - progress.clamp(0.0, 1.0))) as u64
 }
 
@@ -224,40 +246,9 @@ pub async fn send(
     quality: acervo_parser::Quality,
     replaces: Option<String>,
 ) -> Result<()> {
-    let (torrent, hash) = if release.download_url.scheme() == "magnet" {
-        let link = release.download_url.to_string();
-        let hash = magnet_hash(&link).context("link magnet sem infohash")?;
-        (NewTorrent::Magnet(link), hash)
-    } else {
-        let bytes = catalog
-            .download(&release.indexer, &release.download_url)
-            .await
-            .map_err(|error| anyhow::anyhow!("baixando o .torrent: {error}"))?;
-        let hash = info_hash(&bytes).context("o indexador não devolveu um .torrent válido")?;
-        (NewTorrent::File(bytes), hash)
-    };
+    let (torrent, hash) = fetch_torrent(catalog, release).await?;
     let client = qbit(config).await?;
-    client
-        .ensure_category(&config.library.category)
-        .await
-        .context("criando a categoria no qBittorrent")?;
-    let added = client
-        .add(
-            torrent,
-            &AddOptions {
-                category: config.library.category.clone(),
-                save_path: None,
-                stopped: true,
-                tags: vec![QUEUE_TAG.into()],
-            },
-        )
-        .await;
-    match added {
-        // O mesmo release de um grab que falhou, ou de um registro que não
-        // chegou ao banco: o torrent já está no cliente, só falta o grab.
-        Err(QbitError::AddRefused) if client.torrent(&hash).await?.is_some() => {}
-        added => added.context("mandando o torrent ao qBittorrent")?,
-    }
+    add_queued(config, &client, torrent, &hash, false, true).await?;
     store
         .record_grab(&Grab {
             id: 0,
@@ -297,6 +288,70 @@ pub async fn send(
         },
     )
     .await;
+    Ok(())
+}
+
+/// O `.torrent` (ou o magnet) do release, com o infohash.
+///
+/// # Errors
+///
+/// Magnet sem infohash, indexador fora do ar ou `.torrent` inválido.
+pub(crate) async fn fetch_torrent(
+    catalog: &Catalog,
+    release: &acervo_indexers::Release,
+) -> Result<(NewTorrent, String)> {
+    Ok(if release.download_url.scheme() == "magnet" {
+        let link = release.download_url.to_string();
+        let hash = magnet_hash(&link).context("link magnet sem infohash")?;
+        (NewTorrent::Magnet(link), hash)
+    } else {
+        let bytes = catalog
+            .download(&release.indexer, &release.download_url)
+            .await
+            .map_err(|error| anyhow::anyhow!("baixando o .torrent: {error}"))?;
+        let hash = info_hash(&bytes).context("o indexador não devolveu um .torrent válido")?;
+        (NewTorrent::File(bytes), hash)
+    })
+}
+
+/// Põe o torrent no cliente, na categoria do acervo e na fila: parado ou,
+/// com `metadata_first`, andando só até ter a lista de arquivos. Com
+/// `adopt`, um torrent que já estava no cliente conta como adicionado.
+///
+/// # Errors
+///
+/// Cliente inalcançável ou que recusou o torrent (já estava lá, sem
+/// `adopt`).
+pub(crate) async fn add_queued(
+    config: &Config,
+    client: &QbitClient,
+    torrent: NewTorrent,
+    hash: &str,
+    metadata_first: bool,
+    adopt: bool,
+) -> Result<()> {
+    client
+        .ensure_category(&config.library.category)
+        .await
+        .context("criando a categoria no qBittorrent")?;
+    let added = client
+        .add(
+            torrent,
+            &AddOptions {
+                category: config.library.category.clone(),
+                save_path: None,
+                stopped: !metadata_first,
+                stop_after_metadata: metadata_first,
+                tags: vec![QUEUE_TAG.into()],
+            },
+        )
+        .await;
+    match added {
+        // O mesmo release de um grab que falhou, ou de um registro que não
+        // chegou ao banco: o torrent já está no cliente, só falta o grab.
+        Err(QbitError::AddRefused) if adopt && client.torrent(hash).await?.is_some() => {}
+        added => added.context("mandando o torrent ao qBittorrent")?,
+    }
     Ok(())
 }
 
@@ -393,7 +448,9 @@ pub struct ImportLine {
 }
 
 /// O arquivo principal do torrent: o maior vídeo que não é amostra.
-fn main_video(files: &[acervo_clients::TorrentFile]) -> Option<&acervo_clients::TorrentFile> {
+pub(crate) fn main_video(
+    files: &[acervo_clients::TorrentFile],
+) -> Option<&acervo_clients::TorrentFile> {
     files
         .iter()
         .filter(|file| {
@@ -413,7 +470,7 @@ fn main_video(files: &[acervo_clients::TorrentFile]) -> Option<&acervo_clients::
 
 /// Liga `source` em `target`, criando a pasta. Ligação que já existe para o
 /// mesmo arquivo não é erro; arquivo diferente no destino é.
-fn link(source: &Path, target: &Path) -> Result<()> {
+pub(crate) fn link(source: &Path, target: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)
@@ -445,7 +502,7 @@ fn link(source: &Path, target: &Path) -> Result<()> {
 /// Põe o arquivo novo no lugar. Num upgrade com o mesmo nome, liga num nome
 /// temporário e renomeia por cima do antigo (troca atômica); com nome
 /// diferente, liga o novo e só então apaga o antigo.
-fn install(source: &Path, target: &Path, old: Option<&Path>) -> Result<()> {
+pub(crate) fn install(source: &Path, target: &Path, old: Option<&Path>) -> Result<()> {
     match old {
         Some(old) if old == target => {
             let temporary = target.with_extension("acervo-novo");
@@ -548,6 +605,7 @@ pub async fn give_up(
             .block(&acervo_store::Blocked {
                 id: 0,
                 movie_id: Some(grab.movie_id),
+                series_id: None,
                 source_title: grab.title.clone(),
                 indexer: Some(grab.indexer.clone()),
                 quality: Some(grab.quality),

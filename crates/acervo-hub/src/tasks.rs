@@ -542,6 +542,28 @@ pub fn service(
     ]
 }
 
+/// O resumo de uma tarefa que faz filmes e depois séries. Sem parte de
+/// séries, é o resultado dos filmes como sempre foi; com ela, as duas
+/// partes, e erro de uma não esconde a outra.
+fn with_series(movies: Result<String>, series: Option<Result<String>>) -> Result<Outcome> {
+    match (movies, series) {
+        (movies, None) => movies.map(|summary| Outcome::new(true, summary)),
+        (Ok(movies), Some(Ok(series))) => {
+            Ok(Outcome::new(true, format!("{movies}; séries: {series}")))
+        }
+        (Err(movies), Some(Ok(series))) => Ok(Outcome::new(
+            false,
+            format!("filmes: {movies:#}; séries: {series}"),
+        )),
+        (Ok(movies), Some(Err(series))) => {
+            Ok(Outcome::new(false, format!("{movies}; séries: {series:#}")))
+        }
+        (Err(movies), Some(Err(series))) => {
+            anyhow::bail!("filmes: {movies:#}; séries: {series:#}")
+        }
+    }
+}
+
 fn store(database: &Database) -> Result<&acervo_store::Store> {
     database.get().map_err(anyhow::Error::msg)
 }
@@ -577,21 +599,47 @@ impl Job for Missing {
             .start()
             .context("já há uma busca dos que faltam rodando")?;
         let limit = (trigger == Trigger::Scheduled).then_some(config.tasks.search_limit);
-        let lines = crate::decide::search(&config, store, &self.catalog, limit, &turn).await?;
-        if lines.is_empty() {
-            return Ok(Outcome::new(true, "nenhum filme faltando"));
-        }
-        let picked = lines.iter().filter(|l| l.escolhido.is_some()).count();
-        let failed = lines.iter().filter(|l| l.erro.is_some()).count();
-        let mut summary = format!(
-            "{}, {}",
-            count(lines.len(), "buscado", "buscados"),
-            count(picked, "escolhido", "escolhidos")
-        );
-        if failed > 0 {
-            summary = format!("{summary}, {failed} com erro");
-        }
-        Ok(Outcome::new(true, summary))
+        let movies = crate::decide::search(&config, store, &self.catalog, limit, &turn)
+            .await
+            .map(|lines| {
+                if lines.is_empty() {
+                    return "nenhum filme faltando".to_owned();
+                }
+                let picked = lines.iter().filter(|l| l.escolhido.is_some()).count();
+                let failed = lines.iter().filter(|l| l.erro.is_some()).count();
+                let mut summary = format!(
+                    "{}, {}",
+                    count(lines.len(), "buscado", "buscados"),
+                    count(picked, "escolhido", "escolhidos")
+                );
+                if failed > 0 {
+                    summary = format!("{summary}, {failed} com erro");
+                }
+                summary
+            });
+        // As séries depois dos filmes, na mesma vez.
+        let series =
+            crate::series::search::missing(&config, store, &self.catalog, limit, &turn).await;
+        let (series, detail) = match series {
+            Ok(lines) if lines.is_empty() => (None, None),
+            Ok(lines) => {
+                let picked: usize = lines.iter().map(|l| l.escolhidos.len()).sum();
+                let failed = lines.iter().filter(|l| l.erro.is_some()).count();
+                let mut summary = format!(
+                    "{}, {}",
+                    count(lines.len(), "buscada", "buscadas"),
+                    count(picked, "pego", "pegos")
+                );
+                if failed > 0 {
+                    summary = format!("{summary}, {failed} com erro");
+                }
+                (Some(Ok(summary)), Some(json!({ "series": lines })))
+            }
+            Err(error) => (Some(Err(error)), None),
+        };
+        let mut outcome = with_series(movies, series)?;
+        outcome.detail = detail;
+        Ok(outcome)
     }
 
     fn progress(&self) -> Option<String> {
@@ -613,22 +661,53 @@ impl Job for Rss {
     async fn run(&self, _: Trigger) -> Result<Outcome> {
         let store = store(&self.database)?;
         let config = self.settings.get();
-        let grabs = crate::automatic::rss(&config, store, &self.catalog, true).await?;
-        for grab in &grabs {
-            tracing::info!(
-                filme = grab.filme,
-                release = grab.release,
-                erro = grab.erro,
-                "RSS pegou"
-            );
-        }
-        let failed = grabs.iter().filter(|g| g.erro.is_some()).count();
-        let summary = match (grabs.len(), failed) {
-            (0, _) => "nada novo serve à biblioteca".to_owned(),
-            (n, 0) => count(n, "pego", "pegos"),
-            (n, failed) => format!("{}, {failed} falharam", count(n, "pego", "pegos")),
+        let movies = crate::automatic::rss(&config, store, &self.catalog, true)
+            .await
+            .map(|grabs| {
+                for grab in &grabs {
+                    tracing::info!(
+                        filme = grab.filme,
+                        release = grab.release,
+                        erro = grab.erro,
+                        "RSS pegou"
+                    );
+                }
+                let failed = grabs.iter().filter(|g| g.erro.is_some()).count();
+                let summary = match (grabs.len(), failed) {
+                    (0, _) => "nada novo serve à biblioteca".to_owned(),
+                    (n, 0) => count(n, "pego", "pegos"),
+                    (n, failed) => format!("{}, {failed} falharam", count(n, "pego", "pegos")),
+                };
+                (failed == 0, summary)
+            });
+        let series = match crate::series::search::rss(&config, store, &self.catalog, true).await {
+            Ok(grabs) if grabs.is_empty() => None,
+            Ok(grabs) => {
+                for grab in &grabs {
+                    tracing::info!(
+                        serie = grab.serie,
+                        release = grab.release,
+                        erro = grab.erro,
+                        "RSS pegou"
+                    );
+                }
+                let failed = grabs.iter().filter(|g| g.erro.is_some()).count();
+                let summary = if failed == 0 {
+                    count(grabs.len(), "pego", "pegos")
+                } else {
+                    format!("{}, {failed} falharam", count(grabs.len(), "pego", "pegos"))
+                };
+                Some(Ok((failed == 0, summary)))
+            }
+            Err(error) => Some(Err(error)),
         };
-        Ok(Outcome::new(failed == 0, summary))
+        let ok = movies.as_ref().is_ok_and(|(ok, _)| *ok)
+            && series
+                .as_ref()
+                .is_none_or(|s| s.as_ref().is_ok_and(|(ok, _)| *ok));
+        let mut outcome = with_series(movies.map(|(_, s)| s), series.map(|r| r.map(|(_, s)| s)))?;
+        outcome.ok = outcome.ok && ok;
+        Ok(outcome)
     }
 
     fn unavailable(&self) -> Option<String> {
@@ -649,8 +728,19 @@ impl Job for Import {
     async fn run(&self, _: Trigger) -> Result<Outcome> {
         let store = store(&self.database)?;
         let config = self.settings.get();
-        let lines =
-            crate::grab::import_downloads(&config, store, Some(&self.catalog), true).await?;
+        let lines = crate::grab::import_downloads(&config, store, Some(&self.catalog), true).await;
+        let series =
+            crate::series::import::import_downloads(&config, store, Some(&self.catalog), true)
+                .await;
+        let (lines, series) = match (lines, series) {
+            (Ok(lines), Ok(series)) => (lines, series),
+            (Err(error), Ok(series)) if series.is_empty() => return Err(error),
+            (Ok(lines), Err(error)) if lines.is_empty() => {
+                return Err(error.context("séries"));
+            }
+            (Err(error), _) => return Err(error),
+            (_, Err(error)) => return Err(error.context("séries")),
+        };
         for line in lines.iter().filter(|l| l.estado != "baixando") {
             tracing::info!(
                 filme = line.filme,
@@ -660,12 +750,25 @@ impl Job for Import {
                 "importação de download"
             );
         }
-        let by = |estado: &str| lines.iter().filter(|l| l.estado == estado).count();
+        for line in series.iter().filter(|l| l.estado != "baixando") {
+            tracing::info!(
+                serie = line.serie,
+                estado = line.estado,
+                destinos = ?line.destinos,
+                detalhe = line.detalhe,
+                "importação de download"
+            );
+        }
+        let by = |estado: &str| {
+            lines.iter().filter(|l| l.estado == estado).count()
+                + series.iter().filter(|l| l.estado == estado).count()
+        };
         let failed = by("falhou");
         let parts: Vec<String> = [
             (by("importado"), "importado", "importados"),
             (failed, "falhou", "falharam"),
             (by("atencao"), "travado", "travados"),
+            (by("descartado"), "descartado", "descartados"),
             (by("baixando"), "baixando", "baixando"),
         ]
         .into_iter()
@@ -702,14 +805,14 @@ impl Job for Metadata {
             return Ok(Outcome::new(true, "sem chave do TMDB; nada a fazer"));
         };
         let report = crate::library::refresh(store, &tmdb, 24).await?;
-        let summary = format!(
+        let mut summary = format!(
             "{}, {}, {}",
             count(report.conferidos, "conferido", "conferidos"),
             count(report.atualizados.len(), "atualizado", "atualizados"),
             count(report.falhas.len(), "falha", "falhas"),
         );
         // Qual filme falhou e por quê: sem isso a tela só mostra a contagem.
-        let detail = (!report.atualizados.is_empty() || !report.falhas.is_empty()).then(|| {
+        let mut detail = (!report.atualizados.is_empty() || !report.falhas.is_empty()).then(|| {
             json!({
                 "atualizados": report.atualizados,
                 "falhas": report.falhas.iter().map(|(filme, erro)| json!({
@@ -718,8 +821,28 @@ impl Job for Metadata {
                 })).collect::<Vec<_>>(),
             })
         });
+        // Séries a cada 12 h: episódio novo aparece mais depressa que filme.
+        let series = crate::series::library::refresh(store, &tmdb, 12).await?;
+        if series.conferidas > 0 {
+            summary = format!(
+                "{summary}; séries: {}, {}, {}",
+                count(series.conferidas, "conferida", "conferidas"),
+                count(series.atualizadas.len(), "atualizada", "atualizadas"),
+                count(series.falhas.len(), "falha", "falhas"),
+            );
+        }
+        if !series.atualizadas.is_empty() || !series.falhas.is_empty() {
+            detail.get_or_insert_with(|| json!({}))["series"] = json!({
+                "atualizadas": series.atualizadas,
+                "episodios_novos": series.episodios_novos,
+                "falhas": series.falhas.iter().map(|(serie, erro)| json!({
+                    "serie": serie,
+                    "erro": erro,
+                })).collect::<Vec<_>>(),
+            });
+        }
         Ok(Outcome {
-            ok: report.falhas.is_empty(),
+            ok: report.falhas.is_empty() && series.falhas.is_empty(),
             summary,
             detail,
         })
@@ -780,11 +903,50 @@ impl Job for Watched {
             jellyfin.delete_watched_after_minutes,
         )
         .await?;
-        let (ok, summary) = report.summary();
+        let (mut ok, mut summary) = report.summary();
+        let mut detail = serde_json::to_value(&report)?;
+        let series = match crate::series::watched::run(
+            &config,
+            store,
+            &client,
+            jellyfin.delete_watched_after_minutes,
+        )
+        .await
+        {
+            Ok(series) => series,
+            // Os filmes já foram: o erro das séries não esconde o que saiu.
+            Err(error) => {
+                detail["series"] = json!({ "erro": format!("{error:#}") });
+                return Ok(Outcome {
+                    ok: false,
+                    summary: format!("{summary}; séries: {error:#}"),
+                    detail: Some(detail),
+                });
+            }
+        };
+        if !series.apagados.is_empty() || series.recusados > 0 {
+            summary = format!(
+                "{summary}; séries: {}, {} liberados",
+                count(
+                    series.apagados.len(),
+                    "arquivo apagado",
+                    "arquivos apagados"
+                ),
+                acervo_core::Allocated::from_bytes(series.liberado),
+            );
+            if series.recusados > 0 {
+                summary = format!(
+                    "{summary}, {}",
+                    count(series.recusados, "recusado", "recusados")
+                );
+            }
+            ok = ok && series.recusados == 0;
+        }
+        detail["series"] = serde_json::to_value(&series)?;
         Ok(Outcome {
             ok,
             summary,
-            detail: Some(serde_json::to_value(&report)?),
+            detail: Some(detail),
         })
     }
 

@@ -163,6 +163,7 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         catalog: catalog.clone(),
         accounts: accounts.clone(),
         searches: tokio::sync::Mutex::default(),
+        series_searches: tokio::sync::Mutex::default(),
     });
     let admin = HubAdmin::new(settings, catalog.clone(), database, missing, tasks, records);
     tracing::info!(indexadores = catalog.len(), bind = %bind, "servindo Torznab e a interface web");
@@ -173,7 +174,8 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
     axum::serve(
         listener,
         acervo_api::router_with_admin(catalog, api_key, Some(Arc::new(admin)), accounts)
-            .merge(crate::web::router(web)),
+            .merge(crate::web::router(Arc::clone(&web)))
+            .merge(crate::series::web::router(web)),
     )
     .with_graceful_shutdown(shutdown())
     .await

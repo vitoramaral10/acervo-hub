@@ -284,8 +284,21 @@ pub async fn edit(store: &Store, id: i64, change: &MovieEdit) -> Result<CatalogM
 ///
 /// Pasta fora das raízes ou falha ao apagar.
 pub async fn delete_folder(config: &Config, movie_path: &str) -> Result<()> {
+    delete_folder_within(config, movie_path, &config.library.root_folders).await
+}
+
+/// Apaga uma pasta que está direto numa das `roots`, e não é a própria raiz.
+///
+/// # Errors
+///
+/// Pasta fora das raízes ou falha ao apagar.
+pub(crate) async fn delete_folder_within(
+    config: &Config,
+    movie_path: &str,
+    roots: &[String],
+) -> Result<()> {
     let folder = Path::new(movie_path);
-    let inside_root = config.library.root_folders.iter().any(|root| {
+    let inside_root = roots.iter().any(|root| {
         folder
             .parent()
             .is_some_and(|p| p == Path::new(root.trim_end_matches('/')))
@@ -302,7 +315,7 @@ pub async fn delete_folder(config: &Config, movie_path: &str) -> Result<()> {
     Ok(())
 }
 
-fn removal_message(folder: &str, removed: &Result<Vec<String>, String>) -> String {
+pub(crate) fn removal_message(folder: &str, removed: &Result<Vec<String>, String>) -> String {
     match removed {
         Ok(names) if names.is_empty() => {
             format!("pasta apagada: {folder}; nenhum download no cliente")
@@ -321,7 +334,10 @@ fn removal_message(folder: &str, removed: &Result<Vec<String>, String>) -> Strin
 /// biblioteca é hardlink do download, então o mesmo inode aparece nos dois
 /// lados — vale para o que o Radarr baixou e para o que o acervo baixou, e
 /// não depende de nome nem de histórico.
-async fn downloads_of(config: &Config, movie_path: &str) -> Result<Vec<(DownloadHash, String)>> {
+pub(crate) async fn downloads_of(
+    config: &Config,
+    movie_path: &str,
+) -> Result<Vec<(DownloadHash, String)>> {
     let map = config.path_map();
     let folder = map.to_host(Path::new(movie_path))?;
     let inodes = tokio::task::spawn_blocking(move || linked_inodes(&folder)).await??;
@@ -384,7 +400,7 @@ fn linked_inodes(folder: &Path) -> std::io::Result<HashSet<(u64, u64)>> {
     Ok(inodes)
 }
 
-async fn delete_downloads(
+pub(crate) async fn delete_downloads(
     config: &Config,
     found: Vec<(DownloadHash, String)>,
 ) -> Result<Vec<String>, String> {

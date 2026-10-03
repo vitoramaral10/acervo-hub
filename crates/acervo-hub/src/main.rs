@@ -32,6 +32,7 @@ mod naming;
 mod report;
 mod rules;
 mod search;
+mod series;
 mod serve;
 mod settings;
 mod sync;
@@ -67,6 +68,11 @@ enum Command {
     Movies {
         #[command(subcommand)]
         action: MoviesAction,
+    },
+    /// Catálogo de séries.
+    Series {
+        #[command(subcommand)]
+        action: SeriesAction,
     },
     /// Contas da interface web.
     Users {
@@ -156,6 +162,85 @@ fn print_grab(report: &grab::GrabReport) {
     }
     if report.escolhido.is_some() && !report.aplicado {
         println!("  simulação: rode com --apply para pegar");
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum SeriesAction {
+    /// Traz as séries do gerenciador anterior pela API v3: cada uma achada
+    /// no TMDB pelo `tvdbId`, com episódios, `skip` e arquivos. Série já
+    /// cadastrada é pulada. Sem `--apply`, só relata.
+    ImportSonarr {
+        /// Endereço do gerenciador, como `http://sonarr:8989`.
+        #[arg(long)]
+        url: String,
+        /// Chave de API do gerenciador.
+        #[arg(long = "api-key")]
+        api_key: String,
+        /// Grava em vez de só relatar.
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+/// Os subcomandos de `series`. Devolve se algo falhou.
+async fn series_command(
+    config: &config::Config,
+    store: &acervo_store::Store,
+    action: SeriesAction,
+) -> Result<bool> {
+    match action {
+        SeriesAction::ImportSonarr {
+            url,
+            api_key,
+            apply,
+        } => {
+            let tmdb = metadata::require_tmdb(config, store).await?;
+            let lines = series::migrate::import_sonarr(
+                store,
+                &tmdb,
+                &url,
+                &api_key,
+                config.http_timeout(),
+                apply,
+            )
+            .await?;
+            for line in &lines {
+                println!(
+                    "{:<13} {} (tvdb {}, tmdb {}) — {} episódios, {} arquivos{}{}",
+                    line.estado,
+                    line.serie,
+                    line.tvdb,
+                    line.tmdb
+                        .map_or_else(|| "?".to_owned(), |id| id.to_string()),
+                    line.episodios,
+                    line.arquivos,
+                    if line.sem_par.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; sem par no TMDB: {}", line.sem_par.join(", "))
+                    },
+                    line.detalhe
+                        .as_deref()
+                        .map(|d| format!(" — {d}"))
+                        .unwrap_or_default(),
+                );
+            }
+            let count = |estado: &str| lines.iter().filter(|l| l.estado == estado).count();
+            println!(
+                "{} séries: {} {}, {} já cadastradas, {} não achadas, {} falharam",
+                lines.len(),
+                count(if apply { "importada" } else { "importaria" }),
+                if apply { "importadas" } else { "a importar" },
+                count("ja_cadastrada"),
+                count("nao_achada"),
+                count("falhou"),
+            );
+            if !apply {
+                println!("simulação: rode com --apply para gravar");
+            }
+            Ok(count("falhou") > 0)
+        }
     }
 }
 
@@ -390,6 +475,7 @@ async fn run() -> Result<ExitCode> {
             false
         }
         Command::Movies { action } => movies_command(&config, store, action).await?,
+        Command::Series { action } => series_command(&config, &store, action).await?,
         Command::Sync { apply } => sync::run(&config, &store, apply).await? > 0,
     };
     Ok(if failed {

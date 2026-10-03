@@ -27,6 +27,8 @@ pub enum Kind {
     FileDeleted,
     MovieAdded,
     MovieDeleted,
+    SeriesAdded,
+    SeriesDeleted,
     /// Download tirado da fila sem importar.
     Ignored,
 }
@@ -42,6 +44,8 @@ impl Kind {
             Self::FileDeleted => "file_deleted",
             Self::MovieAdded => "movie_added",
             Self::MovieDeleted => "movie_deleted",
+            Self::SeriesAdded => "series_added",
+            Self::SeriesDeleted => "series_deleted",
             Self::Ignored => "ignored",
         }
     }
@@ -55,6 +59,8 @@ impl Kind {
             Self::FileDeleted => "Arquivo apagado",
             Self::MovieAdded => "Filme adicionado",
             Self::MovieDeleted => "Filme removido",
+            Self::SeriesAdded => "Série adicionada",
+            Self::SeriesDeleted => "Série removida",
             Self::Ignored => "Download descartado",
         }
     }
@@ -65,8 +71,10 @@ impl Kind {
 pub struct Event {
     pub kind: Kind,
     pub movie_id: Option<i64>,
-    /// "Título (Ano)".
+    /// "Título (Ano)"; numa série, "Série S01E02".
     pub movie: String,
+    pub series_id: Option<i64>,
+    pub episode_ids: Vec<i64>,
     pub source_title: Option<String>,
     pub quality: Option<Quality>,
     pub indexer: Option<String>,
@@ -77,12 +85,29 @@ pub struct Event {
 }
 
 impl Event {
+    /// Evento de série: `label` é "Série S01E02", e os episódios vão junto.
+    #[must_use]
+    pub fn series(
+        kind: Kind,
+        series_id: i64,
+        label: impl Into<String>,
+        episode_ids: &[i64],
+    ) -> Self {
+        Self {
+            series_id: Some(series_id),
+            episode_ids: episode_ids.to_vec(),
+            ..Self::new(kind, None, label)
+        }
+    }
+
     #[must_use]
     pub fn new(kind: Kind, movie_id: Option<i64>, movie: impl Into<String>) -> Self {
         Self {
             kind,
             movie_id,
             movie: movie.into(),
+            series_id: None,
+            episode_ids: Vec::new(),
             source_title: None,
             quality: None,
             indexer: None,
@@ -146,8 +171,10 @@ impl Gotify {
                 Kind::Imported => self.eventos.importou,
                 Kind::Upgraded => self.eventos.atualizou,
                 Kind::Failed => self.eventos.falhou,
-                Kind::MovieDeleted | Kind::FileDeleted => self.eventos.removido,
-                Kind::MovieAdded | Kind::Ignored => false,
+                Kind::MovieDeleted | Kind::FileDeleted | Kind::SeriesDeleted => {
+                    self.eventos.removido
+                }
+                Kind::MovieAdded | Kind::SeriesAdded | Kind::Ignored => false,
             }
     }
 
@@ -223,6 +250,8 @@ fn body(event: &Event) -> String {
 pub async fn record(store: &Store, event: Event) {
     let entry = NewHistory {
         movie_id: event.movie_id,
+        series_id: event.series_id,
+        episode_ids: event.episode_ids.clone(),
         movie_title: event.movie.clone(),
         event: event.kind.as_str().to_owned(),
         at: now_rfc3339(),

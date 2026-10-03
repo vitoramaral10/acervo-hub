@@ -31,9 +31,9 @@ use crate::serve::Database;
 use crate::settings::Settings;
 
 /// Por quanto tempo uma busca interativa fica guardada para o grab.
-const SEARCH_TTL: Duration = Duration::from_secs(30 * 60);
+pub(crate) const SEARCH_TTL: Duration = Duration::from_secs(30 * 60);
 
-type Cached = (Instant, Vec<acervo_indexers::Release>);
+pub(crate) type Cached = (Instant, Vec<acervo_indexers::Release>);
 
 #[derive(Debug)]
 pub struct Web {
@@ -43,18 +43,20 @@ pub struct Web {
     pub accounts: Option<Arc<dyn Accounts>>,
     /// Última busca interativa de cada filme: o grab escolhe dela pelo guid.
     pub searches: tokio::sync::Mutex<HashMap<i64, Cached>>,
+    /// O mesmo, de cada série.
+    pub series_searches: tokio::sync::Mutex<HashMap<i64, Cached>>,
 }
 
 impl Web {
     /// O instantâneo da configuração, pego a cada requisição.
-    fn config(&self) -> Arc<Config> {
+    pub(crate) fn config(&self) -> Arc<Config> {
         self.settings.get()
     }
 }
 
-type Shared = State<Arc<Web>>;
+pub(crate) type Shared = State<Arc<Web>>;
 
-struct WebError(StatusCode, String);
+pub(crate) struct WebError(pub StatusCode, pub String);
 
 impl axum::response::IntoResponse for WebError {
     fn into_response(self) -> Response {
@@ -62,26 +64,26 @@ impl axum::response::IntoResponse for WebError {
     }
 }
 
-fn bad(error: impl std::fmt::Display) -> WebError {
+pub(crate) fn bad(error: impl std::fmt::Display) -> WebError {
     WebError(StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
 }
 
-fn anyhow_bad(error: &anyhow::Error) -> WebError {
+pub(crate) fn anyhow_bad(error: &anyhow::Error) -> WebError {
     WebError(StatusCode::UNPROCESSABLE_ENTITY, format!("{error:#}"))
 }
 
-type WebResult = Result<Response, Response>;
+pub(crate) type WebResult = Result<Response, Response>;
 
-fn ok(body: &Value) -> WebResult {
+pub(crate) fn ok(body: &Value) -> WebResult {
     Ok(ui_json(StatusCode::OK, body))
 }
 
-fn fail(error: WebError) -> Response {
+pub(crate) fn fail(error: WebError) -> Response {
     axum::response::IntoResponse::into_response(error)
 }
 
 /// Autoriza e devolve o banco.
-async fn enter<'a>(
+pub(crate) async fn enter<'a>(
     web: &'a Web,
     headers: &HeaderMap,
     method: &Method,
@@ -100,6 +102,11 @@ async fn enter<'a>(
 }
 
 pub fn router(web: Arc<Web>) -> Router {
+    routes().with_state(web)
+}
+
+/// As rotas, ainda sem o estado.
+pub(crate) fn routes() -> Router<Arc<Web>> {
     Router::new()
         .route("/ui/api/biblioteca/opcoes", get(options))
         .route("/ui/api/biblioteca/tmdb", get(tmdb_search))
@@ -126,6 +133,10 @@ pub fn router(web: Arc<Web>) -> Router {
             "/ui/api/biblioteca/fila/{id}",
             axum::routing::delete(remove_download),
         )
+        .route(
+            "/ui/api/biblioteca/fila/series/{id}",
+            axum::routing::delete(remove_series_download),
+        )
         .route("/ui/api/biblioteca/historico", get(history))
         .route("/ui/api/biblioteca/bloqueados", get(blocklist))
         .route(
@@ -141,7 +152,6 @@ pub fn router(web: Arc<Web>) -> Router {
             "/ui/api/biblioteca/notificacoes/testar",
             post(test_notification),
         )
-        .with_state(web)
 }
 
 // ---------------------------------------------------------------- opções
@@ -150,22 +160,25 @@ async fn options(State(web): Shared, headers: HeaderMap) -> WebResult {
     enter(&web, &headers, &Method::GET).await?;
     let map = web.config().path_map();
     let roots = web.config().library.root_folders.clone();
-    let folders = tokio::task::spawn_blocking(move || {
-        roots
-            .into_iter()
-            .map(|root| {
-                let free = map
-                    .to_host(std::path::Path::new(&root))
-                    .ok()
-                    .and_then(|host| acervo_fs::free_space(&host).ok());
-                json!({ "caminho": root, "livre": free })
-            })
-            .collect::<Vec<_>>()
+    let series_root = web.config().library.series_root.clone();
+    let (folders, series_folder) = tokio::task::spawn_blocking(move || {
+        let folder = |root: String| {
+            let free = map
+                .to_host(std::path::Path::new(&root))
+                .ok()
+                .and_then(|host| acervo_fs::free_space(&host).ok());
+            json!({ "caminho": root, "livre": free })
+        };
+        (
+            roots.into_iter().map(folder).collect::<Vec<_>>(),
+            folder(series_root),
+        )
     })
     .await
     .unwrap_or_default();
     ok(&json!({
         "pastas": folders,
+        "pasta_series": series_folder,
         "qualidades": Quality::ALL.iter().filter(|q| **q != Quality::Unknown)
             .map(|q| json!({ "id": q.id(), "nome": q.name() })).collect::<Vec<_>>(),
         "indexadores": web.catalog.views().into_iter().map(|v| v.name).collect::<Vec<_>>(),
@@ -281,7 +294,7 @@ struct AddBody {
     buscar: bool,
 }
 
-const fn yes() -> bool {
+pub(crate) const fn yes() -> bool {
     true
 }
 
@@ -362,7 +375,7 @@ async fn delete_file(State(web): Shared, Path(id): Path<i64>, headers: HeaderMap
     ok(&json!({ "ok": true }))
 }
 
-fn age_hours(release: &acervo_indexers::Release) -> Option<f64> {
+pub(crate) fn age_hours(release: &acervo_indexers::Release) -> Option<f64> {
     #[allow(clippy::cast_precision_loss)]
     release
         .published
@@ -447,37 +460,44 @@ async fn grab_release(
 
 async fn queue(State(web): Shared, headers: HeaderMap) -> WebResult {
     let store = enter(&web, &headers, &Method::GET).await?;
-    let (grabs, movies) =
-        tokio::try_join!(store.grabs(), store.movies()).map_err(|e| fail(bad(e)))?;
+    let (grabs, movies, series_grabs) =
+        tokio::try_join!(store.grabs(), store.movies(), store.series_grabs())
+            .map_err(|e| fail(bad(e)))?;
     let downloading: Vec<_> = grabs
         .into_iter()
         .filter(|g| g.state == acervo_store::GrabState::Downloading)
         .collect();
+    let series_downloading: Vec<_> = series_grabs
+        .into_iter()
+        .filter(|g| g.state == acervo_store::GrabState::Downloading)
+        .collect();
     // Progresso do cliente, se ele responde.
-    let torrents: HashMap<String, acervo_clients::TorrentInfo> = if downloading.is_empty() {
-        HashMap::new()
-    } else {
-        match crate::grab::qbit(&web.config()).await {
-            Ok(client) => client
-                .torrents()
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|t| (t.hash.to_ascii_lowercase(), t))
-                .collect(),
-            Err(error) => {
-                tracing::warn!("fila: qBittorrent inalcançável: {error:#}");
-                HashMap::new()
+    let torrents: HashMap<String, acervo_clients::TorrentInfo> =
+        if downloading.is_empty() && series_downloading.is_empty() {
+            HashMap::new()
+        } else {
+            match crate::grab::qbit(&web.config()).await {
+                Ok(client) => client
+                    .torrents()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|t| (t.hash.to_ascii_lowercase(), t))
+                    .collect(),
+                Err(error) => {
+                    tracing::warn!("fila: qBittorrent inalcançável: {error:#}");
+                    HashMap::new()
+                }
             }
-        }
-    };
-    let items: Vec<Value> = downloading
+        };
+    let mut items: Vec<Value> = downloading
         .iter()
         .map(|grab| {
             let movie = movies.iter().find(|m| m.id == grab.movie_id);
             let torrent = torrents.get(&grab.hash);
             json!({
                 "id": grab.id,
+                "tipo": "filme",
                 "filme_id": grab.movie_id,
                 "filme": movie.map(|m| crate::events::label(&m.movie.title, m.movie.year)),
                 "poster": movie.and_then(|m| m.extras.poster.as_ref())
@@ -498,6 +518,14 @@ async fn queue(State(web): Shared, headers: HeaderMap) -> WebResult {
             })
         })
         .collect();
+    if !series_downloading.is_empty() {
+        let list = store.series_list().await.map_err(|e| fail(bad(e)))?;
+        items.extend(
+            series_downloading
+                .iter()
+                .map(|grab| crate::series::web::queue_item(grab, &list, torrents.get(&grab.hash))),
+        );
+    }
     ok(&json!({ "fila": items }))
 }
 
@@ -509,6 +537,27 @@ struct RemoveDownload {
     bloquear: bool,
     #[serde(default)]
     buscar: bool,
+}
+
+async fn remove_series_download(
+    State(web): Shared,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Query(q): Query<RemoveDownload>,
+) -> WebResult {
+    let store = enter(&web, &headers, &Method::DELETE).await?;
+    crate::series::grab::remove_download(
+        &web.config(),
+        store,
+        &web.catalog,
+        id,
+        q.remover_do_cliente,
+        q.bloquear,
+        q.buscar,
+    )
+    .await
+    .map_err(|e| fail(anyhow_bad(&e)))?;
+    ok(&json!({ "ok": true }))
 }
 
 async fn remove_download(
@@ -533,13 +582,13 @@ async fn remove_download(
 }
 
 #[derive(Deserialize)]
-struct HistoryQuery {
+pub(crate) struct HistoryQuery {
     #[serde(default)]
-    evento: Option<String>,
+    pub evento: Option<String>,
     #[serde(default = "first_page")]
-    pagina: i64,
+    pub pagina: i64,
     #[serde(default = "page_size")]
-    tamanho: i64,
+    pub tamanho: i64,
 }
 
 const fn first_page() -> i64 {
@@ -550,7 +599,7 @@ const fn page_size() -> i64 {
     50
 }
 
-async fn history_page(store: &Store, movie: Option<i64>, q: &HistoryQuery) -> WebResult {
+pub(crate) async fn history_page(store: &Store, movie: Option<i64>, q: &HistoryQuery) -> WebResult {
     let size = q.tamanho.clamp(1, 250);
     let page = store
         .history(
@@ -585,8 +634,9 @@ async fn movie_history(
 
 async fn blocklist(State(web): Shared, headers: HeaderMap) -> WebResult {
     let store = enter(&web, &headers, &Method::GET).await?;
-    let (blocked, movies) =
-        tokio::try_join!(store.blocklist(), store.movies()).map_err(|e| fail(bad(e)))?;
+    let (blocked, movies, series) =
+        tokio::try_join!(store.blocklist(), store.movies(), store.series_list())
+            .map_err(|e| fail(bad(e)))?;
     let items: Vec<Value> = blocked
         .iter()
         .map(|b| {
@@ -594,6 +644,12 @@ async fn blocklist(State(web): Shared, headers: HeaderMap) -> WebResult {
             let mut value = serde_json::to_value(b).unwrap_or_default();
             value["filme"] =
                 json!(movie.map(|m| crate::events::label(&m.movie.title, m.movie.year)));
+            if let Some(entry) = b
+                .series_id
+                .and_then(|id| series.iter().find(|s| s.id == id))
+            {
+                value["serie"] = json!(entry.series.title);
+            }
             value
         })
         .collect();

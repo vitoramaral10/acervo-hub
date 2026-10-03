@@ -33,7 +33,7 @@ pub fn clean_title(title: &str) -> String {
 /// O que ainda não pode ir em nome de arquivo, trocado como a referência
 /// troca, com dois-pontos no modo "smart" (`a: b` vira `a - b`); e espaço
 /// repetido, que a limpeza do título deixa onde tirou pontuação, vira um.
-fn file_safe(name: &str) -> String {
+pub(crate) fn file_safe(name: &str) -> String {
     let name = name.replace(": ", " - ");
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {

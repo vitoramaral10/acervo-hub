@@ -107,11 +107,11 @@ fn target(entry: &CatalogMovie, remote: &Remote, now: time::OffsetDateTime) -> T
 
 /// Os indexadores daqui, com prioridade e seeders mínimos do cadastro deles
 /// no gerenciador (`<nome> (acervo-hub)`).
-fn indexers(served: &[String], remote: &Remote) -> Vec<Indexer> {
+pub(crate) fn indexers(served: &[String], rules: &DecisionRules) -> Vec<Indexer> {
     served
         .iter()
         .map(|name| {
-            let rules = remote.rules.indexer(name);
+            let rules = rules.indexer(name);
             Indexer {
                 name: name.clone(),
                 priority: rules.prioridade,
@@ -220,7 +220,7 @@ impl Decider {
             bail!("nenhum indexador ativo para buscar");
         }
         Ok(Self {
-            indexers: indexers(&served, &remote),
+            indexers: indexers(&served, &remote.rules),
             settings: remote.rules.settings(definitions),
             delay: remote.rules.delay(),
             blocklist: blocked
@@ -311,7 +311,7 @@ impl Decider {
 }
 
 /// Os releases do indexador no formato que a decisão lê.
-fn candidates(releases: &[acervo_indexers::Release]) -> Vec<Release> {
+pub(crate) fn candidates(releases: &[acervo_indexers::Release]) -> Vec<Release> {
     releases
         .iter()
         .map(|r| Release {
@@ -322,6 +322,7 @@ fn candidates(releases: &[acervo_indexers::Release]) -> Vec<Release> {
             peers: r.seeders.map(|s| s + r.leechers.unwrap_or(0)),
             imdb_id: None,
             tmdb_id: None,
+            tvdb_id: None,
             languages: Vec::new(),
             container: None,
             flags: if r.tags.iter().any(|t| t.eq_ignore_ascii_case("freeleech")) {
@@ -364,6 +365,18 @@ pub struct ProgressView {
 /// Posse da vez de buscar; solta ao sair de escopo, inclusive em pânico.
 #[derive(Debug)]
 pub struct Turn(Arc<Progress>);
+
+impl Turn {
+    /// Soma ao total da busca: as séries entram depois dos filmes.
+    pub(crate) fn add_total(&self, more: usize) {
+        self.0.total.fetch_add(more, Ordering::SeqCst);
+    }
+
+    /// Mais um buscado.
+    pub(crate) fn advance(&self) {
+        self.0.done.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 impl Drop for Turn {
     fn drop(&mut self) {

@@ -195,6 +195,9 @@ pub struct LibraryConfig {
     /// Pastas raiz dos filmes, como o cliente de download as vê. A tela
     /// oferece-as ao adicionar filme; apagar pasta só vale dentro delas.
     pub root_folders: Vec<String>,
+    /// Pasta raiz das séries, como o cliente de download a vê: cada série
+    /// nova nasce nela, e apagar pasta de série só vale dentro dela.
+    pub series_root: String,
     /// Categoria do cliente de download para o que o acervo pega. Separada da
     /// do gerenciador, para ele não tentar importar o que não pegou.
     pub category: String,
@@ -207,6 +210,7 @@ impl Default for LibraryConfig {
         Self {
             roots: Vec::new(),
             root_folders: vec!["/media/movies".into()],
+            series_root: "/media/series".into(),
             category: "acervo".into(),
             paths: BTreeMap::new(),
         }
@@ -439,6 +443,9 @@ impl Config {
         if library.root_folders.iter().any(|f| f.trim().is_empty()) {
             return Err("biblioteca: pasta raiz em branco".into());
         }
+        if !library.series_root.starts_with('/') {
+            return Err("biblioteca: a pasta raiz das séries precisa ser absoluta".into());
+        }
         if library.category.trim().is_empty() {
             return Err("biblioteca: informe a categoria do cliente de download".into());
         }
@@ -589,6 +596,7 @@ mod tests {
         assert_eq!(config.tasks.minutes("assistidos"), 15);
         assert_eq!(config.tasks.search_limit, 5);
         assert_eq!(config.library.root_folders, ["/media/movies"]);
+        assert_eq!(config.library.series_root, "/media/series");
         assert_eq!(config.library.category, "acervo");
         assert_eq!(config.http_timeout(), Duration::from_secs(30));
         assert!(config.qbittorrent().is_none() && config.jellyfin().is_none());
@@ -670,6 +678,7 @@ mod tests {
             .contains("desconhecida")
         );
         assert!(erro(|c| c.jellyfin.url = "http://j:8096".into()).contains("chave"));
+        assert!(erro(|c| c.library.series_root = "series".into()).contains("séries"));
         assert!(valid().validate().is_ok());
     }
 
