@@ -21,6 +21,8 @@ export const EVENTS: Record<HistoryEventKind, { label: string; icon: LucideIcon;
   file_deleted: { label: 'Arquivo apagado', icon: Trash2, tone: 'text-content-muted' },
   movie_added: { label: 'Adicionado', icon: Plus, tone: 'text-content-muted' },
   movie_deleted: { label: 'Removido', icon: Trash2, tone: 'text-content-muted' },
+  series_added: { label: 'Adicionada', icon: Plus, tone: 'text-content-muted' },
+  series_deleted: { label: 'Removida', icon: Trash2, tone: 'text-content-muted' },
   ignored: { label: 'Descartado', icon: CircleSlash, tone: 'text-content-muted' },
   renamed: { label: 'Renomeado', icon: FilePen, tone: 'text-content-muted' },
 }

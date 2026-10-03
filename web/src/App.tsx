@@ -13,6 +13,7 @@ import {
   ListChecks,
   LogOut,
   Monitor,
+  MonitorPlay,
   Moon,
   Scale,
   Search,
@@ -35,10 +36,11 @@ import { IndexersPage } from '@/pages/Indexers'
 import { LoginPage } from '@/pages/Login'
 import { MoviesPage } from '@/pages/Movies'
 import { SearchPage } from '@/pages/Search'
+import { SeriesPage } from '@/pages/Series'
 import { SettingsPage, type SettingsView } from '@/pages/Settings'
 import { TasksPage } from '@/pages/Tasks'
 
-type MainView = 'filmes' | 'atividade' | 'busca'
+type MainView = 'filmes' | 'series' | 'atividade' | 'busca'
 type ConfigView = 'indexadores' | 'aplicativos' | 'tarefas' | SettingsView
 type View = MainView | ConfigView
 
@@ -47,6 +49,7 @@ type NavItem<V extends View> = { view: V; label: string; icon: typeof Server }
 /** Uso do dia a dia: sempre à vista. */
 const MAIN: NavItem<MainView>[] = [
   { view: 'filmes', label: 'Filmes', icon: Film },
+  { view: 'series', label: 'Séries', icon: MonitorPlay },
   { view: 'atividade', label: 'Atividade', icon: Activity },
   { view: 'busca', label: 'Busca', icon: Search },
 ]
@@ -283,6 +286,8 @@ export function App() {
             <SearchPage />
           ) : view === 'filmes' ? (
             <MoviesPage />
+          ) : view === 'series' ? (
+            <SeriesPage />
           ) : view === 'atividade' ? (
             <ActivityPage />
           ) : view === 'aplicativos' ? (

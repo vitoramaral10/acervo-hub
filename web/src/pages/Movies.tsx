@@ -466,7 +466,7 @@ const CHIP =
   'inline-flex h-7 items-center gap-1 rounded-sm px-2 text-xs font-medium whitespace-nowrap text-content-muted transition-colors hover:text-content focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring'
 
 /** Grupo de opções num contorno só; `single` vira radiogroup, o resto são botões de alternar. */
-function ChipGroup({
+export function ChipGroup({
   label,
   children,
   single = false,
@@ -488,7 +488,7 @@ function ChipGroup({
   )
 }
 
-function Chip({
+export function Chip({
   active,
   single = false,
   onClick,
@@ -846,7 +846,7 @@ function MovieTable({
   )
 }
 
-const GRID =
+export const GRID =
   'grid grid-cols-[repeat(auto-fill,minmax(6.5rem,1fr))] gap-x-3 gap-y-5 sm:gap-x-4 sm:gap-y-6 sm:grid-cols-[repeat(auto-fill,minmax(10rem,1fr))]'
 
 const STATUS: Record<string, string> = {

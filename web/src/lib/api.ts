@@ -422,8 +422,13 @@ export interface InteractiveRelease {
 }
 
 export interface QueueItem {
-  id: number
-  filme_id: number
+  /** Filme: o id do grab; série: `serie-<grab>`. */
+  id: number | string
+  /** Ausente nos itens antigos, que são todos de filme. */
+  tipo?: 'filme' | 'serie'
+  grab_id?: number
+  serie_id?: number
+  filme_id: number | null
   filme: string | null
   poster: string | null
   release: string
@@ -449,6 +454,8 @@ export type HistoryEventKind =
   | 'file_deleted'
   | 'movie_added'
   | 'movie_deleted'
+  | 'series_added'
+  | 'series_deleted'
   | 'ignored'
   | 'renamed'
 
@@ -546,10 +553,22 @@ export const library = {
   movieHistory: (id: number) =>
     request<{ total: number; eventos: HistoryEvent[] }>('GET', `${LIB}/filmes/${id}/historico?tamanho=50`),
   queue: () => request<{ fila: QueueItem[] }>('GET', `${LIB}/fila`),
-  removeDownload: (id: number, options: { remover_do_cliente: boolean; bloquear: boolean; buscar: boolean }) =>
+  removeDownload: (id: number | string, options: { remover_do_cliente: boolean; bloquear: boolean; buscar: boolean }) =>
     request<{ ok: boolean }>(
       'DELETE',
       `${LIB}/fila/${id}?${new URLSearchParams({
+        remover_do_cliente: String(options.remover_do_cliente),
+        bloquear: String(options.bloquear),
+        buscar: String(options.buscar),
+      })}`,
+    ),
+  removeSeriesDownload: (
+    grabId: number,
+    options: { remover_do_cliente: boolean; bloquear: boolean; buscar: boolean },
+  ) =>
+    request<{ ok: boolean }>(
+      'DELETE',
+      `${LIB}/fila/series/${grabId}?${new URLSearchParams({
         remover_do_cliente: String(options.remover_do_cliente),
         bloquear: String(options.bloquear),
         buscar: String(options.buscar),
@@ -568,4 +587,184 @@ export const library = {
   saveNotifications: (gotify: GotifyInput | null) =>
     request<{ gotify: GotifyView | null }>('PUT', `${LIB}/notificacoes`, gotify),
   testNotification: (gotify: GotifyInput) => request<{ ok: boolean }>('POST', `${LIB}/notificacoes/testar`, gotify),
+}
+
+// ---------------------------------------------------------------- séries
+
+export interface EpisodeTotals {
+  quero: number
+  /** Os em Quero que já foram ao ar: o que de fato falta. */
+  quero_exibidos: number
+  tenho: number
+  dispensado: number
+  baixando: number
+}
+
+export interface SeriesSummary {
+  id: number
+  tmdb: number
+  tvdb: number | null
+  imdb: string | null
+  titulo: string
+  titulo_original: string | null
+  titulo_ingles: string | null
+  ano: number | null
+  status: string | null
+  rede: string | null
+  poster: string | null
+  fundo: string | null
+  pasta: string
+  pasta_de_temporada: boolean
+  monitorar_novos: boolean
+  adicionada: string | null
+  atualizada: string | null
+  episodios: EpisodeTotals
+  tamanho: number
+}
+
+export type EpisodeState = 'quero' | 'tenho' | 'dispensado'
+export type SkipReason = 'unwanted' | 'deleted' | 'watched'
+
+export interface EpisodeFile {
+  id: number
+  nome: string
+  tamanho: number
+  qualidade: string
+  idiomas: string[]
+  grupo: string | null
+  release: string | null
+  adicionado: string | null
+}
+
+export interface Episode {
+  id: number
+  numero: number
+  titulo: string | null
+  /** Dia de exibição, `AAAA-MM-DD`. */
+  data: string | null
+  exibido: boolean
+  sinopse: string | null
+  duracao: number | null
+  estado: EpisodeState
+  baixando: boolean
+  motivo: SkipReason | null
+  motivo_em: string | null
+  qualidade: string | null
+  arquivo: EpisodeFile | null
+}
+
+export interface Season {
+  numero: number
+  totais: EpisodeTotals
+  episodios: Episode[]
+}
+
+export interface SeriesDownload {
+  id: number
+  release: string
+  qualidade: string
+  tamanho: number
+  mensagem: string | null
+  pego_em: string
+  episodios: string
+}
+
+export interface SeriesLastSearch {
+  quando: string
+  consultas: number
+  releases: number
+  escolhidos: { titulo: string; indexador: string; qualidade: string; tamanho: number; episodios: string }[]
+  motivos: [string, number][]
+  erro: string | null
+}
+
+export interface SeriesDetail extends SeriesSummary {
+  sinopse: string | null
+  idioma_original: string | null
+  duracao: number | null
+  titulos_alternativos: string[]
+  temporadas: Season[]
+  downloads: SeriesDownload[]
+  ultima_busca: SeriesLastSearch | null
+}
+
+export type WhatToSearch = 'tudo' | 'ultima_temporada' | 'proximos'
+
+export interface NewSeries {
+  tmdb: number
+  monitorar_novos: boolean
+  pasta_de_temporada: boolean
+  buscar: WhatToSearch
+  buscar_agora: boolean
+}
+
+export interface SeriesChange {
+  monitorar_novos?: boolean
+  pasta_de_temporada?: boolean
+  buscar?: WhatToSearch
+}
+
+export interface SeriesTmdbResult {
+  tmdb: number
+  titulo: string
+  titulo_original: string
+  ano: number | null
+  sinopse: string | null
+  poster: string | null
+  no_catalogo: number | null
+}
+
+export interface SeriesRelease {
+  guid: string
+  titulo: string
+  indexador: string
+  tamanho: number
+  seeders: number | null
+  leechers: number | null
+  idade_horas: number | null
+  qualidade: string | null
+  aprovado: boolean
+  seria_pego: boolean
+  outra_serie: boolean
+  /** O que o release cobre, como `S01E01-E10`. */
+  episodios: string
+  episodio_ids: number[]
+  /** Dos cobertos, os que estão em Quero. */
+  quero: number[]
+  motivos: string[]
+  info: string | null
+}
+
+export interface SeriesSearchScope {
+  temporada?: number
+  episodios?: number[]
+}
+
+export const seriesApi = {
+  list: () => request<{ series: SeriesSummary[] }>('GET', `${LIB}/series`),
+  get: (id: number) => request<SeriesDetail>('GET', `${LIB}/series/${id}`),
+  searchTmdb: (q: string) =>
+    request<{ resultados: SeriesTmdbResult[] }>('GET', `${LIB}/series/buscar-tmdb?${new URLSearchParams({ q })}`),
+  add: (series: NewSeries) => request<{ id: number }>('POST', `${LIB}/series`, series),
+  edit: (id: number, change: SeriesChange) => request<{ ok: boolean }>('PATCH', `${LIB}/series/${id}`, change),
+  remove: (id: number, options: { apagar_arquivos: boolean }) =>
+    request<{ ok: boolean }>(
+      'DELETE',
+      `${LIB}/series/${id}?${new URLSearchParams({ apagar_arquivos: String(options.apagar_arquivos) })}`,
+    ),
+  deleteEpisodes: (id: number, ids: number[]) =>
+    request<{ ok: boolean; arquivos: number; episodios: number; torrents: number; aviso: string | null }>(
+      'POST',
+      `${LIB}/series/${id}/episodios/apagar`,
+      { ids },
+    ),
+  skipEpisodes: (id: number, ids: number[], skip: 'unwanted' | null) =>
+    request<{ ok: boolean; alterados: number }>('POST', `${LIB}/series/${id}/episodios/skip`, { ids, skip }),
+  releases: (id: number, scope: SeriesSearchScope) =>
+    request<{ consulta: string; releases: SeriesRelease[] }>('POST', `${LIB}/series/${id}/buscar`, scope),
+  grabRelease: (id: number, guid: string) =>
+    request<{ ok: boolean; titulo: string; download: unknown }>('POST', `${LIB}/series/${id}/pegar`, { guid }),
+  searchNow: (id: number) => request<{ iniciada: boolean }>('POST', `${LIB}/series/${id}/buscar-agora`),
+  history: (id: number) =>
+    request<{ total: number; eventos: HistoryEvent[] }>('GET', `${LIB}/series/${id}/historico?tamanho=50`),
 }

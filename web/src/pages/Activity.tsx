@@ -55,8 +55,12 @@ function RemoveDialog({ item, onClose }: { item: QueueItem | null; onClose: () =
   const [block, setBlock] = useState(false)
   const [search, setSearch] = useState(false)
   const remove = useMutation({
-    mutationFn: () =>
-      library.removeDownload(item!.id, { remover_do_cliente: fromClient, bloquear: block, buscar: search }),
+    mutationFn: () => {
+      const options = { remover_do_cliente: fromClient, bloquear: block, buscar: search }
+      return item!.tipo === 'serie' && item!.grab_id != null
+        ? library.removeSeriesDownload(item!.grab_id, options)
+        : library.removeDownload(item!.id, options)
+    },
     onSuccess: () => {
       toast.success(block ? 'Marcado como falho e bloqueado' : 'Tirado da fila')
       onClose()
@@ -67,6 +71,7 @@ function RemoveDialog({ item, onClose }: { item: QueueItem | null; onClose: () =
       void queryClient.invalidateQueries({ queryKey: ['historico'] })
       void queryClient.invalidateQueries({ queryKey: ['bloqueados'] })
       void queryClient.invalidateQueries({ queryKey: ['filmes'] })
+      void queryClient.invalidateQueries({ queryKey: ['series'] })
     },
   })
   return (
@@ -140,7 +145,7 @@ function QueueRow({ item, onRemove }: { item: QueueItem; onRemove: () => void })
       </div>
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-          <p className="font-medium">{item.filme ?? `Filme ${item.filme_id}`}</p>
+          <p className="font-medium">{item.filme ?? (item.tipo === 'serie' ? 'Série' : `Filme ${item.filme_id}`)}</p>
           <Badge>{item.qualidade}</Badge>
           {item.upgrade && <Badge tone="accent">Upgrade</Badge>}
         </div>

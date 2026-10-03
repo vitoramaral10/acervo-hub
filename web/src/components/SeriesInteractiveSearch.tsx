@@ -1,35 +1,46 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowDownToLine, CircleAlert, CircleCheck, ExternalLink, RefreshCw } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
+import { age } from '@/components/InteractiveSearch'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Badge, Skeleton, Tooltip } from '@/components/ui/misc'
-import { type InteractiveRelease, type Movie, library } from '@/lib/api'
+import { type SeriesRelease, type SeriesSearchScope, seriesApi } from '@/lib/api'
 import { formatCount, formatSize, safeHref } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
-export function age(hours: number | null): string {
-  if (hours == null) return '—'
-  if (hours < 1) return `${Math.max(1, Math.round(hours * 60))} min`
-  if (hours < 48) return `${Math.round(hours)} h`
-  return `${Math.round(hours / 24)} d`
-}
-
 type Filter = 'aprovados' | 'todos'
+
+/** O que o pacote traz de útil: quantos dos episódios que cobre estão em Quero. */
+function coverage(release: SeriesRelease): string | null {
+  const covered = release.episodio_ids.length
+  if (release.quero.length === 0) return covered > 0 ? 'nenhum episódio que falta' : null
+  if (covered > 1 && release.quero.length < covered) {
+    return `baixa só ${release.quero.length} de ${covered} episódios`
+  }
+  return null
+}
 
 function ReleaseRow({
   release,
   onGrab,
   grabbing,
 }: {
-  release: InteractiveRelease
+  release: SeriesRelease
   onGrab: () => void
   grabbing: boolean
 }) {
   const link = safeHref(release.info)
+  const partial = coverage(release)
   return (
-    <li className={cn('grid gap-2 py-3 sm:grid-cols-[1fr_auto]', !release.aprovado && 'opacity-80')}>
+    <li
+      className={cn(
+        'grid gap-2 py-3 sm:grid-cols-[1fr_auto]',
+        !release.aprovado && 'opacity-80',
+        release.seria_pego && 'border-l-2 border-accent bg-accent-soft/40 pl-3',
+      )}
+    >
       <div className="min-w-0">
         <p className="flex items-start gap-1.5 font-mono text-xs break-all">
           {release.aprovado ? (
@@ -45,10 +56,10 @@ function ReleaseRow({
           )}
         </p>
         <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+          {release.seria_pego && <Badge tone="accent">Seria pego</Badge>}
+          {release.episodios && <Badge>{release.episodios}</Badge>}
           {release.qualidade && <Badge>{release.qualidade}</Badge>}
-          {release.idiomas.length > 0 && (
-            <span className="text-xs text-content-subtle">{release.idiomas.join(', ')}</span>
-          )}
+          {partial && <span className="text-xs text-content-muted">{partial}</span>}
         </div>
         {!release.aprovado && release.motivos.length > 0 && (
           <ul className="mt-1.5 text-xs text-warning">
@@ -66,7 +77,7 @@ function ReleaseRow({
         <Tooltip content={release.aprovado ? 'Pegar este' : 'Pegar mesmo recusado'}>
           <Button
             size="sm"
-            variant={release.aprovado ? 'primary' : undefined}
+            variant={release.seria_pego ? 'primary' : undefined}
             loading={grabbing}
             onClick={onGrab}
             aria-label={`Pegar ${release.titulo}`}
@@ -80,54 +91,62 @@ function ReleaseRow({
   )
 }
 
-/** Busca em todos os indexadores e mostra cada release com a decisão; o grab é de quem escolhe. */
-export function InteractiveSearch({
-  movie,
-  open,
-  onOpenChange,
+/**
+ * Busca em todos os indexadores, para a série, uma temporada ou episódios, e mostra cada release com a decisão.
+ * Monte-o só enquanto aberto: a busca sai ao montar. O grab é de quem escolhe.
+ */
+export function SeriesInteractiveSearch({
+  seriesId,
+  title,
+  scope,
+  onClose,
 }: {
-  movie: Movie
-  open: boolean
-  onOpenChange: (open: boolean) => void
+  seriesId: number
+  /** Para o cabeçalho: "Severance", "Severance · T2", "Severance · S02E03". */
+  title: string
+  scope: SeriesSearchScope
+  onClose: () => void
 }) {
   const queryClient = useQueryClient()
   const [filter, setFilter] = useState<Filter>('aprovados')
-  const search = useMutation({ mutationFn: () => library.releases(movie.id) })
+  const search = useMutation({ mutationFn: () => seriesApi.releases(seriesId, scope) })
   const grab = useMutation({
-    mutationFn: (guid: string) => library.grabRelease(movie.id, guid),
+    mutationFn: (guid: string) => seriesApi.grabRelease(seriesId, guid),
     onSuccess: ({ titulo }) => {
       toast.success(`Mandado ao qBittorrent: ${titulo}`)
-      void queryClient.invalidateQueries({ queryKey: ['filmes'] })
+      void queryClient.invalidateQueries({ queryKey: ['series'] })
       void queryClient.invalidateQueries({ queryKey: ['fila'] })
-      onOpenChange(false)
+      onClose()
     },
     onError: (error: Error) => toast.error(error.message),
   })
 
+  // Uma busca por abertura, mesmo com o efeito rodando duas vezes no modo de desenvolvimento.
+  const started = useRef(false)
+  useEffect(() => {
+    if (started.current) return
+    started.current = true
+    search.mutate()
+  }, [search])
+
   const releases = search.data?.releases ?? []
   const approved = releases.filter((r) => r.aprovado)
-  const own = releases.filter((r) => !r.outro_filme)
+  const own = releases.filter((r) => !r.outra_serie)
   const shown = filter === 'aprovados' ? approved : own
 
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(next) => {
-        onOpenChange(next)
-        if (next) {
-          setFilter('aprovados')
-          search.mutate()
-        }
-      }}
-    >
+    <Dialog open onOpenChange={(next) => !next && onClose()}>
       <DialogContent className="max-w-4xl">
         <DialogHeader>
-          <DialogTitle>
-            Busca interativa: {movie.titulo}
-            {movie.ano ? ` (${movie.ano})` : ''}
-          </DialogTitle>
+          <DialogTitle>Busca interativa: {title}</DialogTitle>
           <DialogDescription>
             Todos os releases dos indexadores, na ordem em que o acervo-hub os escolheria, com o motivo de cada recusa.
+            {search.data?.consulta && (
+              <>
+                {' '}
+                Consulta: <span className="font-mono text-xs">{search.data.consulta}</span>
+              </>
+            )}
           </DialogDescription>
         </DialogHeader>
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -135,7 +154,7 @@ export function InteractiveSearch({
             {(
               [
                 ['aprovados', `Aprovados (${approved.length})`],
-                ['todos', `Todos deste filme (${own.length})`],
+                ['todos', `Todos desta série (${own.length})`],
               ] as const
             ).map(([value, label]) => (
               <button
@@ -174,7 +193,7 @@ export function InteractiveSearch({
             <p className="py-10 text-center text-sm text-content-muted">
               {filter === 'aprovados' && own.length > 0
                 ? 'Nenhum release aprovado. Veja todos para saber por que cada um foi recusado.'
-                : 'Nenhum release deste filme nos indexadores.'}
+                : 'Nenhum release desta série nos indexadores.'}
             </p>
           ) : (
             <ul className="divide-y divide-border">
