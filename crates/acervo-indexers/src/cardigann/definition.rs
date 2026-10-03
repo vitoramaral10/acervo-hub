@@ -308,13 +308,19 @@ pub(super) enum Rows {
 }
 
 /// Campos que a busca exige para montar um release.
+/// Intervalo entre requisições, em segundos, quando a definição não declara
+/// `requestDelay`. Tracker privado proíbe automação abusiva: sem declaração
+/// explícita, o ritmo é o conservador.
+const DEFAULT_REQUEST_DELAY: f64 = 5.0;
+
 const REQUIRED_FIELDS: [&str; 2] = ["title", "size"];
 
 /// Campos da referência cujo valor seria perdido em silêncio aqui.
 const REFUSED_FIELDS: [&str; 1] = ["categorydesc"];
 
 impl Document {
-    /// Metadados: devolve se é privado e o intervalo entre requisições.
+    /// Metadados: devolve se é privado e o intervalo entre requisições
+    /// (`DEFAULT_REQUEST_DELAY` quando a definição não declara).
     fn validate_metadata(&self) -> Result<(bool, f64), IndexerError> {
         if self.id.is_empty()
             || !self
@@ -335,7 +341,7 @@ impl Document {
         if !self.encoding.eq_ignore_ascii_case("utf-8") {
             return Err(invalid("encoding", "somente UTF-8 é suportado"));
         }
-        let delay = self.request_delay.unwrap_or(2.0);
+        let delay = self.request_delay.unwrap_or(DEFAULT_REQUEST_DELAY);
         if !delay.is_finite() || !(0.0..=3600.0).contains(&delay) {
             return Err(invalid("requestDelay", "esperado entre 0 e 3600 segundos"));
         }
@@ -1049,4 +1055,25 @@ fn category_id(name: &str) -> Option<u32> {
         "Other/Hashed" => 8020,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FIXTURE: &str = include_str!("../../tests/fixtures/cardigann-public.yml");
+
+    #[test]
+    fn requestdelay_ausente_usa_cinco_segundos() {
+        let yaml = FIXTURE.replace("requestDelay: 0\n", "");
+        assert_ne!(yaml, FIXTURE, "a fixture declarava requestDelay");
+        let definition = CardigannDefinition::from_yaml_v11(&yaml).unwrap();
+        assert_eq!(definition.delay, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn requestdelay_declarado_prevalece() {
+        let definition = CardigannDefinition::from_yaml_v11(FIXTURE).unwrap();
+        assert_eq!(definition.delay, Duration::ZERO);
+    }
 }

@@ -592,6 +592,7 @@ fn indexer_json(server: &Server, view: &crate::IndexerView) -> serde_json::Value
             "ultimo_erro": view.health.last_error,
             "falhas_seguidas": view.health.consecutive_failures,
             "resultados": view.health.last_results,
+            "em_espera_ate": timestamp(view.health.waiting_until()),
         },
     })
 }
@@ -619,7 +620,7 @@ async fn indexers(
                 "categorias": [],
                 "saude": {
                     "ultimo_sucesso": null, "ultima_falha": null, "ultimo_erro": null,
-                    "falhas_seguidas": 0, "resultados": null,
+                    "falhas_seguidas": 0, "resultados": null, "em_espera_ate": null,
                 },
             }));
         }

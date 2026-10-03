@@ -76,6 +76,10 @@ pub enum TorznabError {
     AllFailed(usize),
     #[error("o indexador não entregou o arquivo")]
     DownloadFailed,
+    #[error("indexador `{indexer}` em espera até {until} UTC por excesso de requisições")]
+    IndexerWaiting { indexer: String, until: String },
+    #[error("todos os indexadores em espera até {until} UTC")]
+    AllWaiting { until: String },
 }
 
 impl TorznabError {
@@ -88,7 +92,10 @@ impl TorznabError {
             Self::IncorrectParameter(_) => 201,
             Self::NoSuchFunction => 202,
             Self::NoSuchIndexer => 300,
-            Self::AllFailed(_) | Self::DownloadFailed => 900,
+            Self::AllFailed(_)
+            | Self::DownloadFailed
+            | Self::IndexerWaiting { .. }
+            | Self::AllWaiting { .. } => 900,
         }
     }
 
@@ -102,6 +109,7 @@ impl TorznabError {
                 StatusCode::BAD_REQUEST
             }
             Self::AllFailed(_) | Self::DownloadFailed => StatusCode::BAD_GATEWAY,
+            Self::IndexerWaiting { .. } | Self::AllWaiting { .. } => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 }

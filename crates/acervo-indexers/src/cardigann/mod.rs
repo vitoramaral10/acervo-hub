@@ -566,7 +566,23 @@ impl CardigannClient {
         if let Some(cookie) = cookie {
             request = request.header(COOKIE, cookie.clone());
         }
-        request.send().await.map_err(|error| self.transport(&error))
+        let response = request
+            .send()
+            .await
+            .map_err(|error| self.transport(&error))?;
+        self.not_limited(response)
+    }
+
+    /// 429 vira erro na hora, em qualquer requisição (busca, login, página
+    /// seguinte, download): quem chama para ali, sem tentar a próxima.
+    fn not_limited(&self, response: reqwest::Response) -> Result<reqwest::Response, IndexerError> {
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(IndexerError::from_too_many_requests(
+                &self.definition.id,
+                &response,
+            ));
+        }
+        Ok(response)
     }
 
     /// Garante sessão. `force` refaz o login mesmo com sessão marcada — é o
@@ -607,6 +623,7 @@ impl CardigannClient {
                     .send()
                     .await
                     .map_err(|error| self.transport(&error))?;
+                let response = self.not_limited(response)?;
                 let page = self.follow(response, url, None).await?;
                 let document = Html::parse_document(&page.body);
                 if login

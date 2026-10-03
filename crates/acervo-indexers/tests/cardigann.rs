@@ -272,7 +272,7 @@ async fn linha_ruim_e_pulada_mas_pagina_inteira_ilegivel_e_erro() {
 
 #[tokio::test]
 async fn redirects_e_erros_http_nao_vazam_settings() {
-    for status in [302, 403, 429, 500] {
+    for status in [302, 403, 500] {
         let server = MockServer::start().await;
         Mock::given(path("/browse"))
             .respond_with(

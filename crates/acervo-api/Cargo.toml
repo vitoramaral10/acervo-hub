@@ -24,7 +24,7 @@ url.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "test-util"] }
 
 [lints]
 workspace = true

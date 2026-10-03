@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use acervo_indexers::{
-    Capabilities, Category, Indexer, IndexerFailure, Release, SearchMode, SearchQuery,
-    SearchSupport,
+    Capabilities, Category, Indexer, IndexerError, IndexerFailure, Release, SearchMode,
+    SearchQuery, SearchSupport,
 };
 use futures::future::{BoxFuture, FutureExt, Shared, join_all};
 use time::OffsetDateTime;
@@ -42,6 +42,17 @@ pub enum CatalogError {
     Unknown(String),
 }
 
+/// Espera depois do primeiro 429 seguido, quando o tracker não diz quanto.
+/// Dobra a cada 429 seguido até `BACKOFF_MAX`.
+const BACKOFF_BASE: Duration = Duration::from_secs(10 * 60);
+
+/// Teto do recuo calculado.
+const BACKOFF_MAX: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Teto do `Retry-After` obedecido: um valor absurdo não pode desligar o
+/// indexador até o próximo reinício.
+const RETRY_AFTER_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// O que se sabe da saúde de um indexador desde que o processo subiu.
 ///
 /// Fica em memória de propósito: o estado que importa é o de agora, e um
@@ -54,6 +65,10 @@ pub struct Health {
     pub last_error: Option<String>,
     pub consecutive_failures: u32,
     pub last_results: Option<usize>,
+    /// Respostas 429 seguidas, sem sucesso no meio: define o tamanho do recuo.
+    pub rate_limit_streak: u32,
+    /// Fim da espera, no relógio do tokio (que os testes podem parar).
+    wait_until: Option<Instant>,
 }
 
 impl Health {
@@ -61,6 +76,8 @@ impl Health {
         self.last_success = Some(OffsetDateTime::now_utc());
         self.last_results = Some(results);
         self.consecutive_failures = 0;
+        self.rate_limit_streak = 0;
+        self.wait_until = None;
     }
 
     fn failure(&mut self, error: String) {
@@ -68,6 +85,42 @@ impl Health {
         self.last_error = Some(error);
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
     }
+
+    /// Registra um 429. Devolve até quando o indexador fica em espera, se a
+    /// espera começou agora: um 429 que chega de uma consulta já em voo, com o
+    /// indexador em espera, não dobra o recuo duas vezes.
+    fn rate_limited(&mut self, error: String, retry_after: Option<Duration>) -> Option<Duration> {
+        self.failure(error);
+        if self.waiting_until().is_some() {
+            return None;
+        }
+        self.rate_limit_streak = self.rate_limit_streak.saturating_add(1);
+        let wait = retry_after.map_or_else(
+            || {
+                let doublings = self.rate_limit_streak.saturating_sub(1).min(16);
+                BACKOFF_BASE.saturating_mul(1 << doublings).min(BACKOFF_MAX)
+            },
+            |wait| wait.min(RETRY_AFTER_MAX),
+        );
+        self.wait_until = Instant::now().checked_add(wait);
+        Some(wait)
+    }
+
+    /// Até quando o indexador está em espera, ou `None` se não está.
+    #[must_use]
+    pub fn waiting_until(&self) -> Option<OffsetDateTime> {
+        let left = self.wait_until?.checked_duration_since(Instant::now())?;
+        if left.is_zero() {
+            return None;
+        }
+        Some(OffsetDateTime::now_utc() + left)
+    }
+}
+
+/// "HH:MM", em UTC, para mensagem e selo.
+fn clock(at: OffsetDateTime) -> String {
+    let at = at.to_offset(time::UtcOffset::UTC);
+    format!("{:02}:{:02}", at.hour(), at.minute())
 }
 
 /// Um indexador visto de fora: o que uma interface lista.
@@ -169,8 +222,17 @@ impl Catalog {
         self.entries.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn record(&self, name: &str, outcome: Result<usize, String>) {
+    fn record(&self, name: &str, outcome: Result<usize, &IndexerError>) {
         record(&self.health, name, outcome);
+    }
+
+    /// Até quando o indexador está em espera por 429, se está.
+    fn waiting_until(&self, name: &str) -> Option<OffsetDateTime> {
+        self.health
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+            .and_then(Health::waiting_until)
     }
 
     /// Esquece o que foi guardado de um indexador: a sessão ou a credencial
@@ -208,15 +270,9 @@ impl Catalog {
         let slot_key = key.clone();
         let started = now;
         let fetch = async move {
-            let outcome = indexer
-                .search(&query)
-                .await
-                .map_err(|error| error.to_string());
-            record(
-                &health,
-                &name,
-                outcome.as_ref().map(Vec::len).map_err(Clone::clone),
-            );
+            let outcome = indexer.search(&query).await;
+            record(&health, &name, outcome.as_ref().map(Vec::len));
+            let outcome = outcome.map_err(|error| error.to_string());
             if outcome.is_err() {
                 // Erro não fica guardado. Só sai o próprio slot: outro pode
                 // ter entrado no lugar depois de um `forget`.
@@ -378,10 +434,18 @@ impl Catalog {
             .get(name)
             .cloned()
             .ok_or(TorznabError::NoSuchIndexer)?;
+        // Em espera, nem a requisição sai: o 429 pede que o tracker não seja
+        // consultado, e o download também conta.
+        if let Some(until) = self.waiting_until(name) {
+            return Err(waiting(name, until));
+        }
         entry.indexer.download(link).await.map_err(|error| {
             tracing::warn!(indexer = name, %error, "download falhou");
-            self.record(name, Err(error.to_string()));
-            TorznabError::DownloadFailed
+            self.record(name, Err(&error));
+            match self.waiting_until(name) {
+                Some(until) if error.rate_limited().is_some() => waiting(name, until),
+                _ => TorznabError::DownloadFailed,
+            }
         })
     }
 
@@ -397,14 +461,17 @@ impl Catalog {
             .get(name)
             .cloned()
             .ok_or_else(|| "indexador desconhecido".to_owned())?;
+        // O teste manual também é requisição ao tracker: em espera, não sai.
+        if let Some(until) = self.waiting_until(name) {
+            return Err(waiting(name, until).to_string());
+        }
         let outcome = entry
             .indexer
             .search(&SearchQuery::general(""))
             .await
-            .map(|releases| releases.len())
-            .map_err(|error| error.to_string());
-        self.record(name, outcome.clone());
-        outcome
+            .map(|releases| releases.len());
+        self.record(name, outcome.as_ref().map(|count| *count));
+        outcome.map_err(|error| error.to_string())
     }
 
     /// Capacidades de um indexador, ou a união de todos em `all`.
@@ -429,14 +496,40 @@ impl Catalog {
     ///
     /// Indexador desconhecido, ou **todos** os consultados falharam. Falha
     /// total não pode virar lista vazia: para o consumidor, "nada encontrado"
-    /// e "tracker fora do ar" pedem reações opostas.
+    /// e "tracker fora do ar" pedem reações opostas. Indexador em espera por
+    /// 429 não é consultado e não conta como falha; só se **todos** os que
+    /// seriam consultados estão em espera a busca devolve erro.
     pub async fn search(&self, target: &str, query: &SearchQuery) -> Result<Page, TorznabError> {
         let eligible: Vec<_> = self
             .targets(target)?
             .into_iter()
             .filter_map(|entry| adapt(query, &entry.capabilities).map(|adapted| (entry, adapted)))
             .collect();
+        let mut resume: Option<OffsetDateTime> = None;
+        let eligible: Vec<_> = eligible
+            .into_iter()
+            .filter(
+                |(entry, _)| match self.waiting_until(entry.indexer.name()) {
+                    Some(until) => {
+                        tracing::debug!(
+                            indexer = entry.indexer.name(),
+                            "indexador em espera, pulado"
+                        );
+                        resume = Some(resume.map_or(until, |known| known.min(until)));
+                        false
+                    }
+                    None => true,
+                },
+            )
+            .collect();
         let consulted = eligible.len();
+        if consulted == 0
+            && let Some(until) = resume
+        {
+            return Err(TorznabError::AllWaiting {
+                until: clock(until),
+            });
+        }
 
         let pending = eligible.into_iter().map(|(entry, adapted)| {
             let name = entry.indexer.name().to_owned();
@@ -468,12 +561,36 @@ impl Catalog {
     }
 }
 
-fn record(health: &Mutex<HashMap<String, Health>>, name: &str, outcome: Result<usize, String>) {
+fn waiting(name: &str, until: OffsetDateTime) -> TorznabError {
+    TorznabError::IndexerWaiting {
+        indexer: name.to_owned(),
+        until: clock(until),
+    }
+}
+
+fn record(
+    health: &Mutex<HashMap<String, Health>>,
+    name: &str,
+    outcome: Result<usize, &IndexerError>,
+) {
     let mut health = health.lock().unwrap_or_else(PoisonError::into_inner);
     let entry = health.entry(name.to_owned()).or_default();
     match outcome {
         Ok(results) => entry.success(results),
-        Err(error) => entry.failure(error),
+        Err(error) => match error.rate_limited() {
+            Some(retry_after) => {
+                if let Some(wait) = entry.rate_limited(error.to_string(), retry_after) {
+                    let until = clock(OffsetDateTime::now_utc() + wait);
+                    tracing::warn!(
+                        indexer = name,
+                        espera_s = wait.as_secs(),
+                        seguidos = entry.rate_limit_streak,
+                        "indexador respondeu 429: em espera até {until} UTC"
+                    );
+                }
+            }
+            None => entry.failure(error.to_string()),
+        },
     }
 }
 

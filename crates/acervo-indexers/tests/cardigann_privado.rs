@@ -533,3 +533,94 @@ async fn laravel_sem_o_token_certo_nao_loga() {
     .unwrap_err();
     assert!(!matches!(error, IndexerError::Definition { .. }), "{error}");
 }
+
+#[tokio::test]
+async fn erro_429_na_pagina_seguinte_para_a_paginacao_e_traz_o_retry_after() {
+    let server = MockServer::start().await;
+    mount_form_login(&server, 1).await;
+    Mock::given(path("/torrents-search.php"))
+        .and(query_param_is_missing("page"))
+        .respond_with(html(FORM_PAGE0))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/torrents-search.php"))
+        .and(query_param("page", "1"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "900"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // A terceira página nunca pode ser pedida depois do 429.
+    Mock::given(path("/torrents-search.php"))
+        .and(query_param("page", "2"))
+        .respond_with(html(FORM_PAGE1))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let error = form_client(&server)
+        .search(&SearchQuery::general("Um Filme"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.rate_limited(), Some(Some(Duration::from_secs(900))));
+}
+
+#[tokio::test]
+async fn erro_429_na_busca_sem_retry_after_e_reconhecido() {
+    let server = MockServer::start().await;
+    mount_form_login(&server, 1).await;
+    Mock::given(path("/torrents-search.php"))
+        .respond_with(ResponseTemplate::new(429))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = form_client(&server)
+        .search(&SearchQuery::general("Um Filme"))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, IndexerError::RateLimited { .. }));
+    assert_eq!(error.rate_limited(), Some(None));
+}
+
+#[tokio::test]
+async fn erro_429_no_login_nao_tenta_buscar() {
+    let server = MockServer::start().await;
+    Mock::given(path("/account-login.php"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "60"))
+        .mount(&server)
+        .await;
+    Mock::given(path("/torrents-search.php"))
+        .respond_with(html(FORM_PAGE0))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let error = form_client(&server)
+        .search(&SearchQuery::general("x"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.rate_limited(), Some(Some(Duration::from_secs(60))));
+}
+
+#[tokio::test]
+async fn erro_429_no_download_e_reconhecido() {
+    let server = MockServer::start().await;
+    mount_form_login(&server, 1).await;
+    Mock::given(path("/download.php"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "30"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let base = url::Url::parse(&server.uri()).unwrap();
+
+    let error = form_client(&server)
+        .download(&base.join("/download.php?id=10").unwrap())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.rate_limited(), Some(Some(Duration::from_secs(30))));
+}

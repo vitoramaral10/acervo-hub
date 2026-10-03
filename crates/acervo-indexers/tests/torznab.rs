@@ -241,3 +241,43 @@ async fn clones_compartilham_o_mesmo_rate_limit() {
 
     assert!(tokio::time::Instant::now() - start >= Duration::from_millis(30));
 }
+
+#[tokio::test]
+async fn erro_429_com_retry_after_em_segundos_vira_erro_reconhecivel() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/torznab/api"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "600"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .search(&SearchQuery::general("qualquer"))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, IndexerError::RateLimited { .. }));
+    assert_eq!(error.rate_limited(), Some(Some(Duration::from_secs(600))));
+    assert!(!error.to_string().contains("chave-de-teste"));
+}
+
+#[tokio::test]
+async fn erro_429_sem_retry_after_nem_data_ilegivel_traz_none() {
+    for header in [None, Some("em breve")] {
+        let server = MockServer::start().await;
+        let mut template = ResponseTemplate::new(429);
+        if let Some(value) = header {
+            template = template.insert_header("Retry-After", value);
+        }
+        Mock::given(method("GET"))
+            .and(path("/torznab/api"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+
+        let error = client(&server).capabilities().await.unwrap_err();
+
+        assert_eq!(error.rate_limited(), Some(None));
+    }
+}

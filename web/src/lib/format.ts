@@ -37,6 +37,12 @@ export function formatAgo(iso: string | null | undefined, now = Date.now()): str
   return 'agora'
 }
 
+/** "14:35", no fuso do navegador; "—" se a data não existe. */
+export function formatClock(iso: string | null | undefined): string {
+  if (!iso) return '—'
+  return new Date(iso).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
+}
+
 export function ageInSeconds(iso: string | null | undefined, now = Date.now()): number {
   return iso ? (now - new Date(iso).getTime()) / 1000 : Number.POSITIVE_INFINITY
 }

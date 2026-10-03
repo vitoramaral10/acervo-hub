@@ -5,6 +5,7 @@ import {
   CircleDashed,
   Film,
   CirclePause,
+  Hourglass,
   Pencil,
   Lock,
   Plus,
@@ -30,7 +31,7 @@ import {
 } from '@/components/ui/dialog'
 import { Badge, Skeleton, Switch, Tooltip } from '@/components/ui/misc'
 import { type Indexer, api } from '@/lib/api'
-import { formatAgo, formatCount } from '@/lib/format'
+import { formatAgo, formatClock, formatCount } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
 type Status = 'ok' | 'failing' | 'idle' | 'off'
@@ -171,6 +172,7 @@ function IndexerCard({ indexer, onEdit }: { indexer: Indexer; onEdit: () => void
   })
   const health = indexer.saude
   const StatusIcon = status.icon
+  const waitingUntil = health.em_espera_ate && Date.parse(health.em_espera_ate) > Date.now() ? health.em_espera_ate : null
 
   return (
     <article
@@ -215,6 +217,16 @@ function IndexerCard({ indexer, onEdit }: { indexer: Indexer; onEdit: () => void
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-3">
+          {indexer.ativo && waitingUntil && (
+            <Tooltip content="O tracker respondeu 429 (excesso de requisições): o serviço não o consulta até lá.">
+              <span className="inline-flex">
+                <Badge tone="warning" className="py-1">
+                  <Hourglass aria-hidden="true" />
+                  em espera até {formatClock(waitingUntil)}
+                </Badge>
+              </span>
+            </Tooltip>
+          )}
           <Badge tone={status.tone} className="py-1">
             <StatusIcon aria-hidden="true" />
             {status.label}

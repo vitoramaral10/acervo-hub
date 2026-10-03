@@ -133,6 +133,9 @@ impl TorznabClient {
                     kind: transport_kind(&source),
                 })?;
 
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(IndexerError::from_too_many_requests(&self.name, &response));
+        }
         if !response.status().is_success() {
             return Err(IndexerError::Status {
                 indexer: self.name.clone(),

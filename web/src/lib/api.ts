@@ -41,6 +41,8 @@ export interface Health {
   ultimo_erro: string | null
   falhas_seguidas: number
   resultados: number | null
+  /** RFC 3339; só vem preenchido enquanto o tracker pediu para recuar (HTTP 429). */
+  em_espera_ate: string | null
 }
 
 export interface Indexer {

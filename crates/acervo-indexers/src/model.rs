@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use time::OffsetDateTime;
 use url::Url;
@@ -269,6 +270,14 @@ pub enum IndexerError {
         status: reqwest::StatusCode,
     },
 
+    /// HTTP 429: o tracker pediu para recuar. Quem consulta não deve insistir
+    /// antes de `retry_after` (ou de um prazo próprio, se ele não veio).
+    #[error("indexador `{indexer}` respondeu HTTP 429 (excesso de requisições)")]
+    RateLimited {
+        indexer: String,
+        retry_after: Option<Duration>,
+    },
+
     #[error("indexador `{indexer}` recusou a consulta ({code}): {description}")]
     Api {
         indexer: String,
@@ -294,4 +303,74 @@ pub enum IndexerError {
         indexer: String,
         field: &'static str,
     },
+}
+
+impl IndexerError {
+    /// Se o erro é um 429, o `Retry-After` que o acompanhou (se veio).
+    #[must_use]
+    pub fn rate_limited(&self) -> Option<Option<Duration>> {
+        match self {
+            Self::RateLimited { retry_after, .. } => Some(*retry_after),
+            _ => None,
+        }
+    }
+
+    /// 429 do indexador, com o `Retry-After` lido da resposta.
+    pub(crate) fn from_too_many_requests(indexer: &str, response: &reqwest::Response) -> Self {
+        Self::RateLimited {
+            indexer: indexer.to_owned(),
+            retry_after: retry_after(response.headers()),
+        }
+    }
+}
+
+/// Lê o `Retry-After`: número de segundos ou data HTTP. Valor ilegível, ou
+/// data que já passou, vira `None` — quem recebe usa o recuo padrão.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return (seconds > 0).then(|| Duration::from_secs(seconds));
+    }
+    let date = OffsetDateTime::parse(value, &time::format_description::well_known::Rfc2822).ok()?;
+    let wait = date - OffsetDateTime::now_utc();
+    u64::try_from(wait.whole_seconds())
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+    use super::*;
+
+    fn headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_str(value).unwrap());
+        headers
+    }
+
+    #[test]
+    fn retry_after_em_segundos() {
+        assert_eq!(retry_after(&headers("120")), Some(Duration::from_secs(120)));
+        assert_eq!(retry_after(&headers("0")), None);
+        assert_eq!(retry_after(&headers("logo")), None);
+        assert_eq!(retry_after(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn retry_after_em_data_http() {
+        let future = OffsetDateTime::now_utc() + time::Duration::seconds(3600);
+        let value = future
+            .format(&time::format_description::well_known::Rfc2822)
+            .unwrap();
+        let wait = retry_after(&headers(&value)).expect("data futura");
+        assert!((3500..=3600).contains(&wait.as_secs()));
+        assert_eq!(retry_after(&headers("Wed, 21 Oct 2015 07:28:00 GMT")), None);
+    }
 }
