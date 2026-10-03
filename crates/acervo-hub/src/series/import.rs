@@ -151,7 +151,13 @@ impl Importer<'_> {
             .torrent(&grab.hash)
             .await
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| Failure::Download("o torrent sumiu do cliente".into()))?;
+            .ok_or_else(|| {
+                if crate::grab::fresh_grab(&grab.grabbed_at, OffsetDateTime::now_utc()) {
+                    Failure::Import("o torrent ainda não apareceu no cliente".into())
+                } else {
+                    Failure::Download("o torrent sumiu do cliente".into())
+                }
+            })?;
         if torrent.state == "error" {
             let free = self
                 .free_space

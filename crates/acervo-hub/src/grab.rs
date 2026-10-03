@@ -610,6 +610,26 @@ fn imported_file(
 }
 
 /// Por que um download não importou.
+/// Por quanto tempo um torrent recém-mandado pode ainda não aparecer no
+/// cliente: o qBittorrent 5 responde ao `add` antes de listá-lo, e a nova
+/// busca roda dentro da mesma volta da importação que o procura.
+const FRESH_GRAB: time::Duration = time::Duration::minutes(10);
+
+/// O grab saiu há pouco: torrent ausente é atraso do cliente, não perda.
+pub(crate) fn fresh_grab(grabbed_at: &str, now: time::OffsetDateTime) -> bool {
+    time::OffsetDateTime::parse(grabbed_at, &time::format_description::well_known::Rfc3339)
+        .is_ok_and(|at| now - at < FRESH_GRAB)
+}
+
+/// Torrent ausente do cliente: perda, ou só atraso se o grab é recente.
+fn missing(grabbed_at: &str) -> Failure {
+    if fresh_grab(grabbed_at, time::OffsetDateTime::now_utc()) {
+        Failure::Import("o torrent ainda não apareceu no cliente".into())
+    } else {
+        Failure::Download("o torrent sumiu do cliente".into())
+    }
+}
+
 enum Failure {
     /// O release é o problema: o cliente perdeu ou deu erro. Bloqueia e
     /// busca de novo.
@@ -800,7 +820,7 @@ pub async fn import_downloads(
                 .torrent(&grab.hash)
                 .await
                 .map_err(|e| e.to_string())?
-                .ok_or_else(|| Failure::Download("o torrent sumiu do cliente".into()))?;
+                .ok_or_else(|| missing(&grab.grabbed_at))?;
             // Disco cheio não é culpa do release: bloquear e buscar outro só
             // empilha torrents que dão o mesmo erro. Volta para a fila, com
             // o que já baixou.
@@ -963,6 +983,18 @@ pub async fn import_downloads(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn torrent_ausente_de_grab_recente_e_atraso_nao_perda() {
+        let now = time::OffsetDateTime::parse(
+            "2026-10-03T15:30:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert!(fresh_grab("2026-10-03T15:27:53.096959272Z", now));
+        assert!(!fresh_grab("2026-10-03T15:19:00Z", now));
+        assert!(!fresh_grab("data ilegível", now));
+    }
 
     fn file(name: &str, size: u64) -> acervo_clients::TorrentFile {
         serde_json::from_value(serde_json::json!({ "name": name, "size": size })).unwrap()
