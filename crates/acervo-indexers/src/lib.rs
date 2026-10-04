@@ -15,7 +15,8 @@ pub use cardigann::{
     CardigannClient, CardigannDefinition, DefinitionHeader, SettingInfo, SettingInfoKind,
 };
 pub use model::{
-    Capabilities, Category, IndexerError, Release, SearchMode, SearchQuery, SearchSupport,
+    Capabilities, Category, IndexerError, Release, ResolvedDownload, SearchMode, SearchQuery,
+    SearchSupport,
 };
 pub use rate::RateBudget;
 pub use torznab::TorznabClient;

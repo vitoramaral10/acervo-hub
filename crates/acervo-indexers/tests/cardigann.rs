@@ -52,16 +52,19 @@ fn carrega_metadados_caps_e_mapeamentos_de_categoria_v11() {
 fn recursos_nao_implementados_falham_no_load_sem_expor_yaml() {
     let cases = [
         format!("{YAML}\nlogin:\n  method: post\n"),
-        format!("{YAML}\nlogin:\n  method: form\n  path: login\n"),
-        YAML.replace("method: get", "method: post"),
-        YAML.replace("method: get", "response: {type: json}"),
-        YAML.replace("UTF-8", "windows-1252"),
+        format!("{YAML}\nlogin:\n  method: magia\n  path: login\n"),
+        YAML.replace("method: get", "method: put"),
+        YAML.replace("method: get", "response: {type: xml}"),
+        YAML.replace("UTF-8", "shift_jis"),
         YAML.replace("type: public", "type: private"),
         YAML.replace("name: trim", "name: regexp"),
-        YAML.replace("name: trim", "name: timeago"),
+        YAML.replace("name: trim", "name: filtro-inexistente"),
         YAML.replace("{{ .Keywords }}", "{{ .Config.unknown }}"),
         YAML.replace("{{ .Keywords }}", "{{ printf .Keywords }}"),
-        YAML.replace("path: browse", "path: '{{ .Keywords }}'"),
+        YAML.replace(
+            "path: browse",
+            "path: 'https://other.invalid/{{ .Keywords }}'",
+        ),
         YAML.replace("path: browse", "path: https://other.invalid/search"),
         YAML.replace("path: browse", "path: //other.invalid/search"),
         YAML.replace("TV/HD", "unknown-category"),
@@ -69,7 +72,7 @@ fn recursos_nao_implementados_falham_no_load_sem_expor_yaml() {
         YAML.replace("table.results > tbody > tr.release", "tr[[secret-value"),
         YAML.replace(
             "table.results > tbody > tr.release",
-            "tr:contains(secret-value) td",
+            "tr:is(td:contains(secret-value))",
         ),
         YAML.replace("args: ['_', '.']", "args: ['(x', '.']")
             .replace("name: replace", "name: re_replace"),

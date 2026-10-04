@@ -8,11 +8,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use reqwest::header::HeaderName;
 use serde::Deserialize;
 use serde_yaml_ng::{Mapping, Value as Yaml};
 use url::Url;
 
+use super::charset::Charset;
 use super::filters::Filter;
+use super::json::{JsonPath, path_part};
 use super::selector::Css;
 use super::template::{Names, Scope, Template, Vars};
 use super::{CardigannDefinition, invalid};
@@ -39,9 +42,10 @@ pub(super) struct Document {
     replaces: Vec<String>,
     #[serde(default)]
     followredirect: bool,
-    // Metadados de teste e de TLS da referência: não mudam a busca.
-    #[serde(default)]
-    testlinktorrent: Option<Yaml>,
+    // `false` desliga a conferência do link resolvido por `download.selectors`.
+    #[serde(default = "yes")]
+    testlinktorrent: bool,
+    // Metadado de TLS da referência: não muda a busca.
     #[serde(default)]
     certificates: Option<Yaml>,
     caps: RawCaps,
@@ -50,6 +54,12 @@ pub(super) struct Document {
     #[serde(default)]
     login: Option<RawLogin>,
     search: RawSearch,
+    #[serde(default)]
+    download: Option<RawDownload>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -62,6 +72,9 @@ struct RawCaps {
     modes: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     allowrawsearch: Option<bool>,
+    // A referência não lê esta chave; vem nas definições herdadas do Jackett.
+    #[serde(default)]
+    allowtvsearchimdb: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -95,18 +108,49 @@ struct RawLogin {
     #[serde(default)]
     path: Option<String>,
     #[serde(default)]
+    submitpath: Option<String>,
+    #[serde(default)]
     method: Option<String>,
     #[serde(default)]
+    form: Option<String>,
+    #[serde(default)]
+    selectors: bool,
+    #[serde(default)]
+    cookies: Vec<String>,
+    #[serde(default)]
     inputs: Mapping,
+    #[serde(default)]
+    selectorinputs: Mapping,
+    #[serde(default)]
+    getselectorinputs: Mapping,
+    #[serde(default)]
+    headers: Option<BTreeMap<String, Yaml>>,
     #[serde(default)]
     error: Vec<RawLoginError>,
     #[serde(default)]
     test: Option<RawLoginTest>,
+    #[serde(default)]
+    captcha: Option<RawCaptcha>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCaptcha {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    selector: Option<String>,
+    // O nome do campo onde o operador digitaria a resposta: sem tela para
+    // isso, não é lido.
+    #[serde(default)]
+    input: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawLoginError {
+    #[serde(default)]
+    path: Option<String>,
     selector: String,
     #[serde(default)]
     message: Option<Yaml>,
@@ -129,6 +173,8 @@ struct RawSearch {
     paths: Option<Vec<RawPath>>,
     #[serde(default)]
     inputs: Mapping,
+    #[serde(default)]
+    error: Vec<RawLoginError>,
     #[serde(default)]
     keywordsfilters: Vec<RawFilterYaml>,
     #[serde(default)]
@@ -155,6 +201,17 @@ struct RawPath {
     followredirect: Option<bool>,
     #[serde(default)]
     inheritinputs: Option<bool>,
+    #[serde(default)]
+    response: Option<RawResponse>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawResponse {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default, rename = "noResultsMessage")]
+    no_results_message: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -163,6 +220,18 @@ struct RawRows {
     selector: String,
     #[serde(default)]
     filters: Vec<RawFilterYaml>,
+    #[serde(default)]
+    after: Option<usize>,
+    #[serde(default)]
+    dateheaders: Option<RawField>,
+    #[serde(default)]
+    count: Option<RawField>,
+    #[serde(default)]
+    multiple: bool,
+    #[serde(default)]
+    attribute: Option<String>,
+    #[serde(default, rename = "missingAttributeEqualsNoResults")]
+    missing_attribute_equals_no_results: bool,
 }
 
 #[derive(Deserialize)]
@@ -192,6 +261,55 @@ struct RawFilterYaml {
     name: String,
     #[serde(default)]
     args: Option<Yaml>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDownload {
+    #[serde(default)]
+    selectors: Vec<RawDownloadSelector>,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    before: Option<RawBefore>,
+    #[serde(default)]
+    infohash: Option<RawInfohash>,
+    #[serde(default)]
+    headers: Option<BTreeMap<String, Yaml>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDownloadSelector {
+    selector: String,
+    #[serde(default)]
+    attribute: Option<String>,
+    #[serde(default)]
+    usebeforeresponse: bool,
+    #[serde(default)]
+    filters: Vec<RawFilterYaml>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBefore {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    inputs: Mapping,
+    #[serde(default)]
+    pathselector: Option<RawDownloadSelector>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInfohash {
+    hash: RawDownloadSelector,
+    title: RawDownloadSelector,
+    #[serde(default)]
+    usebeforeresponse: bool,
 }
 
 /// Filtro com os argumentos já em texto.
@@ -256,21 +374,61 @@ pub(super) struct Setting {
     pub default: Option<String>,
 }
 
+/// Formato da resposta de busca. Uma definição não mistura os dois: os campos
+/// são compilados para um só.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Format {
+    Html,
+    Json,
+}
+
+pub(super) type Inputs = Vec<(String, Template)>;
+
+/// Chave de input cujo valor são pares `a=1&b=2` prontos.
+pub(super) const RAW_INPUT: &str = "$raw";
+pub(super) type Headers = Vec<(String, Template)>;
+
 pub(super) enum LoginMethod {
     /// O cookie colado nas settings vai em todo request.
     Cookie(Template),
-    /// POST ou GET de formulário; a sessão fica no cookie jar.
-    Form {
-        path: String,
-        post: bool,
-        inputs: Vec<(String, Template)>,
-    },
+    /// POST de formulário direto no caminho; a sessão fica no cookie jar.
+    Post { path: Template, inputs: Inputs },
+    /// GET com os inputs na query — o login por chave de API.
+    Get { path: Template, inputs: Inputs },
+    /// GET em que o valor de `oneurl` é colado ao caminho.
+    OneUrl { path: Template, input: Template },
+    /// Abre a página, lê o formulário e o envia.
+    Form(Box<FormLogin>),
+}
+
+pub(super) struct FormLogin {
+    pub path: Template,
+    pub form: Css,
+    pub submit_path: Option<String>,
+    pub inputs: Vec<LoginInput>,
+    /// Campos lidos da página de login com seletor (tokens CSRF, por exemplo).
+    pub selector_inputs: Vec<(String, Field)>,
+    /// Os mesmos, mas vão na query do envio.
+    pub get_selector_inputs: Vec<(String, Field)>,
+    /// Elemento que denuncia captcha de imagem na página de login.
+    pub captcha: Option<Css>,
+}
+
+pub(super) struct LoginInput {
+    pub key: String,
+    /// Com `login.selectors`, a chave é um seletor e o nome do campo vem do
+    /// atributo `name` do elemento achado.
+    pub key_css: Option<Css>,
+    pub value: Template,
 }
 
 pub(super) struct Login {
     pub method: LoginMethod,
     pub errors: Vec<Css>,
     pub test: Option<LoginTest>,
+    /// `nome=valor` que vão junto da abertura do login.
+    pub cookies: Vec<String>,
+    pub headers: Option<Headers>,
 }
 
 pub(super) struct LoginTest {
@@ -279,25 +437,60 @@ pub(super) struct LoginTest {
 }
 
 pub(super) struct SearchPath {
-    pub path: String,
-    pub inputs: Vec<(String, Template)>,
+    pub path: Template,
+    pub post: bool,
+    pub inputs: Inputs,
     pub categories: Vec<String>,
+    pub inherit_inputs: bool,
     pub follow_redirect: bool,
+    /// `response.noResultsMessage`: texto que, na resposta, quer dizer "nada".
+    pub no_results: Option<String>,
 }
 
 pub(super) enum Source {
     Text(Template),
     Select {
-        selector: Option<Css>,
+        selector: Option<Selection>,
         attribute: Option<String>,
         remove: Option<Css>,
         case: Vec<(Css, Template)>,
     },
+    Json {
+        selector: Option<Template>,
+        /// Seletor que começa com `..` lê da linha, não do filho de `multiple`.
+        from_row: bool,
+        case: Vec<(String, Template)>,
+    },
+}
+
+/// Seletor CSS de um campo: fixo, ou com template (`a[{{ if ... }}href^=x{{ end }}]`)
+/// e então compilado a cada linha.
+pub(super) enum Selection {
+    Fixed(Css),
+    Templated(Template),
+}
+
+impl Selection {
+    /// O seletor com as variáveis da linha; `None` se o resultado não compila.
+    pub fn resolve<'a>(&'a self, vars: &Vars, scratch: &'a mut Option<Css>) -> Option<&'a Css> {
+        match self {
+            Self::Fixed(css) => Some(css),
+            Self::Templated(template) => {
+                *scratch = Css::parse(&template.render(vars), "search.fields.selector").ok();
+                scratch.as_ref()
+            }
+        }
+    }
 }
 
 pub(super) struct Field {
     pub source: Source,
     pub optional: bool,
+    /// `campo|append`: o valor se junta ao que o campo já tinha (título,
+    /// descrição) — em categoria, soma, que já é o padrão.
+    pub append: bool,
+    /// `campo|noappend`: em categoria, troca em vez de somar.
+    pub no_append: bool,
     pub default: Option<Template>,
     pub filters: Vec<Filter>,
 }
@@ -305,6 +498,45 @@ pub(super) struct Field {
 pub(super) enum Rows {
     Fixed(Css),
     Templated(Template),
+    Json(Box<JsonRows>),
+}
+
+pub(super) struct JsonRows {
+    pub selector: Template,
+    pub attribute: Option<String>,
+    pub multiple: bool,
+    pub missing_is_empty: bool,
+    pub count: Option<Field>,
+}
+
+/// Seletor de um bloco `download` (`selectors`, `infohash`, `pathselector`).
+pub(super) struct DownloadSelector {
+    pub selector: Template,
+    pub attribute: Option<String>,
+    pub use_before_response: bool,
+    pub filters: Vec<Filter>,
+}
+
+pub(super) struct Before {
+    pub path: Option<Template>,
+    pub post: bool,
+    pub inputs: Inputs,
+    pub path_selector: Option<DownloadSelector>,
+}
+
+pub(super) struct Infohash {
+    pub hash: DownloadSelector,
+    pub title: DownloadSelector,
+    pub use_before_response: bool,
+}
+
+/// Como chegar do link do release ao `.torrent` (ou ao magnet).
+pub(super) struct Download {
+    pub post: bool,
+    pub before: Option<Before>,
+    pub infohash: Option<Infohash>,
+    pub selectors: Vec<DownloadSelector>,
+    pub headers: Option<Headers>,
 }
 
 /// Campos que a busca exige para montar um release.
@@ -315,13 +547,10 @@ const DEFAULT_REQUEST_DELAY: f64 = 5.0;
 
 const REQUIRED_FIELDS: [&str; 2] = ["title", "size"];
 
-/// Campos da referência cujo valor seria perdido em silêncio aqui.
-const REFUSED_FIELDS: [&str; 1] = ["categorydesc"];
-
 impl Document {
     /// Metadados: devolve se é privado e o intervalo entre requisições
     /// (`DEFAULT_REQUEST_DELAY` quando a definição não declara).
-    fn validate_metadata(&self) -> Result<(bool, f64), IndexerError> {
+    fn validate_metadata(&self) -> Result<(bool, f64, Charset), IndexerError> {
         if self.id.is_empty()
             || !self
                 .id
@@ -338,18 +567,23 @@ impl Document {
             "private" | "semi-private" => true,
             _ => return Err(invalid("type", "esperado public, private ou semi-private")),
         };
-        if !self.encoding.eq_ignore_ascii_case("utf-8") {
-            return Err(invalid("encoding", "somente UTF-8 é suportado"));
-        }
+        let charset = Charset::from_label(&self.encoding).ok_or_else(|| {
+            invalid(
+                "encoding",
+                "codificação não suportada (UTF-8, Latin-1/2 e Windows 125x/874 sim; de vários bytes não)",
+            )
+        })?;
         let delay = self.request_delay.unwrap_or(DEFAULT_REQUEST_DELAY);
         if !delay.is_finite() || !(0.0..=3600.0).contains(&delay) {
             return Err(invalid("requestDelay", "esperado entre 0 e 3600 segundos"));
         }
-        Ok((private, delay))
+        Ok((private, delay, charset))
     }
 
+    // Leitura em sequência, seção por seção; dividir só espalharia.
+    #[allow(clippy::too_many_lines)]
     pub fn compile(self) -> Result<CardigannDefinition, IndexerError> {
-        let (private, delay) = self.validate_metadata()?;
+        let (private, delay, charset) = self.validate_metadata()?;
         let links = self
             .links
             .iter()
@@ -361,9 +595,9 @@ impl Document {
         let _ = (
             self.legacylinks,
             self.replaces,
-            self.testlinktorrent,
             self.certificates,
             self.caps.allowrawsearch,
+            self.caps.allowtvsearchimdb,
         );
 
         let (categories, mappings) = compile_categories(&self.caps)?;
@@ -377,13 +611,18 @@ impl Document {
             .search
             .fields
             .keys()
-            .map(|key| scalar(key, "search.fields"))
-            .collect::<Result<_, _>>()?;
+            .map(|key| {
+                let key = scalar(key, "search.fields")?;
+                Ok(key.split('|').next().unwrap_or_default().to_owned())
+            })
+            .collect::<Result<_, IndexerError>>()?;
         let names = Names {
             settings: &setting_names,
             fields: &field_names,
+            charset,
         };
 
+        let format = detect_format(self.search.paths.as_deref())?;
         let login = self
             .login
             .map(|login| compile_login(login, &names, &links))
@@ -393,7 +632,7 @@ impl Document {
         }
 
         let search = self.search;
-        let (inputs, raw_inputs) = compile_inputs(search.inputs, &names)?;
+        let inputs = compile_inputs(search.inputs, &names, "search.inputs")?;
         let paths = compile_paths(
             search.path,
             search.paths,
@@ -411,19 +650,43 @@ impl Document {
             .into_iter()
             .map(|raw| Filter::compile(raw.flatten()?, Scope::Request, &names))
             .collect::<Result<Vec<_>, _>>()?;
-        let headers = compile_headers(search.headers.unwrap_or_default())?;
-        let (rows, and_match) = compile_rows(search.rows, &names)?;
-        let fields = compile_fields(search.fields, &names)?;
+        if format == Format::Json && !preprocessing_filters.is_empty() {
+            return Err(invalid(
+                "search.preprocessingfilters",
+                "preprocessingfilters só valem para resposta HTML",
+            ));
+        }
+        let headers = compile_headers(search.headers, Scope::Request, &names)?;
+        let search_errors = search
+            .error
+            .into_iter()
+            .map(|error| Css::parse(&error.selector, "search.error.selector"))
+            .collect::<Result<Vec<_>, _>>()?;
+        if format == Format::Json && !search_errors.is_empty() {
+            return Err(invalid(
+                "search.error",
+                "search.error só vale para resposta HTML",
+            ));
+        }
+        let rows = compile_rows(search.rows, &names, format)?;
+        let fields = compile_fields(search.fields, &names, format)?;
+        let download = self
+            .download
+            .map(|download| compile_download(download, &names))
+            .transpose()?;
 
         let mut templates: Vec<&Template> = inputs.iter().map(|(_, template)| template).collect();
-        templates.extend(
-            paths
+        templates.extend(paths.iter().flat_map(|path| {
+            path.inputs
                 .iter()
-                .flat_map(|path| path.inputs.iter().map(|(_, template)| template)),
-        );
-        templates.extend(raw_inputs.as_ref());
-        if let Rows::Templated(template) = &rows {
-            templates.push(template);
+                .map(|(_, template)| template)
+                .chain(std::iter::once(&path.path))
+        }));
+        templates.extend(headers.iter().map(|(_, template)| template));
+        match &rows.rows {
+            Rows::Templated(template) => templates.push(template),
+            Rows::Json(json) => templates.push(&json.selector),
+            Rows::Fixed(_) => {}
         }
         let consumed: BTreeSet<String> = templates
             .into_iter()
@@ -441,41 +704,78 @@ impl Document {
             links,
             delay: Duration::from_secs_f64(delay),
             capabilities,
-            mappings,
+            charset,
+            mappings: mappings.by_id,
+            description_mappings: mappings.by_description,
+            default_categories: mappings.defaults,
             settings,
             login,
             paths,
             inputs,
-            raw_inputs,
             allow_empty_inputs: search.allow_empty_inputs,
             keywords_filters,
             preprocessing_filters,
             headers,
-            rows,
-            and_match,
+            format,
+            search_errors,
+            rows: rows.rows,
+            and_match: rows.and_match,
+            after: rows.after,
+            date_headers: rows.date_headers,
             fields,
+            download,
+            test_link_torrent: self.testlinktorrent,
         })
     }
 }
 
-type Inputs = Vec<(String, Template)>;
+/// O formato único das rotas de busca; `search.path` sozinho é HTML.
+fn detect_format(paths: Option<&[RawPath]>) -> Result<Format, IndexerError> {
+    let mut found: Option<Format> = None;
+    for raw in paths.unwrap_or_default() {
+        let format = match raw.response.as_ref().map(|response| response.kind.as_str()) {
+            None | Some("html") => Format::Html,
+            Some("json") => Format::Json,
+            Some("xml") => {
+                return Err(invalid(
+                    "search.paths.response",
+                    "resposta XML não é suportada (somente html e json)",
+                ));
+            }
+            Some(_) => {
+                return Err(invalid(
+                    "search.paths.response",
+                    "tipo de resposta desconhecido (esperado html ou json)",
+                ));
+            }
+        };
+        if found.is_some_and(|known| known != format) {
+            return Err(invalid(
+                "search.paths.response",
+                "rotas com respostas html e json na mesma definição",
+            ));
+        }
+        found = Some(format);
+    }
+    Ok(found.unwrap_or(Format::Html))
+}
 
+/// Inputs na ordem declarada. A chave `$raw` (pares `a=1&b=2` já prontos)
+/// fica onde foi escrita: a ordem dos parâmetros na URL segue a da definição.
 fn compile_inputs(
     raw: Mapping,
     names: &Names<'_>,
-) -> Result<(Inputs, Option<Template>), IndexerError> {
-    let mut inputs = Vec::new();
-    let mut raw_inputs = None;
-    for (key, value) in pairs(raw, "search.inputs")? {
-        let template = Template::compile(&value, Scope::Request, names)?;
-        if key == "$raw" {
-            raw_inputs = Some(template);
-        } else {
-            check_input_key(&key)?;
-            inputs.push((key, template));
-        }
-    }
-    Ok((inputs, raw_inputs))
+    section: &'static str,
+) -> Result<Inputs, IndexerError> {
+    pairs(raw, section)?
+        .into_iter()
+        .map(|(key, value)| {
+            if key != RAW_INPUT {
+                check_input_key(&key)?;
+            }
+            Ok((key, Template::compile(&value, Scope::Request, names)?))
+        })
+        .collect()
 }
 
 fn compile_paths(
@@ -493,6 +793,7 @@ fn compile_paths(
             categories: Vec::new(),
             followredirect: None,
             inheritinputs: None,
+            response: None,
         }],
         (None, Some(paths)) if !paths.is_empty() => paths,
         _ => {
@@ -504,71 +805,139 @@ fn compile_paths(
     };
     let mut compiled = Vec::new();
     for raw in raw_paths {
-        if raw
+        let post = match raw
             .method
             .as_deref()
-            .is_some_and(|method| !method.eq_ignore_ascii_case("get"))
+            .map(str::to_ascii_lowercase)
+            .as_deref()
         {
-            return Err(invalid("search.paths.method", "somente GET é suportado"));
-        }
-        if raw.inheritinputs == Some(false) {
-            return Err(invalid(
-                "search.paths.inheritinputs",
-                "inheritinputs: false não é suportado",
-            ));
-        }
-        check_static_path(&raw.path, links, "search.paths.path")?;
-        let mut inputs = Vec::new();
-        for (key, value) in pairs(raw.inputs, "search.paths.inputs")? {
-            check_input_key(&key)?;
-            inputs.push((key, Template::compile(&value, Scope::Request, names)?));
-        }
+            None | Some("get") => false,
+            Some("post") => true,
+            Some(_) => {
+                return Err(invalid(
+                    "search.paths.method",
+                    "método desconhecido (esperado get ou post)",
+                ));
+            }
+        };
+        let template = Template::compile(&raw.path, Scope::Request, names)?;
+        check_templated_path(&template, links, "search.paths.path")?;
+        let inputs = compile_inputs(raw.inputs, names, "search.paths.inputs")?;
         compiled.push(SearchPath {
-            path: raw.path,
+            path: template,
+            post,
             inputs,
             categories: raw
                 .categories
                 .iter()
                 .map(|value| scalar(value, "search.paths.categories"))
                 .collect::<Result<_, _>>()?,
+            inherit_inputs: raw.inheritinputs.unwrap_or(true),
             follow_redirect: raw.followredirect.unwrap_or(follow_redirect),
+            no_results: raw
+                .response
+                .and_then(|response| response.no_results_message),
         });
     }
     Ok(compiled)
 }
 
-fn compile_headers(raw: BTreeMap<String, Yaml>) -> Result<Vec<(String, String)>, IndexerError> {
-    raw.into_iter()
+/// Cabeçalhos de uma seção; o valor é templado e, como na referência, só o
+/// primeiro de uma lista vale.
+fn compile_headers(
+    raw: Option<BTreeMap<String, Yaml>>,
+    scope: Scope,
+    names: &Names<'_>,
+) -> Result<Headers, IndexerError> {
+    raw.unwrap_or_default()
+        .into_iter()
         .map(|(name, value)| {
-            let value = match value {
-                Yaml::Sequence(values) if values.len() == 1 => {
-                    scalar(&values[0], "search.headers")?
-                }
-                other => scalar(&other, "search.headers")?,
-            };
-            if value.contains("{{") {
-                return Err(invalid(
-                    "search.headers",
-                    "templates em cabeçalho não são suportados",
-                ));
+            if HeaderName::from_bytes(name.as_bytes()).is_err() {
+                return Err(invalid("headers", "nome de cabeçalho inválido"));
             }
-            Ok((name, value))
+            let value = match value {
+                Yaml::Sequence(values) if !values.is_empty() => scalar(&values[0], "headers")?,
+                other => scalar(&other, "headers")?,
+            };
+            Ok((name, Template::compile(&value, scope, names)?))
         })
         .collect()
 }
 
-fn compile_rows(raw: RawRows, names: &Names<'_>) -> Result<(Rows, bool), IndexerError> {
+/// Linhas da busca e o que vale só para HTML (`after`, `dateheaders`).
+struct RowsPlan {
+    rows: Rows,
+    and_match: bool,
+    after: usize,
+    date_headers: Option<Field>,
+}
+
+fn compile_rows(raw: RawRows, names: &Names<'_>, format: Format) -> Result<RowsPlan, IndexerError> {
     let mut and_match = false;
     for filter in raw.filters {
-        if filter.name != "andmatch" {
-            return Err(invalid(
-                "search.rows.filters",
-                "filtro de linha não implementado",
-            ));
+        match filter.name.as_str() {
+            "andmatch" => and_match = true,
+            // Diagnóstico da referência: não muda a linha.
+            "strdump" => {}
+            _ => {
+                return Err(invalid(
+                    "search.rows.filters",
+                    "filtro de linha não implementado",
+                ));
+            }
         }
-        and_match = true;
     }
     let template = Template::compile(&raw.selector, Scope::Request, names)?;
+    if format == Format::Json {
+        if raw.after.is_some() || raw.dateheaders.is_some() {
+            return Err(invalid(
+                "search.rows",
+                "after e dateheaders só valem para resposta HTML",
+            ));
+        }
+        // O caminho das linhas precisa ser legível já na carga.
+        let probe = template.render(&Vars::default());
+        if JsonPath::parse(path_part(&probe)).is_none() {
+            return Err(invalid(
+                "search.rows.selector",
+                "caminho JSON fora do subconjunto suportado",
+            ));
+        }
+        if let Some(attribute) = &raw.attribute
+            && JsonPath::parse(attribute).is_none()
+        {
+            return Err(invalid(
+                "search.rows.attribute",
+                "caminho JSON fora do subconjunto suportado",
+            ));
+        }
+        let count = raw
+            .count
+            .map(|count| compile_field(count, names, format))
+            .transpose()?;
+        return Ok(RowsPlan {
+            rows: Rows::Json(Box::new(JsonRows {
+                selector: template,
+                attribute: raw.attribute,
+                multiple: raw.multiple,
+                missing_is_empty: raw.missing_attribute_equals_no_results,
+                count,
+            })),
+            and_match,
+            after: 0,
+            date_headers: None,
+        });
+    }
+    if raw.count.is_some()
+        || raw.multiple
+        || raw.attribute.is_some()
+        || raw.missing_attribute_equals_no_results
+    {
+        return Err(invalid(
+            "search.rows",
+            "count, multiple, attribute e missingAttributeEqualsNoResults só valem para JSON",
+        ));
+    }
     let rows = if let Some(literal) = template.literal() {
         Rows::Fixed(Css::parse(literal, "search.rows.selector")?)
     } else {
@@ -577,22 +946,55 @@ fn compile_rows(raw: RawRows, names: &Names<'_>) -> Result<(Rows, bool), Indexer
         Css::parse(&template.render(&Vars::default()), "search.rows.selector")?;
         Rows::Templated(template)
     };
-    Ok((rows, and_match))
+    if raw.after.unwrap_or(0) > 0 && raw.dateheaders.is_some() {
+        return Err(invalid(
+            "search.rows",
+            "after e dateheaders juntos não são suportados",
+        ));
+    }
+    let date_headers = raw
+        .dateheaders
+        .map(|headers| compile_field(headers, names, format))
+        .transpose()?;
+    Ok(RowsPlan {
+        rows,
+        and_match,
+        after: raw.after.unwrap_or(0),
+        date_headers,
+    })
 }
 
-fn compile_fields(raw: Mapping, names: &Names<'_>) -> Result<Vec<(String, Field)>, IndexerError> {
+fn compile_fields(
+    raw: Mapping,
+    names: &Names<'_>,
+    format: Format,
+) -> Result<Vec<(String, Field)>, IndexerError> {
     let mut fields = Vec::new();
     for (key, value) in raw {
-        let name = scalar(&key, "search.fields")?;
-        if REFUSED_FIELDS.contains(&name.as_str()) {
-            return Err(invalid(
-                "search.fields",
-                "campo não implementado (categorydesc)",
-            ));
-        }
+        let key = scalar(&key, "search.fields")?;
+        let mut modifiers = key.split('|');
+        let name = modifiers.next().unwrap_or_default().to_owned();
         let raw: RawField = serde_yaml_ng::from_value(value)
             .map_err(|_| invalid("search.fields", "campo com chave ou tipo não suportado"))?;
-        fields.push((name, compile_field(raw, names)?));
+        let mut field = compile_field(raw, names, format)?;
+        for modifier in modifiers {
+            let accumulates = matches!(
+                name.as_str(),
+                "title" | "description" | "category" | "categorydesc"
+            );
+            match modifier {
+                "optional" => field.optional = true,
+                "append" if accumulates => field.append = true,
+                "noappend" if name.starts_with("category") => field.no_append = true,
+                _ => {
+                    return Err(invalid(
+                        "search.fields",
+                        "modificador de campo não suportado (aceitos: optional, append, noappend)",
+                    ));
+                }
+            }
+        }
+        fields.push((name, field));
     }
     for required in REQUIRED_FIELDS {
         if !fields.iter().any(|(name, _)| name == required) {
@@ -601,9 +1003,12 @@ fn compile_fields(raw: Mapping, names: &Names<'_>) -> Result<Vec<(String, Field)
     }
     if !fields
         .iter()
-        .any(|(name, _)| name == "download" || name == "magnet")
+        .any(|(name, _)| matches!(name.as_str(), "download" | "magnet" | "infohash"))
     {
-        return Err(invalid("search.fields", "download ou magnet é obrigatório"));
+        return Err(invalid(
+            "search.fields",
+            "download, magnet ou infohash é obrigatório",
+        ));
     }
     Ok(fields)
 }
@@ -663,11 +1068,18 @@ fn compile_settings(raw: Vec<RawSetting>) -> Result<Vec<Setting>, IndexerError> 
             .label
             .filter(|label| !label.trim().is_empty())
             .unwrap_or_else(|| setting.name.clone());
-        let default = setting
+        let mut default = setting
             .default
             .as_ref()
             .map(|value| scalar(value, "settings.default"))
             .transpose()?;
+        // Default de `select` que não é uma das opções é erro da definição, e a
+        // referência também não o consegue usar (sem opção escolhida, a
+        // busca nem monta): fica sem default, e o operador precisa escolher.
+        if matches!(&kind, SettingKind::Select(options) if default.as_ref().is_some_and(|value| !options.contains(value)))
+        {
+            default = None;
+        }
         if let Some(value) = &default {
             validate_setting(&kind, value)?;
         }
@@ -696,9 +1108,24 @@ pub(super) fn validate_setting(kind: &SettingKind, value: &str) -> Result<(), In
     }
 }
 
+// Um método de login por braço; dividir só espalharia.
+#[allow(clippy::too_many_lines)]
 fn compile_login(raw: RawLogin, names: &Names<'_>, links: &[Url]) -> Result<Login, IndexerError> {
     let method = raw.method.as_deref().unwrap_or("post").to_ascii_lowercase();
     let inputs = pairs(raw.inputs, "login.inputs")?;
+    let template = |value: &str| Template::compile(value, Scope::Request, names);
+    let path = |path: Option<String>| -> Result<Template, IndexerError> {
+        let path = path.ok_or_else(|| invalid("login.path", "o login exige path"))?;
+        let compiled = template(&path)?;
+        check_templated_path(&compiled, links, "login.path")?;
+        Ok(compiled)
+    };
+    let templated = |inputs: Vec<(String, String)>| -> Result<Inputs, IndexerError> {
+        inputs
+            .into_iter()
+            .map(|(key, value)| Ok((key, template(&value)?)))
+            .collect()
+    };
     let method = match method.as_str() {
         "cookie" => {
             let [(key, value)] = inputs.as_slice() else {
@@ -713,27 +1140,90 @@ fn compile_login(raw: RawLogin, names: &Names<'_>, links: &[Url]) -> Result<Logi
                     "login por cookie espera só o input cookie",
                 ));
             }
-            LoginMethod::Cookie(Template::compile(value, Scope::Request, names)?)
+            LoginMethod::Cookie(template(value)?)
         }
-        "post" | "get" => {
-            let path = raw
-                .path
-                .ok_or_else(|| invalid("login.path", "login por formulário exige path"))?;
-            check_static_path(&path, links, "login.path")?;
+        "post" => LoginMethod::Post {
+            path: path(raw.path)?,
+            inputs: templated(inputs)?,
+        },
+        "get" => LoginMethod::Get {
+            path: path(raw.path)?,
+            inputs: templated(inputs)?,
+        },
+        "oneurl" => {
+            let [(key, value)] = inputs.as_slice() else {
+                return Err(invalid(
+                    "login.inputs",
+                    "login oneurl espera só o input oneurl",
+                ));
+            };
+            if key != "oneurl" {
+                return Err(invalid(
+                    "login.inputs",
+                    "login oneurl espera só o input oneurl",
+                ));
+            }
+            LoginMethod::OneUrl {
+                path: path(raw.path)?,
+                input: template(value)?,
+            }
+        }
+        "form" => {
+            let form = Css::parse(raw.form.as_deref().unwrap_or("form"), "login.form")?;
             let inputs = inputs
                 .into_iter()
-                .map(|(key, value)| Ok((key, Template::compile(&value, Scope::Request, names)?)))
+                .map(|(key, value)| {
+                    Ok(LoginInput {
+                        key_css: raw
+                            .selectors
+                            .then(|| Css::parse(&key, "login.inputs"))
+                            .transpose()?,
+                        key,
+                        value: template(&value)?,
+                    })
+                })
                 .collect::<Result<_, IndexerError>>()?;
-            LoginMethod::Form {
-                path,
-                post: method == "post",
-                inputs,
+            let captcha = match raw.captcha {
+                None => None,
+                Some(captcha) if captcha.kind == "image" => {
+                    let _ = captcha.input;
+                    let selector = captcha.selector.ok_or_else(|| {
+                        invalid("login.captcha", "captcha de imagem exige selector")
+                    })?;
+                    Some(Css::parse(&selector, "login.captcha.selector")?)
+                }
+                Some(_) => {
+                    return Err(invalid(
+                        "login.captcha",
+                        "captcha que não seja de imagem não é suportado",
+                    ));
+                }
+            };
+            if let Some(submit) = &raw.submitpath {
+                check_static_path(submit, links, "login.submitpath")?;
             }
+            LoginMethod::Form(Box::new(FormLogin {
+                path: path(raw.path)?,
+                form,
+                submit_path: raw.submitpath,
+                inputs,
+                selector_inputs: compile_selector_inputs(
+                    raw.selectorinputs,
+                    names,
+                    "login.selectorinputs",
+                )?,
+                get_selector_inputs: compile_selector_inputs(
+                    raw.getselectorinputs,
+                    names,
+                    "login.getselectorinputs",
+                )?,
+                captcha,
+            }))
         }
         _ => {
             return Err(invalid(
                 "login.method",
-                "suportados: post, get e cookie (form e captcha não)",
+                "método desconhecido (suportados: cookie, post, get, oneurl e form)",
             ));
         }
     };
@@ -741,7 +1231,7 @@ fn compile_login(raw: RawLogin, names: &Names<'_>, links: &[Url]) -> Result<Logi
         .error
         .into_iter()
         .map(|error| {
-            let _ = error.message;
+            let _ = (error.message, error.path);
             Css::parse(&error.selector, "login.error.selector")
         })
         .collect::<Result<_, _>>()?;
@@ -758,14 +1248,152 @@ fn compile_login(raw: RawLogin, names: &Names<'_>, links: &[Url]) -> Result<Logi
             })
         })
         .transpose()?;
+    if raw
+        .cookies
+        .iter()
+        .any(|cookie| !cookie.contains('=') || cookie.contains(['\r', '\n']))
+    {
+        return Err(invalid("login.cookies", "esperado `nome=valor`"));
+    }
+    let headers = raw
+        .headers
+        .map(|headers| compile_headers(Some(headers), Scope::Request, names))
+        .transpose()?;
     Ok(Login {
         method,
         errors,
         test,
+        cookies: raw.cookies,
+        headers,
     })
 }
 
-fn compile_field(raw: RawField, names: &Names<'_>) -> Result<Field, IndexerError> {
+fn compile_selector_inputs(
+    raw: Mapping,
+    names: &Names<'_>,
+    section: &'static str,
+) -> Result<Vec<(String, Field)>, IndexerError> {
+    raw.into_iter()
+        .map(|(key, value)| {
+            let raw: RawField = serde_yaml_ng::from_value(value)
+                .map_err(|_| invalid(section, "campo com chave ou tipo não suportado"))?;
+            Ok((
+                scalar(&key, section)?,
+                compile_field(raw, names, Format::Html)?,
+            ))
+        })
+        .collect()
+}
+
+/// Seletor do bloco `download`: o texto é um template (`.DownloadUri.*`) e o
+/// CSS só se confere por inteiro depois de renderizado; sendo literal, confere
+/// já.
+fn compile_download_selector(
+    raw: RawDownloadSelector,
+    names: &Names<'_>,
+) -> Result<DownloadSelector, IndexerError> {
+    let selector = Template::compile(&raw.selector, Scope::Download, names)?;
+    if let Some(literal) = selector.literal() {
+        Css::parse(literal, "download.selector")?;
+    }
+    Ok(DownloadSelector {
+        selector,
+        attribute: raw.attribute,
+        use_before_response: raw.usebeforeresponse,
+        filters: raw
+            .filters
+            .into_iter()
+            .map(|filter| Filter::compile(filter.flatten()?, Scope::Download, names))
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+fn compile_download(raw: RawDownload, names: &Names<'_>) -> Result<Download, IndexerError> {
+    let post = match raw
+        .method
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("get") => false,
+        Some("post") => true,
+        Some(_) => {
+            return Err(invalid(
+                "download.method",
+                "método desconhecido (esperado get ou post)",
+            ));
+        }
+    };
+    let before = raw
+        .before
+        .map(|before| {
+            let post = match before
+                .method
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                None | Some("get") => false,
+                Some("post") => true,
+                Some(_) => {
+                    return Err(invalid(
+                        "download.before.method",
+                        "método desconhecido (esperado get ou post)",
+                    ));
+                }
+            };
+            if before.path.is_none() && before.pathselector.is_none() {
+                return Err(invalid("download.before", "declare path ou pathselector"));
+            }
+            let inputs = pairs(before.inputs, "download.before.inputs")?
+                .into_iter()
+                .map(|(key, value)| Ok((key, Template::compile(&value, Scope::Download, names)?)))
+                .collect::<Result<_, IndexerError>>()?;
+            Ok(Before {
+                path: before
+                    .path
+                    .map(|path| Template::compile(&path, Scope::Download, names))
+                    .transpose()?,
+                post,
+                inputs,
+                path_selector: before
+                    .pathselector
+                    .map(|selector| compile_download_selector(selector, names))
+                    .transpose()?,
+            })
+        })
+        .transpose()?;
+    let infohash = raw
+        .infohash
+        .map(|infohash| {
+            Ok::<_, IndexerError>(Infohash {
+                hash: compile_download_selector(infohash.hash, names)?,
+                title: compile_download_selector(infohash.title, names)?,
+                use_before_response: infohash.usebeforeresponse,
+            })
+        })
+        .transpose()?;
+    let selectors = raw
+        .selectors
+        .into_iter()
+        .map(|selector| compile_download_selector(selector, names))
+        .collect::<Result<Vec<_>, _>>()?;
+    let headers = raw
+        .headers
+        .map(|headers| compile_headers(Some(headers), Scope::Download, names))
+        .transpose()?;
+    Ok(Download {
+        post,
+        before,
+        infohash,
+        selectors,
+        headers,
+    })
+}
+
+// Um braço por tipo de fonte (texto, HTML, JSON); dividir só espalharia.
+#[allow(clippy::too_many_lines)]
+fn compile_field(raw: RawField, names: &Names<'_>, format: Format) -> Result<Field, IndexerError> {
     let template = |value: &str| Template::compile(value, Scope::Field, names);
     let source = match (raw.text, raw.selector) {
         (Some(text), None) => {
@@ -776,6 +1404,51 @@ fn compile_field(raw: RawField, names: &Names<'_>) -> Result<Field, IndexerError
                 ));
             }
             Source::Text(template(&scalar(&text, "search.fields.text")?)?)
+        }
+        (None, selector) if format == Format::Json => {
+            if raw.attribute.is_some() || raw.remove.is_some() {
+                return Err(invalid(
+                    "search.fields",
+                    "attribute e remove não valem em resposta JSON",
+                ));
+            }
+            let case = raw
+                .case
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(key, value)| {
+                    // `True` e `False` são booleanos para o YAML, e o JSON
+                    // chega ao `case` como o texto .NET deles.
+                    let key = match key {
+                        Yaml::Bool(true) => "True".to_owned(),
+                        Yaml::Bool(false) => "False".to_owned(),
+                        other => scalar(&other, "search.fields.case")?,
+                    };
+                    Ok((key, template(&scalar(&value, "search.fields.case")?)?))
+                })
+                .collect::<Result<Vec<_>, IndexerError>>()?;
+            let from_row = selector.as_deref().is_some_and(|s| s.starts_with(".."));
+            let selector = selector
+                .map(|selector| {
+                    let compiled = template(selector.trim_start_matches('.'))?;
+                    // Seletor literal precisa ser legível já na carga.
+                    if let Some(literal) = compiled.literal()
+                        && !path_part(literal).trim().is_empty()
+                        && JsonPath::parse(path_part(literal)).is_none()
+                    {
+                        return Err(invalid(
+                            "search.fields.selector",
+                            "caminho JSON fora do subconjunto suportado",
+                        ));
+                    }
+                    Ok(compiled)
+                })
+                .transpose()?;
+            Source::Json {
+                selector,
+                from_row,
+                case,
+            }
         }
         // Sem selector, o campo lê a própria linha, como na referência.
         (None, selector) => {
@@ -792,7 +1465,20 @@ fn compile_field(raw: RawField, names: &Names<'_>) -> Result<Field, IndexerError
                 .collect::<Result<Vec<_>, IndexerError>>()?;
             Source::Select {
                 selector: selector
-                    .map(|selector| Css::parse(&selector, "search.fields.selector"))
+                    .map(|selector| {
+                        let compiled = template(&selector)?;
+                        match compiled.literal() {
+                            Some(literal) => {
+                                Css::parse(literal, "search.fields.selector").map(Selection::Fixed)
+                            }
+                            None => {
+                                // Só dá para conferir em cada linha, com as
+                                // variáveis dela; seletor que não compila
+                                // deixa o campo vazio, como na referência.
+                                Ok(Selection::Templated(compiled))
+                            }
+                        }
+                    })
                     .transpose()?,
                 attribute: raw.attribute,
                 remove: raw
@@ -812,6 +1498,8 @@ fn compile_field(raw: RawField, names: &Names<'_>) -> Result<Field, IndexerError
     Ok(Field {
         source,
         optional: raw.optional,
+        append: false,
+        no_append: false,
         default: raw
             .default
             .map(|value| template(&scalar(&value, "search.fields.default")?))
@@ -824,21 +1512,32 @@ fn compile_field(raw: RawField, names: &Names<'_>) -> Result<Field, IndexerError
     })
 }
 
-type CategoryMappings = BTreeMap<String, Vec<u32>>;
+/// Categorias do tracker mapeadas para as do Newznab.
+struct CategoryMaps {
+    /// Por id do tracker.
+    by_id: BTreeMap<String, Vec<u32>>,
+    /// Por descrição (minúscula), que `categorydesc` consulta.
+    by_description: BTreeMap<String, Vec<u32>>,
+    /// Ids do tracker marcados `default`: valem quando a busca não pede categoria.
+    defaults: Vec<String>,
+}
 
-fn compile_categories(caps: &RawCaps) -> Result<(Vec<Category>, CategoryMappings), IndexerError> {
-    let entries: Vec<(String, &str)> = match (&caps.categories, &caps.categorymappings) {
+fn compile_categories(caps: &RawCaps) -> Result<(Vec<Category>, CategoryMaps), IndexerError> {
+    /// id do tracker, categoria Newznab, descrição, padrão.
+    type Entry<'a> = (String, &'a str, Option<&'a str>, bool);
+    let entries: Vec<Entry<'_>> = match (&caps.categories, &caps.categorymappings) {
         (Some(categories), None) if !categories.is_empty() => categories
             .iter()
-            .map(|(id, name)| (id.clone(), name.as_str()))
+            .map(|(id, name)| (id.clone(), name.as_str(), None, false))
             .collect(),
         (None, Some(mappings)) if !mappings.is_empty() => mappings
             .iter()
             .map(|entry| {
-                let _ = (&entry.desc, entry.default);
                 Ok((
                     scalar(&entry.id, "caps.categorymappings")?,
                     entry.cat.as_str(),
+                    entry.desc.as_deref(),
+                    entry.default.unwrap_or(false),
                 ))
             })
             .collect::<Result<_, IndexerError>>()?,
@@ -849,15 +1548,28 @@ fn compile_categories(caps: &RawCaps) -> Result<(Vec<Category>, CategoryMappings
             ));
         }
     };
-    let mut mappings: CategoryMappings = BTreeMap::new();
+    let mut maps = CategoryMaps {
+        by_id: BTreeMap::new(),
+        by_description: BTreeMap::new(),
+        defaults: Vec::new(),
+    };
     let mut categories = BTreeMap::new();
-    for (tracker, name) in entries {
+    for (tracker, name, description, default) in entries {
         if tracker.is_empty() {
             return Err(invalid("caps", "id de categoria vazio"));
         }
         let id =
             category_id(name).ok_or_else(|| invalid("caps", "categoria Newznab desconhecida"))?;
-        mappings.entry(tracker).or_default().push(id);
+        if default && !maps.defaults.contains(&tracker) {
+            maps.defaults.push(tracker.clone());
+        }
+        if let Some(description) = description.filter(|text| !text.trim().is_empty()) {
+            maps.by_description
+                .entry(description.to_lowercase())
+                .or_default()
+                .push(id);
+        }
+        maps.by_id.entry(tracker).or_default().push(id);
         categories.insert(
             id,
             Category {
@@ -867,11 +1579,15 @@ fn compile_categories(caps: &RawCaps) -> Result<(Vec<Category>, CategoryMappings
             },
         );
     }
-    for ids in mappings.values_mut() {
+    for ids in maps
+        .by_id
+        .values_mut()
+        .chain(maps.by_description.values_mut())
+    {
         ids.sort_unstable();
         ids.dedup();
     }
-    Ok((categories.into_values().collect(), mappings))
+    Ok((categories.into_values().collect(), maps))
 }
 
 /// Modos anunciados, reduzidos ao que algum template de fato consome.
@@ -953,6 +1669,21 @@ fn check_static_path(path: &str, links: &[Url], section: &'static str) -> Result
     }
     for link in links {
         same_origin(link, path, section)?;
+    }
+    Ok(())
+}
+
+/// Caminho com templates: o que dá para conferir sem a busca é conferido
+/// renderizado sem variáveis; o resultado real se confere de novo a cada
+/// requisição, em `same_origin`.
+fn check_templated_path(
+    path: &Template,
+    links: &[Url],
+    section: &'static str,
+) -> Result<(), IndexerError> {
+    let probe = path.render(&Vars::default());
+    for link in links {
+        same_origin(link, &probe, section)?;
     }
     Ok(())
 }

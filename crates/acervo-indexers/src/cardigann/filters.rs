@@ -4,6 +4,8 @@
 use time::format_description::well_known::{Rfc2822, Rfc3339};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
 
+use super::charset::Charset;
+use super::dates::{fuzzy, time_ago};
 use super::definition::RawFilter;
 use super::invalid;
 use super::template::{Names, Pattern, Scope, Template, Vars, compile_regex, dotnet_replacement};
@@ -24,8 +26,19 @@ pub(super) enum Filter {
     DateParse(Vec<Token>),
     ToLower,
     ToUpper,
-    UrlDecode,
-    /// Diagnóstico da referência (`strdump`): não muda o valor.
+    UrlDecode(Charset),
+    UrlEncode(Charset),
+    HtmlDecode,
+    HtmlEncode,
+    /// `timeago` e `reltime`: "2 hours ago" → data.
+    TimeAgo,
+    FuzzyTime,
+    ValidFileName,
+    /// `diacritics: replace`: letra acentuada vira a letra-base.
+    Diacritics,
+    /// `validate`: fica só o que está na lista de termos aceitos.
+    Validate(Vec<String>),
+    /// Diagnóstico da referência (`strdump`, `hexdump`): não muda o valor.
     Noop,
 }
 
@@ -66,12 +79,20 @@ impl Filter {
             ("dateparse" | "timeparse", [layout]) => Self::DateParse(layout_tokens(layout)?),
             ("tolower", []) => Self::ToLower,
             ("toupper", []) => Self::ToUpper,
-            ("urldecode", []) => Self::UrlDecode,
-            ("strdump", _) => Self::Noop,
+            ("urldecode", []) => Self::UrlDecode(names.charset),
+            ("urlencode", _) => Self::UrlEncode(names.charset),
+            ("htmldecode", _) => Self::HtmlDecode,
+            ("htmlencode", _) => Self::HtmlEncode,
+            ("timeago" | "reltime", _) => Self::TimeAgo,
+            ("fuzzytime", _) => Self::FuzzyTime,
+            ("validfilename", _) => Self::ValidFileName,
+            ("diacritics", [operation]) if operation == "replace" => Self::Diacritics,
+            ("validate", [terms]) => Self::Validate(words(terms)),
+            ("strdump" | "hexdump", _) => Self::Noop,
             _ => {
                 return Err(invalid(
                     "filters",
-                    "filtro não implementado (timeago, fuzzytime, validfilename, ...)",
+                    "filtro não implementado ou com argumentos inválidos",
                 ));
             }
         })
@@ -108,12 +129,176 @@ impl Filter {
             Self::Noop => value,
             Self::ToLower => value.to_lowercase(),
             Self::ToUpper => value.to_uppercase(),
-            Self::UrlDecode => url::form_urlencoded::parse(format!("x={value}").as_bytes())
-                .next()
-                .map(|(_, decoded)| decoded.into_owned())
-                .unwrap_or_default(),
+            Self::UrlDecode(charset) => charset.url_decode(&value),
+            Self::UrlEncode(charset) => charset.url_encode(&value),
+            Self::HtmlDecode => html_decode(&value),
+            Self::HtmlEncode => html_encode(&value),
+            Self::TimeAgo => time_ago(&value, OffsetDateTime::now_utc())
+                .ok_or(())?
+                .format(&Rfc3339)
+                .map_err(|_| ())?,
+            Self::FuzzyTime => fuzzy(&value, OffsetDateTime::now_utc())
+                .ok_or(())?
+                .format(&Rfc3339)
+                .map_err(|_| ())?,
+            Self::ValidFileName => valid_file_name(&value),
+            Self::Diacritics => value.chars().map(strip_diacritic).collect(),
+            Self::Validate(accepted) => {
+                let present = words(&value);
+                accepted
+                    .iter()
+                    .filter(|term| present.contains(term))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
         })
     }
+}
+
+/// Termos do filtro `validate`: minúsculos, separados pelos delimitadores da
+/// referência, sem repetição.
+fn words(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for word in text
+        .to_lowercase()
+        .split(|c: char| ", /)(.;[]\"|:".contains(c))
+        .map(str::trim)
+        .filter(|word| !word.is_empty())
+    {
+        if !found.iter().any(|known| known == word) {
+            found.push(word.to_owned());
+        }
+    }
+    found
+}
+
+/// `WebUtility.HtmlDecode` para as entidades que aparecem em página de
+/// tracker: as cinco do XML, `&nbsp;` e as numéricas. O resto fica como veio.
+fn html_decode(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('&') {
+        output.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let decoded = rest.find(';').filter(|end| *end <= 10).and_then(|end| {
+            let entity = &rest[1..end];
+            let character = match entity {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "nbsp" => Some('\u{a0}'),
+                _ => entity
+                    .strip_prefix('#')
+                    .and_then(|number| match number.strip_prefix(['x', 'X']) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                        None => number.parse().ok(),
+                    })
+                    .and_then(char::from_u32),
+            }?;
+            Some((character, end + 1))
+        });
+        if let Some((character, consumed)) = decoded {
+            output.push(character);
+            rest = &rest[consumed..];
+        } else {
+            output.push('&');
+            rest = &rest[1..];
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
+/// `WebUtility.HtmlEncode`: `<>&"'` e tudo acima de Latin-1 vira entidade.
+fn html_encode(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '&' => output.push_str("&amp;"),
+            '"' => output.push_str("&quot;"),
+            '\'' => output.push_str("&#39;"),
+            c if (' '..='~').contains(&c) || c.is_control() => output.push(c),
+            c => {
+                let _ =
+                    std::fmt::Write::write_fmt(&mut output, format_args!("&#{};", u32::from(c)));
+            }
+        }
+    }
+    output
+}
+
+/// Caracteres que o Windows não aceita em nome de arquivo viram `_`; nome
+/// vazio vira `_`, como o `MakeValidFileName` da referência.
+fn valid_file_name(text: &str) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|c| {
+            if c.is_control() || "\"<>|:*?\\/".contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "_".into()
+    } else {
+        cleaned
+    }
+}
+
+/// Letra acentuada do Latin-1 e do Latin Estendido-A → letra-base. O que não
+/// se decompõe (`Đ`, `ł`, `ø`) fica, como no filtro da referência.
+fn strip_diacritic(character: char) -> char {
+    const TABLE: [(&str, char); 38] = [
+        ("ÀÁÂÃÄÅĀĂĄǍ", 'A'),
+        ("àáâãäåāăąǎ", 'a'),
+        ("ÇĆĈĊČ", 'C'),
+        ("çćĉċč", 'c'),
+        ("Ď", 'D'),
+        ("ď", 'd'),
+        ("ÈÉÊËĒĔĖĘĚ", 'E'),
+        ("èéêëēĕėęě", 'e'),
+        ("ĜĞĠĢ", 'G'),
+        ("ĝğġģ", 'g'),
+        ("Ĥ", 'H'),
+        ("ĥ", 'h'),
+        ("ÌÍÎÏĨĪĬĮİǏ", 'I'),
+        ("ìíîïĩīĭįǐ", 'i'),
+        ("Ĵ", 'J'),
+        ("ĵ", 'j'),
+        ("Ķ", 'K'),
+        ("ķ", 'k'),
+        ("ĹĻĽ", 'L'),
+        ("ĺļľ", 'l'),
+        ("ÑŃŅŇ", 'N'),
+        ("ñńņň", 'n'),
+        ("ÒÓÔÕÖŌŎŐǑ", 'O'),
+        ("òóôõöōŏőǒ", 'o'),
+        ("ŔŖŘ", 'R'),
+        ("ŕŗř", 'r'),
+        ("ŚŜŞŠ", 'S'),
+        ("śŝşš", 's'),
+        ("ŢŤ", 'T'),
+        ("ţť", 't'),
+        ("ÙÚÛÜŨŪŬŮŰŲǓ", 'U'),
+        ("ùúûüũūŭůűųǔ", 'u'),
+        ("Ŵ", 'W'),
+        ("ŵ", 'w'),
+        ("ÝŶŸ", 'Y'),
+        ("ýÿŷ", 'y'),
+        ("ŹŻŽ", 'Z'),
+        ("źżž", 'z'),
+    ];
+    TABLE
+        .iter()
+        .find(|(accented, _)| accented.contains(character))
+        .map_or(character, |(_, base)| *base)
 }
 
 /// Só o subconjunto que as definições usam: `$` seguido de chaves.
@@ -253,6 +438,8 @@ pub(super) enum Token {
     Month1,
     Day2,
     Day1,
+    /// `ddd` e `dddd`: nome do dia da semana, lido e descartado.
+    DayName,
     Hour24,
     Hour12,
     Minute,
@@ -283,6 +470,7 @@ fn layout_tokens(layout: &str) -> Result<Vec<Token>, IndexerError> {
             ('M', 3 | 4) => Token::MonthName,
             ('M', 2) => Token::Month2,
             ('M', 1) => Token::Month1,
+            ('d', 3 | 4) => Token::DayName,
             ('d', 2) => Token::Day2,
             ('d', 1) => Token::Day1,
             ('H', 1 | 2) => Token::Hour24,
@@ -291,6 +479,15 @@ fn layout_tokens(layout: &str) -> Result<Vec<Token>, IndexerError> {
             ('s', 1 | 2) => Token::Second,
             ('t', 2) => Token::Meridiem,
             ('z', 1..=3) => Token::Offset,
+            // `\a` é a letra `a` e não o formato.
+            ('\\', _) => {
+                let literal = chars
+                    .get(index + 1)
+                    .ok_or_else(|| invalid("filters.dateparse", "escape sem caractere"))?;
+                tokens.push(Token::Literal(*literal));
+                index += 2;
+                continue;
+            }
             ('\'', _) => {
                 let end = chars[index + 1..]
                     .iter()
@@ -350,6 +547,8 @@ fn go_to_dotnet(layout: &str) -> String {
     output
 }
 
+const WEEKDAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
 const MONTHS: [&str; 12] = [
     "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
 ];
@@ -383,6 +582,14 @@ fn parse_with_layout(value: &str, layout: &[Token]) -> Option<OffsetDateTime> {
                 let key = name.to_lowercase();
                 let index = MONTHS.iter().position(|month| key.starts_with(month))?;
                 month = Some(u32::try_from(index).ok()? + 1);
+                rest = &rest[name.len()..];
+            }
+            Token::DayName => {
+                let name: String = rest.chars().take_while(|c| c.is_alphabetic()).collect();
+                let key = name.to_lowercase();
+                if !WEEKDAYS.iter().any(|weekday| key.starts_with(weekday)) {
+                    return None;
+                }
                 rest = &rest[name.len()..];
             }
             Token::Day2 => day = Some(digits(&mut rest, 2, 2)?),
@@ -483,7 +690,17 @@ mod tests {
         assert_eq!(parsed.format(&Rfc3339).unwrap(), "2026-09-24T21:05:00Z");
 
         assert!(parse_with_layout("31/02/26 00:00:00", &tokens).is_none());
-        assert!(layout_tokens("dddd, dd/MM/yyyy").is_err());
+        // Nome do dia da semana é lido e descartado; `\a` é a letra.
+        let weekday = layout_tokens("dddd, MMMM d, yyyy \\a\\t h:mmtt zzz").unwrap();
+        let parsed = parse_with_layout("Thursday, September 24, 2026 at 9:05PM +00:00", &weekday);
+        assert_eq!(
+            parsed.unwrap().format(&Rfc3339).unwrap(),
+            "2026-09-24T21:05:00Z"
+        );
+        assert!(
+            parse_with_layout("Someday, September 24, 2026 at 9:05PM +00:00", &weekday).is_none()
+        );
+        assert!(layout_tokens("dd/MM/yyyy fff").is_err());
     }
 
     #[test]
@@ -527,6 +744,49 @@ mod tests {
         assert!(parse_date("2026-09-24 10:00:00", now).is_some());
         assert!(parse_date("2026-09-24T10:00:00Z", now).is_some());
         assert!(parse_date("ontem", now).is_none());
+    }
+
+    #[test]
+    fn filtros_de_texto_urlencode_html_validfilename_diacritics_e_validate() {
+        let vars = Vars::default();
+        let apply = |filter: Filter, value: &str| filter.apply(value.into(), &vars).unwrap();
+        assert_eq!(
+            apply(Filter::UrlEncode(Charset::Utf8), "a b&c/é"),
+            "a+b%26c%2F%C3%A9"
+        );
+        assert_eq!(
+            apply(Filter::UrlDecode(Charset::Utf8), "a+b%26c%2F%C3%A9"),
+            "a b&c/é"
+        );
+        assert_eq!(
+            apply(Filter::HtmlDecode, "A &amp; B &#39;c&#x41; &foo; &"),
+            "A & B 'cA &foo; &"
+        );
+        assert_eq!(
+            apply(Filter::HtmlEncode, "<a href=\"x\">é'</a>"),
+            "&lt;a href=&quot;x&quot;&gt;&#233;&#39;&lt;/a&gt;"
+        );
+        assert_eq!(apply(Filter::ValidFileName, "a/b:c?.txt"), "a_b_c_.txt");
+        assert_eq!(apply(Filter::ValidFileName, ""), "_");
+        assert_eq!(
+            apply(Filter::Diacritics, "Žluťoučký kůň Đ"),
+            "Zlutoucky kun Đ"
+        );
+        let validate = Filter::Validate(words("Drama, Action; Comedy"));
+        assert_eq!(
+            apply(validate, "comedy / thriller | drama"),
+            "drama, comedy"
+        );
+        // O Rfc3339 do filtro se lê de volta na data do release.
+        let ago = apply(Filter::TimeAgo, "3 hours ago");
+        let parsed = OffsetDateTime::parse(&ago, &Rfc3339).unwrap();
+        let drift = (OffsetDateTime::now_utc() - parsed - time::Duration::hours(3)).abs();
+        assert!(drift < time::Duration::seconds(5), "{ago}");
+        assert!(
+            Filter::TimeAgo
+                .apply("3 fortnights ago".into(), &vars)
+                .is_err()
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::future::join_all;
 
-use crate::{IndexerError, Release, SearchQuery};
+use crate::{IndexerError, Release, ResolvedDownload, SearchQuery};
 
 #[async_trait]
 pub trait Indexer: std::fmt::Debug + Send + Sync {
@@ -31,6 +31,17 @@ pub trait Indexer: std::fmt::Debug + Send + Sync {
         Err(IndexerError::UnsupportedQuery {
             reason: "este indexador não intermedia downloads",
         })
+    }
+
+    /// Resolve um link de download até o arquivo ou, quando o indexador só
+    /// oferece o magnet, até o magnet. Por padrão é o `.torrent` de `download`.
+    ///
+    /// # Errors
+    ///
+    /// Os mesmos de `download`, mais a página que não entrega nem arquivo
+    /// nem magnet.
+    async fn resolve_download(&self, url: &url::Url) -> Result<ResolvedDownload, IndexerError> {
+        self.download(url).await.map(ResolvedDownload::Torrent)
     }
 }
 

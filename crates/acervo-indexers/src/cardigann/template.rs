@@ -12,6 +12,7 @@ use std::borrow::Cow;
 
 use regex::Regex;
 
+use super::charset::Charset;
 use super::invalid;
 use crate::IndexerError;
 
@@ -69,6 +70,8 @@ pub(super) enum Scope {
     Request,
     /// Campos de resultado: podem ler `.Result.*` dos campos anteriores.
     Field,
+    /// Bloco `download`: enxerga também `.DownloadUri.*`, a URL do release.
+    Download,
 }
 
 /// Nomes que a compilação aceita.
@@ -76,6 +79,8 @@ pub(super) enum Scope {
 pub(super) struct Names<'a> {
     pub settings: &'a [String],
     pub fields: &'a [String],
+    /// Codificação da definição: os filtros `urlencode` e `urldecode` a usam.
+    pub charset: Charset,
 }
 
 #[derive(Debug)]
@@ -158,7 +163,16 @@ impl Template {
 
     pub fn render(&self, vars: &Vars) -> String {
         let mut output = String::new();
-        render(&self.0, vars, None, &mut output);
+        render(&self.0, vars, None, None, &mut output);
+        output
+    }
+
+    /// Como `render`, mas cada valor substituído passa por `modifier` — o
+    /// texto literal do template não. É o `TemplateTextModifier` da referência,
+    /// que usa para codificar variáveis em caminho de URL.
+    pub fn render_with(&self, vars: &Vars, modifier: fn(&str) -> String) -> String {
+        let mut output = String::new();
+        render(&self.0, vars, None, Some(modifier), &mut output);
         output
     }
 
@@ -171,11 +185,23 @@ impl Template {
     }
 }
 
-fn render(nodes: &[Node], vars: &Vars, dot: Option<&str>, output: &mut String) {
+fn render(
+    nodes: &[Node],
+    vars: &Vars,
+    dot: Option<&str>,
+    modifier: Option<fn(&str) -> String>,
+    output: &mut String,
+) {
     for node in nodes {
         match node {
             Node::Text(text) => output.push_str(text),
-            Node::Output(expr) => output.push_str(&eval(expr, vars, dot).text()),
+            Node::Output(expr) => {
+                let text = eval(expr, vars, dot).text();
+                match modifier {
+                    Some(modify) => output.push_str(&modify(&text)),
+                    None => output.push_str(&text),
+                }
+            }
             Node::If {
                 branches,
                 otherwise,
@@ -184,7 +210,7 @@ fn render(nodes: &[Node], vars: &Vars, dot: Option<&str>, output: &mut String) {
                     .iter()
                     .find(|(condition, _)| eval(condition, vars, dot).truthy())
                     .map_or(otherwise, |(_, body)| body);
-                render(chosen, vars, dot, output);
+                render(chosen, vars, dot, modifier, output);
             }
             Node::Range { over, body } => {
                 let items = match eval(over, vars, dot) {
@@ -193,7 +219,7 @@ fn render(nodes: &[Node], vars: &Vars, dot: Option<&str>, output: &mut String) {
                     Value::Null | Value::Bool(_) => Vec::new(),
                 };
                 for item in &items {
-                    render(body, vars, Some(item), output);
+                    render(body, vars, Some(item), modifier, output);
                 }
             }
         }
@@ -648,7 +674,32 @@ impl Parser<'_> {
                     | ".True"
                     | ".False"
                     | ".Today.Year"
+                    | ".Config.sitelink"
+                    // Parâmetros de outros modos de busca (música, livro) e IDs
+                    // sem origem aqui: a referência os declara nulos fora do
+                    // modo que os preenche, e é como chegam aqui.
+                    | ".Query.Type"
+                    | ".Query.Limit"
+                    | ".Query.Offset"
+                    | ".Query.Categories"
+                    | ".Query.Extended"
+                    | ".Query.APIKey"
+                    | ".Query.Genre"
+                    | ".Query.Movie"
+                    | ".Query.Series"
+                    | ".Query.TVRageID"
+                    | ".Query.TVMazeID"
+                    | ".Query.TraktID"
+                    | ".Query.DoubanID"
+                    | ".Query.Album"
+                    | ".Query.Artist"
+                    | ".Query.Label"
+                    | ".Query.Track"
+                    | ".Query.Author"
+                    | ".Query.Title"
+                    | ".Query.Publisher"
             )
+            || (self.scope == Scope::Download && is_download_uri(name))
             || name
                 .strip_prefix(".Config.")
                 .is_some_and(|setting| self.names.settings.iter().any(|known| known == setting))
@@ -665,6 +716,45 @@ impl Parser<'_> {
             ))
         }
     }
+}
+
+/// `.DownloadUri.*` da referência: partes da URL do release e, em
+/// `.DownloadUri.Query.<chave>`, cada parâmetro da query.
+fn is_download_uri(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(".DownloadUri.") else {
+        return false;
+    };
+    matches!(
+        rest,
+        "AbsoluteUri" | "AbsolutePath" | "Scheme" | "Host" | "Port" | "PathAndQuery" | "Query"
+    ) || rest
+        .strip_prefix("Query.")
+        .is_some_and(|key| !key.is_empty())
+}
+
+/// Codificação de valor em URL como a `WebUtility.UrlEncode` da referência:
+/// espaço vira `+` e `-_.!*()` ficam como estão.
+pub(super) fn url_encode(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'*'
+            | b'('
+            | b')' => output.push(char::from(byte)),
+            b' ' => output.push('+'),
+            other => {
+                let _ = std::fmt::Write::write_fmt(&mut output, format_args!("%{other:02X}"));
+            }
+        }
+    }
+    output
 }
 
 /// Regex das definições, com teto de tamanho: a definição é arquivo de fora.
@@ -707,7 +797,61 @@ impl Pattern {
     }
 }
 
+/// Dois hábitos do .NET que o `regex` do Rust lê como erro dentro de uma
+/// classe: `[` solto (`[\[!"[\]^]`) e `-` logo depois de um atalho
+/// (`[\s-_]`, o hífen é literal). Escapa os dois — menos nas classes POSIX
+/// (`[:alpha:]`).
+fn escape_class_brackets(pattern: &str) -> Cow<'_, str> {
+    if !pattern.contains('[') {
+        return Cow::Borrowed(pattern);
+    }
+    let mut output = String::with_capacity(pattern.len() + 4);
+    let mut in_class = false;
+    let mut after_shorthand = false;
+    let mut chars = pattern.char_indices().peekable();
+    while let Some((index, character)) = chars.next() {
+        let mut shorthand = false;
+        match character {
+            '\\' => {
+                output.push(character);
+                if let Some((_, escaped)) = chars.next() {
+                    output.push(escaped);
+                    shorthand = in_class && "sSdDwW".contains(escaped);
+                }
+            }
+            '[' if in_class => {
+                if pattern[index..].starts_with("[:") {
+                    output.push(character);
+                } else {
+                    output.push_str("\\[");
+                }
+            }
+            '[' => {
+                in_class = true;
+                output.push(character);
+                // `^` e um `]` logo na abertura fazem parte da classe.
+                for lead in ['^', ']'] {
+                    if chars.peek().is_some_and(|(_, next)| *next == lead) {
+                        output.push(lead);
+                        chars.next();
+                    }
+                }
+            }
+            ']' if in_class => {
+                in_class = false;
+                output.push(character);
+            }
+            '-' if in_class && after_shorthand => output.push_str("\\-"),
+            other => output.push(other),
+        }
+        after_shorthand = shorthand;
+    }
+    Cow::Owned(output)
+}
+
 pub(super) fn compile_regex(pattern: &str, section: &'static str) -> Result<Pattern, IndexerError> {
+    let pattern = escape_class_brackets(pattern);
+    let pattern = pattern.as_ref();
     if let Ok(regex) = regex::RegexBuilder::new(pattern)
         .size_limit(1 << 20)
         .build()
@@ -764,6 +908,7 @@ mod tests {
             &Names {
                 settings: &settings,
                 fields: &fields,
+                charset: Charset::Utf8,
             },
         )
         .unwrap()
@@ -778,6 +923,7 @@ mod tests {
             &Names {
                 settings: &settings,
                 fields: &fields,
+                charset: Charset::Utf8,
             },
         )
         .is_ok()
@@ -872,6 +1018,21 @@ mod tests {
             "{{ re_replace .Keywords \"(x\" \"\" }}",
             Scope::Request
         ));
+    }
+
+    #[test]
+    fn colchete_solto_em_classe_vale_como_no_dotnet() {
+        let pattern =
+            compile_regex(r##"[\[!"#$%&'()*+,\-.\/:;<=>?@[\]^_`{|}~]"##, "teste").unwrap();
+        assert_eq!(pattern.replace_all("a[b](c)!d", " ").unwrap(), "a b  c  d");
+        let posix = compile_regex("[[:digit:]]+", "teste").unwrap();
+        assert_eq!(posix.replace_all("a12b", "-").unwrap(), "a-b");
+        let negated = compile_regex("[^[]+", "teste").unwrap();
+        assert_eq!(negated.first_group("x"), None);
+        // `\s-_` é "espaço, hífen ou sublinhado", não uma faixa.
+        let dash = compile_regex(r"T[\s-_]?(\d+)", "teste").unwrap();
+        assert_eq!(dash.first_group("T-12").as_deref(), Some("12"));
+        assert_eq!(dash.first_group("T_7").as_deref(), Some("7"));
     }
 
     #[test]

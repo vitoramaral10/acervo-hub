@@ -202,6 +202,30 @@ impl std::fmt::Debug for Release {
     }
 }
 
+/// Aonde um link de download leva depois de resolvido: o arquivo `.torrent`
+/// ou, quando a página só oferece o magnet, o magnet.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ResolvedDownload {
+    Torrent(Vec<u8>),
+    Magnet(Url),
+}
+
+impl std::fmt::Debug for ResolvedDownload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // O magnet e o arquivo podem carregar passkey: nunca vão ao log.
+        match self {
+            Self::Torrent(bytes) => formatter
+                .debug_tuple("Torrent")
+                .field(&format_args!("{} bytes", bytes.len()))
+                .finish(),
+            Self::Magnet(_) => formatter
+                .debug_tuple("Magnet")
+                .field(&"<redacted>")
+                .finish(),
+        }
+    }
+}
+
 /// Suporte declarado para um modo de busca.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchSupport {
