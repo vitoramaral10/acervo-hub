@@ -3,7 +3,9 @@ import {
   Activity,
   Bell,
   Blocks,
+  CalendarDays,
   ChevronDown,
+  CircleDashed,
   Clapperboard,
   Download,
   Eraser,
@@ -32,15 +34,17 @@ import { type Theme, saveTheme, storedTheme } from '@/lib/theme'
 import { cn } from '@/lib/utils'
 import { ActivityPage } from '@/pages/Activity'
 import { AppsPage } from '@/pages/Apps'
+import { CalendarPage } from '@/pages/Calendar'
 import { IndexersPage } from '@/pages/Indexers'
 import { LoginPage } from '@/pages/Login'
+import { MissingPage } from '@/pages/Missing'
 import { MoviesPage } from '@/pages/Movies'
 import { SearchPage } from '@/pages/Search'
 import { SeriesPage } from '@/pages/Series'
 import { SettingsPage, type SettingsView } from '@/pages/Settings'
 import { TasksPage } from '@/pages/Tasks'
 
-type MainView = 'filmes' | 'series' | 'atividade' | 'busca'
+type MainView = 'filmes' | 'series' | 'faltando' | 'calendario' | 'atividade' | 'busca'
 type ConfigView = 'indexadores' | 'aplicativos' | 'tarefas' | SettingsView
 type View = MainView | ConfigView
 
@@ -50,6 +54,8 @@ type NavItem<V extends View> = { view: V; label: string; icon: typeof Server }
 const MAIN: NavItem<MainView>[] = [
   { view: 'filmes', label: 'Filmes', icon: Film },
   { view: 'series', label: 'Séries', icon: MonitorPlay },
+  { view: 'faltando', label: 'Faltando', icon: CircleDashed },
+  { view: 'calendario', label: 'Calendário', icon: CalendarDays },
   { view: 'atividade', label: 'Atividade', icon: Activity },
   { view: 'busca', label: 'Busca', icon: Search },
 ]
@@ -239,7 +245,7 @@ export function App() {
           </span>
         </a>
         {/* Celular: barra horizontal, com o grupo de configurações numa folha. */}
-        <nav aria-label="Seções" className="flex min-w-0 flex-1 gap-1 md:hidden">
+        <nav aria-label="Seções" className="flex min-w-0 flex-1 gap-1 overflow-x-auto md:hidden">
           {MAIN.map(({ view: target, label, icon: Icon }) => (
             <a
               key={target}
@@ -288,6 +294,10 @@ export function App() {
             <MoviesPage />
           ) : view === 'series' ? (
             <SeriesPage />
+          ) : view === 'faltando' ? (
+            <MissingPage />
+          ) : view === 'calendario' ? (
+            <CalendarPage />
           ) : view === 'atividade' ? (
             <ActivityPage />
           ) : view === 'aplicativos' ? (

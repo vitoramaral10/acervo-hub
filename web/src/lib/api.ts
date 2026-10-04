@@ -205,6 +205,7 @@ export interface Movie {
   sinopse: string | null
   status: string | null
   monitorado: boolean
+  prioritario: boolean
   pasta: string
   adicionado: string | null
   arquivo: MovieFile | null
@@ -260,6 +261,8 @@ export interface ServerSection {
   public_url: string | null
   catalogos: string[]
   http_timeout_seconds: number
+  /** Base do XEM, de onde vem a numeração de cena. */
+  xem_url: string
 }
 
 export interface DownloadClientSection {
@@ -407,6 +410,7 @@ export interface NewMovie {
 
 export interface MovieChange {
   monitorado?: boolean
+  prioritario?: boolean
 }
 
 export interface InteractiveRelease {
@@ -538,6 +542,130 @@ export interface GotifyInput {
 
 const LIB = '/ui/api/biblioteca'
 
+// ---------------------------------------------------------------- renomear e verificar disco
+
+export interface RenameStep {
+  arquivo_id: number
+  de: string
+  para: string
+  legendas: { de: string; para: string }[]
+  feito: boolean
+  erro: string | null
+}
+
+export interface RenameReport {
+  aplicado: boolean
+  renomeados: number
+  erros: number
+  plano: RenameStep[]
+}
+
+export interface VerifyNew {
+  arquivo: string
+  tamanho: number
+  episodios: number[]
+  codigo: string | null
+  qualidade: string | null
+  estava_dispensado: boolean
+  feito: boolean
+  erro: string | null
+}
+
+export interface VerifyGone {
+  arquivo_id: number
+  arquivo: string
+  episodios: number[]
+  codigo: string | null
+  volta_a_busca: boolean
+  feito: boolean
+  erro: string | null
+}
+
+export interface VerifySubtitle {
+  arquivo: string
+  video: string
+  idioma: string | null
+  forcada: boolean
+  feito: boolean
+  erro: string | null
+}
+
+export interface VerifyReport {
+  aplicado: boolean
+  novos: VerifyNew[]
+  nao_reconhecidos: { arquivo: string; motivo: string }[]
+  sumidos: VerifyGone[]
+  legendas: VerifySubtitle[]
+}
+
+export interface VerifyAllReport {
+  aplicado: boolean
+  total: number
+  filmes: (VerifyReport & { filme_id: number; filme: string; aviso: string | null })[]
+}
+
+export type MediaKind = 'filme' | 'serie'
+
+/** Item de "Faltando": episódio ou filme que ainda não está no disco. */
+export type MissingItem =
+  | {
+      tipo: 'episodio'
+      serie_id: number
+      serie: string
+      poster: string | null
+      prioritario: boolean
+      episodio_id: number
+      temporada: number
+      numero: number
+      titulo: string | null
+      data: string | null
+      baixando: boolean
+    }
+  | {
+      tipo: 'filme'
+      filme_id: number
+      filme: string
+      titulo: string
+      ano: number | null
+      poster: string | null
+      prioritario: boolean
+      data: string | null
+      baixando: boolean
+    }
+
+export type ReleaseKind = 'cinema' | 'digital' | 'fisico'
+
+export type CalendarItem =
+  | {
+      tipo: 'episodio'
+      data: string
+      serie_id: number
+      serie: string
+      poster: string | null
+      prioritario: boolean
+      episodio_id: number
+      temporada: number
+      numero: number
+      titulo: string | null
+      estado: 'quero' | 'tenho' | 'dispensado'
+      baixando: boolean
+      exibido: boolean
+    }
+  | {
+      tipo: 'filme'
+      data: string
+      lancamento: ReleaseKind
+      filme_id: number
+      filme: string
+      titulo: string
+      ano: number | null
+      poster: string | null
+      prioritario: boolean
+      estado: 'tenho' | 'falta' | 'baixando'
+    }
+
+const mediaPath = (kind: MediaKind, id: number) => `${LIB}/${kind === 'filme' ? 'filmes' : 'series'}/${id}`
+
 export const library = {
   options: () => request<LibraryOptions>('GET', `${LIB}/opcoes`),
   searchTmdb: (termo: string) =>
@@ -584,6 +712,19 @@ export const library = {
     if (params.evento) query.set('evento', params.evento)
     return request<{ total: number; eventos: HistoryEvent[] }>('GET', `${LIB}/historico?${query}`)
   },
+  missing: (tipo?: MediaKind) =>
+    request<{ total: number; itens: MissingItem[] }>('GET', `${LIB}/faltando${tipo ? `?${new URLSearchParams({ tipo })}` : ''}`),
+  calendar: (de: string, ate: string) =>
+    request<{ de: string; ate: string; total: number; itens: CalendarItem[] }>(
+      'GET',
+      `${LIB}/calendario?${new URLSearchParams({ de, ate })}`,
+    ),
+  rename: (kind: MediaKind, id: number, aplicar: boolean) =>
+    request<RenameReport>('POST', `${mediaPath(kind, id)}/renomear?${new URLSearchParams({ aplicar: String(aplicar) })}`),
+  verify: (kind: MediaKind, id: number, aplicar: boolean) =>
+    request<VerifyReport>('POST', `${mediaPath(kind, id)}/verificar?${new URLSearchParams({ aplicar: String(aplicar) })}`),
+  verifyAllMovies: (aplicar: boolean) =>
+    request<VerifyAllReport>('POST', `${LIB}/filmes/verificar?${new URLSearchParams({ aplicar: String(aplicar) })}`),
   blocklist: () => request<{ bloqueados: BlockedRelease[] }>('GET', `${LIB}/bloqueados`),
   unblock: (id: number) => request<{ ok: boolean }>('DELETE', `${LIB}/bloqueados/${id}`),
   rules: () => request<RulesView>('GET', `${LIB}/regras`),
@@ -621,6 +762,7 @@ export interface SeriesSummary {
   pasta: string
   pasta_de_temporada: boolean
   monitorar_novos: boolean
+  prioritario: boolean
   adicionada: string | null
   atualizada: string | null
   episodios: EpisodeTotals
@@ -707,6 +849,7 @@ export interface SeriesChange {
   monitorar_novos?: boolean
   pasta_de_temporada?: boolean
   buscar?: WhatToSearch
+  prioritario?: boolean
 }
 
 export interface SeriesTmdbResult {

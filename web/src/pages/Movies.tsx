@@ -16,15 +16,20 @@ import {
   LoaderCircle,
   Plus,
   Radar,
+  ScanSearch,
   SearchX,
+  Star,
   Trash2,
+  FilePen,
 } from 'lucide-react'
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { AddMovieDialog } from '@/components/AddMovieDialog'
 import { HistoryList } from '@/components/HistoryList'
 import { InteractiveSearch } from '@/components/InteractiveSearch'
+import { RenameDialog, VerifyAllMoviesDialog, VerifyDialog } from '@/components/MaintenanceDialogs'
 import { PageHeader } from '@/components/PageHeader'
+import { PriorityBadge, PriorityStar } from '@/components/PriorityStar'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -285,6 +290,7 @@ export function MoviesPage() {
   const [prefs, setPrefs] = useState<MovieListPrefs>(loadPrefs)
   const [selected, setSelected] = useState<number | null>(null)
   const [adding, setAdding] = useState(false)
+  const [verifyingAll, setVerifyingAll] = useState(false)
 
   // A busca dos que faltam roda no servidor; a tela só acompanha enquanto ela dura.
   const progress = useQuery({
@@ -354,6 +360,10 @@ export function MoviesPage() {
                 ? `Buscando ${progress.data?.buscados} de ${progress.data?.total}`
                 : 'Buscar os que faltam'}
             </Button>
+            <Button variant="ghost" onClick={() => setVerifyingAll(true)} disabled={counts.total === 0}>
+              <ScanSearch aria-hidden="true" />
+              Verificar todos os filmes
+            </Button>
             <Button variant="primary" onClick={() => setAdding(true)}>
               <Plus aria-hidden="true" />
               Adicionar filme
@@ -361,6 +371,7 @@ export function MoviesPage() {
           </div>
         }
       />
+      {verifyingAll && <VerifyAllMoviesDialog onClose={() => setVerifyingAll(false)} />}
       <AddMovieDialog
         open={adding}
         onOpenChange={setAdding}
@@ -460,6 +471,7 @@ const CLEARED = {
   qualities: DEFAULT_PREFS.qualities,
   audio: DEFAULT_PREFS.audio,
   monitored: DEFAULT_PREFS.monitored,
+  priority: DEFAULT_PREFS.priority,
 }
 
 const CHIP =
@@ -560,6 +572,12 @@ function MovieToolbar({
             )}
           </ChipGroup>
         </div>
+        <ChipGroup label="Prioridade">
+          <Chip active={prefs.priority} onClick={() => onChange({ priority: !prefs.priority })}>
+            <Star className={cn('size-3.5', prefs.priority && 'fill-warning text-warning')} aria-hidden="true" />
+            Prioritários
+          </Chip>
+        </ChipGroup>
         <div className="flex shrink-0 items-center gap-1.5">
           <Select
             value={prefs.sort}
@@ -824,6 +842,9 @@ function MovieTable({
                   className="block max-w-full truncate rounded-sm text-left font-medium focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
                   title={movie.titulo}
                 >
+                  {movie.prioritario && (
+                    <Star className="mr-1 inline size-3.5 fill-warning text-warning" aria-label="Prioritário" />
+                  )}
                   {movie.titulo}
                 </button>
               </td>
@@ -938,6 +959,7 @@ function PosterCard({ movie, onOpen }: { movie: Movie; onOpen: () => void }) {
         <div className="absolute top-2 left-2 max-w-[calc(100%-1rem)]">
           <PosterMark movie={movie} />
         </div>
+        {movie.prioritario && <PriorityBadge className="absolute top-2 right-2" />}
       </div>
       <p className="mt-2 line-clamp-2 text-sm leading-snug font-medium">{movie.titulo}</p>
       <p className="mt-0.5 text-xs text-content-subtle tabular-nums">
@@ -1054,7 +1076,7 @@ function MovieHistory({ movie }: { movie: Movie }) {
   return <HistoryList events={history.data.eventos} showMovie={false} />
 }
 
-function MovieDetails({
+export function MovieDetails({
   movie,
   open,
   onOpenChange,
@@ -1067,6 +1089,8 @@ function MovieDetails({
   const [grabbing, setGrabbing] = useState(false)
   const [interactive, setInteractive] = useState(false)
   const [removing, setRemoving] = useState(false)
+  const [renaming, setRenaming] = useState(false)
+  const [verifying, setVerifying] = useState(false)
   const [showHistory, setShowHistory] = useState(false)
   const file = movie.arquivo
   const disk = file ? DISK[file.disco] : null
@@ -1077,6 +1101,16 @@ function MovieDetails({
     onSuccess: () => toast.success('Arquivo apagado'),
     onError: (error: Error) => toast.error(error.message),
     onSettled: () => void queryClient.invalidateQueries({ queryKey: ['filmes'] }),
+  })
+  const prioritize = useMutation({
+    mutationFn: (prioritario: boolean) => library.edit(movie.id, { prioritario }),
+    onSuccess: (_, prioritario) => toast.success(prioritario ? 'Filme marcado como prioritário' : 'Prioridade removida'),
+    onError: (error: Error) => toast.error(error.message),
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ['filmes'] })
+      void queryClient.invalidateQueries({ queryKey: ['faltando'] })
+      void queryClient.invalidateQueries({ queryKey: ['calendario'] })
+    },
   })
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -1173,6 +1207,21 @@ function MovieDetails({
               <Trash2 aria-hidden="true" />
               Remover
             </Button>
+            <PriorityStar
+              active={movie.prioritario}
+              busy={prioritize.isPending}
+              onToggle={(next) => prioritize.mutate(next)}
+            />
+            <Button variant="ghost" onClick={() => setVerifying(true)}>
+              <ScanSearch aria-hidden="true" />
+              Verificar disco
+            </Button>
+            {file && (
+              <Button variant="ghost" onClick={() => setRenaming(true)}>
+                <FilePen aria-hidden="true" />
+                Renomear
+              </Button>
+            )}
             {file && (
               <Button variant="ghost" loading={deleteFile.isPending} onClick={() => deleteFile.mutate()}>
                 Apagar arquivo
@@ -1201,6 +1250,8 @@ function MovieDetails({
           </div>
         </DialogFooter>
         {!downloading && <GrabDialog movie={movie} open={grabbing} onOpenChange={setGrabbing} />}
+        {renaming && <RenameDialog kind="filme" id={movie.id} title={movie.titulo} onClose={() => setRenaming(false)} />}
+        {verifying && <VerifyDialog kind="filme" id={movie.id} title={movie.titulo} onClose={() => setVerifying(false)} />}
         <InteractiveSearch movie={movie} open={interactive} onOpenChange={setInteractive} />
         <RemoveMovieDialog
           movie={movie}

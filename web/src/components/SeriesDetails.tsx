@@ -3,11 +3,13 @@ import {
   Ban,
   ChevronRight,
   ExternalLink,
+  FilePen,
   ListFilter,
   LoaderCircle,
   Pencil,
   Radar,
   RotateCcw,
+  ScanSearch,
   Search,
   Trash2,
   X,
@@ -16,6 +18,8 @@ import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { ConfirmButton } from '@/components/ConfirmButton'
 import { HistoryList } from '@/components/HistoryList'
+import { RenameDialog, VerifyDialog } from '@/components/MaintenanceDialogs'
+import { PriorityStar } from '@/components/PriorityStar'
 import { SeriesInteractiveSearch } from '@/components/SeriesInteractiveSearch'
 import { SeriesPoster } from '@/components/SeriesPoster'
 import { Button } from '@/components/ui/button'
@@ -571,6 +575,8 @@ function SeriesBody({ series, onClose }: { series: SeriesDetail; onClose: () => 
   const queryClient = useQueryClient()
   const [editing, setEditing] = useState(false)
   const [removing, setRemoving] = useState(false)
+  const [renaming, setRenaming] = useState(false)
+  const [verifying, setVerifying] = useState(false)
   const [showHistory, setShowHistory] = useState(false)
   const [search, setSearch] = useState<{ scope: SeriesSearchScope; label: string } | null>(null)
   const [selection, setSelection] = useState<Set<number>>(new Set())
@@ -609,6 +615,16 @@ function SeriesBody({ series, onClose }: { series: SeriesDetail; onClose: () => 
       iniciada ? toast.success('Busca iniciada') : toast.info('Já há uma busca desta série em andamento'),
     onError: (error: Error) => toast.error(error.message),
     onSettled: refresh,
+  })
+  const prioritize = useMutation({
+    mutationFn: (prioritario: boolean) => seriesApi.edit(series.id, { prioritario }),
+    onSuccess: (_, prioritario) => toast.success(prioritario ? 'Série marcada como prioritária' : 'Prioridade removida'),
+    onError: (error: Error) => toast.error(error.message),
+    onSettled: () => {
+      refresh()
+      void queryClient.invalidateQueries({ queryKey: ['faltando'] })
+      void queryClient.invalidateQueries({ queryKey: ['calendario'] })
+    },
   })
   const del = useMutation({
     mutationFn: (ids: number[]) => seriesApi.deleteEpisodes(series.id, ids),
@@ -716,6 +732,19 @@ function SeriesBody({ series, onClose }: { series: SeriesDetail; onClose: () => 
               <ListFilter aria-hidden="true" />
               Busca interativa
             </Button>
+            <PriorityStar
+              active={series.prioritario}
+              busy={prioritize.isPending}
+              onToggle={(next) => prioritize.mutate(next)}
+            />
+            <Button variant="ghost" onClick={() => setVerifying(true)}>
+              <ScanSearch aria-hidden="true" />
+              Verificar disco
+            </Button>
+            <Button variant="ghost" onClick={() => setRenaming(true)}>
+              <FilePen aria-hidden="true" />
+              Renomear
+            </Button>
             <Button variant="ghost" aria-expanded={editing} onClick={() => setEditing((v) => !v)}>
               <Pencil aria-hidden="true" />
               Editar
@@ -817,6 +846,8 @@ function SeriesBody({ series, onClose }: { series: SeriesDetail; onClose: () => 
           onClose={() => setSearch(null)}
         />
       )}
+      {renaming && <RenameDialog kind="serie" id={series.id} title={series.titulo} onClose={() => setRenaming(false)} />}
+      {verifying && <VerifyDialog kind="serie" id={series.id} title={series.titulo} onClose={() => setVerifying(false)} />}
       <RemoveSeriesDialog
         series={series}
         open={removing}

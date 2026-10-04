@@ -1,8 +1,9 @@
 import { useQuery } from '@tanstack/react-query'
-import { LoaderCircle, Plus, SearchX, Tv } from 'lucide-react'
+import { LoaderCircle, Plus, SearchX, Star, Tv } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { AddSeriesDialog } from '@/components/AddSeriesDialog'
 import { PageHeader } from '@/components/PageHeader'
+import { PriorityBadge } from '@/components/PriorityStar'
 import { SeriesDetails } from '@/components/SeriesDetails'
 import { SeriesPoster } from '@/components/SeriesPoster'
 import { Button } from '@/components/ui/button'
@@ -59,6 +60,7 @@ function PosterCard({ series, onOpen }: { series: SeriesSummary; onOpen: () => v
           )}
         />
         <PosterMarks series={series} />
+        {series.prioritario && <PriorityBadge className="absolute top-2 right-2" />}
       </div>
       <p className="mt-2 line-clamp-2 text-sm leading-snug font-medium">{series.titulo}</p>
       <p className="mt-0.5 text-xs text-content-subtle tabular-nums">
@@ -91,6 +93,7 @@ export function SeriesPage() {
   const [filter, setFilter] = useState<SeriesFilter>('todas')
   const [selected, setSelected] = useState<number | null>(null)
   const [adding, setAdding] = useState(false)
+  const [priority, setPriority] = useState(false)
 
   const list = series.data?.series
   const counts = useMemo(() => {
@@ -110,9 +113,9 @@ export function SeriesPage() {
   const visible = useMemo(
     () =>
       searched
-        .filter((s) => matchesFilter(s, filter))
+        .filter((s) => matchesFilter(s, filter) && (!priority || s.prioritario))
         .sort((a, b) => seriesTitleKey(a).localeCompare(seriesTitleKey(b), 'pt-BR')),
-    [searched, filter],
+    [searched, filter, priority],
   )
 
   return (
@@ -181,6 +184,12 @@ export function SeriesPage() {
                 ))}
               </ChipGroup>
             </div>
+            <ChipGroup label="Prioridade">
+              <Chip active={priority} onClick={() => setPriority((on) => !on)}>
+                <Star className={cn('size-3.5', priority && 'fill-warning text-warning')} aria-hidden="true" />
+                Prioritários
+              </Chip>
+            </ChipGroup>
           </div>
 
           {visible.length === 0 ? (
@@ -193,6 +202,7 @@ export function SeriesPage() {
                 onClick={() => {
                   setQuery('')
                   setFilter('todas')
+                  setPriority(false)
                 }}
               >
                 Limpar filtros

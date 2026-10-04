@@ -17,6 +17,8 @@ export interface MovieListPrefs {
   qualities: QualityFilter[]
   audio: AudioFilter[]
   monitored: MonitoredFilter
+  /** Só os marcados como prioritários. */
+  priority: boolean
   view: ViewMode
 }
 
@@ -27,6 +29,7 @@ export const DEFAULT_PREFS: MovieListPrefs = {
   qualities: [],
   audio: [],
   monitored: 'todos',
+  priority: false,
   view: 'poster',
 }
 
@@ -183,7 +186,8 @@ export function filterExceptState(movies: Movie[], query: string, prefs: MovieLi
       matchesQuery(movie, needle) &&
       matchesQuality(movie, prefs.qualities) &&
       matchesAudio(movie, prefs.audio) &&
-      matchesMonitored(movie, prefs.monitored),
+      matchesMonitored(movie, prefs.monitored) &&
+      (!prefs.priority || movie.prioritario),
   )
 }
 
@@ -242,12 +246,12 @@ export function applyList(movies: Movie[], query: string, prefs: MovieListPrefs)
 
 /** Algum filtro (não ordem nem visualização) fora do padrão. */
 export const hasActiveFilters = (prefs: MovieListPrefs) =>
-  prefs.state !== 'todos' || prefs.qualities.length > 0 || prefs.audio.length > 0 || prefs.monitored !== 'todos'
+  prefs.state !== 'todos' || prefs.qualities.length > 0 || prefs.audio.length > 0 || prefs.monitored !== 'todos' || prefs.priority
 
 // ---------------------------------------------------------------- escolhas lembradas
 
 const STORAGE_KEY = 'acervo.filmes.lista'
-const KEYS = ['ordem', 'dir', 'estado', 'qualidade', 'audio', 'monitorado', 'vista'] as const
+const KEYS = ['ordem', 'dir', 'estado', 'qualidade', 'audio', 'monitorado', 'prioritario', 'vista'] as const
 
 const pick = <T extends string>(value: string | null | undefined, options: readonly { value: T }[], fallback: T): T =>
   options.find((option) => option.value === value)?.value ?? fallback
@@ -269,6 +273,7 @@ export function prefsFromParams(params: URLSearchParams): MovieListPrefs {
     qualities: pickMany(params.get('qualidade'), QUALITIES),
     audio: pickMany(params.get('audio'), AUDIOS),
     monitored: pick(params.get('monitorado'), MONITORED, DEFAULT_PREFS.monitored),
+    priority: params.get('prioritario') === '1',
     view: pick(params.get('vista'), VIEWS, DEFAULT_PREFS.view),
   }
 }
@@ -282,6 +287,7 @@ export function prefsToParams(prefs: MovieListPrefs): URLSearchParams {
   if (prefs.qualities.length > 0) params.set('qualidade', prefs.qualities.join(','))
   if (prefs.audio.length > 0) params.set('audio', prefs.audio.join(','))
   if (prefs.monitored !== 'todos') params.set('monitorado', prefs.monitored)
+  if (prefs.priority) params.set('prioritario', '1')
   if (prefs.view !== 'poster') params.set('vista', prefs.view)
   return params
 }

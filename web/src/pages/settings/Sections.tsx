@@ -198,6 +198,7 @@ function ServerForm({ data, save, saving }: FormProps<'servidor'>) {
   const [publicUrl, setPublicUrl] = useState(data.public_url ?? '')
   const [catalogs, setCatalogs] = useState(data.catalogos.join('\n'))
   const [timeout, setTimeoutSeconds] = useState(String(data.http_timeout_seconds))
+  const [xemUrl, setXemUrl] = useState(data.xem_url)
   return (
     <form
       noValidate
@@ -208,6 +209,7 @@ function ServerForm({ data, save, saving }: FormProps<'servidor'>) {
           public_url: publicUrl.trim() || null,
           catalogos: lines(catalogs),
           http_timeout_seconds: whole(timeout),
+          xem_url: xemUrl.trim(),
         }
         if (key.trim()) value.api_key = key.trim()
         save(value)
@@ -293,6 +295,21 @@ function ServerForm({ data, save, saving }: FormProps<'servidor'>) {
           onChange={(event) => setTimeoutSeconds(event.target.value)}
           aria-describedby="servidor-timeout-ajuda"
           className="w-28 tabular-nums"
+        />
+      </Field>
+      <Field
+        id="servidor-xem"
+        label="Endereço do XEM"
+        help="De onde vem a numeração de cena das séries (a tarefa «Numeração de cena»). O padrão é https://thexem.info."
+      >
+        <Input
+          id="servidor-xem"
+          type="url"
+          spellCheck={false}
+          value={xemUrl}
+          onChange={(event) => setXemUrl(event.target.value)}
+          placeholder="https://thexem.info"
+          aria-describedby="servidor-xem-ajuda"
         />
       </Field>
       <SaveRow saving={saving} />
