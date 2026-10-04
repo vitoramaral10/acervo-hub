@@ -1,18 +1,20 @@
 //! Grab e importação: o acervo pega o release que a decisão escolheu e, quando
 //! o download termina, liga o arquivo na pasta do filme.
 //!
-//! O que é pego vai ao cliente numa categoria própria, que o gerenciador de
-//! filmes não importa. A importação liga (hardlink) o arquivo baixado com o
-//! nome que o gerenciador daria, na pasta do filme; num upgrade, troca o
-//! antigo.
+//! O que é pego vai ao cliente numa categoria própria, parado e com a tag da
+//! fila; a fila o inicia quando cabe no disco. A importação liga (hardlink) o
+//! arquivo baixado na pasta do filme, com o nome do padrão; se o filme já
+//! tinha arquivo (troca escolhida na mão), troca o antigo.
 //!
 //! Download que o cliente dá como perdido vai para a lista de bloqueio e o
-//! filme é buscado de novo (com a busca automática ligada). Problema na
-//! importação (arquivo no caminho, disco diferente) não é culpa do release:
-//! o download fica na fila, com o aviso, até dar certo.
+//! filme é buscado de novo. Problema na importação (arquivo no caminho, disco
+//! diferente) não é culpa do release: o download fica na fila, com o aviso,
+//! até dar certo. O que o cliente diz uma vez só (arquivos sumidos, erro, sem
+//! seeds) precisa persistir 30 min observados antes de virar falha.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
 use acervo_api::Catalog;
 use acervo_clients::{
@@ -22,6 +24,7 @@ use acervo_indexers::ResolvedDownload;
 use acervo_store::{Grab, GrabState, MovieFile, Store};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use time::OffsetDateTime;
 
 use crate::config::Config;
 use crate::decide::{Decider, label, now_rfc3339, summarize};
@@ -57,9 +60,132 @@ pub struct GrabReport {
 pub(crate) const QUEUE_TAG: &str = "acervo:fila";
 pub(crate) const QUEUED: &str = "na fila: aguardando espaço";
 
+/// A mensagem de quem pede um segundo download do mesmo filme.
+pub(crate) const ALREADY_DOWNLOADING: &str = "já há um download em andamento";
+
 /// Uma rodada da fila por vez: duas lendo o mesmo espaço livre iniciariam
 /// torrents para o mesmo buraco.
 static QUEUE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// O que se acompanha de um torrent, volta a volta, em memória.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Condition {
+    /// O cliente não acha os arquivos (`missingFiles`).
+    MissingFiles,
+    /// O cliente marcou erro, e há espaço livre: não é disco cheio.
+    ClientError,
+    /// Baixando, sem seed nenhum.
+    NoSeeds,
+    /// A importação travou ("atenção").
+    Attention,
+}
+
+/// Desde quando cada condição vale, sem interrupção, para cada torrent — como
+/// este processo a viu. Só em memória: reiniciar recomeça a contagem, e
+/// condição observada uma vez só nunca vira falha.
+#[derive(Debug, Default)]
+pub(crate) struct Watch {
+    since: HashMap<(String, Condition), OffsetDateTime>,
+    /// Os torrents cujo aviso de importação travada já saiu.
+    noticed: HashSet<String>,
+}
+
+impl Watch {
+    /// Registra o que se viu agora e devolve há quanto tempo a condição vale
+    /// sem interrupção: zero se não vale (e aí a contagem recomeça).
+    pub fn observe(
+        &mut self,
+        hash: &str,
+        condition: Condition,
+        holds: bool,
+        now: OffsetDateTime,
+    ) -> time::Duration {
+        let key = (hash.to_owned(), condition);
+        if !holds {
+            self.since.remove(&key);
+            return time::Duration::ZERO;
+        }
+        let since = *self.since.entry(key).or_insert(now);
+        (now - since).max(time::Duration::ZERO)
+    }
+
+    /// `true` uma vez só por torrent, até [`Watch::forget`].
+    pub fn first_notice(&mut self, hash: &str) -> bool {
+        self.noticed.insert(hash.to_owned())
+    }
+
+    /// O grab terminou: tudo o que se acompanhava do torrent sai.
+    pub fn forget(&mut self, hash: &str) {
+        self.since.retain(|(h, _), _| h != hash);
+        self.noticed.remove(hash);
+    }
+}
+
+static WATCH: LazyLock<Mutex<Watch>> = LazyLock::new(Mutex::default);
+
+/// O acompanhamento dos torrents, dividido entre filmes e séries.
+pub(crate) fn watch() -> MutexGuard<'static, Watch> {
+    WATCH.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Quanto uma condição passageira do cliente precisa persistir, observada,
+/// antes de virar falha.
+const PERSIST: time::Duration = time::Duration::minutes(30);
+
+/// Quanto a importação pode ficar travada antes do aviso.
+const ATTENTION_NOTICE: time::Duration = time::Duration::hours(6);
+
+/// A mensagem do torrent cujos arquivos o cliente não acha.
+pub(crate) const MISSING_FILES: &str = "o cliente não acha os arquivos do torrent";
+
+/// A mensagem da falha por erro do cliente com espaço sobrando. Marca a
+/// expiração do bloqueio, como a de [`NO_SEEDS`]: não mude sem migrar as
+/// linhas que já a guardam.
+pub(crate) const CLIENT_ERROR: &str = "o cliente marcou o torrent com `error`";
+
+/// O que o estado do torrent no cliente diz da volta: `missingFiles` e
+/// `error` (o de disco cheio já foi tratado antes) tentam de novo até
+/// persistirem [`PERSIST`] observados. Aí, arquivo sumido é falha sem
+/// bloqueio — o release não tem culpa —, e erro é falha com o bloqueio que
+/// expira, como o de sem seeds.
+pub(crate) fn client_trouble(
+    watch: &mut Watch,
+    torrent: &acervo_clients::TorrentInfo,
+    now: OffsetDateTime,
+) -> Option<Failure> {
+    let state = torrent.state.as_str();
+    let missing = watch.observe(
+        &torrent.hash,
+        Condition::MissingFiles,
+        state == "missingFiles",
+        now,
+    );
+    let error = watch.observe(&torrent.hash, Condition::ClientError, state == "error", now);
+    match state {
+        "missingFiles" if missing >= PERSIST => Some(Failure::Lost(MISSING_FILES.into())),
+        "missingFiles" => Some(Failure::Import(format!(
+            "{MISSING_FILES}; tenta de novo por 30 min"
+        ))),
+        "error" if error >= PERSIST => Some(Failure::Download(CLIENT_ERROR.into())),
+        "error" => Some(Failure::Import(format!(
+            "{CLIENT_ERROR}; tenta de novo por 30 min"
+        ))),
+        _ => None,
+    }
+}
+
+/// O aviso da importação travada: `true` uma vez só, quando o torrent passa
+/// de [`ATTENTION_NOTICE`] seguidas em atenção. Fora de atenção, a contagem
+/// recomeça.
+pub(crate) fn attention_due(
+    watch: &mut Watch,
+    hash: &str,
+    stuck: bool,
+    now: OffsetDateTime,
+) -> bool {
+    watch.observe(hash, Condition::Attention, stuck, now) >= ATTENTION_NOTICE
+        && watch.first_notice(hash)
+}
 
 /// Torrent do acervo que está baixando de verdade: não parado e incompleto.
 fn is_active(torrent: &acervo_clients::TorrentInfo) -> bool {
@@ -145,10 +271,17 @@ fn pick_starts_prioritized(
 /// regras fica sempre livre: a importação cria a pasta do filme e o servidor
 /// de mídia grava miniaturas no mesmo disco.
 ///
+/// Torrent na fila do acervo sem grab em andamento que o reclame não é de
+/// ninguém: é apagado com os arquivos, nunca iniciado ([`orphans`]).
+///
 /// # Errors
 ///
 /// Cliente inalcançável ou que recusou um comando.
-pub(crate) async fn start_queued(store: &Store, client: &QbitClient) -> Result<Vec<String>> {
+pub(crate) async fn start_queued(
+    config: &Config,
+    store: &Store,
+    client: &QbitClient,
+) -> Result<Vec<String>> {
     let _guard = QUEUE_LOCK.lock().await;
     if !client.preallocates().await? {
         client.enable_preallocation().await?;
@@ -176,7 +309,10 @@ pub(crate) async fn start_queued(store: &Store, client: &QbitClient) -> Result<V
             known.get(&t.hash).copied().unwrap_or(0)
         }
     };
-    let torrents = client.torrents().await?;
+    let mut torrents = client.torrents().await?;
+    drop_orphans(config, store, client, &torrents, &known).await?;
+    // O que foi apagado, ou ficou por ter link, não entra na conta.
+    torrents.retain(|t| !t.has_tag(QUEUE_TAG) || known.contains_key(&t.hash));
     let priority = store.priority_hashes().await?;
     // Prioritário que o próprio cliente segura na fila dele (limite de
     // downloads ativos do qBittorrent) sobe para o topo dela.
@@ -246,6 +382,100 @@ pub(crate) async fn start_queued(store: &Store, client: &QbitClient) -> Result<V
     Ok(started)
 }
 
+/// Por quanto tempo um torrent recém-posto na fila pode ainda não ter grab:
+/// o grab é gravado logo depois de o torrent entrar no cliente.
+const ORPHAN_GRACE: i64 = 10 * 60;
+
+/// Os torrents da fila do acervo (tag e categoria dele) que nenhum grab em
+/// andamento reclama, entrados no cliente há mais de [`ORPHAN_GRACE`]. Sem
+/// data de entrada, na dúvida, nenhum.
+fn orphans(
+    torrents: &[acervo_clients::TorrentInfo],
+    known: &HashMap<String, u64>,
+    category: &str,
+    now: i64,
+) -> Vec<String> {
+    torrents
+        .iter()
+        .filter(|t| t.has_tag(QUEUE_TAG) && t.category == category)
+        .filter(|t| !known.contains_key(&t.hash))
+        .filter(|t| t.added_on > 0 && now - t.added_on >= ORPHAN_GRACE)
+        .map(|t| t.hash.clone())
+        .collect()
+}
+
+/// Hashes dos grabs em andamento, de filme e de série, lidos agora.
+async fn claimed(store: &Store) -> Result<Vec<String>> {
+    let mut hashes: Vec<String> = store
+        .grabs()
+        .await?
+        .into_iter()
+        .filter(|g| g.state == GrabState::Downloading)
+        .map(|g| g.hash)
+        .collect();
+    hashes.extend(
+        store
+            .series_grabs()
+            .await?
+            .into_iter()
+            .filter(|g| g.state == GrabState::Downloading)
+            .map(|g| g.hash),
+    );
+    Ok(hashes)
+}
+
+/// Apaga com os arquivos os torrents da fila sem grab ([`orphans`]), menos o
+/// que tem arquivo ligado em outro lugar: esse fica parado, com aviso. Antes
+/// de cada remoção os grabs são lidos de novo: um grab gravado depois da
+/// leitura de `known` (o torrent entrou e foi adotado) reclama o torrent, que
+/// então fica. Remoção recusada pelo cliente vira aviso: não trava a fila.
+///
+/// # Errors
+///
+/// Catálogo ilegível.
+async fn drop_orphans(
+    config: &Config,
+    store: &Store,
+    client: &QbitClient,
+    torrents: &[acervo_clients::TorrentInfo],
+    known: &HashMap<String, u64>,
+) -> Result<()> {
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    for hash in orphans(torrents, known, &config.library.category, now) {
+        let Some(torrent) = torrents.iter().find(|t| t.hash == hash) else {
+            continue;
+        };
+        if !only_link(config, client, torrent).await {
+            tracing::warn!(
+                torrent = %torrent.name,
+                "torrent na fila sem grab, com arquivo ligado em outro lugar: fica parado"
+            );
+            continue;
+        }
+        if claimed(store)
+            .await?
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(&hash))
+        {
+            continue;
+        }
+        if let Err(error) = client
+            .delete(&[acervo_core::DownloadHash::new(hash)], true)
+            .await
+        {
+            tracing::warn!(torrent = %torrent.name, "torrent sem grab não apagado: {error}");
+            continue;
+        }
+        tracing::info!(torrent = %torrent.name, "torrent na fila sem grab apagado");
+    }
+    Ok(())
+}
+
+/// O torrent espera na fila do acervo e nunca começou.
+fn is_waiting(torrent: &acervo_clients::TorrentInfo) -> bool {
+    torrent.has_tag(QUEUE_TAG) && torrent.progress <= 0.0
+}
+
 /// Hashes dos torrents que ainda esperam na fila do acervo, sem nunca terem
 /// começado. Vazio se o cliente não responde: aí nada é trocado.
 pub(crate) async fn waiting(config: &Config) -> HashSet<String> {
@@ -256,7 +486,7 @@ pub(crate) async fn waiting(config: &Config) -> HashSet<String> {
     match torrents {
         Ok(torrents) => torrents
             .into_iter()
-            .filter(|t| t.has_tag(QUEUE_TAG))
+            .filter(is_waiting)
             .map(|t| t.hash)
             .collect(),
         Err(error) => {
@@ -268,6 +498,9 @@ pub(crate) async fn waiting(config: &Config) -> HashSet<String> {
 
 /// Tira da fila os grabs que deram lugar a um release melhor: apaga o
 /// torrent, que nunca baixou nada, e encerra o grab sem bloquear o release.
+/// Cada torrent é lido de novo antes de apagar, sob [`QUEUE_LOCK`]: o que
+/// iniciou desde a leitura de [`waiting`] fica, com o grab. O que tem o
+/// mesmo hash do release novo também fica no cliente: já é o torrent dele.
 ///
 /// # Errors
 ///
@@ -287,17 +520,32 @@ pub(crate) async fn swap_out(
         .into_iter()
         .find(|m| m.id == first.movie_id)
         .context("o filme saiu do catálogo")?;
-    let hashes: Vec<_> = olds
-        .iter()
-        .map(|g| acervo_core::DownloadHash::new(g.hash.clone()))
-        .collect();
-    qbit(config)
-        .await?
-        .delete(&hashes, true)
-        .await
-        .context("apagando da fila do qBittorrent")?;
+    let client = qbit(config).await?;
+    let grabs = store.grabs().await?;
     let reason = format!("trocado na fila por {by}");
+    let _guard = QUEUE_LOCK.lock().await;
     for grab in olds {
+        // Outro grab em andamento com o mesmo hash é o release novo.
+        let reused = grabs.iter().any(|g| {
+            g.state == GrabState::Downloading
+                && olds.iter().all(|old| old.id != g.id)
+                && g.hash.eq_ignore_ascii_case(&grab.hash)
+        });
+        if !reused {
+            match client.torrent(&grab.hash).await? {
+                Some(torrent) if !is_waiting(&torrent) => {
+                    tracing::info!(release = grab.title, "torrent já iniciou: não é trocado");
+                    continue;
+                }
+                Some(_) => {
+                    client
+                        .delete(&[acervo_core::DownloadHash::new(grab.hash.clone())], true)
+                        .await
+                        .context("apagando da fila do qBittorrent")?;
+                }
+                None => {}
+            }
+        }
         give_up(store, grab, &movie, &reason, false, Kind::Ignored).await?;
     }
     Ok(())
@@ -328,12 +576,33 @@ pub(crate) async fn qbit(config: &Config) -> Result<QbitClient> {
     .context("entrando no qBittorrent")
 }
 
-/// Manda um release ao cliente e registra o grab. `replaces` é o arquivo que
-/// o filme tem hoje, se tiver: a importação o troca pelo novo.
+/// Recusa um download novo para um filme que já tem um em andamento: dois
+/// grabs do mesmo filme brigariam pela importação. `swapping` são os grabs
+/// que o novo vem trocar (a troca na fila), e esses não contam.
 ///
 /// # Errors
 ///
-/// `.torrent` inválido, cliente inalcançável ou falha ao registrar.
+/// [`ALREADY_DOWNLOADING`], ou banco inalcançável.
+async fn ensure_none_downloading(store: &Store, movie_id: i64, swapping: &[i64]) -> Result<()> {
+    let busy = store.grabs().await?.into_iter().any(|g| {
+        g.movie_id == movie_id && g.state == GrabState::Downloading && !swapping.contains(&g.id)
+    });
+    if busy {
+        bail!(ALREADY_DOWNLOADING);
+    }
+    Ok(())
+}
+
+/// Manda um release ao cliente e registra o grab. `replaces` é o arquivo que
+/// o filme tem hoje, se tiver: a importação o troca pelo novo. Com outro
+/// grab do filme em andamento, recusa — menos os de `swapping`, que quem
+/// chama vai tirar da fila ([`swap_out`]).
+///
+/// # Errors
+///
+/// Download em andamento, `.torrent` inválido, cliente inalcançável ou
+/// falha ao registrar.
+#[allow(clippy::too_many_arguments)] // O release e o que vem com ele.
 pub async fn send(
     config: &Config,
     store: &Store,
@@ -342,7 +611,9 @@ pub async fn send(
     release: &acervo_indexers::Release,
     quality: acervo_parser::Quality,
     replaces: Option<String>,
+    swapping: &[i64],
 ) -> Result<()> {
+    ensure_none_downloading(store, movie_id, swapping).await?;
     let (torrent, hash) = fetch_torrent(catalog, release).await?;
     let client = qbit(config).await?;
     add_queued(config, &client, torrent, &hash, false, true).await?;
@@ -366,7 +637,7 @@ pub async fn send(
         .context("registrando o grab")?;
     crate::stats::grabbed(store, &release.indexer).await;
     // Já registrado: a fila sabe o tamanho mesmo de um magnet sem metadados.
-    if let Err(error) = start_queued(store, &client).await {
+    if let Err(error) = start_queued(config, store, &client).await {
         tracing::warn!("fila de downloads: {error:#}");
     }
     let movie = store.movies().await?.into_iter().find(|m| m.id == movie_id);
@@ -489,7 +760,8 @@ pub(crate) async fn add_queued(
 ///
 /// # Errors
 ///
-/// Filme fora do catálogo, `.torrent` inválido ou cliente inalcançável.
+/// Filme fora do catálogo, download já em andamento, `.torrent` inválido ou
+/// cliente inalcançável.
 pub async fn send_chosen(
     config: &Config,
     store: &Store,
@@ -507,16 +779,26 @@ pub async fn send_chosen(
         .file
         .map(|f| f.relative_path);
     let quality = acervo_parser::parse_quality(&release.title).quality;
-    send(config, store, catalog, movie_id, release, quality, replaces).await
+    send(
+        config,
+        store,
+        catalog,
+        movie_id,
+        release,
+        quality,
+        replaces,
+        &[],
+    )
+    .await
 }
 
-/// Busca o filme, decide e, com `apply`, manda o escolhido ao cliente. Filme
-/// com arquivo só é pego se a decisão aprovar como upgrade.
+/// Busca o filme, decide e, com `apply`, manda o escolhido ao cliente; sem
+/// ele, é a prévia da tela. Com download já em andamento, nem busca.
 ///
 /// # Errors
 ///
-/// Filme fora do catálogo, busca que falhou em todos os indexadores,
-/// `.torrent` inválido, cliente inalcançável.
+/// Filme fora do catálogo, download já em andamento, busca que falhou em
+/// todos os indexadores, `.torrent` inválido, cliente inalcançável.
 pub async fn grab(
     config: &Config,
     store: &Store,
@@ -526,6 +808,9 @@ pub async fn grab(
 ) -> Result<GrabReport> {
     let decider = Decider::load(store, catalog).await?;
     let movie = decider.target(movie_id).context("filme fora do catálogo")?;
+    if apply {
+        ensure_none_downloading(store, movie_id, &[]).await?;
+    }
     let outcome = decider
         .decide(catalog, movie)
         .await
@@ -559,7 +844,17 @@ pub async fn grab(
         .into_iter()
         .find(|m| m.id == movie_id)
         .and_then(|m| m.movie.file.map(|f| f.relative_path));
-    send(config, store, catalog, movie_id, release, quality, replaces).await?;
+    send(
+        config,
+        store,
+        catalog,
+        movie_id,
+        release,
+        quality,
+        replaces,
+        &[],
+    )
+    .await?;
     report.aplicado = true;
     Ok(report)
 }
@@ -569,11 +864,12 @@ pub async fn grab(
 pub struct ImportLine {
     pub filme: String,
     pub release: String,
-    /// `baixando`, `importaria`, `importado`, `atencao` (importação
-    /// travada, tenta de novo) ou `falhou`.
+    /// `baixando`, `importado`, `atencao` (importação travada, tenta de
+    /// novo), `falhou` ou `descartado` (o filme ganhou arquivo por outro
+    /// caminho).
     pub estado: &'static str,
     pub detalhe: Option<String>,
-    /// Caminho do arquivo na pasta do filme, como o gerenciador vê.
+    /// Caminho do arquivo na pasta do filme, como o cliente vê.
     pub destino: Option<String>,
 }
 
@@ -767,30 +1063,56 @@ const STALL: time::Duration = time::Duration::minutes(30);
 /// não mude sem migrar as linhas que já a guardam.
 pub(crate) const NO_SEEDS: &str = "sem seeds há 30 min";
 
-/// Por quanto tempo o bloqueio por falta de seeds vale: o release pode só
-/// ter estado sem seeds naquela hora.
-const NO_SEEDS_BLOCK: time::Duration = time::Duration::days(7);
+/// Por quanto tempo um bloqueio automático vale: o release pode só ter
+/// estado sem seeds naquela hora.
+pub(crate) const NO_SEEDS_BLOCK: time::Duration = time::Duration::days(7);
 
-/// Download ativo que não anda: sem seed algum, sem transferir nada e já há
-/// 30 min ativo. Parado, na fila, verificando ou com erro não conta.
-pub(crate) fn stalled(torrent: &acervo_clients::TorrentInfo, now: time::OffsetDateTime) -> bool {
-    let limit = STALL.whole_seconds();
-    let quiet = torrent.last_activity == 0 || now.unix_timestamp() - torrent.last_activity >= limit;
+/// Baixando de verdade e sem seed nenhum, conectado ou no enxame. Parado,
+/// na fila (do acervo ou do cliente), verificando ou com erro não conta.
+fn seedless(torrent: &acervo_clients::TorrentInfo) -> bool {
     matches!(
         torrent.state.as_str(),
         "downloading" | "stalledDL" | "metaDL" | "forcedDL"
     ) && torrent.progress < 1.0
-        && torrent.time_active >= limit
         && torrent.num_complete <= 0
         && torrent.num_seeds == 0
-        && quiet
 }
 
-/// O bloqueio ainda vale? O de "sem seeds" e o de torrent desregistrado
-/// expiram em 7 dias; qualquer outro é para sempre. A linha fica, para a
-/// tela de bloqueados.
-pub(crate) fn still_blocks(blocked: &acervo_store::Blocked, now: time::OffsetDateTime) -> bool {
-    if !matches!(blocked.message.as_deref(), Some(NO_SEEDS | UNREGISTERED)) {
+/// Download ativo que não anda, pelo que o cliente diz agora: sem seed algum,
+/// sem transferir nada e já há 30 min ativo.
+pub(crate) fn stalled(torrent: &acervo_clients::TorrentInfo, now: OffsetDateTime) -> bool {
+    let limit = STALL.whole_seconds();
+    let quiet = torrent.last_activity == 0 || now.unix_timestamp() - torrent.last_activity >= limit;
+    seedless(torrent) && torrent.time_active >= limit && quiet
+}
+
+/// Sem seeds de verdade: [`stalled`] agora e sem seed há 30 min observados
+/// por este processo, sem interrupção. O `time_active` do cliente soma o
+/// tempo ativo de antes de uma parada; sem a observação, torrent retomado
+/// depois de parado ou de esperar na fila cairia como sem seeds na primeira
+/// volta.
+pub(crate) fn no_seeds(
+    watch: &mut Watch,
+    torrent: &acervo_clients::TorrentInfo,
+    now: OffsetDateTime,
+) -> bool {
+    let seen = watch.observe(&torrent.hash, Condition::NoSeeds, seedless(torrent), now);
+    stalled(torrent, now) && seen >= STALL
+}
+
+/// As mensagens dos bloqueios automáticos que expiram: o release pode só
+/// ter estado ruim naquela hora.
+pub(crate) const EXPIRING: [&str; 3] = [NO_SEEDS, UNREGISTERED, CLIENT_ERROR];
+
+/// O bloqueio ainda vale? Os de [`EXPIRING`] expiram em 7 dias; qualquer
+/// outro é para sempre. A linha fica, para a tela de bloqueados, até a poda
+/// da limpeza.
+pub(crate) fn still_blocks(blocked: &acervo_store::Blocked, now: OffsetDateTime) -> bool {
+    if !blocked
+        .message
+        .as_deref()
+        .is_some_and(|message| EXPIRING.contains(&message))
+    {
         return true;
     }
     // Data ilegível: na dúvida, bloqueia.
@@ -848,18 +1170,15 @@ impl Suspects {
     }
 }
 
-static SUSPECTS: std::sync::LazyLock<std::sync::Mutex<Suspects>> =
-    std::sync::LazyLock::new(std::sync::Mutex::default);
+static SUSPECTS: LazyLock<Mutex<Suspects>> = LazyLock::new(Mutex::default);
 
 /// O torrent perdeu o registro no tracker: ativo, incompleto, sem seed
 /// conectado, ativo há 30 min, e [`unregistered`] em duas voltas seguidas.
-/// Só consulta os trackers de quem passa pelo resto. Sem `record` (a volta
-/// que só mostra), não conta a volta. Erro na consulta é "não sei": `false`,
-/// sem mudar o que se lembra.
+/// Só consulta os trackers de quem passa pelo resto. Erro na consulta é "não
+/// sei": `false`, sem mudar o que se lembra.
 pub(crate) async fn gone_from_tracker(
     client: &QbitClient,
     torrent: &acervo_clients::TorrentInfo,
-    record: bool,
 ) -> bool {
     let candidate = is_active(torrent)
         && torrent.num_seeds == 0
@@ -875,14 +1194,10 @@ pub(crate) async fn gone_from_tracker(
     } else {
         false
     };
-    let mut suspects = SUSPECTS
+    SUSPECTS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if record {
-        suspects.observe(&torrent.hash, now)
-    } else {
-        now && suspects.0.contains(&torrent.hash)
-    }
+        .unwrap_or_else(PoisonError::into_inner)
+        .observe(&torrent.hash, now)
 }
 
 /// Nenhum arquivo do torrent tem outro link (biblioteca de alguém, outro
@@ -893,7 +1208,7 @@ pub(crate) fn no_other_link(files: Option<&[crate::series::remove::OnDisk]>) -> 
 }
 
 /// [`no_other_link`], lendo os arquivos do torrent no cliente e no disco.
-async fn only_link(
+pub(crate) async fn only_link(
     config: &Config,
     client: &QbitClient,
     torrent: &acervo_clients::TorrentInfo,
@@ -931,18 +1246,22 @@ pub(crate) fn fresh_grab(grabbed_at: &str, now: time::OffsetDateTime) -> bool {
 }
 
 /// Torrent ausente do cliente: perda, ou só atraso se o grab é recente.
-fn missing(grabbed_at: &str) -> Failure {
-    if fresh_grab(grabbed_at, time::OffsetDateTime::now_utc()) {
+pub(crate) fn missing(grabbed_at: &str) -> Failure {
+    if fresh_grab(grabbed_at, OffsetDateTime::now_utc()) {
         Failure::Import("o torrent ainda não apareceu no cliente".into())
     } else {
         Failure::Download("o torrent sumiu do cliente".into())
     }
 }
 
-enum Failure {
+/// Por que um download não importou nesta volta.
+pub(crate) enum Failure {
     /// O release é o problema: o cliente perdeu ou deu erro. Bloqueia e
     /// busca de novo.
     Download(String),
+    /// O download se perdeu sem culpa do release (os arquivos sumiram do
+    /// disco): desiste e busca de novo, sem bloquear.
+    Lost(String),
     /// A importação é o problema: tenta de novo na próxima rodada.
     Import(String),
 }
@@ -977,6 +1296,7 @@ pub async fn give_up(
     store
         .update_grab(grab.id, GrabState::Failed, Some(reason), None, &at)
         .await?;
+    watch().forget(&grab.hash);
     if blocklist {
         store
             .block(&acervo_store::Blocked {
@@ -1029,7 +1349,9 @@ async fn search_again(config: &Config, store: &Store, catalog: Option<&Catalog>,
 }
 
 /// Tira um download da fila: apaga do cliente (com os arquivos) se pedido,
-/// bloqueia o release se pedido e busca outro se pedido.
+/// bloqueia o release se pedido e busca outro se pedido. Sem apagar, o
+/// torrent perde a tag da fila: fica no cliente, parado, e a fila não o
+/// inicia nem o apaga.
 ///
 /// # Errors
 ///
@@ -1055,12 +1377,17 @@ pub async fn remove_download(
         .into_iter()
         .find(|m| m.id == grab.movie_id)
         .context("o filme do download saiu do catálogo")?;
+    let client = qbit(config).await?;
     if remove_from_client {
-        qbit(config)
-            .await?
+        client
             .delete(&[acervo_core::DownloadHash::new(grab.hash.clone())], true)
             .await
             .context("apagando do qBittorrent")?;
+    } else {
+        client
+            .remove_tag(&[&grab.hash], QUEUE_TAG)
+            .await
+            .context("tirando da fila do qBittorrent")?;
     }
     let (reason, kind) = if blocklist {
         ("marcado como falho na tela", Kind::Failed)
@@ -1077,19 +1404,346 @@ pub async fn remove_download(
     Ok(())
 }
 
-/// Importa os downloads do acervo que terminaram. Sem `apply`, só diz o que
-/// faria.
+/// Apaga do cliente o torrent de um grab de filme, com os arquivos, se
+/// nenhum deles tem outro link. Com link, fica, com aviso.
+async fn delete_unlinked(
+    config: &Config,
+    client: &QbitClient,
+    torrent: &acervo_clients::TorrentInfo,
+    why: &str,
+) -> Result<(), String> {
+    if only_link(config, client, torrent).await {
+        client
+            .delete(
+                &[acervo_core::DownloadHash::new(torrent.hash.clone())],
+                true,
+            )
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        tracing::warn!(
+            torrent = %torrent.name,
+            "{why}, com arquivo ligado em outro lugar: fica no cliente"
+        );
+        Ok(())
+    }
+}
+
+/// Apaga do cliente o torrent de um grab de filme que sai ainda na fila, sem
+/// nada baixado: sem grab em andamento, ele ficaria no cliente sem dono. Só
+/// se for dele; erro vira aviso.
+pub(crate) async fn drop_queued(config: &Config, store: &Store, client: &QbitClient, grab: &Grab) {
+    let torrent = match client.torrent(&grab.hash).await {
+        Ok(Some(torrent)) if torrent.has_tag(QUEUE_TAG) && torrent.progress <= 0.0 => torrent,
+        Ok(_) => return,
+        Err(error) => {
+            tracing::warn!(
+                release = grab.title,
+                "torrent da fila não conferido: {error}"
+            );
+            return;
+        }
+    };
+    let owner = crate::series::grab::Owner::Movie(grab.id);
+    if !crate::series::grab::owns_torrent(config, store, client, owner, &grab.grabbed_at, &torrent)
+        .await
+    {
+        tracing::warn!(
+            release = grab.title,
+            "torrent na fila sem grab, mas não é só deste: fica no cliente"
+        );
+        return;
+    }
+    if let Err(error) = client
+        .delete(&[acervo_core::DownloadHash::new(grab.hash.clone())], true)
+        .await
+    {
+        tracing::warn!(release = grab.title, "torrent da fila não apagado: {error}");
+    }
+}
+
+/// O que uma volta da importação fez com um grab de filme.
+enum Step {
+    /// Ainda não terminou: o porquê, para a tela.
+    Waiting(String),
+    /// O arquivo foi ligado na pasta do filme.
+    Imported(Imported),
+    /// O filme ganhou arquivo por outro caminho: o grab não tem mais o que
+    /// fazer.
+    Superseded,
+}
+
+/// O andamento como a fila mostra.
+pub(crate) fn progress(torrent: &acervo_clients::TorrentInfo) -> String {
+    if torrent.has_tag(QUEUE_TAG) {
+        QUEUED.into()
+    } else if matches!(torrent.state.as_str(), "pausedDL" | "stoppedDL") {
+        format!("parado, {:.0}%", torrent.progress * 100.0)
+    } else {
+        format!("{:.0}%", torrent.progress * 100.0)
+    }
+}
+
+/// O que a importação de filmes lê uma vez por volta.
+struct MovieImport<'a> {
+    config: &'a Config,
+    client: QbitClient,
+    free_space: Option<u64>,
+    map: acervo_fs::PathMap,
+}
+
+impl MovieImport<'_> {
+    /// Uma volta de um grab: o estado do torrent decide se espera, se
+    /// desiste ou se liga o arquivo.
+    #[allow(clippy::too_many_lines)] // A sequência da importação; dividir só espalharia.
+    async fn step(&self, entry: &acervo_store::CatalogMovie, grab: &Grab) -> Result<Step, Failure> {
+        let movie = &entry.movie;
+        let client = &self.client;
+        let torrent = client
+            .torrent(&grab.hash)
+            .await
+            .map_err(|e| e.to_string())?;
+        // Arquivo que não é o que o grab ia trocar: alguém importou por
+        // outro caminho no meio. O torrent, que nada ligou, sai do cliente.
+        let current = movie.file.as_ref().map(|f| f.relative_path.as_str());
+        if current.is_some() && current != grab.replaces.as_deref() {
+            if let Some(torrent) = &torrent {
+                delete_unlinked(self.config, client, torrent, "grab que perdeu o motivo").await?;
+            }
+            return Ok(Step::Superseded);
+        }
+        let torrent = torrent.ok_or_else(|| missing(&grab.grabbed_at))?;
+        let now = OffsetDateTime::now_utc();
+        // Disco cheio não é culpa do release: bloquear e buscar outro só
+        // empilha torrents que dão o mesmo erro. Volta para a fila, com o que
+        // já baixou.
+        if torrent.state == "error" {
+            // Sem saber o espaço não dá para culpar o release: tenta de novo
+            // na próxima rodada.
+            let free = self
+                .free_space
+                .ok_or("erro no cliente e espaço livre ilegível")?;
+            if free < left(torrent.size, torrent.progress) {
+                watch().observe(&torrent.hash, Condition::ClientError, false, now);
+                // A fila não é falta de seed: a contagem do sem seeds recomeça.
+                watch().observe(&torrent.hash, Condition::NoSeeds, false, now);
+                client
+                    .stop(&[&grab.hash])
+                    .await
+                    .map_err(|e| e.to_string())?;
+                client
+                    .add_tag(&[&grab.hash], QUEUE_TAG)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                return Ok(Step::Waiting(QUEUED.into()));
+            }
+        }
+        let trouble = client_trouble(&mut watch(), &torrent, now);
+        if let Some(failure) = trouble {
+            // Arquivo sumido: o torrent perdido sai do cliente (se nenhum
+            // arquivo tem outro link), senão a nova busca devolveria o mesmo
+            // hash, ainda em `missingFiles`, e o ciclo nunca acabaria. Sem
+            // bloqueio: a culpa não é do release.
+            if matches!(failure, Failure::Lost(_)) {
+                delete_unlinked(self.config, client, &torrent, "arquivos sumidos").await?;
+            }
+            return Err(failure);
+        }
+        if gone_from_tracker(client, &torrent).await {
+            tracing::info!(
+                filme = movie.title,
+                release = grab.title,
+                "o tracker não reconhece mais o torrent"
+            );
+            // Como o sem seeds: bloqueio e nova busca vêm do
+            // `Failure::Download`; o torrent morto sai do cliente, se nenhum
+            // arquivo dele tem outro link.
+            delete_unlinked(self.config, client, &torrent, "torrent desregistrado").await?;
+            return Err(Failure::Download(UNREGISTERED.into()));
+        }
+        let stuck = no_seeds(&mut watch(), &torrent, now);
+        if stuck {
+            tracing::info!(
+                filme = movie.title,
+                release = grab.title,
+                "trocando release sem seeds"
+            );
+            // O bloqueio e a nova busca vêm do `Failure::Download`; o torrent
+            // travado, porém, ocuparia vaga e reserva.
+            delete_unlinked(self.config, client, &torrent, "torrent sem seeds").await?;
+            return Err(Failure::Download(NO_SEEDS.into()));
+        }
+        if torrent.progress < 1.0 {
+            return Ok(Step::Waiting(progress(&torrent)));
+        }
+        let hash = acervo_core::DownloadHash::new(grab.hash.clone());
+        let files = client.files(&hash).await.map_err(|e| e.to_string())?;
+        let video = main_video(&files).ok_or("nenhum vídeo no torrent")?;
+        let extension = Path::new(&video.name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("mkv")
+            .to_ascii_lowercase();
+        let relative = format!(
+            "{}.{extension}",
+            movie_file_stem(movie, entry.extras.metadata_title.as_deref())
+        );
+        let map = &self.map;
+        let destination = PathBuf::from(&movie.path).join(&relative);
+        let old_host = match current {
+            Some(old) => Some(
+                map.to_host(&PathBuf::from(&movie.path).join(old))
+                    .map_err(|e| e.to_string())?,
+            ),
+            None => None,
+        };
+        let size = video.size;
+        let source_host = map
+            .to_host(&client_path(&torrent, video))
+            .map_err(|e| e.to_string())?;
+        let destination_host = map.to_host(&destination).map_err(|e| e.to_string())?;
+        let installed = destination_host.clone();
+        tokio::task::spawn_blocking(move || install(&source_host, &installed, old_host.as_deref()))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?;
+        let subtitles = link_movie_subtitles(
+            map,
+            &torrent,
+            &files,
+            &movie.path,
+            &relative,
+            &entry.subtitles,
+        )
+        .await;
+        Ok(Step::Imported(Imported {
+            shown: destination.display().to_string(),
+            relative,
+            size,
+            host: destination_host,
+            subtitles,
+        }))
+    }
+}
+
+/// Grava o arquivo que a volta ligou: o catálogo, as legendas (as antigas do
+/// torrent saem do disco) e o evento.
+async fn record_import(
+    store: &Store,
+    map: &acervo_fs::PathMap,
+    entry: &acervo_store::CatalogMovie,
+    grab: &Grab,
+    imported: Imported,
+) -> Result<String> {
+    let Imported {
+        shown: destination,
+        relative,
+        size,
+        host,
+        subtitles,
+    } = imported;
+    let movie = &entry.movie;
+    let probe = crate::mediainfo::probe(&host).await;
+    store
+        .set_movie_file(entry.id, Some(&imported_file(grab, relative, size, probe)))
+        .await?;
+    // As legendas antigas que não viraram as de agora: a do torrent sai do
+    // disco; a posta à mão fica, e continua no catálogo (como do disco). As
+    // novas entram no catálogo.
+    let mut kept = Vec::new();
+    for old in &entry.subtitles {
+        let path = &old.subtitle.relative_path;
+        if subtitles.iter().any(|s| &s.relative_path == path) {
+            continue;
+        }
+        let Ok(host) = map.to_host(&PathBuf::from(&movie.path).join(path)) else {
+            continue;
+        };
+        let origin = Some(old.subtitle.origin);
+        let gone = tokio::task::spawn_blocking(move || {
+            crate::subtitles::remove_if_from_torrent(&host, origin)
+        })
+        .await;
+        match gone {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => kept.push(acervo_store::Subtitle {
+                origin: acervo_store::SubtitleOrigin::Disk,
+                ..old.subtitle.clone()
+            }),
+            Ok(Err(error)) => {
+                tracing::warn!(legenda = path, "antiga não apagada: {error}");
+            }
+            Err(error) => tracing::warn!(legenda = path, "antiga não apagada: {error}"),
+        }
+    }
+    for subtitle in subtitles.iter().chain(&kept) {
+        if let Err(error) = store.add_movie_subtitle(entry.id, subtitle).await {
+            tracing::warn!(
+                legenda = subtitle.relative_path,
+                "legenda fora do catálogo: {error}"
+            );
+        }
+    }
+    store
+        .update_grab(
+            grab.id,
+            GrabState::Imported,
+            None,
+            Some(&destination),
+            &now_rfc3339(),
+        )
+        .await?;
+    watch().forget(&grab.hash);
+    events::record(
+        store,
+        Event {
+            source_title: Some(grab.title.clone()),
+            quality: Some(grab.quality),
+            indexer: Some(grab.indexer.clone()),
+            download_id: Some(grab.hash.clone()),
+            message: Some(destination.clone()),
+            poster: entry.extras.poster.clone(),
+            ..Event::new(
+                if grab.replaces.is_some() {
+                    Kind::Upgraded
+                } else {
+                    Kind::Imported
+                },
+                Some(entry.id),
+                events::label(&movie.title, movie.year),
+            )
+        },
+    )
+    .await;
+    Ok(destination)
+}
+
+/// A importação travada há horas avisa, uma vez por grab.
+pub(crate) async fn notify_attention(
+    store: &Store,
+    hash: &str,
+    stuck: bool,
+    label: &str,
+    release: &str,
+    message: &str,
+    poster: Option<&str>,
+) {
+    let due = attention_due(&mut watch(), hash, stuck, OffsetDateTime::now_utc());
+    if due {
+        events::notify_stuck(store, label, release, message, poster).await;
+    }
+}
+
+/// Importa os downloads do acervo que terminaram.
 ///
 /// # Errors
 ///
 /// Catálogo ilegível ou cliente inalcançável. Falha de um download fica na
 /// linha dele; os outros seguem.
-#[allow(clippy::too_many_lines)]
 pub async fn import_downloads(
     config: &Config,
     store: &Store,
     catalog: Option<&Catalog>,
-    apply: bool,
 ) -> Result<Vec<ImportLine>> {
     let pending: Vec<Grab> = store
         .grabs()
@@ -1101,294 +1755,90 @@ pub async fn import_downloads(
         return Ok(Vec::new());
     }
     let client = qbit(config).await?;
-    if apply && let Err(error) = start_queued(store, &client).await {
-        tracing::warn!("fila de downloads: {error:#}");
-    }
-    let free_space = client.free_space().await.ok();
+    let round = MovieImport {
+        config,
+        free_space: client.free_space().await.ok(),
+        client,
+        map: config.path_map(),
+    };
     let movies = store.movies().await?;
-    let map = config.path_map();
     let mut lines = Vec::new();
     for grab in pending {
         let Some(entry) = movies.iter().find(|m| m.id == grab.movie_id) else {
             continue;
         };
-        let movie = &entry.movie;
-        let filme = match movie.year {
-            Some(year) => format!("{} ({year})", movie.title),
-            None => movie.title.clone(),
-        };
+        let filme = events::label(&entry.movie.title, entry.movie.year);
         let mut line = ImportLine {
-            filme,
+            filme: filme.clone(),
             release: grab.title.clone(),
             estado: "baixando",
             detalhe: None,
             destino: None,
         };
-        let outcome: Result<Option<Imported>, Failure> = async {
-            let torrent = client
-                .torrent(&grab.hash)
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| missing(&grab.grabbed_at))?;
-            // Disco cheio não é culpa do release: bloquear e buscar outro só
-            // empilha torrents que dão o mesmo erro. Volta para a fila, com
-            // o que já baixou.
-            if torrent.state == "error" {
-                // Sem saber o espaço não dá para culpar o release: tenta de
-                // novo na próxima rodada.
-                let free = free_space.ok_or("erro no cliente e espaço livre ilegível")?;
-                if free < left(torrent.size, torrent.progress) {
-                    if apply {
-                        client
-                            .stop(&[&grab.hash])
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        client
-                            .add_tag(&[&grab.hash], QUEUE_TAG)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                    }
-                    line.detalhe = Some(QUEUED.into());
-                    return Ok(None);
-                }
-            }
-            if matches!(torrent.state.as_str(), "error" | "missingFiles") {
-                return Err(Failure::Download(format!(
-                    "o cliente marcou o torrent com `{}`",
-                    torrent.state
-                )));
-            }
-            if gone_from_tracker(&client, &torrent, apply).await {
-                tracing::info!(
-                    filme = line.filme,
-                    release = grab.title,
-                    "o tracker não reconhece mais o torrent"
-                );
-                // Como o sem seeds: bloqueio e nova busca vêm do
-                // `Failure::Download`; o torrent morto sai do cliente, se
-                // nenhum arquivo dele tem outro link.
-                if apply {
-                    if only_link(config, &client, &torrent).await {
-                        client
-                            .delete(&[acervo_core::DownloadHash::new(grab.hash.clone())], true)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                    } else {
-                        tracing::warn!(
-                            release = grab.title,
-                            "torrent desregistrado com arquivo ligado em outro lugar: fica no cliente"
-                        );
-                    }
-                }
-                return Err(Failure::Download(UNREGISTERED.into()));
-            }
-            if stalled(&torrent, time::OffsetDateTime::now_utc()) {
-                tracing::info!(
-                    filme = line.filme,
-                    release = grab.title,
-                    "trocando release sem seeds"
-                );
-                // O bloqueio e a nova busca vêm do `Failure::Download`; o
-                // torrent travado, porém, ocuparia vaga e reserva.
-                if apply {
-                    client
-                        .delete(&[acervo_core::DownloadHash::new(grab.hash.clone())], true)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
-                return Err(Failure::Download(NO_SEEDS.into()));
-            }
-            if torrent.progress < 1.0 {
-                line.detalhe = Some(if torrent.has_tag(QUEUE_TAG) {
-                    QUEUED.into()
-                } else if matches!(torrent.state.as_str(), "pausedDL" | "stoppedDL") {
-                    format!("parado, {:.0}%", torrent.progress * 100.0)
-                } else {
-                    format!("{:.0}%", torrent.progress * 100.0)
-                });
-                return Ok(None);
-            }
-            // Arquivo que não é o que o grab ia trocar: alguém importou por
-            // outro caminho no meio.
-            let current = movie.file.as_ref().map(|f| f.relative_path.as_str());
-            if current.is_some() && current != grab.replaces.as_deref() {
-                return Err("o filme ganhou arquivo por outro caminho".into());
-            }
-            let hash = acervo_core::DownloadHash::new(grab.hash.clone());
-            let files = client.files(&hash).await.map_err(|e| e.to_string())?;
-            let video = main_video(&files).ok_or("nenhum vídeo no torrent")?;
-            let extension = Path::new(&video.name)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("mkv")
-                .to_ascii_lowercase();
-            let relative = format!(
-                "{}.{extension}",
-                movie_file_stem(movie, entry.extras.metadata_title.as_deref())
-            );
-            let destination = PathBuf::from(&movie.path).join(&relative);
-            let old_host = match current {
-                Some(old) => Some(
-                    map.to_host(&PathBuf::from(&movie.path).join(old))
-                        .map_err(|e| e.to_string())?,
-                ),
-                None => None,
-            };
-            let size = video.size;
-            let source_host = map
-                .to_host(&client_path(&torrent, video))
-                .map_err(|e| e.to_string())?;
-            let destination_host = map.to_host(&destination).map_err(|e| e.to_string())?;
-            let shown = destination.display().to_string();
-            if !apply {
-                return Ok(Some(Imported {
-                    shown,
-                    relative,
-                    size,
-                    host: destination_host,
-                    subtitles: Vec::new(),
-                }));
-            }
-            let installed = destination_host.clone();
-            tokio::task::spawn_blocking(move || {
-                install(&source_host, &installed, old_host.as_deref())
-            })
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| format!("{e:#}"))?;
-            let subtitles =
-                link_movie_subtitles(
-                    &map,
-                    &torrent,
-                    &files,
-                    &movie.path,
-                    &relative,
-                    &entry.subtitles,
-                )
-                .await;
-            Ok(Some(Imported {
-                shown,
-                relative,
-                size,
-                host: destination_host,
-                subtitles,
-            }))
-        }
-        .await;
-
-        let at = now_rfc3339();
-        match outcome {
-            Ok(None) => {
-                if apply {
-                    store
-                        .update_grab(
-                            grab.id,
-                            GrabState::Downloading,
-                            line.detalhe.as_deref(),
-                            None,
-                            &at,
-                        )
-                        .await?;
-                }
-            }
-            Ok(Some(imported)) if !apply => {
-                line.estado = "importaria";
-                line.destino = Some(imported.shown);
-            }
-            Ok(Some(Imported {
-                shown: destination,
-                relative,
-                size,
-                host,
-                subtitles,
-            })) => {
-                let probe = crate::mediainfo::probe(&host).await;
+        let step = round.step(entry, &grab).await;
+        let stuck = matches!(step, Err(Failure::Import(_)));
+        match step {
+            Ok(Step::Waiting(detail)) => {
                 store
-                    .set_movie_file(entry.id, Some(&imported_file(&grab, relative, size, probe)))
+                    .update_grab(
+                        grab.id,
+                        GrabState::Downloading,
+                        Some(&detail),
+                        None,
+                        &now_rfc3339(),
+                    )
                     .await?;
-                // As legendas antigas que não viraram as de agora: a do
-                // torrent sai do disco; a posta à mão fica, e continua no
-                // catálogo (como do disco). As novas entram no catálogo.
-                let mut kept = Vec::new();
-                for old in &entry.subtitles {
-                    let path = &old.subtitle.relative_path;
-                    if subtitles.iter().any(|s| &s.relative_path == path) {
-                        continue;
-                    }
-                    let Ok(host) = map.to_host(&PathBuf::from(&movie.path).join(path)) else {
-                        continue;
-                    };
-                    let origin = Some(old.subtitle.origin);
-                    let gone = tokio::task::spawn_blocking(move || {
-                        crate::subtitles::remove_if_from_torrent(&host, origin)
-                    })
-                    .await;
-                    match gone {
-                        Ok(Ok(true)) => {}
-                        Ok(Ok(false)) => kept.push(acervo_store::Subtitle {
-                            origin: acervo_store::SubtitleOrigin::Disk,
-                            ..old.subtitle.clone()
-                        }),
-                        Ok(Err(error)) => {
-                            tracing::warn!(legenda = path, "antiga não apagada: {error}");
-                        }
-                        Err(error) => tracing::warn!(legenda = path, "antiga não apagada: {error}"),
-                    }
-                }
-                for subtitle in subtitles.iter().chain(&kept) {
-                    if let Err(error) = store.add_movie_subtitle(entry.id, subtitle).await {
-                        tracing::warn!(
-                            legenda = subtitle.relative_path,
-                            "legenda fora do catálogo: {error}"
-                        );
-                    }
-                }
-                store
-                    .update_grab(grab.id, GrabState::Imported, None, Some(&destination), &at)
-                    .await?;
+                line.detalhe = Some(detail);
+            }
+            Ok(Step::Imported(imported)) => {
+                let destination = record_import(store, &round.map, entry, &grab, imported).await?;
                 line.estado = "importado";
-                line.destino = Some(destination.clone());
-                events::record(
-                    store,
-                    Event {
-                        source_title: Some(grab.title.clone()),
-                        quality: Some(grab.quality),
-                        indexer: Some(grab.indexer.clone()),
-                        download_id: Some(grab.hash.clone()),
-                        message: Some(destination),
-                        poster: entry.extras.poster.clone(),
-                        ..Event::new(
-                            if grab.replaces.is_some() {
-                                Kind::Upgraded
-                            } else {
-                                Kind::Imported
-                            },
-                            Some(entry.id),
-                            events::label(&movie.title, movie.year),
-                        )
-                    },
-                )
-                .await;
+                line.destino = Some(destination);
+            }
+            Ok(Step::Superseded) => {
+                let reason = "o filme ganhou arquivo por outro caminho";
+                line.estado = "descartado";
+                line.detalhe = Some(reason.into());
+                give_up(store, &grab, entry, reason, false, Kind::Ignored).await?;
             }
             Err(Failure::Download(error)) => {
                 line.estado = "falhou";
                 line.detalhe = Some(error.clone());
-                if apply {
-                    give_up(store, &grab, entry, &error, true, Kind::Failed).await?;
-                    search_again(config, store, catalog, entry.id).await;
-                }
+                give_up(store, &grab, entry, &error, true, Kind::Failed).await?;
+                search_again(config, store, catalog, entry.id).await;
+            }
+            // O arquivo sumido do disco não é culpa do release: sem bloqueio.
+            Err(Failure::Lost(error)) => {
+                line.estado = "falhou";
+                line.detalhe = Some(error.clone());
+                give_up(store, &grab, entry, &error, false, Kind::Failed).await?;
+                search_again(config, store, catalog, entry.id).await;
             }
             Err(Failure::Import(error)) => {
                 line.estado = "atencao";
                 line.detalhe = Some(error.clone());
-                if apply {
-                    let message = format!("importação: {error}");
-                    store
-                        .update_grab(grab.id, GrabState::Downloading, Some(&message), None, &at)
-                        .await?;
-                }
+                let message = format!("importação: {error}");
+                store
+                    .update_grab(
+                        grab.id,
+                        GrabState::Downloading,
+                        Some(&message),
+                        None,
+                        &now_rfc3339(),
+                    )
+                    .await?;
             }
         }
+        notify_attention(
+            store,
+            &grab.hash,
+            stuck,
+            &filme,
+            &grab.title,
+            line.detalhe.as_deref().unwrap_or_default(),
+            entry.extras.poster.as_deref(),
+        )
+        .await;
         lines.push(line);
     }
     Ok(lines)
@@ -1530,6 +1980,165 @@ mod tests {
         assert!(!stalled(&t, now));
     }
 
+    fn torrent(state: &str) -> acervo_clients::TorrentInfo {
+        serde_json::from_value(serde_json::json!({
+            "hash": "h", "name": "n", "state": state, "save_path": "/", "progress": 0.4,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn so_espera_na_fila_o_torrent_com_a_tag_e_sem_progresso() {
+        let queued = |progress: f64| -> acervo_clients::TorrentInfo {
+            serde_json::from_value(serde_json::json!({
+                "hash": "h", "name": "n", "state": "pausedDL", "save_path": "/",
+                "tags": QUEUE_TAG, "progress": progress,
+            }))
+            .unwrap()
+        };
+        assert!(is_waiting(&queued(0.0)));
+        assert!(!is_waiting(&queued(0.02)));
+        // Sem a tag, mesmo parado e sem progresso, não é da fila.
+        let mut other = queued(0.0);
+        other.tags = String::new();
+        assert!(!is_waiting(&other));
+    }
+
+    #[test]
+    fn arquivos_sumidos_so_viram_falha_sem_bloqueio_depois_de_30_min_observados() {
+        let mut watch = Watch::default();
+        let start = at("2026-10-03T12:00:00Z");
+        let missing = torrent("missingFiles");
+        for minutes in [0, 10, 29] {
+            assert!(
+                matches!(
+                    client_trouble(
+                        &mut watch,
+                        &missing,
+                        start + time::Duration::minutes(minutes)
+                    ),
+                    Some(Failure::Import(_))
+                ),
+                "{minutes} min"
+            );
+        }
+        assert!(matches!(
+            client_trouble(&mut watch, &missing, start + time::Duration::minutes(30)),
+            Some(Failure::Lost(message)) if message == MISSING_FILES
+        ));
+        // Voltou ao normal: a contagem recomeça.
+        assert!(client_trouble(&mut watch, &torrent("stalledDL"), start).is_none());
+        assert!(matches!(
+            client_trouble(&mut watch, &missing, start + time::Duration::hours(2)),
+            Some(Failure::Import(_))
+        ));
+    }
+
+    #[test]
+    fn erro_com_espaco_vira_falha_com_bloqueio_que_expira() {
+        let mut watch = Watch::default();
+        let start = at("2026-10-03T12:00:00Z");
+        let error = torrent("error");
+        assert!(matches!(
+            client_trouble(&mut watch, &error, start),
+            Some(Failure::Import(_))
+        ));
+        let Some(Failure::Download(message)) =
+            client_trouble(&mut watch, &error, start + time::Duration::minutes(31))
+        else {
+            panic!("erro persistente vira falha de download");
+        };
+        assert_eq!(message, CLIENT_ERROR);
+        assert!(EXPIRING.contains(&message.as_str()));
+        // Cada torrent conta por si.
+        let mut other = torrent("error");
+        other.hash = "outro".into();
+        assert!(matches!(
+            client_trouble(&mut watch, &other, start + time::Duration::minutes(31)),
+            Some(Failure::Import(_))
+        ));
+    }
+
+    #[test]
+    fn sem_seeds_exige_30_min_observados_e_retomar_recomeca() {
+        let now = at("2026-10-03T12:00:00Z");
+        let mut watch = Watch::default();
+        // O cliente diz que está ativo há horas (tempo de antes de parar), mas
+        // este processo acabou de vê-lo: ainda não.
+        let mut resumed = travado(now);
+        resumed.time_active = 5 * 3600;
+        assert!(!no_seeds(&mut watch, &resumed, now));
+        assert!(!no_seeds(
+            &mut watch,
+            &resumed,
+            now + time::Duration::minutes(29)
+        ));
+        let later = now + time::Duration::minutes(30);
+        let mut quiet = resumed.clone();
+        quiet.last_activity = later.unix_timestamp() - 1800;
+        assert!(no_seeds(&mut watch, &quiet, later));
+
+        // Parado ou na fila do cliente no meio: recomeça do zero.
+        let mut watch = Watch::default();
+        assert!(!no_seeds(&mut watch, &resumed, now));
+        let mut held = resumed.clone();
+        held.state = "queuedDL".into();
+        assert!(!no_seeds(
+            &mut watch,
+            &held,
+            now + time::Duration::minutes(15)
+        ));
+        assert!(!no_seeds(&mut watch, &quiet, later));
+        assert!(no_seeds(
+            &mut watch,
+            &quiet,
+            later + time::Duration::minutes(30)
+        ));
+    }
+
+    #[test]
+    fn atencao_avisa_uma_vez_depois_de_6_horas_seguidas() {
+        let mut watch = Watch::default();
+        let start = at("2026-10-03T00:00:00Z");
+        let hours = |n: i64| start + time::Duration::hours(n);
+        assert!(!attention_due(&mut watch, "h", true, start));
+        assert!(!attention_due(&mut watch, "h", true, hours(5)));
+        // Saiu de atenção: recomeça.
+        assert!(!attention_due(&mut watch, "h", false, hours(5)));
+        assert!(!attention_due(&mut watch, "h", true, hours(6)));
+        assert!(attention_due(&mut watch, "h", true, hours(12)));
+        // Uma vez só por grab.
+        assert!(!attention_due(&mut watch, "h", true, hours(13)));
+        assert!(!attention_due(&mut watch, "h", true, hours(30)));
+        // O grab terminou: outro grab do mesmo torrent avisa de novo.
+        watch.forget("h");
+        assert!(!attention_due(&mut watch, "h", true, hours(31)));
+        assert!(attention_due(&mut watch, "h", true, hours(37)));
+    }
+
+    #[test]
+    fn fila_sem_grab_so_com_tag_categoria_e_passada_a_carencia() {
+        let now = 1_000_000;
+        let queued = |hash: &str, category: &str, tags: &str, added_on: i64| {
+            serde_json::from_value::<acervo_clients::TorrentInfo>(serde_json::json!({
+                "hash": hash, "name": hash, "state": "stoppedDL", "save_path": "/",
+                "category": category, "tags": tags, "added_on": added_on,
+            }))
+            .unwrap()
+        };
+        let old = now - ORPHAN_GRACE;
+        let torrents = [
+            queued("orfao", "acervo", QUEUE_TAG, old),
+            queued("com-grab", "acervo", QUEUE_TAG, old),
+            queued("recente", "acervo", QUEUE_TAG, now - 60),
+            queued("sem-data", "acervo", QUEUE_TAG, 0),
+            queued("manual", "manual", QUEUE_TAG, old),
+            queued("sem-tag", "acervo", "", old),
+        ];
+        let known = HashMap::from([("com-grab".to_owned(), 1)]);
+        assert_eq!(orphans(&torrents, &known, "acervo", now), ["orfao"]);
+    }
+
     #[test]
     fn bloqueio_sem_seeds_expira_em_sete_dias() {
         let blocked = |message: Option<&str>| acervo_store::Blocked {
@@ -1547,6 +2156,11 @@ mod tests {
         let sem_seeds = blocked(Some(NO_SEEDS));
         assert!(still_blocks(&sem_seeds, at("2026-10-07T23:59:59Z")));
         assert!(!still_blocks(&sem_seeds, at("2026-10-08T00:00:00Z")));
+        // O de erro do cliente também.
+        assert!(!still_blocks(
+            &blocked(Some(CLIENT_ERROR)),
+            at("2026-10-08T00:00:00Z")
+        ));
         // Outra mensagem, ou nenhuma, nunca expira.
         let outra = blocked(Some("o torrent sumiu do cliente"));
         assert!(still_blocks(&outra, at("2027-10-01T00:00:00Z")));

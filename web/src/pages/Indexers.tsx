@@ -71,7 +71,7 @@ export function IndexersPage() {
     <>
       <PageHeader
         title="Indexadores"
-        description="Saúde desde que o serviço subiu; consultas, falhas e grabs por dia ficam guardados. Cada busca — do Sonarr ou daqui — atualiza esta tela."
+        description="Saúde desde que o serviço subiu; consultas, falhas e grabs por dia ficam guardados. Cada busca — automática ou daqui — atualiza esta tela."
         action={
           <div className="flex gap-2">
             <Button onClick={() => void indexers.refetch()} loading={indexers.isFetching && !indexers.isPending}>
@@ -254,7 +254,7 @@ function IndexerCard({
   const toggle = useMutation({
     mutationFn: (ativo: boolean) => api.setEnabled(indexer.nome, ativo),
     onSuccess: (_, ativo) =>
-      toast.success(ativo ? `${indexer.nome} ativado` : `${indexer.nome} desativado — não é servido nem sincronizado`),
+      toast.success(ativo ? `${indexer.nome} ativado` : `${indexer.nome} desativado — fora das buscas`),
     onError: (error: Error) => toast.error(error.message),
     onSettled: () => void queryClient.invalidateQueries({ queryKey: ['indexadores'] }),
   })
@@ -343,7 +343,7 @@ function IndexerCard({
 
       {!indexer.ativo ? (
         <p className="border-t border-border pt-4 text-sm text-content-muted">
-          Desativado: não é servido ao Sonarr nem entra na busca. Ative para voltar.
+          Desativado: não entra em busca nenhuma. Ative para voltar.
         </p>
       ) : (
       <dl className="grid grid-cols-3 gap-3 border-t border-border pt-4 text-sm">
@@ -406,8 +406,8 @@ function IndexerCard({
           <DialogHeader>
             <DialogTitle>Remover {indexer.nome}?</DialogTitle>
             <DialogDescription>
-              Sai do acervo-hub junto com as credenciais guardadas. O cadastro dele no Sonarr só some na
-              próxima sincronização; para trazê-lo de volta, adicione-o de novo pelo catálogo.
+              Sai do acervo-hub junto com as credenciais guardadas. Para trazê-lo de volta, adicione-o de
+              novo pelo catálogo.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

@@ -9,8 +9,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { type DecisionRules, type RulesView, library } from '@/lib/api'
 
 const PROPERS = [
-  { value: 'preferir_e_atualizar', label: 'Preferir e trocar pelo PROPER/REPACK' },
-  { value: 'nao_atualizar', label: 'Preferir, mas não trocar o que já tem' },
+  { value: 'preferir', label: 'Preferir o PROPER/REPACK' },
   { value: 'nao_preferir', label: 'Ignorar PROPER/REPACK' },
 ] as const
 

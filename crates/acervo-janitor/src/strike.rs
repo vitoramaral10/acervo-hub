@@ -1,35 +1,24 @@
-//! Contagem de strikes: um item precisa aparecer como órfão várias execuções
-//! seguidas antes de sair.
+//! Contagem de strikes: um download precisa aparecer sem dono várias
+//! execuções seguidas antes de sair.
 //!
 //! O que a contagem protege não é o falso positivo lógico — é a leitura
-//! instantânea errada. Uma instância que responde uma vez com a fila torta
-//! marca um strike, não apaga.
+//! instantânea errada. Uma leitura torta do cliente ou do catálogo marca um
+//! strike, não apaga.
 
 use std::collections::HashMap;
 
-use acervo_core::{DownloadHash, QueueItem};
+use acervo_core::DownloadHash;
 use serde::{Deserialize, Serialize};
 
-/// Chave estável de um item entre ciclos.
-///
-/// Prefere o hash do download ao id do item: ids de fila são reatribuídos
-/// quando a instância reinicia, e um id reciclado herdaria strikes alheios.
+/// Chave estável de um download entre ciclos: o hash dele.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StrikeKey(String);
 
 impl StrikeKey {
-    #[must_use]
-    pub fn for_item(item: &QueueItem) -> Self {
-        let tail = item
-            .download
-            .as_ref()
-            .map_or_else(|| format!("titulo:{}", item.title), |h| format!("hash:{h}"));
-        Self(format!("{}/{tail}", item.instance))
-    }
-
-    /// Chave de um download sem dono, que não tem item de fila: o prefixo
-    /// `download/` o separa das chaves de fila, que começam pela instância.
+    /// Chave de um download sem dono. O prefixo `download/` vem de quando
+    /// havia também chave de item de fila; ficou para não zerar os strikes
+    /// gravados.
     #[must_use]
     pub fn for_download(hash: &DownloadHash) -> Self {
         Self(format!("download/hash:{hash}"))
@@ -71,9 +60,8 @@ impl StrikeLedger {
 
     /// Esquece tudo que não apareceu neste ciclo.
     ///
-    /// Sem isso, um item que deixou de ser órfão — porque a obra voltou, ou
-    /// porque a instância estava fora do ar — guardaria strikes antigos e
-    /// seria apagado na primeira recaída.
+    /// Sem isso, um download que voltou a ter dono guardaria strikes antigos
+    /// e seria apagado na primeira recaída.
     pub fn retain_only(&mut self, seen: &[StrikeKey]) {
         self.counts.retain(|k, _| seen.contains(k));
     }
@@ -92,39 +80,25 @@ impl StrikeLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use acervo_core::{DownloadHash, InstanceName, QueueItemId};
 
-    fn item(id: i64, hash: Option<&str>) -> QueueItem {
-        QueueItem {
-            id: QueueItemId(id),
-            instance: InstanceName::new("filmes"),
-            title: format!("titulo {id}"),
-            download: hash.map(DownloadHash::new),
-            work: None,
-        }
+    fn chave(hash: &str) -> StrikeKey {
+        StrikeKey::for_download(&DownloadHash::new(hash))
     }
 
     #[test]
     fn strikes_acumulam_um_por_ciclo() {
         let mut l = StrikeLedger::new();
-        let k = StrikeKey::for_item(&item(1, Some("aa")));
+        let k = chave("aa");
         assert_eq!(l.strike(k.clone()), 1);
         assert_eq!(l.strike(k.clone()), 2);
         assert_eq!(l.count(&k), 2);
     }
 
     #[test]
-    fn id_reciclado_nao_herda_strike_de_outro_torrent() {
-        let a = StrikeKey::for_item(&item(1, Some("aa")));
-        let b = StrikeKey::for_item(&item(1, Some("bb")));
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn item_que_deixou_de_ser_orfao_perde_os_strikes() {
+    fn download_que_voltou_a_ter_dono_perde_os_strikes() {
         let mut l = StrikeLedger::new();
-        let sumiu = StrikeKey::for_item(&item(1, Some("aa")));
-        let ficou = StrikeKey::for_item(&item(2, Some("bb")));
+        let sumiu = chave("aa");
+        let ficou = chave("bb");
         l.strike(sumiu.clone());
         l.strike(ficou.clone());
 
@@ -136,17 +110,8 @@ mod tests {
     }
 
     #[test]
-    fn download_sem_dono_nao_colide_com_item_de_fila() {
-        let h = DownloadHash::new("aa");
-        assert_ne!(
-            StrikeKey::for_download(&h),
-            StrikeKey::for_item(&item(1, Some("aa")))
-        );
-    }
-
-    #[test]
-    fn item_sem_hash_cai_no_titulo() {
-        let k = StrikeKey::for_item(&item(1, None));
-        assert!(k.as_str().contains("titulo:"));
+    fn chave_e_o_hash_sem_caixa() {
+        assert_eq!(chave("AA"), chave("aa"));
+        assert_eq!(chave("aa").as_str(), "download/hash:aa");
     }
 }

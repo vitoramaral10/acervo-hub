@@ -148,7 +148,7 @@ async fn trocar_o_indexador_esquece_o_que_era_dele() {
 async fn busca_termina_mesmo_se_quem_pediu_desistir() {
     let indexer = Arc::new(Counting::default());
     let catalog = Catalog::new([entry(Arc::clone(&indexer))]).unwrap();
-    // O gerenciador corta antes de o tracker responder...
+    // Quem pediu desiste antes de o tracker responder...
     let gave_up = tokio::time::timeout(
         Duration::from_millis(10),
         catalog.search(ALL, &movie("Filme")),

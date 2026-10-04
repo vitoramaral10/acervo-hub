@@ -132,6 +132,8 @@ pub struct NotifyOn {
     pub atualizou: bool,
     pub falhou: bool,
     pub removido: bool,
+    /// Download com a importação travada há horas.
+    pub travou: bool,
 }
 
 impl Default for NotifyOn {
@@ -142,6 +144,7 @@ impl Default for NotifyOn {
             atualizou: true,
             falhou: true,
             removido: false,
+            travou: true,
         }
     }
 }
@@ -247,6 +250,31 @@ fn body(event: &Event) -> String {
         lines.push(message.clone());
     }
     lines.join("\n\n")
+}
+
+/// Avisa que a importação de um download está travada há horas. Só a
+/// notificação: o histórico já tem o grab, e o motivo fica na fila.
+pub async fn notify_stuck(
+    store: &Store,
+    label: &str,
+    release: &str,
+    message: &str,
+    poster: Option<&str>,
+) {
+    match gotify(store).await {
+        Ok(Some(gotify)) if gotify.ligado && gotify.eventos.travou => {
+            let title = format!("Importação travada há 6 h: {label}");
+            let body = format!("`{release}`\n\n{message}");
+            let poster = poster.map(str::to_owned);
+            tokio::spawn(async move {
+                if let Err(error) = gotify.send(&title, &body, poster.as_deref()).await {
+                    tracing::warn!("notificação: {error:#}");
+                }
+            });
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!("notificação: {error}"),
+    }
 }
 
 /// Grava o evento no histórico e notifica, se for o caso. Falha de gravação

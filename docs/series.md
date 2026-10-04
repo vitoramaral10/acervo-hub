@@ -11,7 +11,7 @@ motivo de existir:
    o pacote, e às vezes apaga os avulsos. A decisão aceita o pacote se ele cobre ao menos
    um episódio que falta, e o grab manda prioridade zero ao qBittorrent para os arquivos
    que não interessam: baixa-se só o que falta, sem duplicar nada.
-3. **Não há upgrade.** Episódio com arquivo nunca é trocado, como os filmes.
+3. **Não há upgrade.** Episódio com arquivo nunca é trocado.
 
 ## Estado de um episódio
 
@@ -32,9 +32,10 @@ Ao adicionar uma série, a tela escolhe o que buscar: **tudo que falta**, **só 
 ## Metadados
 
 TMDB, com o `tvdb_id` guardado. O título em inglês (`metadata_title`) dá nome à pasta e
-aos arquivos, como fazia o gerenciador anterior. A tarefa `metadados` atualiza cada série
-a cada 12 h: dados da série, e os episódios por `sync_episodes`, que nunca mexe em `skip`
-nem em arquivo.
+aos arquivos. A tarefa `metadados` atualiza cada série a cada 12 h: só os dados que vêm da
+base (nunca pasta, pasta de temporada, `monitor_new` nem prioridade, que são da tela), e os
+episódios por `sync_episodes`, que nunca mexe em `skip` nem em arquivo. Série removida no
+meio da atualização é pulada.
 
 ## Decisão (`acervo-decision`, módulo de episódios)
 
@@ -57,7 +58,8 @@ embutida, bloqueio):
 - `AlreadyQueued`: todos os em Quero que ele cobre já estão num grab em andamento.
 
 O tamanho se mede por episódio: tamanho do release dividido pelos episódios que ele cobre,
-contra a definição de qualidade (MB/min) vezes a duração do episódio (padrão 45 min).
+contra o limite por minuto da qualidade (uma tabela fixa no código, a mesma dos filmes)
+vezes a duração do episódio (padrão 45 min).
 
 Escolha: os aprovados vão na ordem do `rank` de filmes (saúde, qualidade, prioridade do
 indexador, seeders, tamanho). Em seguida, guloso: pega o primeiro, marca os episódios
@@ -106,18 +108,23 @@ Tarefa `importacao`. Para cada grab de série em andamento cujo torrent terminou
 arquivos escolhidos:
 
 - cada vídeo escolhido vira um hardlink em
-  `{pasta da série}/[Season {N}/]{Título} - S{TT}E{EE}[-E{EE}…] - {Título do episódio} {Qualidade}.{ext}`,
-  o formato do gerenciador anterior (multi-episódio no estilo "prefixed range", título de
-  episódio de multi-episódio unido por ` + `);
+  `{pasta da série}/[Season {N}/]{Título} - S{TT}E{EE}[-E{EE}…] - {Título do episódio} {Qualidade}.{ext}`
+  (multi-episódio no estilo "prefixed range", título de episódio de multi-episódio unido
+  por ` + `);
 - **título do episódio é obrigatório**: sem ele, a importação espera a próxima volta, e
   importa com `TBA` depois de 48 h da exibição;
 - `ffprobe` lê os idiomas; `add_episode_file` grava e liga os episódios;
 - o arquivo antigo que ficar sem episódio sai do disco.
 
-Falhas seguem as dos filmes: torrent com erro ou sumido vai para a lista de bloqueio (com
+Falhas seguem as dos filmes: torrent sumido do cliente vai para a lista de bloqueio (com
 `series_id`) e os episódios são buscados de novo; disco cheio devolve o torrent à fila.
-Torrent que o tracker deixou de reconhecer (o avulso apagado quando o pacote sai) conta
-como falha de download e leva à busca do pacote.
+O que o cliente diz uma vez só não derruba o download: `missingFiles` e `error` (com espaço
+livre) tentam de novo até persistirem 30 min observados pelo processo; aí o arquivo sumido
+vira falha sem bloqueio, com o torrent saindo do cliente, e o erro, falha com bloqueio de 7 dias. "Sem seeds" exige, além do
+que o cliente diz, 30 min observados ativo e sem seed — torrent que sai de parado ou da fila
+recomeça a contagem. Torrent que o tracker deixou de reconhecer (o avulso apagado quando o
+pacote sai) conta como falha de download e leva à busca do pacote. Importação travada por
+6 h seguidas avisa pelo Gotify, uma vez por grab.
 
 ## Remoção
 
@@ -133,19 +140,9 @@ como falha de download e leva à busca do pacote.
 Tarefa `assistidos`, junto com os filmes. Episódio assistido por algum usuário do Jellyfin
 há mais que a carência, que não é favorito e cuja série não é favorita: o arquivo sai e o
 episódio fica `watched`. Arquivo multi-episódio só sai quando todos os episódios dele
-foram assistidos. O torrent fica semeando até a limpeza, como nos filmes.
-
-## Migração do gerenciador anterior
-
-Comando único, `series import-sonarr <url> <chave>`, idempotente:
-
-- cada série é achada no TMDB pelo `tvdbId`;
-- pasta, `seasonFolder` e `monitorNewItems` vêm de lá;
-- episódio monitorado sem arquivo entra sem `skip`, e desmonitorado sem arquivo entra
-  `unwanted`;
-- cada arquivo entra com caminho, tamanho, qualidade, idiomas, grupo e nome do release;
-- episódio do gerenciador que o TMDB não tem (numeração diferente) entra no relatório e
-  não no catálogo.
+foram assistidos. Só sai o arquivo que chegou antes de assistirem: o Jellyfin lembra o
+assistido de um episódio apagado, e o mesmo episódio baixado de novo ficaria sem chance.
+Arquivo sem data de adição fica. O torrent fica semeando até a limpeza, como nos filmes.
 
 ## Prioridade
 
@@ -184,8 +181,8 @@ ao lado do vídeo, como `<stem do vídeo>.<idioma>[.forced].<ext>` (idioma pelo 
 em `pt-BR`, `pt` ou `en`), e fica em `subtitle_files` com a origem (`importacao` ou
 `disco`). Num pacote, a legenda de episódio escolhido baixa junto (casada pelo caminho, ou
 pelo vídeo da mesma pasta). Apagar o arquivo apaga as legendas; renomear leva junto, com as
-do disco que seguem o nome do vídeo. No upgrade de filme só a legenda do torrent (da
-importação, ou com outro link) é trocada ou apagada; a posta à mão fica.
+do disco que seguem o nome do vídeo. Quando o arquivo de um filme é trocado, só a legenda
+do torrent (da importação, ou com outro link) é trocada ou apagada; a posta à mão fica.
 
 ## Torrent desregistrado
 

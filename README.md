@@ -1,69 +1,57 @@
 # acervo-hub
 
-Um serviço único, em Rust, para gerenciar uma biblioteca de mídia — no lugar de quatro
-processos separados conversando por HTTP.
+Um serviço único, em Rust, que cuida de uma biblioteca de filmes e séries: busca nos
+indexadores, decide o release, manda ao cliente de torrent, importa o que terminou, mantém
+os metadados, apaga o que já foi assistido e limpa o que sobrou no cliente — no lugar dos
+quatro processos separados (gerenciador de séries, gerenciador de filmes, agregador de
+indexadores e faxineiro) que a stack usual roda conversando por HTTP.
 
-> **Estado: indexadores, limpeza e filmes em produção; séries ainda no gerenciador de séries.**
+> **Estado: em produção — filmes, séries, indexadores, limpeza e assistidos.**
+
+Dois princípios mandam no produto:
+
+- **Tudo roda de verdade.** Não há modo de simulação. Cada tarefa age; o que protege o
+  acervo são as travas, que abortam a ação quando a leitura do mundo não é confiável.
+- **Configura-se só o necessário.** Não há perfil de qualidade, tabela de tamanhos nem
+  disponibilidade mínima para editar: o que tem uma resposta certa vem pronto.
 
 ## Por quê
 
-A stack usual de automação de mídia roda como quatro serviços independentes: um gerenciador
-de séries, um de filmes, um agregador de indexadores e um faxineiro que reconcilia o que os
-outros três deixaram para trás. Na prática eles são **um serviço só, particionado por
-acidente histórico**:
+Os quatro serviços da stack usual são, na prática, **um serviço só, particionado por
+acidente histórico**: o gerenciador de séries e o de filmes são o mesmo código com um
+discriminador de tipo; o agregador existe para os dois dividirem rate limit de tracker; o
+faxineiro faz, por HTTP, um *join* entre bancos que costumam morar no mesmo Postgres.
 
-- O gerenciador de séries e o de filmes são o mesmo código com um discriminador de tipo de
-  mídia. Um filme é uma série de um episódio só.
-- O agregador de indexadores existe porque os dois primeiros são processos separados e
-  precisam de alguém para compartilhar rate limit de tracker.
-- O faxineiro faz, por HTTP, um *join* entre bancos que frequentemente já moram no mesmo
-  Postgres.
-
-O custo dessa partição não é memória — é uma classe de falha. Quando uma instância trava, o
-faxineiro estoura o timeout do cliente HTTP **antes** de avaliar qualquer coisa, e o ciclo
-inteiro morre sem limpar nada. O sintoma chega como "não apagou X"; a causa é um healthcheck
-vermelho três serviços adiante.
-
-Em processo único, com uma transação, "item de fila sem obra correspondente" deixa de ser um
-cruzamento de três APIs e vira:
-
-```sql
-select q.id, q.download_id
-from   queue_item q
-left   join work w on w.id = q.work_id
-where  w.id is null;
-```
+O custo dessa partição é uma classe de falha. Quando uma instância trava, o faxineiro
+estoura o timeout **antes** de avaliar qualquer coisa, e o ciclo inteiro morre sem limpar
+nada. Em processo único, "download sem dono" é uma consulta ao próprio catálogo.
 
 ## Arquitetura
 
 Workspace Cargo, binário único `acervo-hub`:
 
-| Crate | Responsabilidade | Estado |
-|---|---|---|
-| `acervo-core` | Domínio puro, zero IO: `Work`, `Item`, `Download`, `Inventory` | existe |
-| `acervo-janitor` | Reconciliação: órfãos de fila, hardlink perdido, limpeza de download | existe |
-| `acervo-fs` | Tradução de caminho container→host e `stat(2)` | existe |
-| `acervo-arr` | Cliente da API v3 do gerenciador de séries: fila, inventário, indexadores | existe |
-| `acervo-clients` | Clientes de download (hoje qBittorrent) | existe |
-| `acervo-hub` | Binário: configuração, coleta, relato, execução | existe |
-| `acervo-indexers` | Busca em indexadores (Torznab e Cardigann), rate limit compartilhado | existe |
-| `acervo-metadata` | Metadados do TMDB | existe |
-| `acervo-parser` | Parsing de nome de release | existe |
-| `acervo-decision` | Casamento com o filme, rejeições e ordem de preferência (perfil automático) | existe |
-| `acervo-store` | Catálogo, histórico, fila e contas no Postgres | existe |
-| `acervo-api` | HTTP: Torznab e interface web | existe |
+| Crate | Responsabilidade |
+|---|---|
+| `acervo-core` | Domínio puro, sem IO: downloads, fila, inventário, tamanhos |
+| `acervo-parser` | Nome de release: título, ano, temporada e episódio, qualidade, idiomas, grupo |
+| `acervo-decision` | Casamento com o filme ou a série, rejeições e ordem de preferência |
+| `acervo-indexers` | Busca em indexadores (Cardigann e Torznab), rate limit, proxy e `FlareSolverr` |
+| `acervo-api` | O catálogo de indexadores servido, com cache de consultas, e a interface web |
+| `acervo-metadata` | Metadados do TMDB |
+| `acervo-clients` | qBittorrent e Jellyfin |
+| `acervo-fs` | Tradução de caminho container→host e `stat(2)` |
+| `acervo-janitor` | A limpeza: decide o que apagar do cliente, sem executar nada |
+| `acervo-store` | Catálogo, fila, histórico, configuração e contas no Postgres |
+| `acervo-hub` | Binário: tarefas de fundo, importação, decisão aplicada, interface |
 
-### Duas decisões que mandam no projeto
-
-**Filme entra só pela tela.** O acervo não expõe a API v3 de gerenciador de filmes: o
-portal de pedidos fica só com as séries, no gerenciador de séries, e filme novo se adiciona
-em **Filmes**. A superfície HTTP é o Torznab, que o gerenciador de séries consome, e a
-interface.
+O acervo não expõe API para terceiros. A superfície HTTP é a interface e a API JSON dela;
+script e automação podem usá-la com a chave de API do servidor no cabeçalho `X-Api-Key`.
 
 **O parser é o crate perigoso.** O parsing de nome de release é uma década de regex
-acumulada contra a criatividade dos grupos de scene. É tabela de dados, não lógica — mas
-validar um port exige corpus real. Quando o parser erra, não há crash: há import silencioso
-no lugar errado.
+acumulada contra a criatividade dos grupos de scene: tabela de dados, não lógica — e
+validar exige corpus real. Quando o parser erra, não há crash: há import silencioso no
+lugar errado. Os corpora de filmes e de séries rodam como testes ignorados, com o caminho
+do JSON no ambiente.
 
 ## Como rodar
 
@@ -72,83 +60,145 @@ só duas variáveis de ambiente:
 
 | Variável | Para quê | Padrão |
 |---|---|---|
-| `ACERVO_DATABASE_URL` | `postgres://usuário:senha@host:5432/banco` — obrigatória para todo comando | — |
+| `ACERVO_DATABASE_URL` | `postgres://usuário:senha@host:5432/banco` — obrigatória | — |
 | `ACERVO_BIND` | Endereço de escuta do `serve` | `0.0.0.0:9797` |
 
 ```sh
 export ACERVO_DATABASE_URL=postgres://acervo:senha@localhost:5432/acervo
 
-cargo run --bin acervo-hub -- serve   # indexadores, interface e tarefas
-cargo run --bin acervo-hub -- apply   # um ciclo de limpeza à mão
-cargo run --bin acervo-hub -- sync    # planeja o cadastro nos *arr
-cargo run --bin acervo-hub -- sync --apply
-cargo run --bin acervo-hub -- search "termo" [-i indexador] [-k 5000]
+cargo run --bin acervo-hub -- serve                       # o serviço
+echo 'senha-longa' | cargo run --bin acervo-hub -- users set admin
+cargo run --bin acervo-hub -- users list
+cargo run --bin acervo-hub -- users remove admin
 ```
 
-As tabelas são criadas na primeira conexão. Banco novo sobe com os padrões; o resto se
-preenche em **Configurações**: Cliente de download, Jellyfin, Biblioteca, Limpeza, Regras de
-decisão, Notificações, TMDB e Servidor (onde se gera a chave de API). Os gerenciadores
-(Sonarr, Radarr) se cadastram em **Aplicativos**; os intervalos das tarefas, na própria tela
-**Tarefas**. Sem chave de API definida, o Torznab recusa tudo.
+A linha de comando tem só isso: `serve` e as contas da interface. A senha vem da entrada
+padrão, nunca de argumento. As tabelas são criadas e migradas na primeira conexão; banco
+novo sobe com os padrões, e o resto se preenche em **Configurações**.
 
-### Interface web
+## O que o serviço faz
 
-`serve` também serve uma interface em `/`, com o que se fazia pela tela do agregador atual:
+### Busca e decisão
 
-- **Indexadores** — estado de cada um (último sucesso, último erro, falhas seguidas), teste,
-  ativar e desativar, trocar credencial, remover, e **adicionar** a partir do catálogo de
-  definições (diretórios em Configurações → Servidor) ou de qualquer endpoint Torznab. As definições que o
-  executor ainda não roda aparecem com o motivo, em vez de sumirem.
-- **Busca** manual em todos os indexadores, com download do `.torrent` pela sessão.
-- **Filmes** — a biblioteca em pôsteres. Adicionar pelo TMDB; editar monitoramento e
-  disponibilidade; buscar os que faltam ou buscar um só, interativamente (cada release com
-  qualidade, idiomas e o motivo de cada recusa); apagar o arquivo ou remover o filme — com a
-  pasta e o download no qBittorrent, na hora; histórico do filme; cada arquivo conferido
-  contra o disco.
-- **Atividade** — a fila com o progresso do qBittorrent (tirar da fila, bloquear, buscar
-  outro), o histórico de tudo e a lista de bloqueio.
-- **Aplicativos** — os gerenciadores (adicionar, editar, remover) e o `sync` na tela: mostra
-  o que mudaria em cada um e aplica.
-- **Tarefas** — as rotinas de fundo do serviço (busca dos que faltam, RSS, importação,
-  metadados, a limpeza e, com o Jellyfin configurado, apagar assistidos), com intervalo
-  editável (vale na hora; tarefa sem o que precisa fica parada, com o motivo), última e
-  próxima execução e "rodar agora"; e o histórico das últimas execuções, gravado no banco —
-  o da limpeza abre o relatório do ciclo, o dos assistidos a lista do que saiu e do que ficou,
-  o dos metadados o que mudou e qual filme falhou, com o motivo.
-- **Configurações** — um item de menu por seção: cliente de download, Jellyfin, biblioteca
-  (pastas, caminhos, categoria), limpeza (strikes, carências, travas), regras de decisão,
-  notificações (Gotify), TMDB e servidor (chave de API, endereço público, catálogo de
-  definições, timeout HTTP).
+Filmes e séries entram pela tela, a partir do TMDB. Todo filme e toda série usam o **perfil
+automático**: da melhor qualidade de arquivo para a pior (Remux 2160p … SD), sem upgrade.
+Os seeders pesam antes — um release com 5 ou mais vence qualquer um mais fraco, e a
+qualidade decide dentro da faixa. O tamanho por minuto de cada qualidade é uma tabela fixa.
 
-A qualidade não se configura: todo filme usa o **perfil automático**, da melhor qualidade de
-arquivo para a pior (Remux 2160p … SD), sem upgrade. Os seeders pesam antes: um release com
-5 ou mais vence qualquer um mais fraco, e a qualidade decide dentro da faixa. Espaço livre
-não trava o grab — com o disco cheio, o cliente pausa o download.
+- **Busca dos que faltam** (`busca`): os prioritários primeiro, depois os há mais tempo sem
+  busca. Agendada, pega um lote; pelo botão, todos.
+- **RSS** (`rss`): os releases recentes de todos os indexadores, casados com a biblioteca
+  inteira.
+- **Busca interativa**: cada release com qualidade, idiomas e o motivo de cada recusa; o
+  escolhido à mão pula a decisão.
 
-Entra-se com usuário e senha, cadastrados por linha de comando — a senha vem da entrada
-padrão, nunca de argumento:
+Um filme tem um download por vez: com um em andamento, o grab é recusado ("já há um
+download em andamento"). A exceção é a troca na fila — o release melhor que aparece
+enquanto o anterior ainda espera, sem ter começado, toma o lugar dele.
 
-```sh
-echo 'senha-longa' | acervo-hub users set admin   # cria ou troca a senha
-acervo-hub users list
-acervo-hub users remove admin
-```
+### Fila por espaço
 
-Scripts e automação podem, em vez disso, mandar a chave de API do servidor no cabeçalho
-`X-Api-Key`.
+O grab manda o torrent ao qBittorrent **parado**, na categoria do acervo e com a tag
+`acervo:fila`. A fila inicia o que cabe no disco, do menor para o maior, pulando quem não
+cabe, com os prioritários antes, sem passar do limite de downloads simultâneos e sempre
+deixando a folga mínima livre. O espaço livre não basta: desconta-se o que falta baixar de
+todo download ativo, porque o cliente reserva aos poucos.
 
-- **Segredo nunca volta para a tela.** Senhas e chaves (do cliente, do Jellyfin, dos
-  gerenciadores, dos indexadores e a do servidor) chegam como "definida" ou não; salvar com o
-  campo em branco mantém o valor guardado. Nada disso vai para o log. Indexadores são todos
-  cadastros do banco: editáveis e removíveis.
+Torrent com a tag da fila, na categoria do acervo, que nenhum grab em andamento reclama
+não é de ninguém: a fila o apaga com os arquivos, e nunca o inicia — a menos que algum
+arquivo dele tenha outro hardlink.
+
+### Importação
+
+A tarefa `importacao` (a cada 5 minutos) liga por hardlink o que terminou na pasta do
+filme ou da série, com o nome do padrão; lê os idiomas com `ffprobe`; leva as legendas do
+torrent junto; e pede ao Jellyfin, se configurado, que varra a biblioteca. Depois, uma vez
+por volta, roda a fila.
+
+O que o cliente diz uma vez só não derruba o download:
+
+- **Arquivos sumidos** (`missingFiles`) e **erro do cliente com espaço livre** tentam de
+  novo até persistirem 30 minutos observados pelo processo. Depois, o arquivo sumido vira
+  falha sem bloqueio, e o torrent sai do cliente (se nenhum arquivo tem outro link); o erro,
+  falha com bloqueio de 7 dias.
+- **Disco cheio** devolve o torrent à fila, com o que já baixou.
+- **Sem seeds**: além do que o cliente diz, o torrent precisa estar ativo e sem seed há 30
+  minutos observados; torrent que sai de parado ou da fila recomeça a contagem.
+- **Desregistrado no tracker** em duas voltas seguidas é falha, e numa série a nova busca
+  prefere o pacote.
+
+Falha de download bloqueia o release (os bloqueios automáticos expiram em 7 dias) e busca
+de novo. Filme que ganhou arquivo por outro caminho desiste do grab, sem bloquear. Problema
+na importação em si (arquivo no caminho, discos diferentes) fica "em atenção", tentando a
+cada volta; 6 horas seguidas assim avisam pelo Gotify, uma vez por grab.
+
+### Metadados, cena e definições
+
+- `metadados` atualiza filmes (a cada dia) e séries (a cada 12 h) pelo TMDB, gravando só o
+  que vem da base: monitorado, pasta, prioridade e as escolhas da tela ficam como estão.
+- `cena` baixa a numeração de cena (XEM) uma vez por dia.
+- `definicoes` baixa as definições Cardigann do repositório oficial uma vez por dia e troca
+  a de cada indexador em uso que mudou, sem reiniciar.
+
+### Assistidos
+
+Com o Jellyfin configurado, `assistidos` (a cada 15 minutos) apaga o filme ou o episódio que
+algum usuário assistiu há mais que a carência (padrão 60 minutos) e que ninguém marcou como
+favorito. Só sai o arquivo que chegou antes de assistirem: o Jellyfin lembra o assistido de
+um título apagado, e o mesmo título adicionado de novo sairia assim que importado. Assistido
+sem data, ou arquivo sem data de adição, fica.
+
+### Limpeza
+
+`limpeza` (a cada 60 minutos) lê a fila do acervo, o cliente e o disco, e apaga do cliente:
+
+- o **seed que perdeu o hardlink** com a biblioteca — o privado só depois do ratio alvo, da
+  ociosidade ou do teto de tempo de seed;
+- o **download sem dono** — sem grab em andamento, sem seed e sem hardlink — depois de
+  aparecer assim em ciclos seguidos.
+
+Só nas categorias gerenciadas. As travas abortam o ciclo inteiro quando a leitura não é
+confiável: fila do acervo ilegível, catálogo vazio, lote maior que o teto absoluto ou que a
+fração da biblioteca, biblioteca que mede zero. Uma vez por dia, a limpeza também poda o
+banco: as buscas com mais de 30 dias (a mais recente de cada obra fica) e os bloqueios
+automáticos vencidos. O histórico fica.
+
+### Tarefas
+
+Cada tarefa tem intervalo editável na tela **Tarefas** (vale na hora; zero desliga o
+agendamento), "rodar agora" e o histórico das últimas execuções, com o relatório de cada
+uma. Tarefa sem o que precisa — cliente de download, Jellyfin — fica parada, com o motivo.
+Execução que passa de 2 horas é dada como falha e a tarefa segue agendada; cada consulta ao
+banco tem teto de 60 segundos.
+
+## Interface
+
+`serve` responde em `/`:
+
+- **Filmes** e **Séries** — a biblioteca em pôsteres: adicionar pelo TMDB, monitorar,
+  prioridade, busca automática ou interativa, renomear, verificar o disco, apagar arquivo
+  ou remover — com a pasta e o download no cliente, na hora.
+- **Faltando**, **Calendário**, **Atividade** (a fila com o progresso do cliente, o
+  histórico e a lista de bloqueio) e **Busca** manual em todos os indexadores.
+- **Indexadores** — estado e estatística de cada um, teste, ativar e desativar, trocar
+  credencial, remover e adicionar a partir do catálogo de definições ou de um endpoint
+  Torznab. As definições que o executor ainda não roda aparecem com o motivo.
+- **Configurações** — cliente de download, Jellyfin, biblioteca, limpeza, regras de
+  decisão, notificações (Gotify), TMDB e servidor (chave de API, rede dos indexadores,
+  catálogo de definições).
+
+Segurança:
+
+- **Segredo nunca volta para a tela.** Senhas e chaves chegam como "definida" ou não;
+  salvar com o campo em branco mantém o valor guardado. Nada disso vai para o log.
 - **Senha em argon2id, sessão em cookie `HttpOnly` e `SameSite=Strict`.** O banco guarda
-  só o SHA-256 do token da sessão, que vale 30 dias; sair apaga a sessão no servidor, e
-  trocar a senha derruba todas as abertas. Toda ação que muda estado exige
-  um cabeçalho que formulário de outra origem não consegue mandar. A CSP só aceita script
-  servido pelo próprio binário.
-- O front é React + TypeScript + Tailwind, em `web/`. O build é versionado em
-  `crates/acervo-api/src/ui/dist` e embutido no binário: `cargo build` e a imagem não
-  precisam de Node. Mudou o front? `npm run --prefix web build` — o CI confere.
+  só o SHA-256 do token da sessão, que vale 30 dias; trocar a senha derruba todas as
+  sessões. Toda ação que muda estado exige um cabeçalho que formulário de outra origem não
+  consegue mandar. A CSP só aceita script servido pelo próprio binário.
+
+O front é React + TypeScript + Tailwind, em `web/`. O build é versionado em
+`crates/acervo-api/src/ui/dist` e embutido no binário: `cargo build` e a imagem não
+precisam de Node.
 
 ```sh
 npm ci --prefix web
@@ -156,55 +206,19 @@ npm run --prefix web dev      # Vite em :5173, falando com um serve em 127.0.0.1
 npm run --prefix web build    # atualiza o build embutido
 ```
 
-`serve` é o outro modo de vida do binário: processo longo que responde Torznab em
-`/<indexador>/api`, e em `/all/api` por todos de uma vez. Os gerenciadores de série e de
-filme cadastram essa URL como cadastrariam o agregador atual. Três escolhas do desenho:
-
-- **A consulta chega a cada indexador reduzida ao que ele anunciou.** Parâmetro que ele não
-  entende é retirado — mas se, sem ele, uma busca por episódio viraria "últimos
-  lançamentos", o indexador simplesmente não é consultado.
-- **Paginação é local.** Nem todo indexador pagina; pedir a página 2 a quem não pagina
-  devolve a 1 de novo, e o consumidor tomaria a repetição por release nova.
-- **O cadastro nos gerenciadores é declarativo.** `sync` compara o que cada instância tem
-  com o que deveria ter e cria, atualiza ou remove — só os indexadores com o sufixo
-  ` (acervo-hub)`. Os do agregador atual ficam intocados, então os dois convivem durante a
-  migração. Habilitações, prioridade e tags ajustadas na interface são preservadas.
-- **Falha total não vira lista vazia.** Se todos os indexadores consultados falham, a
-  resposta é erro Torznab `900`: "nada encontrado" e "tracker fora do ar" pedem reações
-  opostas de quem consulta.
-
-A limpeza roda dentro de `serve`, como a tarefa "Limpeza", a cada 60 minutos por padrão
-(editável em Tarefas). Não há modo de simulação: cada ciclo avança
-os strikes e executa o plano, e as travas abortam o ciclo inteiro quando a leitura do mundo
-não é confiável.
-
-Com o Jellyfin configurado, a tarefa "Apagar assistidos" roda a cada 15 minutos por padrão:
-o filme que algum usuário do Jellyfin assistiu, há mais que a carência (padrão 60 minutos)
-e que ninguém marcou como favorito, sai do catálogo com a pasta e o download — sem
-simulação. Assistido sem data conhecida fica.
-
-Códigos de saída: `0` sucesso, `1` falha de execução, `3` ciclo abortado por trava. O `3`
-é próprio para que um agendador distinga "a leitura do mundo não era confiável" de "algo
-quebrou".
-
-### Em container
+## Em container
 
 ```sh
 docker build -t acervo-hub .
 ```
 
 Multi-stage com alvo musl e distroless `static` como base: o binário estático e um
-`ffprobe` estático (≈135 MB, a maior parte da imagem), que lê os idiomas das faixas de
-áudio do que o acervo importa. Sem shell, sem gerenciador de pacotes, sem `curl` — o que não está
-lá não precisa ser corrigido nem serve a quem entrar.
+`ffprobe` estático, que lê os idiomas das faixas do que o acervo importa. Sem shell, sem
+gerenciador de pacotes, sem `curl`.
 
-`deploy/` traz o serviço para um stack Compose existente. Dois pontos do desenho que
-valem atenção:
-
-**O ciclo roda dentro do serviço**, agendado com as outras tarefas, e só remove pela API do
-cliente de download: o acervo é montado com escrita porque a importação cria o hardlink do
-filme, então a garantia de não apagar arquivo da biblioteca fica no código do janitor.
-
-**Não há diretório de estado.** Configuração, cadastros de indexador e strikes moram no
-Postgres; o container pode rodar com o sistema de arquivos somente leitura, montando só o
-acervo e, se houver, as definições Cardigann.
+`deploy/compose.yaml` traz o serviço para um stack Compose existente. Não há diretório de
+estado: configuração, indexadores, fila e strikes moram no Postgres, e o container roda com
+o sistema de arquivos somente leitura, montando a biblioteca (com escrita: a importação cria
+os hardlinks) e, se houver, as definições Cardigann próprias. A garantia de não apagar
+arquivo da biblioteca fica no código: a limpeza só age pela API do cliente, e só sobre o
+que não tem hardlink.

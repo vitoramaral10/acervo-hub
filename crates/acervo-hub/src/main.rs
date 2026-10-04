@@ -1,9 +1,8 @@
 //! Binário do `acervo-hub`.
 //!
-//! `serve` é o modo de vida principal: um processo longo que responde buscas
-//! Torznab, serve a interface e roda as tarefas de fundo — a limpeza entre
-//! elas. `apply` roda um ciclo de limpeza à mão: ler o mundo, planejar,
-//! relatar e executar.
+//! `serve` é o modo de vida do serviço: um processo longo que serve a
+//! interface e roda as tarefas de fundo — busca, RSS, importação, metadados,
+//! limpeza, assistidos. `users` cuida das contas da interface.
 //!
 //! A configuração mora no Postgres e se edita pela tela. Fora do banco só
 //! há duas variáveis de ambiente: `ACERVO_DATABASE_URL`, que todo comando
@@ -33,15 +32,12 @@ mod movies;
 mod naming;
 mod registry;
 mod rename;
-mod report;
 mod rules;
-mod search;
 mod series;
 mod serve;
 mod settings;
 mod stats;
 mod subtitles;
-mod sync;
 mod tasks;
 mod verify;
 mod watched;
@@ -51,7 +47,7 @@ mod web;
 #[command(
     name = "acervo-hub",
     version,
-    about = "Reconcilia a biblioteca de mídia e serve os indexadores"
+    about = "Gerencia a biblioteca de filmes e séries e serve a interface"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -60,195 +56,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Um ciclo de limpeza à mão: lê, planeja, relata e executa.
-    Apply,
-    /// Serve os indexadores configurados pela API Torznab.
+    /// Sobe o serviço: a interface e as tarefas de fundo.
     Serve,
-    /// Cadastra os indexadores servidos nos gerenciadores. Sem `--apply`, só
-    /// mostra o plano.
-    Sync {
-        /// Executa o plano em vez de só mostrá-lo.
-        #[arg(long)]
-        apply: bool,
-    },
-    /// Catálogo de filmes.
-    Movies {
-        #[command(subcommand)]
-        action: MoviesAction,
-    },
-    /// Catálogo de séries.
-    Series {
-        #[command(subcommand)]
-        action: SeriesAction,
-    },
     /// Contas da interface web.
     Users {
         #[command(subcommand)]
         action: UsersAction,
     },
-    /// Busca manual nos indexadores configurados.
-    Search {
-        /// Termo da busca.
-        term: String,
-        /// Só este indexador; sem ele, todos.
-        #[arg(long, short)]
-        indexer: Option<String>,
-        /// Categoria Newznab (repetível), como 5000 para TV ou 2000 para filmes.
-        #[arg(long = "categoria", short = 'k')]
-        categories: Vec<u32>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum MoviesAction {
-    /// Confere cada arquivo do catálogo contra o disco.
-    Check,
-    /// Busca um filme que falta, decide e, com `--apply`, manda o escolhido
-    /// ao qBittorrent.
-    Grab {
-        /// Id do filme no TMDB.
-        tmdb: u32,
-        /// Pega de verdade em vez de só mostrar a escolha.
-        #[arg(long)]
-        apply: bool,
-    },
-    /// Importa os downloads do acervo que terminaram: hardlink na pasta do
-    /// filme, com o nome que o gerenciador daria. Sem `--apply`, só mostra.
-    Downloads {
-        #[arg(long)]
-        apply: bool,
-    },
-    /// Adiciona um filme ao catálogo a partir do TMDB, com o acervo como dono.
-    Add {
-        /// Id do filme no TMDB.
-        tmdb: u32,
-        /// Pasta raiz, como o gerenciador a vê.
-        #[arg(long, default_value = "/media/movies")]
-        root: String,
-        /// Adiciona sem monitorar.
-        #[arg(long)]
-        unmonitored: bool,
-    },
-    /// Atualiza os metadados pelo TMDB.
-    Refresh {
-        /// Todos, e não só os conferidos há mais de um dia.
-        #[arg(long)]
-        all: bool,
-    },
-    /// Lê os releases recentes de todos os indexadores e decide contra a
-    /// biblioteca inteira, como a busca automática faz. Sem `--apply`, só
-    /// mostra o que pegaria.
-    Rss {
-        #[arg(long)]
-        apply: bool,
-    },
-}
-
-fn print_grab(report: &grab::GrabReport) {
-    match &report.escolhido {
-        Some(pick) => println!(
-            "{}: {} {} — {} ({}, {:.1} GiB)",
-            report.filme,
-            if report.aplicado { "pegou" } else { "pegaria" },
-            pick.titulo,
-            pick.indexador,
-            pick.qualidade,
-            f64::from(u32::try_from(pick.tamanho / 1_048_576).unwrap_or(u32::MAX)) / 1024.0,
-        ),
-        None => println!(
-            "{}: nada entre {} releases — {}",
-            report.filme,
-            report.releases,
-            report
-                .motivos
-                .iter()
-                .map(|(reason, n)| format!("{reason} {n}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
-    if report.escolhido.is_some() && !report.aplicado {
-        println!("  simulação: rode com --apply para pegar");
-    }
-}
-
-#[derive(Debug, Subcommand)]
-enum SeriesAction {
-    /// Traz as séries do gerenciador anterior pela API v3: cada uma achada
-    /// no TMDB pelo `tvdbId`, com episódios, `skip` e arquivos. Série já
-    /// cadastrada é pulada. Sem `--apply`, só relata.
-    ImportSonarr {
-        /// Endereço do gerenciador, como `http://sonarr:8989`.
-        #[arg(long)]
-        url: String,
-        /// Chave de API do gerenciador.
-        #[arg(long = "api-key")]
-        api_key: String,
-        /// Grava em vez de só relatar.
-        #[arg(long)]
-        apply: bool,
-    },
-}
-
-/// Os subcomandos de `series`. Devolve se algo falhou.
-async fn series_command(
-    config: &config::Config,
-    store: &acervo_store::Store,
-    action: SeriesAction,
-) -> Result<bool> {
-    match action {
-        SeriesAction::ImportSonarr {
-            url,
-            api_key,
-            apply,
-        } => {
-            let tmdb = metadata::require_tmdb(config, store).await?;
-            let lines = series::migrate::import_sonarr(
-                store,
-                &tmdb,
-                &url,
-                &api_key,
-                config.http_timeout(),
-                apply,
-            )
-            .await?;
-            for line in &lines {
-                println!(
-                    "{:<13} {} (tvdb {}, tmdb {}) — {} episódios, {} arquivos{}{}",
-                    line.estado,
-                    line.serie,
-                    line.tvdb,
-                    line.tmdb
-                        .map_or_else(|| "?".to_owned(), |id| id.to_string()),
-                    line.episodios,
-                    line.arquivos,
-                    if line.sem_par.is_empty() {
-                        String::new()
-                    } else {
-                        format!("; sem par no TMDB: {}", line.sem_par.join(", "))
-                    },
-                    line.detalhe
-                        .as_deref()
-                        .map(|d| format!(" — {d}"))
-                        .unwrap_or_default(),
-                );
-            }
-            let count = |estado: &str| lines.iter().filter(|l| l.estado == estado).count();
-            println!(
-                "{} séries: {} {}, {} já cadastradas, {} não achadas, {} falharam",
-                lines.len(),
-                count(if apply { "importada" } else { "importaria" }),
-                if apply { "importadas" } else { "a importar" },
-                count("ja_cadastrada"),
-                count("nao_achada"),
-                count("falhou"),
-            );
-            if !apply {
-                println!("simulação: rode com --apply para gravar");
-            }
-            Ok(count("falhou") > 0)
-        }
-    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -304,121 +118,12 @@ async fn users(store: &acervo_store::Store, action: UsersAction) -> Result<()> {
     Ok(())
 }
 
-/// Os subcomandos de `movies`. Devolve se algo falhou.
-#[allow(clippy::too_many_lines)] // Um braço por subcomando.
-async fn movies_command(
-    config: &config::Config,
-    store: acervo_store::Store,
-    action: MoviesAction,
-) -> Result<bool> {
-    Ok(match action {
-        MoviesAction::Check => movies::check(config, &store).await? > 0,
-        MoviesAction::Grab { tmdb, apply } => {
-            let movie = store
-                .movies()
-                .await?
-                .into_iter()
-                .find(|m| m.movie.tmdb_id == tmdb)
-                .ok_or_else(|| anyhow::anyhow!("TMDB {tmdb} não está no catálogo"))?;
-            let catalog = acervo_api::Catalog::new(serve::stored_entries(config, &store).await?)?;
-            let report = grab::grab(config, &store, &catalog, movie.id, apply).await?;
-            print_grab(&report);
-            report.escolhido.is_none()
-        }
-        MoviesAction::Downloads { apply } => {
-            let lines = grab::import_downloads(config, &store, None, apply).await?;
-            if lines.is_empty() {
-                println!("nenhum download do acervo em andamento");
-            }
-            for line in &lines {
-                println!(
-                    "{:<10} {} — {}{}",
-                    line.estado,
-                    line.filme,
-                    line.release,
-                    line.destino
-                        .as_deref()
-                        .or(line.detalhe.as_deref())
-                        .map(|d| format!(" → {d}"))
-                        .unwrap_or_default()
-                );
-            }
-            lines.iter().any(|l| l.estado == "falhou")
-        }
-        MoviesAction::Add {
-            tmdb,
-            root,
-            unmonitored,
-        } => {
-            let client = metadata::require_tmdb(config, &store).await?;
-            let id = library::add(
-                &store,
-                &client,
-                &library::AddRequest {
-                    tmdb_id: tmdb,
-                    root_folder: root,
-                    monitored: !unmonitored,
-                },
-            )
-            .await?;
-            let added = store.movies().await?.into_iter().find(|m| m.id == id);
-            if let Some(added) = added {
-                println!(
-                    "adicionado: {} — {} ({})",
-                    added.movie.title,
-                    added.movie.path,
-                    added.movie.status.as_deref().unwrap_or("?")
-                );
-            }
-            false
-        }
-        MoviesAction::Refresh { all } => {
-            let client = metadata::require_tmdb(config, &store).await?;
-            let report = library::refresh(&store, &client, if all { 0 } else { 24 }).await?;
-            for name in &report.atualizados {
-                println!("atualizado  {name}");
-            }
-            for (name, error) in &report.falhas {
-                println!("falhou      {name} — {error}");
-            }
-            println!(
-                "{} conferidos, {} atualizados, {} falhas",
-                report.conferidos,
-                report.atualizados.len(),
-                report.falhas.len()
-            );
-            !report.falhas.is_empty()
-        }
-        MoviesAction::Rss { apply } => {
-            let catalog = acervo_api::Catalog::new(serve::stored_entries(config, &store).await?)?;
-            let grabs = automatic::rss(config, &store, &catalog, apply).await?;
-            if grabs.is_empty() {
-                println!("nada entre os releases recentes serve à biblioteca");
-            }
-            for grab in &grabs {
-                println!(
-                    "{} {} — {}{}",
-                    if apply { "pegou  " } else { "pegaria" },
-                    grab.filme,
-                    grab.release,
-                    grab.erro
-                        .as_deref()
-                        .map(|e| format!(" (falhou: {e})"))
-                        .unwrap_or_default()
-                );
-            }
-            grabs.iter().any(|g| g.erro.is_some())
-        }
-    })
-}
-
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "acervo_hub=info,acervo_arr=info,acervo_fs=info,acervo_api=info".into()
-            }),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "acervo_hub=info,acervo_fs=info,acervo_api=info".into()),
         )
         .with_target(false)
         .init();
@@ -452,41 +157,21 @@ const DEFAULT_BIND: &str = "0.0.0.0:9797";
 async fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
     let url = database_url()?;
-    if matches!(cli.command, Command::Serve) {
-        let bind = std::env::var("ACERVO_BIND")
-            .ok()
-            .filter(|bind| !bind.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_BIND.to_owned());
-        serve::run(serve::connect(&url).await, &bind).await?;
-        return Ok(ExitCode::SUCCESS);
-    }
-    // Comando avulso: uma tentativa só, e a configuração de agora.
-    let store = acervo_store::Store::connect(&url)
-        .await
-        .map_err(|error| anyhow::anyhow!("conectando ao banco: {error}"))?;
-    let config = settings::Settings::load(store.clone()).await?.get();
-    let failed = match cli.command {
-        Command::Apply => {
-            let report = cycle::run(&config, &store, true).await?;
-            return Ok(ExitCode::from(report.exit_code()));
+    match cli.command {
+        Command::Serve => {
+            let bind = std::env::var("ACERVO_BIND")
+                .ok()
+                .filter(|bind| !bind.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_BIND.to_owned());
+            serve::run(serve::connect(&url).await, &bind).await?;
         }
-        Command::Serve => unreachable!("tratado acima"),
-        Command::Search {
-            term,
-            indexer,
-            categories,
-        } => search::run(&config, &store, &term, indexer.as_deref(), &categories).await? > 0,
         Command::Users { action } => {
+            // Comando avulso: uma tentativa só.
+            let store = acervo_store::Store::connect(&url)
+                .await
+                .map_err(|error| anyhow::anyhow!("conectando ao banco: {error}"))?;
             users(&store, action).await?;
-            false
         }
-        Command::Movies { action } => movies_command(&config, store, action).await?,
-        Command::Series { action } => series_command(&config, &store, action).await?,
-        Command::Sync { apply } => sync::run(&config, &store, apply).await? > 0,
-    };
-    Ok(if failed {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    })
+    }
+    Ok(ExitCode::SUCCESS)
 }

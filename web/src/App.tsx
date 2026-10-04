@@ -2,7 +2,6 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Activity,
   Bell,
-  Blocks,
   CalendarDays,
   ChevronDown,
   CircleDashed,
@@ -33,7 +32,6 @@ import { api, isUnauthorized } from '@/lib/api'
 import { type Theme, saveTheme, storedTheme } from '@/lib/theme'
 import { cn } from '@/lib/utils'
 import { ActivityPage } from '@/pages/Activity'
-import { AppsPage } from '@/pages/Apps'
 import { CalendarPage } from '@/pages/Calendar'
 import { IndexersPage } from '@/pages/Indexers'
 import { LoginPage } from '@/pages/Login'
@@ -45,7 +43,7 @@ import { SettingsPage, type SettingsView } from '@/pages/Settings'
 import { TasksPage } from '@/pages/Tasks'
 
 type MainView = 'filmes' | 'series' | 'faltando' | 'calendario' | 'atividade' | 'busca'
-type ConfigView = 'indexadores' | 'aplicativos' | 'tarefas' | SettingsView
+type ConfigView = 'indexadores' | 'tarefas' | SettingsView
 type View = MainView | ConfigView
 
 type NavItem<V extends View> = { view: V; label: string; icon: typeof Server }
@@ -63,8 +61,6 @@ const MAIN: NavItem<MainView>[] = [
 /** Configuração do serviço: num grupo que se recolhe. */
 const CONFIG: NavItem<ConfigView>[] = [
   { view: 'indexadores', label: 'Indexadores', icon: Server },
-  // Gerenciadores (Sonarr, Radarr) e a sincronização dos indexadores neles: uma tela só.
-  { view: 'aplicativos', label: 'Aplicativos', icon: Blocks },
   { view: 'tarefas', label: 'Tarefas', icon: ListChecks },
   { view: 'cliente-download', label: 'Cliente de download', icon: Download },
   { view: 'jellyfin', label: 'Jellyfin', icon: Tv },
@@ -176,7 +172,7 @@ function ConfigSheet({ current }: { current: View }) {
       <DialogContent id="folha-configuracoes" className="max-w-sm">
         <DialogHeader>
           <DialogTitle>Configurações</DialogTitle>
-          <DialogDescription>Indexadores, aplicativos, tarefas e cada seção do serviço.</DialogDescription>
+          <DialogDescription>Indexadores, tarefas e cada seção do serviço.</DialogDescription>
         </DialogHeader>
         <nav aria-label="Configurações" className="grid gap-0.5">
           {CONFIG.map((item) => (
@@ -300,8 +296,6 @@ export function App() {
             <CalendarPage />
           ) : view === 'atividade' ? (
             <ActivityPage />
-          ) : view === 'aplicativos' ? (
-            <AppsPage />
           ) : view === 'tarefas' ? (
             <TasksPage />
           ) : view === 'indexadores' ? (

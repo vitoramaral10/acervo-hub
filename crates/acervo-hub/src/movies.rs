@@ -1,4 +1,4 @@
-//! Catálogo de filmes: a visão da tela e a conferência de cada arquivo
+//! Catálogo de filmes: a visão da tela, com a conferência de cada arquivo
 //! contra o disco.
 
 use std::collections::HashMap;
@@ -188,40 +188,6 @@ pub async fn list(config: &Config, store: &Store) -> Result<Vec<MovieView>> {
     })
     .await
     .context("leitura interrompida")?
-}
-
-/// `movies check`: relata o que o disco não confirma. Devolve quantos.
-///
-/// # Errors
-///
-/// Catálogo ilegível.
-pub async fn check(config: &Config, store: &Store) -> Result<usize> {
-    let movies = list(config, store).await?;
-    let with_file = movies.iter().filter(|m| m.arquivo.is_some()).count();
-    let mut problems = 0;
-    for movie in &movies {
-        let Some(file) = &movie.arquivo else {
-            continue;
-        };
-        if file.disco != Disk::Ok {
-            problems += 1;
-            println!(
-                "  {:?}  {} ({}) — {}{}",
-                file.disco,
-                movie.titulo,
-                movie.ano.map_or_else(String::new, |y| y.to_string()),
-                file.nome,
-                file.disco_detalhe
-                    .as_ref()
-                    .map_or_else(String::new, |d| format!(" [{d}]"))
-            );
-        }
-    }
-    println!(
-        "{} filmes no catálogo, {with_file} com arquivo; {problems} arquivos que o disco não confirma",
-        movies.len()
-    );
-    Ok(problems)
 }
 
 #[cfg(test)]

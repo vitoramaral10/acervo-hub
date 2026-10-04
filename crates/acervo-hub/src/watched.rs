@@ -5,7 +5,9 @@
 //! A regra é por filme, somando os usuários: sai quando qualquer um assistiu,
 //! a última vez que alguém assistiu foi há mais que a carência, e ninguém o
 //! marcou como favorito. Na dúvida, fica: assistido sem data conhecida não
-//! sai.
+//! sai. E só sai o arquivo que chegou antes de assistirem: o Jellyfin
+//! lembra o assistido de um filme apagado, e o mesmo filme adicionado de
+//! novo sairia assim que importado.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -160,6 +162,26 @@ impl WatchedReport {
     }
 }
 
+/// Assistido depois de o arquivo de agora chegar à biblioteca? Data de
+/// adição ausente ou ilegível é "não sei": não.
+pub(crate) fn watched_after_added(at: OffsetDateTime, date_added: Option<&str>) -> bool {
+    date_added
+        .and_then(|added| OffsetDateTime::parse(added, &Rfc3339).ok())
+        .is_some_and(|added| at > added)
+}
+
+/// Por que um assistido fica: visto antes de o arquivo de agora chegar, ou
+/// arquivo sem data de adição.
+pub(crate) fn before_added_reason(date_added: Option<&str>) -> String {
+    match date_added {
+        Some(added) if OffsetDateTime::parse(added, &Rfc3339).is_ok() => format!(
+            "assistido antes de o arquivo de agora chegar ({})",
+            parse_date(added).map(human).unwrap_or_default()
+        ),
+        _ => "arquivo sem data de adição conhecida".into(),
+    }
+}
+
 /// Data do Jellyfin (ISO 8601 em UTC, com até sete casas de fração).
 fn parse_date(text: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(text, &Rfc3339).ok()
@@ -194,6 +216,7 @@ async fn folder_size(config: &Config, entry: &CatalogMovie) -> Allocated {
 ///
 /// Jellyfin inalcançável ou catálogo ilegível — antes de apagar qualquer
 /// coisa. Falha num filme fica no relatório; os outros seguem.
+#[allow(clippy::too_many_lines)] // Um braço por veredito, como nas séries.
 pub async fn run(
     config: &Config,
     store: &Store,
@@ -239,7 +262,15 @@ pub async fn run(
             ano: entry.movie.year,
             motivo,
         };
+        let added = entry
+            .movie
+            .file
+            .as_ref()
+            .and_then(|f| f.date_added.as_deref());
         match verdict {
+            Verdict::Delete { at, .. } if !watched_after_added(at, added) => {
+                report.pulados.push(skip(before_added_reason(added)));
+            }
             Verdict::Delete { user, at } => {
                 // Medido antes: depois de apagar, não há o que medir.
                 let size = folder_size(config, entry).await;
@@ -447,6 +478,16 @@ mod tests {
     }
 
     #[test]
+    fn so_sai_o_arquivo_que_chegou_antes_de_assistirem() {
+        let seen = at("2026-09-01T20:00:00Z");
+        assert!(watched_after_added(seen, Some("2026-09-01T19:59:59Z")));
+        assert!(!watched_after_added(seen, Some("2026-09-01T20:00:00Z")));
+        assert!(!watched_after_added(seen, Some("2026-09-10T00:00:00Z")));
+        assert!(!watched_after_added(seen, None));
+        assert!(!watched_after_added(seen, Some("ontem")));
+    }
+
+    #[test]
     fn resumo_conta_apagados_e_recusados() {
         assert_eq!(
             WatchedReport::default().summary(),
@@ -474,7 +515,8 @@ mod tests {
         );
     }
 
-    fn movie(tmdb_id: u32, title: &str, path: &str) -> Movie {
+    /// Um filme com arquivo adicionado em `added`.
+    fn movie(tmdb_id: u32, title: &str, path: &str, added: Option<&str>) -> Movie {
         Movie {
             tmdb_id,
             imdb_id: None,
@@ -486,12 +528,20 @@ mod tests {
             monitored: false,
             path: path.into(),
             added: None,
-            file: None,
+            file: Some(acervo_store::MovieFile {
+                relative_path: format!("{title}.mkv"),
+                size: 1,
+                quality: acervo_parser::parse_quality("x.1080p.WEB-DL"),
+                languages: Vec::new(),
+                release_group: None,
+                edition: None,
+                scene_name: None,
+                date_added: added.map(str::to_owned),
+            }),
             runtime: 0,
             secondary_year: None,
             clean_title: None,
             alternate_titles: Vec::new(),
-            available: true,
             in_cinemas: None,
             digital_release: None,
             physical_release: None,
@@ -507,6 +557,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Montar o Jellyfin e o disco e conferir cada veredito.
     async fn apaga_o_assistido_e_poupa_o_favorito() {
         let Some(db) = acervo_store::testing::TestDb::new("assistidos").await else {
             return;
@@ -514,8 +565,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!("acervo-assistidos-{}", std::process::id()));
         let visto = root.join("movies/Visto (2024)");
         let amado = root.join("movies/Amado (2024)");
+        let de_novo = root.join("movies/De Novo (2024)");
         std::fs::create_dir_all(&visto).unwrap();
         std::fs::create_dir_all(&amado).unwrap();
+        std::fs::create_dir_all(&de_novo).unwrap();
         std::fs::write(visto.join("visto.mkv"), vec![0_u8; 64 * 1024]).unwrap();
         std::fs::write(amado.join("amado.mkv"), b"fica").unwrap();
         let mut config = Config::default();
@@ -526,12 +579,41 @@ mod tests {
         config.library.root_folders = vec!["/media/movies".into()];
         let store = &db.store;
         let extras = MovieExtras::default();
+        let before = Some("2026-08-01T00:00:00Z");
         store
-            .add_movie(&movie(10, "Visto", "/media/movies/Visto (2024)"), &extras)
+            .add_movie(
+                &movie(10, "Visto", "/media/movies/Visto (2024)", before),
+                &extras,
+            )
             .await
             .unwrap();
         store
-            .add_movie(&movie(20, "Amado", "/media/movies/Amado (2024)"), &extras)
+            .add_movie(
+                &movie(20, "Amado", "/media/movies/Amado (2024)", before),
+                &extras,
+            )
+            .await
+            .unwrap();
+        // Apagado por assistido e adicionado de novo depois: o Jellyfin ainda
+        // lembra o assistido de antes, mas o arquivo de agora é mais novo.
+        store
+            .add_movie(
+                &movie(
+                    40,
+                    "De Novo",
+                    "/media/movies/De Novo (2024)",
+                    Some("2026-09-10T00:00:00Z"),
+                ),
+                &extras,
+            )
+            .await
+            .unwrap();
+        // Sem data de adição: na dúvida, fica.
+        store
+            .add_movie(
+                &movie(50, "Sem Data", "/media/movies/Sem Data (2024)", None),
+                &extras,
+            )
             .await
             .unwrap();
 
@@ -550,8 +632,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "Items": [item("Visto", 10, &played), item("Amado", 20, &played),
                           // Fora do catálogo: ignorado.
-                          item("Outro", 30, &played)],
-                "TotalRecordCount": 3
+                          item("Outro", 30, &played),
+                          item("De Novo", 40, &played), item("Sem Data", 50, &played)],
+                "TotalRecordCount": 5
             })))
             .mount(&server)
             .await;
@@ -579,13 +662,27 @@ mod tests {
         assert_eq!(report.apagados[0].assistido_por, "vitor");
         assert_eq!(report.apagados[0].assistido_em, "2026-09-01T20:00:00Z");
         assert_ne!(report.liberado, "0 B");
-        assert_eq!(report.pulados.len(), 1);
-        assert_eq!(report.pulados[0].titulo, "Amado");
-        assert_eq!(report.pulados[0].motivo, "favorito de ana");
+        let skipped: Vec<(&str, &str)> = report
+            .pulados
+            .iter()
+            .map(|p| (p.titulo.as_str(), p.motivo.as_str()))
+            .collect();
+        assert_eq!(
+            skipped,
+            [
+                ("Amado", "favorito de ana"),
+                (
+                    "De Novo",
+                    "assistido antes de o arquivo de agora chegar (10/09/2026 00:00 UTC)"
+                ),
+                ("Sem Data", "arquivo sem data de adição conhecida"),
+            ]
+        );
         assert!(report.summary().0);
 
         assert!(!visto.exists());
         assert!(amado.join("amado.mkv").exists());
+        assert!(de_novo.exists());
         let left: Vec<_> = store
             .movies()
             .await
@@ -593,7 +690,7 @@ mod tests {
             .into_iter()
             .map(|m| m.movie.tmdb_id)
             .collect();
-        assert_eq!(left, [20]);
+        assert_eq!(left, [20, 40, 50]);
         let history = store
             .history(None, Some("movie_deleted"), 10, 0)
             .await

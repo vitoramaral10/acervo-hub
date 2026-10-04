@@ -11,7 +11,7 @@ use crate::size::{Allocated, Apparent};
 ///
 /// `Paused` é um estado próprio, e **não** é sinônimo de órfão: a maior parte
 /// dos pausados é download desejado esperando liberar espaço. Órfão é o item
-/// cuja obra não existe mais — ver [`crate::queue::QueueItem::is_orphaned`].
+/// cuja obra não existe mais.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DownloadState {
     Downloading,

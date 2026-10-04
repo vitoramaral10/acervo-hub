@@ -13,7 +13,6 @@ use time::{Date, OffsetDateTime};
 pub mod grab;
 pub mod import;
 pub mod library;
-pub mod migrate;
 pub mod naming;
 pub mod remove;
 pub mod scene;

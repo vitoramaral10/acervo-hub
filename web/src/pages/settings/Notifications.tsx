@@ -15,9 +15,17 @@ const EVENT_FIELDS: { key: keyof NotifyOn; label: string; description: string }[
   { key: 'atualizou', label: 'Atualizou', description: 'Quando trocar por versão melhor' },
   { key: 'falhou', label: 'Falhou', description: 'Quando um download falhar' },
   { key: 'removido', label: 'Removido', description: 'Quando um filme for removido' },
+  { key: 'travou', label: 'Travou', description: 'Quando a importação de um download passar 6 h em atenção' },
 ]
 
-const DEFAULT_EVENTS: NotifyOn = { pegou: true, importou: true, atualizou: true, falhou: true, removido: false }
+const DEFAULT_EVENTS: NotifyOn = {
+  pegou: true,
+  importou: true,
+  atualizou: true,
+  falhou: true,
+  removido: false,
+  travou: true,
+}
 
 export function NotificationsSection() {
   const queryClient = useQueryClient()

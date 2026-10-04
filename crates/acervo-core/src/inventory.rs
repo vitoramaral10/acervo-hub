@@ -1,6 +1,5 @@
-//! A fotografia de um ciclo: o que cada instância reportou e o que o cliente tem.
+//! A fotografia de um ciclo: a fila do acervo e o que o cliente tem.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::download::Download;
@@ -8,10 +7,10 @@ use crate::ids::{DownloadHash, InstanceName};
 use crate::queue::{InstanceSnapshot, QueueItem};
 use crate::size::Allocated;
 
-/// Uma instância que não respondeu.
+/// Uma fila que não pôde ser lida.
 ///
-/// Guardar a falha em vez de omitir a instância é deliberado: uma instância
-/// ausente faz o acervo inteiro parecer órfão. Quem decide precisa **ver** o
+/// Guardar a falha em vez de omitir a fila é deliberado: sem ela, todo
+/// download em andamento pareceria sem dono. Quem decide precisa **ver** o
 /// buraco para poder abortar.
 #[derive(Debug, Clone)]
 pub struct UnreachableInstance {
@@ -56,22 +55,14 @@ impl Inventory {
         }
     }
 
-    /// Todos os itens de fila, de todas as instâncias.
+    /// Todos os itens de fila.
     pub fn queue_items(&self) -> impl Iterator<Item = &QueueItem> {
         self.snapshots.iter().flat_map(|s| s.queue.iter())
     }
 
-    /// Índice hash → download, para cruzar fila e cliente.
-    #[must_use]
-    pub fn downloads_by_hash(&self) -> HashMap<&DownloadHash, &Download> {
-        self.downloads.iter().map(|d| (&d.hash, d)).collect()
-    }
-
     /// Hashes presentes em alguma fila.
     ///
-    /// Sustenta a separação entre os dois lados da limpeza: quem está em fila é
-    /// caso da reconciliação de fila; quem está em seeding fora de fila é caso
-    /// da limpeza de download. Não há sobreposição, por construção.
+    /// Quem está em fila é download em andamento e fica fora da limpeza.
     #[must_use]
     pub fn hashes_in_any_queue(&self) -> Vec<&DownloadHash> {
         self.queue_items()
@@ -91,12 +82,12 @@ mod tests {
             instance: InstanceName::new("filmes"),
             title: "exemplo".into(),
             download: hash.map(DownloadHash::new),
-            work: QueueItem::normalize_work(work),
+            work: work.map(WorkId),
         }
     }
 
     #[test]
-    fn fila_agrega_todas_as_instancias() {
+    fn fila_agrega_todas_as_leituras() {
         let mut inv = Inventory::new(Allocated::ZERO);
         inv.snapshots.push(InstanceSnapshot {
             instance: InstanceName::new("filmes"),
@@ -111,7 +102,6 @@ mod tests {
 
         assert_eq!(inv.queue_items().count(), 2);
         assert_eq!(inv.hashes_in_any_queue().len(), 2);
-        assert_eq!(inv.queue_items().filter(|i| i.is_orphaned()).count(), 1);
         assert_eq!(item(None, Some(3)).work, Some(WorkId(3)));
     }
 }

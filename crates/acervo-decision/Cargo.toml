@@ -10,7 +10,6 @@ repository.workspace = true
 [dependencies]
 acervo-parser.workspace = true
 fancy-regex.workspace = true
-serde.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

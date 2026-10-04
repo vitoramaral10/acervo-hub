@@ -124,15 +124,14 @@ impl Parts {
     /// Banco inalcançável ou nenhum indexador.
     pub async fn load(store: &Store, catalog: &Catalog) -> Result<Self> {
         let rules = crate::rules::stored(store).await?;
-        let (definitions, blocked) =
-            tokio::try_join!(store.quality_definitions(), store.blocklist())?;
+        let blocked = store.blocklist().await?;
         let served: Vec<String> = catalog.views().into_iter().map(|view| view.name).collect();
         if served.is_empty() {
             bail!("nenhum indexador ativo para buscar");
         }
         Ok(Self {
             indexers: crate::decide::indexers(&served, &rules),
-            settings: rules.settings(definitions),
+            settings: rules.settings(),
             // Bloqueio de filme não diz nada a série.
             blocklist: blocked
                 .into_iter()
@@ -468,17 +467,12 @@ pub struct RssGrab {
 }
 
 /// RSS de séries: os releases recentes da categoria de TV, cada um casado
-/// com a biblioteca inteira; `pick` escolhe e, com `apply`, vai ao cliente.
+/// com a biblioteca inteira; `pick` escolhe, e o escolhido vai ao cliente.
 ///
 /// # Errors
 ///
 /// Nenhum indexador ou busca que falhou em todos.
-pub async fn rss(
-    config: &Config,
-    store: &Store,
-    catalog: &Catalog,
-    apply: bool,
-) -> Result<Vec<RssGrab>> {
+pub async fn rss(config: &Config, store: &Store, catalog: &Catalog) -> Result<Vec<RssGrab>> {
     let _guard = SEARCH_LOCK.lock().await;
     let list = store.series_list().await?;
     if list.is_empty() {
@@ -507,15 +501,13 @@ pub async fn rss(
             release: release.title.clone(),
             erro: None,
         };
-        if apply {
-            let quality = decision
-                .quality
-                .map_or(acervo_parser::Quality::Unknown, |q| q.quality);
-            if let Err(error) =
-                super::grab::send(config, store, catalog, entry.id, release, quality, &wanted).await
-            {
-                line.erro = Some(format!("{error:#}"));
-            }
+        let quality = decision
+            .quality
+            .map_or(acervo_parser::Quality::Unknown, |q| q.quality);
+        if let Err(error) =
+            super::grab::send(config, store, catalog, entry.id, release, quality, &wanted).await
+        {
+            line.erro = Some(format!("{error:#}"));
         }
         grabs.push(line);
     }

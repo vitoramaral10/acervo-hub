@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use acervo_api::{ALL, Catalog, Entry, TorznabError};
+use acervo_api::{ALL, Catalog, Entry, SearchError};
 use acervo_indexers::{Capabilities, Indexer, IndexerError, Release, SearchQuery, SearchSupport};
 use async_trait::async_trait;
 
@@ -160,8 +160,7 @@ async fn entra_em_espera_pula_na_busca_e_recusa_o_download() {
         .search("limitado", &query("tres"))
         .await
         .unwrap_err();
-    assert!(matches!(error, TorznabError::AllWaiting { .. }));
-    assert_eq!(error.code(), 900);
+    assert!(matches!(error, SearchError::AllWaiting { .. }));
     assert!(
         error
             .to_string()
@@ -171,7 +170,7 @@ async fn entra_em_espera_pula_na_busca_e_recusa_o_download() {
 
     // O download recusa sem requisição.
     let error = catalog.download("limitado", &link()).await.unwrap_err();
-    assert!(matches!(error, TorznabError::IndexerWaiting { .. }));
+    assert!(matches!(error, SearchError::IndexerWaiting { .. }));
     let message = error.to_string();
     assert!(message.contains("indexador `limitado` em espera até "));
     assert!(message.contains("UTC por excesso de requisições"));
@@ -189,10 +188,10 @@ async fn todos_em_espera_viram_erro_e_o_prazo_vencido_volta_a_consultar() {
 
     // A consulta que levou o 429 falhou, e é a única: erro de falha total.
     let error = catalog.search(ALL, &query("um")).await.unwrap_err();
-    assert!(matches!(error, TorznabError::AllFailed(1)));
+    assert!(matches!(error, SearchError::AllFailed(1)));
 
     let error = catalog.search(ALL, &query("um")).await.unwrap_err();
-    assert!(matches!(error, TorznabError::AllWaiting { .. }));
+    assert!(matches!(error, SearchError::AllWaiting { .. }));
     assert_eq!(tracker.searches(), 1, "o erro de espera não foi ao tracker");
 
     // Passados os 10 minutos, o indexador volta a ser consultado — e o erro
@@ -285,7 +284,7 @@ async fn download_com_429_poe_em_espera_e_o_teste_manual_tambem_recua() {
     tracker.limit(Some(HOUR));
 
     let error = catalog.download("unico", &link()).await.unwrap_err();
-    assert!(matches!(error, TorznabError::IndexerWaiting { .. }));
+    assert!(matches!(error, SearchError::IndexerWaiting { .. }));
     assert_eq!(tracker.downloads(), 1);
 
     assert!(catalog.download("unico", &link()).await.is_err());

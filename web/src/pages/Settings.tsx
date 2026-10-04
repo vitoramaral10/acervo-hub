@@ -145,7 +145,7 @@ export type SettingsView = 'servidor' | 'cliente-download' | 'jellyfin' | 'bibli
 const PAGES: Record<SettingsView, { title: string; description: string; body: () => ReactNode }> = {
   servidor: {
     title: 'Servidor',
-    description: 'A chave de API, o endereço público e o catálogo de definições. Vale na hora, sem reiniciar.',
+    description: 'A chave de API, a rede dos indexadores e o catálogo de definições. Vale na hora, sem reiniciar.',
     body: () => <ServerSettings />,
   },
   'cliente-download': {

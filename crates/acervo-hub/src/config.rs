@@ -10,7 +10,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use acervo_arr::ArrKind;
 use acervo_core::Allocated;
 use acervo_janitor::{Guards, Policy};
 use anyhow::{Context, Result};
@@ -20,18 +19,17 @@ use serde_json::Value;
 pub const SERVIDOR: &str = "servidor";
 pub const QBITTORRENT: &str = "qbittorrent";
 pub const JELLYFIN: &str = "jellyfin";
-pub const GERENCIADORES: &str = "gerenciadores";
 pub const BIBLIOTECA: &str = "biblioteca";
 pub const LIMPEZA: &str = "limpeza";
 pub const TAREFAS: &str = "tarefas";
 
 /// Campos secretos de cada seção: nunca voltam pela API, e vazio ao salvar
-/// mantém o valor guardado. Em `gerenciadores`, vale para cada item.
+/// mantém o valor guardado.
 #[must_use]
 pub fn secrets(section: &str) -> &'static [&'static str] {
     match section {
         SERVIDOR => &["api_key", "proxy_password"],
-        JELLYFIN | GERENCIADORES => &["api_key"],
+        JELLYFIN => &["api_key"],
         QBITTORRENT => &["password"],
         _ => &[],
     }
@@ -39,7 +37,7 @@ pub fn secrets(section: &str) -> &'static [&'static str] {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Config {
-    /// Superfície Torznab, catálogo de definições e timeout HTTP.
+    /// Chave da interface, catálogo de definições, rede e timeout HTTP.
     pub server: ServerConfig,
     /// Cliente de download. Sem URL, não há cliente: o grab e a limpeza
     /// ficam parados.
@@ -47,8 +45,6 @@ pub struct Config {
     /// Servidor de mídia que diz o que já foi assistido. Sem URL, a tarefa de
     /// apagar assistidos fica parada.
     pub jellyfin: JellyfinConfig,
-    /// Os gerenciadores de série e de filme.
-    pub instances: Vec<InstanceConfig>,
     pub library: LibraryConfig,
     pub policy: PolicyConfig,
     pub tasks: TasksConfig,
@@ -65,13 +61,9 @@ pub const DEFINITIONS_URL: &str =
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
-    /// Chave que os consumidores mandam em `apikey`. Vale para todos os
-    /// indexadores servidos e para a tela em `X-Api-Key`.
-    /// Vazia, nada disso aceita chave nenhuma.
+    /// Chave que a interface aceita em `X-Api-Key`, para quem a usa sem
+    /// sessão. Vazia, nenhuma chave vale.
     pub api_key: String,
-    /// Como os gerenciadores alcançam este serviço — o endereço que `sync`
-    /// cadastra neles. Em Compose, o nome do serviço na rede interna.
-    pub public_url: Option<String>,
     /// Diretórios locais de definições Cardigann — as customizadas. Valem
     /// acima de tudo e nunca são trocadas pelas do repositório. O primeiro
     /// que tiver um id vence.
@@ -106,7 +98,6 @@ impl std::fmt::Debug for ServerConfig {
         // A chave dá acesso a links com passkey.
         formatter
             .debug_struct("ServerConfig")
-            .field("public_url", &self.public_url)
             .field("catalogs", &self.catalogs)
             .field("reserve_catalogs", &self.reserve_catalogs)
             .field("definitions_url", &self.definitions_url)
@@ -151,7 +142,6 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             api_key: String::new(),
-            public_url: None,
             catalogs: Vec::new(),
             reserve_catalogs: Vec::new(),
             definitions_url: DEFINITIONS_URL.into(),
@@ -219,45 +209,6 @@ impl std::fmt::Debug for JellyfinConfig {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InstanceConfig {
-    pub name: String,
-    pub kind: InstanceKind,
-    pub url: String,
-    #[serde(default)]
-    pub api_key: String,
-}
-
-impl std::fmt::Debug for InstanceConfig {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("InstanceConfig")
-            .field("name", &self.name)
-            .field("kind", &self.kind)
-            .field("url", &self.url)
-            .finish_non_exhaustive()
-    }
-}
-
-/// `series` ou `movie`: decide qual campo da fila aponta para a obra — ler o
-/// campo do outro produto esconderia órfão.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum InstanceKind {
-    Series,
-    Movie,
-}
-
-impl From<InstanceKind> for ArrKind {
-    fn from(kind: InstanceKind) -> Self {
-        match kind {
-            InstanceKind::Series => Self::Series,
-            InstanceKind::Movie => Self::Movie,
-        }
-    }
-}
-
 /// A categoria padrão da busca manual.
 pub const MANUAL_CATEGORY: &str = "manual";
 
@@ -273,8 +224,8 @@ pub struct LibraryConfig {
     /// Pasta raiz das séries, como o cliente de download a vê: cada série
     /// nova nasce nela, e apagar pasta de série só vale dentro dela.
     pub series_root: String,
-    /// Categoria do cliente de download para o que o acervo pega. Separada da
-    /// do gerenciador, para ele não tentar importar o que não pegou.
+    /// Categoria do cliente de download para o que o acervo pega. Separada de
+    /// qualquer outra: a fila e a limpeza só mexem no que é dela.
     pub category: String,
     /// Categoria do que a busca manual manda ao cliente. Fica fora das
     /// gerenciadas pela limpeza e de qualquer grab do acervo: o torrent é
@@ -326,7 +277,6 @@ impl LibraryConfig {
 pub struct PolicyConfig {
     pub orphan_strikes: u32,
     pub delete_private_orphans: bool,
-    pub skip_orphan_if_missing_in_client: bool,
     /// Zero apaga sem carência de seed.
     pub private_seed_grace_hours: u64,
     /// Ratio que libera o seed privado sem vínculo antes do teto. Zero desliga.
@@ -337,7 +287,8 @@ pub struct PolicyConfig {
     pub recent_change_grace_hours: u64,
     pub max_batch_gib: u64,
     pub max_batch_fraction: f64,
-    /// Categorias do cliente que os *arr usam. Só seed nelas pode ser apagado
+    /// Categorias do cliente cujos downloads a limpeza gerencia — a do
+    /// acervo e as que sobraram de antes dele. Só seed nelas pode ser apagado
     /// por perda de hardlink; vazia, essa regra não apaga nada.
     pub managed_categories: Vec<String>,
 }
@@ -347,7 +298,6 @@ impl Default for PolicyConfig {
         Self {
             orphan_strikes: 3,
             delete_private_orphans: false,
-            skip_orphan_if_missing_in_client: true,
             private_seed_grace_hours: 120,
             seed_ratio_alvo: 1.0,
             seed_ocioso_horas: 24,
@@ -365,7 +315,6 @@ impl PolicyConfig {
         Policy {
             orphan_strikes: self.orphan_strikes,
             delete_private_orphans: self.delete_private_orphans,
-            skip_orphan_if_missing_in_client: self.skip_orphan_if_missing_in_client,
             private_seed_grace: (self.private_seed_grace_hours > 0)
                 .then(|| Duration::from_secs(self.private_seed_grace_hours * 3600)),
             private_seed_ratio: (self.seed_ratio_alvo > 0.0).then_some(self.seed_ratio_alvo),
@@ -480,7 +429,6 @@ impl Config {
             SERVIDOR => serde_json::to_value(&self.server),
             QBITTORRENT => serde_json::to_value(&self.qbittorrent),
             JELLYFIN => serde_json::to_value(&self.jellyfin),
-            GERENCIADORES => serde_json::to_value(&self.instances),
             BIBLIOTECA => serde_json::to_value(&self.library),
             LIMPEZA => serde_json::to_value(&self.policy),
             TAREFAS => serde_json::to_value(&self.tasks),
@@ -503,7 +451,6 @@ impl Config {
             SERVIDOR => config.server = parse(value)?,
             QBITTORRENT => config.qbittorrent = parse(value)?,
             JELLYFIN => config.jellyfin = parse(value)?,
-            GERENCIADORES => config.instances = parse(value)?,
             BIBLIOTECA => config.library = parse(value)?,
             LIMPEZA => config.policy = parse(value)?,
             TAREFAS => config.tasks = parse(value)?,
@@ -520,16 +467,10 @@ impl Config {
     /// O primeiro problema encontrado.
     pub fn validate(&self) -> Result<(), String> {
         let server = &self.server;
-        // A superfície devolve links de download de tracker, com passkey.
+        // A chave abre a interface inteira, credenciais de tracker inclusas.
         // Chave curta é chave adivinhável.
         if !server.api_key.is_empty() && server.api_key.chars().count() < 16 {
             return Err("servidor: a chave de API precisa de ao menos 16 caracteres".into());
-        }
-        if let Some(public_url) = &server.public_url {
-            check_url("servidor: endereço público", public_url)?;
-            if public_url.contains('?') {
-                return Err("servidor: o endereço público não leva query".into());
-            }
         }
         check_url("servidor: endereço do XEM", &server.xem_url)?;
         server.validate_network()?;
@@ -543,20 +484,6 @@ impl Config {
             check_url("Jellyfin: URL", &self.jellyfin.url)?;
             if self.jellyfin.api_key.is_empty() {
                 return Err("Jellyfin: informe a chave de API".into());
-            }
-        }
-        let mut names = std::collections::BTreeSet::new();
-        for instance in &self.instances {
-            let name = instance.name.trim();
-            if name.is_empty() {
-                return Err("gerenciadores: todo gerenciador precisa de nome".into());
-            }
-            if !names.insert(name) {
-                return Err(format!("gerenciadores: o nome {name} aparece duas vezes"));
-            }
-            check_url(&format!("gerenciador {name}: URL"), &instance.url)?;
-            if instance.api_key.is_empty() {
-                return Err(format!("gerenciador {name}: informe a chave de API"));
             }
         }
         let library = &self.library;
@@ -624,8 +551,7 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Sem cliente de download ou sem raiz de biblioteca. Gerenciador *arr é
-    /// opcional: a fila interna do acervo cobre o que ele cobriria.
+    /// Sem cliente de download ou sem raiz de biblioteca.
     pub fn janitor(&self) -> Result<&QbitConfig> {
         let qbit = self.qbittorrent().context(
             "cliente de download não configurado: o ciclo age pelo qBittorrent \
@@ -637,28 +563,6 @@ impl Config {
              trava proporcional não tem denominador"
         );
         Ok(qbit)
-    }
-
-    /// O que `sync` exige: chave, endereço público e gerenciadores.
-    ///
-    /// # Errors
-    ///
-    /// Sem chave, sem endereço público ou sem gerenciador.
-    pub fn sync(&self) -> Result<(&ServerConfig, String)> {
-        let server = &self.server;
-        anyhow::ensure!(
-            !server.api_key.is_empty(),
-            "a chave de API do servidor não está definida (Configurações → Servidor)"
-        );
-        let public_url = server.public_url.as_deref().context(
-            "endereço público ausente: `sync` precisa saber como os gerenciadores \
-             alcançam este serviço (Configurações → Servidor)",
-        )?;
-        anyhow::ensure!(
-            !self.instances.is_empty(),
-            "nenhum gerenciador configurado: não haveria onde cadastrar"
-        );
-        Ok((server, public_url.trim_end_matches('/').to_owned()))
     }
 
     #[must_use]
@@ -691,12 +595,6 @@ mod tests {
             username: "u".into(),
             password: "p".into(),
         };
-        config.instances.push(InstanceConfig {
-            name: "filmes".into(),
-            kind: InstanceKind::Movie,
-            url: "http://localhost:7878".into(),
-            api_key: "k".into(),
-        });
         config.library.roots.push("/acervo".into());
         config
     }
@@ -757,7 +655,6 @@ mod tests {
             SERVIDOR,
             QBITTORRENT,
             JELLYFIN,
-            GERENCIADORES,
             BIBLIOTECA,
             LIMPEZA,
             TAREFAS,
@@ -770,14 +667,14 @@ mod tests {
     }
 
     #[test]
-    fn limpeza_exige_cliente_e_raiz_mas_nao_gerenciador() {
+    fn limpeza_exige_cliente_e_raiz() {
         assert!(valid().janitor().is_ok());
         let mut sem_raiz = valid();
         sem_raiz.library.roots.clear();
         assert!(sem_raiz.janitor().is_err());
-        let mut sem_instancia = valid();
-        sem_instancia.instances.clear();
-        assert!(sem_instancia.janitor().is_ok());
+        let mut sem_cliente = valid();
+        sem_cliente.qbittorrent.url.clear();
+        assert!(sem_cliente.janitor().is_err());
     }
 
     #[test]
@@ -807,9 +704,8 @@ mod tests {
         assert!(erro(|c| c.server.api_key = "curta".into()).contains("16"));
         assert!(erro(|c| c.policy.max_batch_fraction = 1.5).contains("fração"));
         assert!(erro(|c| c.policy.seed_ratio_alvo = -1.0).contains("ratio"));
-        assert!(erro(|c| c.server.public_url = Some("http://u:p@x".into())).contains("usuário"));
+        assert!(erro(|c| c.qbittorrent.url = "http://u:p@x".into()).contains("usuário"));
         assert!(erro(|c| c.qbittorrent.url = "nada".into()).contains("URL"));
-        assert!(erro(|c| c.instances[0].api_key.clear()).contains("chave"));
         assert!(
             erro(|c| {
                 c.tasks.intervalos.insert("rss".into(), 2);
@@ -840,17 +736,6 @@ mod tests {
         proxied.server.flaresolverr_url = Some("http://flaresolverr:8191".into());
         assert!(proxied.validate().is_ok());
         assert!(valid().validate().is_ok());
-    }
-
-    #[test]
-    fn sync_exige_chave_endereco_e_gerenciador() {
-        let mut config = valid();
-        assert!(config.sync().is_err());
-        config.server.public_url = Some("http://acervo:9797/".into());
-        let (_, url) = config.sync().unwrap();
-        assert_eq!(url, "http://acervo:9797");
-        config.server.api_key.clear();
-        assert!(config.sync().is_err());
     }
 
     #[test]

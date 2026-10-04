@@ -1,5 +1,5 @@
-//! `serve`: monta o catálogo de indexadores e expõe a superfície Torznab e a
-//! interface web.
+//! `serve`: monta o catálogo de indexadores, sobe as tarefas de fundo e
+//! serve a interface web.
 //!
 //! Tudo vem do banco: a configuração ([`Settings`]) e os indexadores
 //! cadastrados (tabela `indexers`). Não há indexador "do arquivo" e "da
@@ -10,7 +10,7 @@ use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use acervo_api::{Accounts, Admin, ApiKey, Catalog, DefinitionView, Entry, SettingView};
-use acervo_indexers::{Capabilities, CardigannDefinition, SettingInfo, SettingInfoKind};
+use acervo_indexers::{CardigannDefinition, SettingInfo, SettingInfoKind};
 use acervo_store::{IndexerRecord, Store};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -83,36 +83,6 @@ pub async fn connect(url: &str) -> Store {
     }
 }
 
-/// Os downloads do acervo, do mais novo ao mais velho, com o título do filme.
-async fn downloads_json(store: &Store) -> Result<serde_json::Value> {
-    let (grabs, movies) = tokio::try_join!(store.grabs(), store.movies())?;
-    Ok(serde_json::Value::Array(
-        grabs
-            .iter()
-            .map(|grab| {
-                let movie = movies.iter().find(|m| m.id == grab.movie_id);
-                json!({
-                    "id": grab.id,
-                    "filme_id": grab.movie_id,
-                    "filme": movie.map(|m| match m.movie.year {
-                        Some(year) => format!("{} ({year})", m.movie.title),
-                        None => m.movie.title.clone(),
-                    }),
-                    "release": grab.title,
-                    "indexador": grab.indexer,
-                    "qualidade": grab.quality.name(),
-                    "tamanho": grab.size,
-                    "estado": grab.state,
-                    "mensagem": grab.message,
-                    "destino": grab.imported_path,
-                    "pego_em": grab.grabbed_at,
-                    "concluido_em": grab.finished_at,
-                })
-            })
-            .collect(),
-    ))
-}
-
 /// Como a tela rotula um indexador cadastrado.
 const ORIGIN: &str = "cadastro";
 
@@ -157,11 +127,6 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         let settings = Arc::clone(&settings);
         move || settings.get().server.api_key.clone()
     });
-    if settings.get().server.api_key.is_empty() {
-        tracing::warn!(
-            "sem chave de API: o Torznab recusa tudo até gerar uma em Configurações → Servidor"
-        );
-    }
     let web = Arc::new(crate::web::Web {
         settings: Arc::clone(&settings),
         database: database.clone(),
@@ -178,7 +143,7 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         tasks,
         registry,
     );
-    tracing::info!(indexadores = catalog.len(), bind = %bind, "servindo Torznab e a interface web");
+    tracing::info!(indexadores = catalog.len(), bind = %bind, "servindo a interface web");
 
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -196,22 +161,6 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
     .await
     .context("servidor HTTP")?;
     Ok(())
-}
-
-/// Os indexadores servidos, lidos do banco — para os comandos avulsos, que
-/// não sobem o serviço.
-///
-/// # Errors
-///
-/// Banco inalcançável.
-pub async fn stored_entries(config: &Config, store: &Store) -> Result<Vec<Entry>> {
-    let records = store.indexers().await.context("lendo os indexadores")?;
-    let rows = store
-        .definitions()
-        .await
-        .context("lendo as definições do banco")?;
-    let registry = Registry::new(config, &rows, records);
-    Ok(entries(config, &registry).await)
 }
 
 /// Os indexadores servidos: os cadastros ativos que sobem.
@@ -252,8 +201,8 @@ fn now() -> String {
 #[derive(Debug)]
 struct HubAdmin {
     settings: Arc<Settings>,
-    /// O catálogo servido: a busca dos que faltam passa por ele e divide as consultas com
-    /// os gerenciadores.
+    /// O catálogo servido: a busca dos que faltam e a da tela passam por ele
+    /// e dividem as consultas guardadas.
     catalog: Catalog,
     database: Database,
     /// Andamento da busca dos que faltam.
@@ -740,32 +689,6 @@ impl Admin for HubAdmin {
         Ok(Some(entry))
     }
 
-    fn apps(&self) -> serde_json::Value {
-        let config = self.settings.get();
-        json!({
-            "endereco_publico": config.server.public_url,
-            "instancias": config.instances.iter().map(|instance| json!({
-                "nome": instance.name,
-                "tipo": match instance.kind {
-                    crate::config::InstanceKind::Series => "series",
-                    crate::config::InstanceKind::Movie => "filmes",
-                },
-                "url": instance.url,
-            })).collect::<Vec<_>>(),
-        })
-    }
-
-    async fn sync(
-        &self,
-        indexers: Vec<(String, Capabilities)>,
-        apply: bool,
-    ) -> Result<serde_json::Value, String> {
-        let report = crate::sync::execute(&self.settings.get(), &indexers, apply, false)
-            .await
-            .map_err(|e| message(&e))?;
-        serde_json::to_value(report).map_err(|e| e.to_string())
-    }
-
     fn tasks(&self) -> serde_json::Value {
         self.tasks.view()
     }
@@ -811,27 +734,6 @@ impl Admin for HubAdmin {
         .await
         .map_err(|e| message(&e))?;
         serde_json::to_value(report).map_err(|e| e.to_string())
-    }
-
-    async fn downloads(&self, import: bool) -> Result<serde_json::Value, String> {
-        let store = self.store()?;
-        let imported = if import {
-            let _guard = self.registry.write.lock().await;
-            Some(
-                crate::grab::import_downloads(
-                    &self.settings.get(),
-                    store,
-                    Some(&self.catalog),
-                    true,
-                )
-                .await
-                .map_err(|e| message(&e))?,
-            )
-        } else {
-            None
-        };
-        let list = downloads_json(store).await.map_err(|e| message(&e))?;
-        Ok(json!({ "downloads": list, "importacao": imported }))
     }
 
     async fn configuration(&self) -> Result<serde_json::Value, String> {
@@ -1194,17 +1096,16 @@ mod tests {
         assert_eq!(body["url"], "http://qbit:8080");
         assert!(!body.to_string().contains("senha-qbit"));
 
-        // Gerenciador e Jellyfin: chave só como `definida`.
-        let (status, body) = call(
+        // Jellyfin sem chave é recusado; seção que não existe mais, 404.
+        let (status, _) = call(
             &client,
-            reqwest::Method::PUT,
+            reqwest::Method::GET,
             &url("gerenciadores"),
             first,
-            Some(json!([{ "name": "series", "kind": "series", "url": "http://s:8989", "api_key": "chave-sonarr" }])),
+            None,
         )
         .await;
-        assert_eq!(status, 200, "{body}");
-        assert!(!body.to_string().contains("chave-sonarr"));
+        assert_eq!(status, 404);
         let (status, body) = call(
             &client,
             reqwest::Method::PUT,

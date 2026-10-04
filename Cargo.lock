@@ -10,7 +10,6 @@ dependencies = [
  "async-trait",
  "axum",
  "futures",
- "quick-xml",
  "reqwest",
  "serde",
  "serde_json",
@@ -19,21 +18,6 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
-]
-
-[[package]]
-name = "acervo-arr"
-version = "0.0.0"
-dependencies = [
- "acervo-core",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "url",
- "wiremock",
 ]
 
 [[package]]
@@ -47,7 +31,6 @@ dependencies = [
  "sha1",
  "thiserror",
  "tokio",
- "tracing",
  "url",
  "wiremock",
 ]
@@ -62,7 +45,6 @@ version = "0.0.0"
 dependencies = [
  "acervo-parser",
  "fancy-regex",
- "serde",
  "serde_json",
 ]
 
@@ -81,7 +63,6 @@ name = "acervo-hub"
 version = "0.0.0"
 dependencies = [
  "acervo-api",
- "acervo-arr",
  "acervo-clients",
  "acervo-core",
  "acervo-decision",

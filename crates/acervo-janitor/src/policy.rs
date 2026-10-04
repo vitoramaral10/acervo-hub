@@ -33,13 +33,11 @@ impl Default for Guards {
 /// A política completa de um ciclo.
 #[derive(Debug, Clone)]
 pub struct Policy {
-    /// Quantas execuções consecutivas um item precisa aparecer como órfão
+    /// Quantas execuções consecutivas um download precisa aparecer sem dono
     /// antes de sair. Um strike por ciclo, sem janela de espera.
     pub orphan_strikes: u32,
-    /// Apagar também os arquivos de órfão de tracker privado.
+    /// Apagar também os arquivos de download sem dono de tracker privado.
     pub delete_private_orphans: bool,
-    /// Órfão de fila cujo torrent sumiu do cliente: pular em vez de agir.
-    pub skip_orphan_if_missing_in_client: bool,
     /// Carência de seed para torrent privado que perdeu o vínculo com a
     /// biblioteca. `None` apaga assim que o vínculo cai — rápido, mas expõe a
     /// hit&run se o torrent for recente.
@@ -64,7 +62,6 @@ impl Default for Policy {
         Self {
             orphan_strikes: 3,
             delete_private_orphans: false,
-            skip_orphan_if_missing_in_client: true,
             private_seed_grace: Some(Duration::from_secs(120 * 60 * 60)),
             private_seed_ratio: Some(1.0),
             private_seed_idle: Some(Duration::from_secs(24 * 60 * 60)),

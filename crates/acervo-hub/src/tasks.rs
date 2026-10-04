@@ -1,6 +1,6 @@
-//! Registro das tarefas de fundo do serviço, como a tela "Tarefas" dos
-//! gerenciadores as mostra: cada uma com intervalo, estado, última e próxima
-//! execução, e um "rodar agora".
+//! Registro das tarefas de fundo do serviço, como a tela "Tarefas" as
+//! mostra: cada uma com intervalo, estado, última e próxima execução, e um
+//! "rodar agora".
 //!
 //! Cada tarefa tem um laço próprio que espera o que vier primeiro — a hora
 //! agendada ou um pedido de rodar agora — e roda uma execução por vez. O
@@ -35,6 +35,11 @@ const KEEP: i64 = 100;
 const SHOWN: i64 = 100;
 /// Teto do resumo: uma linha na tela, não um log.
 const SUMMARY_CHARS: usize = 300;
+/// Quanto uma execução pode levar. Passou disso, algo travou (um banco ou um
+/// serviço que não responde e não desiste): a execução é dada como falha e
+/// a tarefa segue agendada. Generoso: a busca de todos os que faltam, pelo
+/// botão, leva bem menos.
+const CEILING: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// Id da busca dos que faltam: o botão da tela de filmes dispara esta tarefa.
 pub const BUSCA: &str = "busca";
@@ -199,10 +204,18 @@ impl Slot {
 }
 
 /// O registro. Sem tarefas ([`Default`]), responde vazio.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Tasks {
     slots: Vec<Arc<Slot>>,
     database: Database,
+    /// [`CEILING`]; menor nos testes.
+    ceiling: Duration,
+}
+
+impl Default for Tasks {
+    fn default() -> Self {
+        Self::new(Database::default(), Vec::new())
+    }
 }
 
 impl Tasks {
@@ -220,6 +233,7 @@ impl Tasks {
                 })
                 .collect(),
             database,
+            ceiling: CEILING,
         }
     }
 
@@ -386,11 +400,22 @@ impl Tasks {
         let clock = Instant::now();
         let job = Arc::clone(&slot.task.job);
         // Numa task à parte: pânico no trabalho vira execução com falha, e o
-        // laço segue agendando.
-        let outcome = match tokio::spawn(async move { job.run(trigger).await }).await {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(error)) => Outcome::new(false, format!("{error:#}")),
-            Err(_) => Outcome::new(false, "a tarefa parou com pânico"),
+        // laço segue agendando. Travada além do teto, é abortada.
+        let mut handle = tokio::spawn(async move { job.run(trigger).await });
+        let outcome = match tokio::time::timeout(self.ceiling, &mut handle).await {
+            Ok(Ok(Ok(outcome))) => outcome,
+            Ok(Ok(Err(error))) => Outcome::new(false, format!("{error:#}")),
+            Ok(Err(_)) => Outcome::new(false, "a tarefa parou com pânico"),
+            Err(_) => {
+                handle.abort();
+                Outcome::new(
+                    false,
+                    format!(
+                        "travada: passou de {} min sem terminar; dada como falha",
+                        self.ceiling.as_secs() / 60
+                    ),
+                )
+            }
         };
         let summary: String = outcome.summary.chars().take(SUMMARY_CHARS).collect();
         let finished_at = now_rfc3339();
@@ -531,6 +556,7 @@ pub fn service(
             job: Arc::new(Cleanup {
                 settings: Arc::clone(settings),
                 database: database.clone(),
+                pruned: tokio::sync::Mutex::default(),
             }),
         },
         Task {
@@ -690,7 +716,7 @@ impl Job for Rss {
     async fn run(&self, _: Trigger) -> Result<Outcome> {
         let store = store(&self.database)?;
         let config = self.settings.get();
-        let movies = crate::automatic::rss(&config, store, &self.catalog, true)
+        let movies = crate::automatic::rss(&config, store, &self.catalog)
             .await
             .map(|grabs| {
                 for grab in &grabs {
@@ -709,7 +735,7 @@ impl Job for Rss {
                 };
                 (failed == 0, summary)
             });
-        let series = match crate::series::search::rss(&config, store, &self.catalog, true).await {
+        let series = match crate::series::search::rss(&config, store, &self.catalog).await {
             Ok(grabs) if grabs.is_empty() => None,
             Ok(grabs) => {
                 for grab in &grabs {
@@ -794,10 +820,18 @@ impl Job for Import {
     async fn run(&self, _: Trigger) -> Result<Outcome> {
         let store = store(&self.database)?;
         let config = self.settings.get();
-        let lines = crate::grab::import_downloads(&config, store, Some(&self.catalog), true).await;
+        let lines = crate::grab::import_downloads(&config, store, Some(&self.catalog)).await;
         let series =
-            crate::series::import::import_downloads(&config, store, Some(&self.catalog), true)
-                .await;
+            crate::series::import::import_downloads(&config, store, Some(&self.catalog)).await;
+        // A fila uma vez por volta, depois de filmes e séries: o que terminou
+        // ou desistiu já liberou espaço e vaga.
+        let queue = match crate::grab::qbit(&config).await {
+            Ok(client) => crate::grab::start_queued(&config, store, &client).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = queue {
+            tracing::warn!("fila de downloads: {error:#}");
+        }
         let (lines, series) = match (lines, series) {
             (Ok(lines), Ok(series)) => (lines, series),
             (Err(error), Ok(series)) if series.is_empty() => return Err(error),
@@ -852,6 +886,24 @@ impl Job for Import {
                 "{summary}; {}",
                 count(found, "ligado do disco", "ligados do disco")
             );
+        }
+        // Arquivo novo na biblioteca: o Jellyfin varre já, sem esperar a
+        // varredura agendada dele.
+        if (by("importado") > 0 || found > 0)
+            && let Some(jellyfin) = config.jellyfin()
+        {
+            let refreshed = match JellyfinClient::new(
+                &jellyfin.url,
+                &jellyfin.api_key,
+                config.http_timeout(),
+            ) {
+                Ok(client) => client.refresh_library().await.map_err(|e| e.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            if let Err(error) = refreshed {
+                tracing::warn!("varredura do Jellyfin: {error}");
+                summary = format!("{summary}; varredura do Jellyfin não pedida");
+            }
         }
         Ok(Outcome::new(failed == 0, summary))
     }
@@ -928,11 +980,65 @@ impl Job for Metadata {
     }
 }
 
+/// De quanto em quanto tempo a limpeza também poda o banco.
+const PRUNE_EVERY: Duration = Duration::from_secs(24 * 3600);
+
+/// Até que idade uma busca fica guardada (a mais recente de cada obra fica
+/// sempre).
+const SEARCHES_KEPT: time::Duration = time::Duration::days(30);
+
 /// O ciclo de limpeza, aplicado. O relatório vira o detalhe da execução.
+/// Uma vez por dia, também poda o banco ([`prune`]).
 #[derive(Debug)]
 struct Cleanup {
     settings: Arc<Settings>,
     database: Database,
+    /// Quando foi a última poda. Só em memória: reiniciar poda de novo.
+    pruned: tokio::sync::Mutex<Option<Instant>>,
+}
+
+/// A poda: as buscas com mais de 30 dias (menos a mais recente de cada
+/// obra) e os bloqueios automáticos vencidos. O histórico fica: é do
+/// usuário. Devolve o resumo, se algo saiu.
+async fn prune(store: &acervo_store::Store, now: OffsetDateTime) -> Result<Option<String>> {
+    let at = |when: OffsetDateTime| when.format(&Rfc3339).unwrap_or_default();
+    let searches = store.prune_searches(&at(now - SEARCHES_KEPT)).await?;
+    let blocks = store
+        .delete_blocks(
+            &crate::grab::EXPIRING,
+            &at(now - crate::grab::NO_SEEDS_BLOCK),
+        )
+        .await?;
+    let parts: Vec<String> = [
+        (searches, "busca antiga", "buscas antigas"),
+        (blocks, "bloqueio vencido", "bloqueios vencidos"),
+    ]
+    .into_iter()
+    .filter(|(n, _, _)| *n > 0)
+    .map(|(n, one, many)| count(usize::try_from(n).unwrap_or(usize::MAX), one, many))
+    .collect();
+    Ok((!parts.is_empty()).then(|| format!("podou {}", parts.join(" e "))))
+}
+
+impl Cleanup {
+    /// A poda, se a última foi há mais de um dia. Falha vira aviso: a
+    /// limpeza do cliente não depende dela.
+    async fn prune_daily(&self, store: &acervo_store::Store) -> Option<String> {
+        let mut last = self.pruned.lock().await;
+        if last.is_some_and(|at| at.elapsed() < PRUNE_EVERY) {
+            return None;
+        }
+        match prune(store, OffsetDateTime::now_utc()).await {
+            Ok(summary) => {
+                *last = Some(Instant::now());
+                summary
+            }
+            Err(error) => {
+                tracing::warn!("poda do banco: {error:#}");
+                None
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -940,8 +1046,12 @@ impl Job for Cleanup {
     async fn run(&self, _: Trigger) -> Result<Outcome> {
         let store = store(&self.database)?;
         let config = self.settings.get();
-        let report = crate::cycle::run(&config, store, false).await?;
-        let (ok, summary) = report.summary();
+        let pruned = self.prune_daily(store).await;
+        let report = crate::cycle::run(&config, store).await?;
+        let (ok, mut summary) = report.summary();
+        if let Some(pruned) = pruned {
+            summary = format!("{summary}; {pruned}");
+        }
         Ok(Outcome {
             ok,
             summary,
@@ -1252,6 +1362,34 @@ mod tests {
             tasks.view()[0]["proxima"].is_null() && !tasks.is_running("teste")
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn execucao_travada_passado_o_teto_e_falha_e_a_tarefa_segue() {
+        let (tasks, gate) = registry(Database::default(), Duration::ZERO, First::Now);
+        let mut tasks = Arc::try_unwrap(tasks).unwrap();
+        tasks.ceiling = Duration::from_millis(50);
+        let tasks = Arc::new(tasks);
+        tasks.start().await;
+        // A primeira nunca é solta: trava até o teto.
+        assert_eq!(tasks.run_now("teste"), Some(true));
+        gate.started.notified().await;
+        until("execução abortada", || !tasks.is_running("teste")).await;
+        let view = tasks.view_one("teste").unwrap();
+        assert_eq!(view["ultima"]["ok"], false);
+        assert!(
+            view["ultima"]["resumo"]
+                .as_str()
+                .unwrap()
+                .starts_with("travada"),
+            "{view}"
+        );
+        // Livre de novo: a próxima roda normalmente.
+        assert_eq!(tasks.run_now("teste"), Some(true));
+        gate.started.notified().await;
+        gate.release.notify_one();
+        until("segunda execução", || !tasks.is_running("teste")).await;
+        assert_eq!(tasks.view_one("teste").unwrap()["ultima"]["ok"], true);
     }
 
     #[derive(Debug)]

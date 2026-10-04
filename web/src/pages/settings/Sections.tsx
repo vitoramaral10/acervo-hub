@@ -9,13 +9,11 @@ import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge, Skeleton } from '@/components/ui/misc'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import {
   type CleanupSection,
   type DownloadClientSection,
   type JellyfinSection,
   type LibrarySection,
-  type Manager,
   type SectionInput,
   type SectionName,
   type Sections,
@@ -34,10 +32,8 @@ export function useSection<N extends SectionName>(name: N) {
     mutationFn: (value: SectionInput<N>) => api.saveSection(name, value),
     onSuccess: (data) => {
       queryClient.setQueryData(sectionKey(name), data)
-      // Tarefas (disponíveis ou não) e aplicativos dependem da configuração.
-      for (const key of ['tarefas', 'aplicativos', 'sincronizacao']) {
-        void queryClient.invalidateQueries({ queryKey: [key] })
-      }
+      // As tarefas (disponíveis ou não) dependem da configuração.
+      void queryClient.invalidateQueries({ queryKey: ['tarefas'] })
       toast.success('Configuração salva')
     },
     onError: (error: Error) => toast.error(error.message),
@@ -195,7 +191,6 @@ function newKey(): string {
 function ServerForm({ data, save, saving }: FormProps<'servidor'>) {
   const [key, setKey] = useState('')
   const [generated, setGenerated] = useState(false)
-  const [publicUrl, setPublicUrl] = useState(data.public_url ?? '')
   const [catalogs, setCatalogs] = useState(data.catalogos.join('\n'))
   const [reserve, setReserve] = useState(data.catalogos_reserva.join('\n'))
   const [definitionsUrl, setDefinitionsUrl] = useState(data.definicoes_url)
@@ -213,7 +208,6 @@ function ServerForm({ data, save, saving }: FormProps<'servidor'>) {
       onSubmit={(event) => {
         event.preventDefault()
         const value: SectionInput<'servidor'> = {
-          public_url: publicUrl.trim() || null,
           catalogos: lines(catalogs),
           catalogos_reserva: lines(reserve),
           definicoes_url: definitionsUrl.trim(),
@@ -232,7 +226,7 @@ function ServerForm({ data, save, saving }: FormProps<'servidor'>) {
       <Field
         id="servidor-chave"
         label="Chave de API"
-        help="Vale para o Torznab e o cabeçalho X-Api-Key. Ao menos 16 caracteres. Trocar derruba quem usa a antiga: sincronize os aplicativos depois."
+        help="Abre a interface no cabeçalho X-Api-Key, para script e automação. Ao menos 16 caracteres. Trocar derruba quem usa a antiga."
       >
         {generated ? (
           <Input
@@ -271,21 +265,6 @@ function ServerForm({ data, save, saving }: FormProps<'servidor'>) {
           Gerar nova chave
         </Button>
       </div>
-      <Field
-        id="servidor-endereco"
-        label="Endereço público"
-        help="Como os gerenciadores alcançam este serviço; é o que a sincronização cadastra neles. Em Compose, o nome do serviço na rede interna."
-      >
-        <Input
-          id="servidor-endereco"
-          type="url"
-          spellCheck={false}
-          value={publicUrl}
-          onChange={(event) => setPublicUrl(event.target.value)}
-          placeholder="http://acervo-hub:9797"
-          aria-describedby="servidor-endereco-ajuda"
-        />
-      </Field>
       <Field
         id="servidor-catalogos"
         label="Diretórios locais de definições Cardigann"
@@ -393,7 +372,7 @@ function ServerForm({ data, save, saving }: FormProps<'servidor'>) {
           />
         </Field>
       </div>
-      <Field id="servidor-timeout" label="Timeout HTTP (segundos)" help="De cada chamada a tracker, cliente e gerenciador.">
+      <Field id="servidor-timeout" label="Timeout HTTP (segundos)" help="De cada chamada a tracker, cliente de download e servidor de mídia.">
         <Input
           id="servidor-timeout"
           type="number"
@@ -430,7 +409,7 @@ export function ServerSettings() {
     <SectionCard
       name="servidor"
       title="Servidor"
-      description="A chave da superfície Torznab, o endereço pelo qual os gerenciadores chegam aqui e o catálogo de definições."
+      description="A chave de API da interface, a rede dos indexadores e o catálogo de definições."
       status={(data: ServerSection) => data.api_key.definida}
       Form={ServerForm}
     />
@@ -567,120 +546,6 @@ export function JellyfinSettings() {
   )
 }
 
-// ---------------------------------------------------------------- gerenciadores
-
-type ManagerRow = { name: string; kind: Manager['kind']; url: string; key: string; defined: boolean }
-
-function ManagersForm({ data, save, saving }: FormProps<'gerenciadores'>) {
-  const [rows, setRows] = useState<ManagerRow[]>(
-    data.map((m) => ({ name: m.name, kind: m.kind, url: m.url, key: '', defined: m.api_key.definida })),
-  )
-  const update = (index: number, patch: Partial<ManagerRow>) =>
-    setRows((current) => current.map((row, i) => (i === index ? { ...row, ...patch } : row)))
-  return (
-    <form
-      noValidate
-      className="mt-6 grid gap-4"
-      onSubmit={(event) => {
-        event.preventDefault()
-        save(
-          rows.map((row) => ({
-            name: row.name.trim(),
-            kind: row.kind,
-            url: row.url.trim(),
-            ...(row.key.trim() ? { api_key: row.key.trim() } : {}),
-          })),
-        )
-      }}
-    >
-      {rows.length === 0 && (
-        <p className="text-sm text-content-muted">Nenhum gerenciador. Adicione o Sonarr ou o Radarr abaixo.</p>
-      )}
-      {rows.map((row, index) => {
-        const id = `gerenciador-${index}`
-        return (
-          <fieldset key={id} className="grid gap-3 rounded-md border border-border p-4 sm:grid-cols-2">
-            <legend className="px-1 text-sm font-semibold">{row.name || 'Novo gerenciador'}</legend>
-            <Field id={`${id}-nome`} label="Nome">
-              <Input
-                id={`${id}-nome`}
-                value={row.name}
-                spellCheck={false}
-                onChange={(event) => update(index, { name: event.target.value })}
-              />
-            </Field>
-            <Field id={`${id}-tipo`} label="Tipo">
-              <Select value={row.kind} onValueChange={(kind) => update(index, { kind: kind as Manager['kind'] })}>
-                <SelectTrigger id={`${id}-tipo`}>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="series">Séries (Sonarr)</SelectItem>
-                  <SelectItem value="movie">Filmes (Radarr)</SelectItem>
-                </SelectContent>
-              </Select>
-            </Field>
-            <Field id={`${id}-url`} label="URL">
-              <Input
-                id={`${id}-url`}
-                type="url"
-                spellCheck={false}
-                value={row.url}
-                placeholder="http://sonarr:8989"
-                onChange={(event) => update(index, { url: event.target.value })}
-              />
-            </Field>
-            <Field id={`${id}-chave`} label="Chave de API">
-              <SecretInput
-                id={`${id}-chave`}
-                defined={row.defined}
-                value={row.key}
-                onChange={(key) => update(index, { key })}
-              />
-            </Field>
-            <div className="sm:col-span-2">
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={() => setRows((current) => current.filter((_, i) => i !== index))}
-              >
-                <Trash2 aria-hidden="true" />
-                Remover {row.name || 'este'}
-              </Button>
-            </div>
-          </fieldset>
-        )
-      })}
-      <div>
-        <Button
-          type="button"
-          size="sm"
-          onClick={() => setRows((current) => [...current, { name: '', kind: 'series', url: '', key: '', defined: false }])}
-        >
-          <Plus aria-hidden="true" />
-          Adicionar gerenciador
-        </Button>
-      </div>
-      <p className="text-xs text-content-subtle">
-        A chave guardada segue o nome: trocar o nome de um gerenciador pede a chave de novo.
-      </p>
-      <SaveRow saving={saving} />
-    </form>
-  )
-}
-
-export function ManagersSettings() {
-  return (
-    <SectionCard
-      name="gerenciadores"
-      title="Gerenciadores"
-      description="Os gerenciadores de série e de filme: a sincronização cadastra os indexadores neles, e a limpeza cruza a fila de cada um."
-      Form={ManagersForm}
-    />
-  )
-}
-
 // ---------------------------------------------------------------- biblioteca
 
 function LibraryForm({ data, save, saving }: FormProps<'biblioteca'>) {
@@ -735,7 +600,7 @@ function LibraryForm({ data, save, saving }: FormProps<'biblioteca'>) {
       <Field
         id="biblioteca-categoria"
         label="Categoria no cliente de download"
-        help="Para o que o acervo pega, separada da do gerenciador. Ponha-a também nas categorias gerenciadas da limpeza."
+        help="Para o que o acervo pega, separada de qualquer outra. Ponha-a também nas categorias gerenciadas da limpeza."
       >
         <Input
           id="biblioteca-categoria"
@@ -863,21 +728,20 @@ function CleanupForm({ data, save, saving }: FormProps<'limpeza'>) {
       }}
     >
       <fieldset className="grid gap-4 sm:grid-cols-2">
-        <legend className="mb-2 text-sm font-semibold">Órfãos de fila</legend>
-        {number('limpeza-strikes', 'orphan_strikes', 'Strikes até sair', 'Ciclos seguidos como órfão antes de agir.')}
+        <legend className="mb-2 text-sm font-semibold">Downloads sem dono</legend>
+        {number(
+          'limpeza-strikes',
+          'orphan_strikes',
+          'Strikes até sair',
+          'Ciclos seguidos sem grab e sem hardlink antes de sair do cliente.',
+        )}
         <div className="grid gap-3 sm:col-span-2">
           <Toggle
             id="limpeza-privados"
-            label="Apagar os arquivos de órfão em tracker privado"
-            help="Desligado, o item sai da fila e o torrent fica."
+            label="Apagar os arquivos de download sem dono em tracker privado"
+            help="Desligado, o torrent sai do cliente e os arquivos ficam."
             checked={policy.delete_private_orphans}
             onChange={(on) => set('delete_private_orphans', on)}
-          />
-          <Toggle
-            id="limpeza-sem-cliente"
-            label="Pular órfão cujo torrent já não está no cliente"
-            checked={policy.skip_orphan_if_missing_in_client}
-            onChange={(on) => set('skip_orphan_if_missing_in_client', on)}
           />
         </div>
       </fieldset>
@@ -937,7 +801,7 @@ function CleanupForm({ data, save, saving }: FormProps<'limpeza'>) {
           id="limpeza-categorias"
           value={categories}
           onChange={setCategories}
-          placeholder={'tv-sonarr\nacervo'}
+          placeholder={'acervo'}
           describedBy="limpeza-categorias-ajuda"
         />
       </Field>
@@ -951,7 +815,7 @@ export function CleanupSettings() {
     <SectionCard
       name="limpeza"
       title="Limpeza"
-      description="O ciclo tira da fila o que o gerenciador esqueceu e apaga o seed que perdeu o hardlink com a biblioteca. Não há simulação: as travas abortam o ciclo quando a leitura do mundo não é confiável."
+      description="O ciclo apaga o seed que perdeu o hardlink com a biblioteca e o download que ficou sem dono. Não há simulação: as travas abortam o ciclo quando a leitura do mundo não é confiável."
       Form={CleanupForm}
     />
   )

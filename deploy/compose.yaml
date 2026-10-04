@@ -1,24 +1,17 @@
-# Serviço do acervo-hub para um stack Compose existente. Um processo só: serve
-# o Torznab e a interface e agenda as tarefas, inclusive o ciclo de limpeza.
+# Serviço do acervo-hub para um stack Compose existente. Um processo só:
+# serve a interface e agenda as tarefas — busca, RSS, importação, metadados,
+# limpeza, assistidos.
 #
 # A tag `main` acompanha o último build da branch principal. `latest` só nasce
 # em tag semver (`v*`). Para fixar uma versão, troque por `:vX.Y.Z` ou digest.
 #
 # Toda a configuração mora no Postgres e se edita na interface (Configurações,
-# Aplicativos, Tarefas). Fora do banco, só o ambiente abaixo.
+# Tarefas). Fora do banco, só o ambiente abaixo.
 
 services:
-  # Os gerenciadores o alcançam pela rede `media` em
-  # `http://acervo-hub-indexadores:9797/<indexador>` — que é o "Endereço
-  # público" a pôr em Configurações → Servidor.
-  #
-  # Cadastrar os indexadores nos gerenciadores (simula sem `--apply`; também
-  # há o botão em Aplicativos):
-  #   docker compose run --rm acervo-hub-indexadores sync --apply
-  #
   # Contas da interface (a senha vem da entrada padrão):
-  #   echo 'senha-longa' | docker compose run --rm -T acervo-hub-indexadores users set admin
-  acervo-hub-indexadores:
+  #   echo 'senha-longa' | docker compose run --rm -T acervo-hub users set admin
+  acervo-hub:
     image: ghcr.io/vitoramaral10/acervo-hub:main
     user: "65532:65532"
     restart: unless-stopped
@@ -43,14 +36,19 @@ services:
       # ACERVO_BIND: 0.0.0.0:9797
 
     volumes:
-      # Definições Cardigann, se houver: o diretório vai em Configurações →
-      # Servidor → "Diretórios de definições".
+      # A biblioteca e os downloads, no mesmo sistema de arquivos: a
+      # importação liga o arquivo baixado na pasta do filme ou da série por
+      # hardlink. O caminho de cada lado se acerta em Configurações →
+      # Biblioteca.
+      - /srv/media:/media
+      # Definições Cardigann próprias, se houver: o diretório vai em
+      # Configurações → Servidor → "Diretórios locais de definições".
       - ./definicoes:/etc/acervo-hub/definicoes:ro
 
     command: ["serve"]
 
-    # A interface web (e a API Torznab) só na própria máquina: de fora, por
-    # túnel SSH ou atrás de um proxy com TLS.
+    # A interface só na própria máquina: de fora, por túnel SSH ou atrás de
+    # um proxy com TLS.
     ports:
       - 127.0.0.1:9797:9797
 

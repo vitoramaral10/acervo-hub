@@ -133,24 +133,6 @@ export interface Definition {
   added: boolean
 }
 
-export interface SyncAction {
-  acao: 'criar' | 'atualizar' | 'remover' | 'manter'
-  indexador: string
-  categorias: number[]
-  falha: string | null
-}
-
-export interface SyncReport {
-  aplicado: boolean
-  falhas: number
-  instancias: { nome: string; tipo: string; erro: string | null; acoes: SyncAction[] }[]
-}
-
-export interface Apps {
-  endereco_publico: string | null
-  instancias: { nome: string; tipo: 'series' | 'filmes'; url: string }[]
-}
-
 export interface CycleReport {
   quando: string
   instancias: { nome: string; fila: number | null; obras: number | null; erro: string | null }[]
@@ -158,7 +140,7 @@ export interface CycleReport {
   ilegiveis: { nome: string; motivo: string }[]
   biblioteca: string
   abortado: string | null
-  acoes: { tipo: string; instancia: string | null; titulo: string; detalhe: string }[]
+  acoes: { tipo: string; titulo: string; detalhe: string }[]
   espaco: string
   pulados: { motivo: string; quantos: number }[]
   executadas: number | null
@@ -289,7 +271,6 @@ export interface Secret {
 
 export interface ServerSection {
   api_key: Secret
-  public_url: string | null
   catalogos: string[]
   /** O catálogo antigo: vale abaixo das definições baixadas do repositório. */
   catalogos_reserva: string[]
@@ -317,13 +298,6 @@ export interface JellyfinSection {
   delete_watched_after_minutes: number
 }
 
-export interface Manager {
-  name: string
-  kind: 'series' | 'movie'
-  url: string
-  api_key: Secret
-}
-
 export interface LibrarySection {
   roots: string[]
   root_folders: string[]
@@ -336,7 +310,6 @@ export interface LibrarySection {
 export interface CleanupSection {
   orphan_strikes: number
   delete_private_orphans: boolean
-  skip_orphan_if_missing_in_client: boolean
   private_seed_grace_hours: number
   seed_ratio_alvo: number
   seed_ocioso_horas: number
@@ -356,7 +329,6 @@ export interface Sections {
   servidor: ServerSection
   qbittorrent: DownloadClientSection
   jellyfin: JellyfinSection
-  gerenciadores: Manager[]
   biblioteca: LibrarySection
   limpeza: CleanupSection
   tarefas: TasksSection
@@ -397,8 +369,6 @@ export const api = {
     request<{ ok: boolean }>('DELETE', `/ui/api/indexadores/${encodeURIComponent(name)}`),
   setEnabled: (name: string, ativo: boolean) =>
     request<{ ok: boolean }>('PUT', `/ui/api/indexadores/${encodeURIComponent(name)}/ativo`, { ativo }),
-  apps: () => request<{ aplicativos: Apps }>('GET', '/ui/api/aplicativos'),
-  sync: (aplicar: boolean) => request<SyncReport>('POST', '/ui/api/aplicativos/sincronizar', { aplicar }),
   tasks: () => request<{ tarefas: Task[] }>('GET', '/ui/api/tarefas'),
   taskHistory: () => request<{ historico: TaskRun[] }>('GET', '/ui/api/tarefas/historico'),
   runTask: (id: string) =>
@@ -408,7 +378,6 @@ export const api = {
   missingSearch: () => request<MissingSearch>('GET', '/ui/api/filmes/buscar'),
   grab: (id: number, aplicar: boolean) =>
     request<GrabReport>('POST', `/ui/api/filmes/${id}/pegar`, { aplicar }),
-  importDownloads: () => request<{ downloads: unknown[] }>('POST', '/ui/api/downloads/importar'),
   configuration: () => request<Configuration>('GET', '/ui/api/configuracoes'),
   saveConfiguration: (values: Record<string, string | null>) =>
     request<Configuration>('PUT', '/ui/api/configuracoes', values),
@@ -547,7 +516,7 @@ export interface DecisionRules {
   tamanho_maximo_mb: number
   aceitar_legenda_embutida: boolean
   legendas_embutidas_liberadas: string
-  propers: 'preferir_e_atualizar' | 'nao_atualizar' | 'nao_preferir'
+  propers: 'preferir' | 'nao_preferir'
   preferir_flags_do_indexador: boolean
   folga_minima_mb: number
   downloads_simultaneos: number
@@ -567,6 +536,7 @@ export interface NotifyOn {
   atualizou: boolean
   falhou: boolean
   removido: boolean
+  travou: boolean
 }
 
 export interface GotifyView {

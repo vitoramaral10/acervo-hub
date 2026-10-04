@@ -21,11 +21,7 @@ numeric_id!(
     WorkId
 );
 numeric_id!(
-    /// Uma unidade baixável: episódio, ou o filme inteiro.
-    ItemId
-);
-numeric_id!(
-    /// Item de fila, no espaço de ids da instância que o reportou.
+    /// Item de fila: o id do grab (negativo, num grab de série).
     QueueItemId
 );
 
@@ -34,7 +30,7 @@ numeric_id!(
 pub struct DownloadHash(String);
 
 impl DownloadHash {
-    /// Normaliza para minúsculas: as instâncias `*arr` e o cliente divergem no caixa.
+    /// Normaliza para minúsculas: o catálogo e o cliente divergem no caixa.
     #[must_use]
     pub fn new(raw: impl AsRef<str>) -> Self {
         Self(raw.as_ref().trim().to_ascii_lowercase())
@@ -52,7 +48,7 @@ impl fmt::Display for DownloadHash {
     }
 }
 
-/// Uma instância `*arr` da qual se leu um inventário.
+/// De onde veio uma fila lida num ciclo.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct InstanceName(String);
 

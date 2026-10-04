@@ -1,6 +1,6 @@
 //! Importação de séries, dentro da tarefa `importacao`: cada vídeo escolhido
-//! de um torrent terminado vira um hardlink na pasta da série, com o nome
-//! do gerenciador anterior, e o catálogo liga o arquivo aos episódios.
+//! de um torrent terminado vira um hardlink na pasta da série, com o nome do
+//! padrão, e o catálogo liga o arquivo aos episódios.
 //!
 //! Falha segue a dos filmes: torrent com erro ou sumido vai para a lista de
 //! bloqueio (com a série) e os episódios são buscados de novo; disco cheio
@@ -22,7 +22,10 @@ use super::naming::{TBA, episode_path};
 use crate::config::Config;
 use crate::decide::now_rfc3339;
 use crate::events::{self, Event, Kind};
-use crate::grab::{NO_SEEDS, QUEUE_TAG, QUEUED, UNREGISTERED, install, left, qbit, stalled};
+use crate::grab::{
+    Condition, Failure, NO_SEEDS, QUEUE_TAG, QUEUED, UNREGISTERED, client_trouble, install, left,
+    no_seeds, progress, qbit, watch,
+};
 
 /// Quanto se espera pelo título do episódio depois da exibição.
 const TITLE_WAIT: Duration = Duration::hours(48);
@@ -33,9 +36,8 @@ pub struct ImportLine {
     /// "Série S01E02".
     pub serie: String,
     pub release: String,
-    /// `baixando`, `importaria`, `importado`, `atencao` (importação
-    /// travada, tenta de novo), `falhou` ou `descartado` (nada mais a
-    /// importar dele).
+    /// `baixando`, `importado`, `atencao` (importação travada, tenta de
+    /// novo), `falhou` ou `descartado` (nada mais a importar dele).
     pub estado: &'static str,
     pub detalhe: Option<String>,
     /// Caminhos dos arquivos na pasta da série, como o cliente vê.
@@ -84,30 +86,10 @@ pub fn to_link(
         .collect()
 }
 
-/// Por que um download não importou.
-enum Failure {
-    /// O release é o problema: bloqueia e busca de novo.
-    Download(String),
-    /// A importação é o problema: tenta de novo na próxima volta.
-    Import(String),
-}
-
-impl From<String> for Failure {
-    fn from(message: String) -> Self {
-        Self::Import(message)
-    }
-}
-
-impl From<&str> for Failure {
-    fn from(message: &str) -> Self {
-        Self::Import(message.to_owned())
-    }
-}
-
 /// O que uma volta fez com um grab.
 #[derive(Default)]
 struct Step {
-    /// Destinos ligados nesta volta (ou que seriam, sem `apply`).
+    /// Destinos ligados nesta volta.
     linked: Vec<String>,
     /// Por que ainda não terminou.
     waiting: Option<String>,
@@ -133,23 +115,11 @@ pub(crate) fn split_video(video: &str) -> (&str, &str) {
     (dir, file.rsplit_once('.').map_or(file, |(stem, _)| stem))
 }
 
-/// O andamento como a fila mostra.
-fn progress(torrent: &TorrentInfo) -> String {
-    if torrent.has_tag(QUEUE_TAG) {
-        QUEUED.into()
-    } else if matches!(torrent.state.as_str(), "pausedDL" | "stoppedDL") {
-        format!("parado, {:.0}%", torrent.progress * 100.0)
-    } else {
-        format!("{:.0}%", torrent.progress * 100.0)
-    }
-}
-
 struct Importer<'a> {
     config: &'a Config,
     store: &'a Store,
     client: QbitClient,
     free_space: Option<u64>,
-    apply: bool,
 }
 
 impl Importer<'_> {
@@ -215,53 +185,49 @@ impl Importer<'_> {
                     Failure::Download("o torrent sumiu do cliente".into())
                 }
             })?;
+        let now = OffsetDateTime::now_utc();
         if torrent.state == "error" {
             let free = self
                 .free_space
                 .ok_or("erro no cliente e espaço livre ilegível")?;
             if free < left(torrent.size, torrent.progress) {
-                if self.apply {
-                    self.client
-                        .stop(&[&grab.hash])
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    self.client
-                        .add_tag(&[&grab.hash], QUEUE_TAG)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
+                watch().observe(&torrent.hash, Condition::ClientError, false, now);
+                // A fila não é falta de seed: a contagem do sem seeds recomeça.
+                watch().observe(&torrent.hash, Condition::NoSeeds, false, now);
+                self.client
+                    .stop(&[&grab.hash])
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.client
+                    .add_tag(&[&grab.hash], QUEUE_TAG)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 return Ok(Step::waiting(QUEUED));
             }
         }
-        if matches!(torrent.state.as_str(), "error" | "missingFiles") {
-            return Err(Failure::Download(format!(
-                "o cliente marcou o torrent com `{}`",
-                torrent.state
-            )));
+        let trouble = client_trouble(&mut watch(), &torrent, now);
+        if let Some(failure) = trouble {
+            // Arquivo sumido: o torrent perdido sai do cliente (se é só deste
+            // grab), senão a nova busca devolveria o mesmo hash, ainda em
+            // `missingFiles`. Sem bloqueio: a culpa não é do release.
+            if matches!(failure, Failure::Lost(_)) {
+                self.drop_torrent(grab, &torrent, "arquivos sumidos").await?;
+            }
+            return Err(failure);
         }
-        if crate::grab::gone_from_tracker(&self.client, &torrent, self.apply).await {
+        if crate::grab::gone_from_tracker(&self.client, &torrent).await {
             tracing::info!(
                 serie = entry.series.title,
                 release = grab.title,
                 "o tracker não reconhece mais o torrent"
             );
             // Como o sem seeds: só sai do cliente se é só deste grab.
-            if self.apply {
-                if super::grab::owns(self.config, self.store, &self.client, grab, &torrent).await {
-                    self.client
-                        .delete(&[DownloadHash::new(grab.hash.clone())], true)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                } else {
-                    tracing::warn!(
-                        release = grab.title,
-                        "torrent desregistrado, mas não é só deste grab: fica no cliente"
-                    );
-                }
-            }
+            self.drop_torrent(grab, &torrent, "torrent desregistrado")
+                .await?;
             return Err(Failure::Download(UNREGISTERED.into()));
         }
-        if stalled(&torrent, OffsetDateTime::now_utc()) {
+        let stuck = no_seeds(&mut watch(), &torrent, now);
+        if stuck {
             tracing::info!(
                 serie = entry.series.title,
                 release = grab.title,
@@ -269,19 +235,8 @@ impl Importer<'_> {
             );
             // O bloqueio e a nova busca vêm do `Failure::Download`; o torrent
             // travado ocuparia vaga e reserva. Só sai se é só deste grab.
-            if self.apply {
-                if super::grab::owns(self.config, self.store, &self.client, grab, &torrent).await {
-                    self.client
-                        .delete(&[DownloadHash::new(grab.hash.clone())], true)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                } else {
-                    tracing::warn!(
-                        release = grab.title,
-                        "torrent sem seeds, mas não é só deste grab: fica no cliente"
-                    );
-                }
-            }
+            self.drop_torrent(grab, &torrent, "torrent sem seeds")
+                .await?;
             return Err(Failure::Download(NO_SEEDS.into()));
         }
         let Some(selection) = apply_selection(
@@ -290,7 +245,7 @@ impl Importer<'_> {
             entry,
             &grab.episode_ids,
             &grab.title,
-            self.apply,
+            true,
         )
         .await
         .map_err(|e| format!("{e:#}"))?
@@ -302,19 +257,8 @@ impl Importer<'_> {
         if chosen.is_empty() {
             // Nunca baixou nada: não há o que semear. Mas só sai se o torrent
             // é deste grab e de mais ninguém; na dúvida, fica no cliente.
-            if self.apply {
-                if super::grab::owns(self.config, self.store, &self.client, grab, &torrent).await {
-                    self.client
-                        .delete(&[DownloadHash::new(grab.hash.clone())], true)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                } else {
-                    tracing::warn!(
-                        release = grab.title,
-                        "torrent sem arquivo útil, mas não é só deste grab: fica no cliente"
-                    );
-                }
-            }
+            self.drop_torrent(grab, &torrent, "torrent sem arquivo útil")
+                .await?;
             return Err(Failure::Download(
                 "nenhum arquivo do torrent é de episódio que se quer".into(),
             ));
@@ -334,7 +278,7 @@ impl Importer<'_> {
                         .iter()
                         .any(|e| e.file_id == Some(f.id) && wanted.contains(&e.id))
             });
-            if !ours && self.apply {
+            if !ours {
                 super::grab::drop_queued(self.config, self.store, &self.client, grab).await;
             }
             return Ok(if ours {
@@ -355,7 +299,6 @@ impl Importer<'_> {
 
         let mut step = Step::default();
         let mut waiting = Vec::new();
-        let now = OffsetDateTime::now_utc();
         let map = self.config.path_map();
         let series = &entry.series;
         for (file, choice) in pending {
@@ -406,10 +349,6 @@ impl Importer<'_> {
             );
             let destination = PathBuf::from(&series.path).join(&relative);
             let shown = destination.display().to_string();
-            if !self.apply {
-                step.linked.push(shown);
-                continue;
-            }
             let source = map
                 .to_host(&client_path(&torrent, file))
                 .map_err(|e| e.to_string())?;
@@ -515,13 +454,35 @@ impl Importer<'_> {
     }
 }
 
+impl Importer<'_> {
+    /// Apaga do cliente o torrent de um grab que desistiu, se ele é só deste
+    /// grab e nenhum arquivo tem outro link; na dúvida, fica, com aviso.
+    async fn drop_torrent(
+        &self,
+        grab: &SeriesGrab,
+        torrent: &TorrentInfo,
+        why: &str,
+    ) -> Result<(), Failure> {
+        if super::grab::owns(self.config, self.store, &self.client, grab, torrent).await {
+            self.client
+                .delete(&[DownloadHash::new(grab.hash.clone())], true)
+                .await
+                .map_err(|e| e.to_string())?;
+        } else {
+            tracing::warn!(
+                release = grab.title,
+                "{why}, mas não é só deste grab: fica no cliente"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Grava o que a volta deu: o estado do grab, o bloqueio e a nova busca.
-#[allow(clippy::too_many_arguments)] // O contexto da volta, passado adiante.
 async fn finish(
     config: &Config,
     store: &Store,
     catalog: Option<&Catalog>,
-    apply: bool,
     grab: &SeriesGrab,
     entry: &CatalogSeries,
     step: Result<Step, Failure>,
@@ -535,60 +496,58 @@ async fn finish(
         }) => {
             line.estado = "descartado";
             line.detalhe = Some(reason.clone());
-            if apply {
-                give_up(store, grab, entry, &reason, false, Kind::Ignored).await?;
-            }
+            give_up(store, grab, entry, &reason, false, Kind::Ignored).await?;
         }
         Ok(step) => {
             line.destinos = step.linked;
             line.detalhe.clone_from(&step.waiting);
-            line.estado = if !line.destinos.is_empty() && !apply {
-                "importaria"
-            } else if line.destinos.is_empty() && step.waiting.is_some() {
+            line.estado = if line.destinos.is_empty() && step.waiting.is_some() {
                 "baixando"
             } else {
                 "importado"
             };
-            if apply {
-                if let Some(waiting) = &step.waiting {
-                    store
-                        .update_series_grab(grab.id, GrabState::Downloading, Some(waiting), None)
-                        .await?;
-                } else {
-                    store
-                        .update_series_grab(grab.id, GrabState::Imported, None, Some(&at))
-                        .await?;
-                }
+            if let Some(waiting) = &step.waiting {
+                store
+                    .update_series_grab(grab.id, GrabState::Downloading, Some(waiting), None)
+                    .await?;
+            } else {
+                store
+                    .update_series_grab(grab.id, GrabState::Imported, None, Some(&at))
+                    .await?;
+                watch().forget(&grab.hash);
             }
         }
-        Err(Failure::Download(error)) => {
+        Err(failure @ (Failure::Download(_) | Failure::Lost(_))) => {
+            // O arquivo sumido do disco não é culpa do release: sem bloqueio.
+            let (error, block) = match failure {
+                Failure::Download(error) => (error, true),
+                Failure::Lost(error) => (error, false),
+                Failure::Import(_) => unreachable!("o braço de baixo trata"),
+            };
             line.estado = "falhou";
             line.detalhe = Some(error.clone());
-            if apply {
-                give_up(store, grab, entry, &error, true, Kind::Failed).await?;
-                if let Some(catalog) = catalog {
-                    let only: HashSet<i64> = grab.episode_ids.iter().copied().collect();
-                    // O avulso que o tracker apagou deu lugar ao pacote.
-                    let prefer_pack = error == UNREGISTERED;
-                    match super::search::series_now_with(
-                        config,
-                        store,
-                        catalog,
-                        entry.id,
-                        Some(&only),
-                        prefer_pack,
-                    )
-                    .await
-                    {
-                        Ok(found) => tracing::info!(
-                            serie = found.serie,
-                            pegou = ?found.escolhidos,
-                            "nova busca depois de falha"
-                        ),
-                        Err(error) => tracing::info!(
-                            serie = entry.id,
-                            "nova busca depois de falha: {error:#}"
-                        ),
+            give_up(store, grab, entry, &error, block, Kind::Failed).await?;
+            if let Some(catalog) = catalog {
+                let only: HashSet<i64> = grab.episode_ids.iter().copied().collect();
+                // O avulso que o tracker apagou deu lugar ao pacote.
+                let prefer_pack = error == UNREGISTERED;
+                match super::search::series_now_with(
+                    config,
+                    store,
+                    catalog,
+                    entry.id,
+                    Some(&only),
+                    prefer_pack,
+                )
+                .await
+                {
+                    Ok(found) => tracing::info!(
+                        serie = found.serie,
+                        pegou = ?found.escolhidos,
+                        "nova busca depois de falha"
+                    ),
+                    Err(error) => {
+                        tracing::info!(serie = entry.id, "nova busca depois de falha: {error:#}");
                     }
                 }
             }
@@ -596,19 +555,16 @@ async fn finish(
         Err(Failure::Import(error)) => {
             line.estado = "atencao";
             line.detalhe = Some(error.clone());
-            if apply {
-                let message = format!("importação: {error}");
-                store
-                    .update_series_grab(grab.id, GrabState::Downloading, Some(&message), None)
-                    .await?;
-            }
+            let message = format!("importação: {error}");
+            store
+                .update_series_grab(grab.id, GrabState::Downloading, Some(&message), None)
+                .await?;
         }
     }
     Ok(())
 }
 
-/// Importa os downloads de série do acervo que terminaram. Sem `apply`, só
-/// diz o que faria, sem mexer no cliente.
+/// Importa os downloads de série do acervo que terminaram.
 ///
 /// # Errors
 ///
@@ -618,7 +574,6 @@ pub async fn import_downloads(
     config: &Config,
     store: &Store,
     catalog: Option<&Catalog>,
-    apply: bool,
 ) -> Result<Vec<ImportLine>> {
     let pending: Vec<SeriesGrab> = store
         .series_grabs()
@@ -630,15 +585,11 @@ pub async fn import_downloads(
         return Ok(Vec::new());
     }
     let client = qbit(config).await?;
-    if apply && let Err(error) = crate::grab::start_queued(store, &client).await {
-        tracing::warn!("fila de downloads: {error:#}");
-    }
     let importer = Importer {
         config,
         store,
         free_space: client.free_space().await.ok(),
         client,
-        apply,
     };
     let mut lines = Vec::new();
     for grab in pending {
@@ -654,10 +605,18 @@ pub async fn import_downloads(
             destinos: Vec::new(),
         };
         let step = importer.step(&grab, &entry).await;
-        finish(
-            config, store, catalog, apply, &grab, &entry, step, &mut line,
+        let stuck = matches!(step, Err(Failure::Import(_)));
+        finish(config, store, catalog, &grab, &entry, step, &mut line).await?;
+        crate::grab::notify_attention(
+            store,
+            &grab.hash,
+            stuck,
+            &line.serie,
+            &grab.title,
+            line.detalhe.as_deref().unwrap_or_default(),
+            entry.series.poster.as_deref(),
         )
-        .await?;
+        .await;
         lines.push(line);
     }
     Ok(lines)

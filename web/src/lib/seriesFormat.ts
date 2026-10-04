@@ -1,4 +1,4 @@
-import type { Episode, EpisodeTotals, SeriesSummary } from '@/lib/api'
+import type { Episode, SeriesSummary } from '@/lib/api'
 import { normalize } from '@/lib/movieList'
 
 // Texto e contas da tela de Séries: funções puras, sem React.
@@ -62,8 +62,6 @@ export const SERIES_REASONS: Record<string, string> = {
   HardcodeSubtitles: 'legenda embutida',
   Sample: 'amostra',
 }
-
-export const totalEpisodes = (totals: EpisodeTotals) => totals.quero + totals.tenho + totals.dispensado
 
 export type SeriesFilter = 'todas' | 'faltando' | 'baixando'
 

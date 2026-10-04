@@ -264,7 +264,9 @@ pub async fn edit(store: &Store, id: i64, change: &SeriesEdit) -> Result<()> {
         series.season_folder = season_folder;
     }
     if series != entry.series {
-        store.update_series(id, &series).await?;
+        store
+            .set_series_options(id, series.monitor_new, series.season_folder)
+            .await?;
     }
     if let Some(priority) = change.priority
         && priority != entry.priority
@@ -300,8 +302,9 @@ pub struct RefreshReport {
 }
 
 /// Atualiza as séries não conferidas nas últimas `stale_hours` horas (zero:
-/// todas): os dados da série e os episódios, por `sync_episodes`, que nunca
-/// mexe em `skip` nem em arquivo.
+/// todas): os dados da série que vêm da base — nunca pasta, `monitor_new`
+/// nem prioridade — e os episódios, por `sync_episodes`, que nunca mexe em
+/// `skip` nem em arquivo. Série que saiu do catálogo no meio é pulada.
 ///
 /// # Errors
 ///
@@ -346,9 +349,16 @@ pub async fn refresh(store: &Store, tmdb: &Tmdb, stale_hours: i64) -> Result<Ref
         apply(&mut series, &meta);
         let changed = series != entry.series;
         series.refreshed_at = Some(now_rfc3339());
-        store.update_series(entry.id, &series).await?;
+        if !store.update_series_metadata(entry.id, &series).await? {
+            continue;
+        }
         let episodes: Vec<Episode> = episodes.iter().map(episode).collect();
-        let sync = store.sync_episodes(entry.id, &episodes).await?;
+        let sync = match store.sync_episodes(entry.id, &episodes).await {
+            Ok(sync) => sync,
+            // Saiu entre a gravação da série e a dos episódios.
+            Err(_) if store.series(entry.id).await?.is_none() => continue,
+            Err(error) => return Err(error.into()),
+        };
         report.episodios_novos += sync.added.len();
         if changed || sync.updated > 0 || !sync.added.is_empty() || sync.removed > 0 {
             report.atualizadas.push(label);

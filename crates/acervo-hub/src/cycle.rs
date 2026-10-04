@@ -1,7 +1,5 @@
-//! Um ciclo de limpeza completo, com relatório estruturado.
-//!
-//! A CLI imprime; no serviço, o relatório vira o detalhe da execução da
-//! tarefa `limpeza` no histórico.
+//! Um ciclo de limpeza completo, com relatório estruturado: o relatório vira
+//! o detalhe da execução da tarefa `limpeza` no histórico.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -13,7 +11,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::config::Config;
-use crate::{apply, collect, ledger, report};
+use crate::{apply, collect, ledger};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CycleReport {
@@ -48,7 +46,6 @@ pub struct Unreadable {
 #[derive(Debug, Clone, Serialize)]
 pub struct ActionLine {
     pub tipo: &'static str,
-    pub instancia: Option<String>,
     pub titulo: String,
     pub detalhe: String,
 }
@@ -60,16 +57,6 @@ pub struct SkippedLine {
 }
 
 impl CycleReport {
-    /// Saída do processo: 3 é ciclo abortado por trava, que não é falha.
-    #[must_use]
-    pub fn exit_code(&self) -> u8 {
-        if self.abortado.is_some() {
-            3
-        } else {
-            u8::from(self.falharam.unwrap_or(0) > 0)
-        }
-    }
-
     /// Uma linha para a lista de tarefas, e se o ciclo terminou bem. Ciclo
     /// abortado conta como erro na tela: nada falhou, mas a leitura do mundo
     /// não era confiável e alguém precisa olhar.
@@ -146,36 +133,8 @@ impl CycleReport {
 
 fn action_line(action: &Action) -> ActionLine {
     match action {
-        Action::StrikeOrphan {
-            instance,
-            title,
-            strikes,
-            limit,
-            ..
-        } => ActionLine {
-            tipo: "strike",
-            instancia: Some(instance.to_string()),
-            titulo: title.clone(),
-            detalhe: format!("strike {strikes}/{limit}"),
-        },
-        Action::RemoveOrphan {
-            instance,
-            title,
-            delete_files,
-            ..
-        } => ActionLine {
-            tipo: "remover-da-fila",
-            instancia: Some(instance.to_string()),
-            titulo: title.clone(),
-            detalhe: if *delete_files {
-                "remove da fila e apaga os arquivos".into()
-            } else {
-                "remove da fila e preserva os arquivos".into()
-            },
-        },
         Action::DeleteUnlinked { name, reclaim, .. } => ActionLine {
             tipo: "apagar-torrent",
-            instancia: None,
             titulo: name.clone(),
             detalhe: format!("libera {reclaim}"),
         },
@@ -186,7 +145,6 @@ fn action_line(action: &Action) -> ActionLine {
             ..
         } => ActionLine {
             tipo: "strike-sem-dono",
-            instancia: None,
             titulo: name.clone(),
             detalhe: format!("strike {strikes}/{limit}"),
         },
@@ -197,7 +155,6 @@ fn action_line(action: &Action) -> ActionLine {
             ..
         } => ActionLine {
             tipo: "apagar-sem-dono",
-            instancia: None,
             titulo: name.clone(),
             detalhe: if *delete_files {
                 format!("remove do cliente e apaga os arquivos, libera {reclaim}")
@@ -208,18 +165,14 @@ fn action_line(action: &Action) -> ActionLine {
     }
 }
 
-/// Roda um ciclo e aplica o plano. `print` imprime o relato como a CLI
-/// sempre fez.
+/// Roda um ciclo e aplica o plano.
 ///
 /// # Errors
 ///
 /// Configuração do ciclo incompleta, cliente de download fora do ar ou falha
 /// ao ler ou gravar os strikes.
-pub async fn run(config: &Config, store: &acervo_store::Store, print: bool) -> Result<CycleReport> {
+pub async fn run(config: &Config, store: &acervo_store::Store) -> Result<CycleReport> {
     let session = collect::collect(config, store).await?;
-    if print {
-        report::inventory(&session.inventory);
-    }
     let mut result = CycleReport::header(&session.inventory);
     let inventory = &session.inventory;
 
@@ -235,17 +188,10 @@ pub async fn run(config: &Config, store: &acervo_store::Store, print: bool) -> R
             // Abortar é resultado esperado, não defeito: a leitura do mundo não
             // estava confiável.
             tracing::warn!("ciclo abortado: {abort}");
-            if print {
-                println!("Ciclo abortado: {abort}");
-                println!("Nenhuma alteração foi feita.");
-            }
             result.abortado = Some(abort.to_string());
             return Ok(result);
         }
     };
-    if print {
-        report::plan(&plan);
-    }
     result.acoes = plan.actions.iter().map(action_line).collect();
     result.espaco = plan.reclaim.to_string();
     let mut by_reason: BTreeMap<String, usize> = BTreeMap::new();
@@ -259,12 +205,6 @@ pub async fn run(config: &Config, store: &acervo_store::Store, print: bool) -> R
 
     ledger::save(store, &strikes).await?;
     let outcome = apply::execute(&session, &plan).await;
-    if print {
-        println!(
-            "Executadas {} ações, {} falharam.",
-            outcome.done, outcome.failed
-        );
-    }
     result.executadas = Some(outcome.done);
     result.falharam = Some(outcome.failed);
     Ok(result)

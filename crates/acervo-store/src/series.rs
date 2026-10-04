@@ -283,58 +283,10 @@ impl Store {
     pub async fn add_series(&self, series: &Series, episodes: &[Episode]) -> Result<i64> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
-        let id = write_series(&tx, None, series).await?;
+        let id = insert_series(&tx, series).await?;
         write_titles(&tx, id, series).await?;
         for episode in episodes {
             insert_episode(&tx, id, episode, default_skip(series, episode)).await?;
-        }
-        tx.commit().await?;
-        Ok(id)
-    }
-
-    /// Cadastra a série trazida de outro gerenciador, tudo numa transação: os
-    /// episódios com o `skip` dado (o `skipped_at` é `at` em quem tem) e cada
-    /// arquivo ligado aos episódios (temporada, número) que cobre. Falha no
-    /// meio não deixa nada gravado.
-    ///
-    /// # Errors
-    ///
-    /// Série já cadastrada, arquivo que cobre episódio fora da lista ou
-    /// falha de escrita.
-    pub async fn import_series(
-        &self,
-        series: &Series,
-        episodes: &[(Episode, Option<Skip>)],
-        files: &[(EpisodeFile, Vec<(u16, u16)>)],
-        at: &str,
-    ) -> Result<i64> {
-        let mut client = self.pool.get().await?;
-        let tx = client.transaction().await?;
-        let id = write_series(&tx, None, series).await?;
-        write_titles(&tx, id, series).await?;
-        let mut ids = HashMap::new();
-        for (episode, skip) in episodes {
-            let episode_id = insert_episode(&tx, id, episode, *skip).await?;
-            ids.insert((episode.season, episode.number), episode_id);
-        }
-        tx.execute(
-            "UPDATE episodes SET skipped_at = $2 WHERE series_id = $1 AND skip IS NOT NULL",
-            &[&id, &at],
-        )
-        .await?;
-        for (file, covers) in files {
-            let episode_ids = covers
-                .iter()
-                .map(|key| {
-                    ids.get(key).copied().ok_or_else(|| {
-                        StoreError::Corrupt(format!(
-                            "arquivo `{}` cobre S{:02}E{:02}, fora da série",
-                            file.relative_path, key.0, key.1
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<i64>>>()?;
-            link_file(&tx, id, file, &episode_ids).await?;
         }
         tx.commit().await?;
         Ok(id)
@@ -358,26 +310,75 @@ impl Store {
         Ok(read_series(&self.pool.get().await?, Some(id)).await?.pop())
     }
 
-    /// Regrava os campos da série e os títulos alternativos. Não toca nos
-    /// episódios. Devolve `false` se a série não existe.
+    /// Regrava só o que vem da base de metadados e os títulos alternativos,
+    /// nunca o que é de quem usa (pasta, pasta de temporada, `monitor_new`,
+    /// prioridade, data de entrada): a atualização parte de uma leitura que
+    /// pode ter envelhecido. Não toca nos episódios. `false` se a série saiu
+    /// do catálogo no meio.
     ///
     /// # Errors
     ///
     /// Falha de escrita.
-    pub async fn update_series(&self, id: i64, series: &Series) -> Result<bool> {
+    pub async fn update_series_metadata(&self, id: i64, series: &Series) -> Result<bool> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
-        if tx
-            .query_opt("SELECT 1 FROM series WHERE id = $1", &[&id])
-            .await?
-            .is_none()
-        {
+        let tv_id = series.tvdb_id.map(i64::from);
+        let year = series.year.map(i32::from);
+        let runtime = i32::try_from(series.runtime).unwrap_or(i32::MAX);
+        let updated = tx
+            .execute(
+                "UPDATE series SET tvdb_id = $2, imdb_id = $3, title = $4, original_title = $5,
+                     original_language = $6, year = $7, status = $8, overview = $9,
+                     network = $10, runtime = $11, poster = $12, fanart = $13,
+                     refreshed_at = $14, metadata_title = $15
+                 WHERE id = $1",
+                &[
+                    &id,
+                    &tv_id,
+                    &series.imdb_id,
+                    &series.title,
+                    &series.original_title,
+                    &series.original_language,
+                    &year,
+                    &series.status,
+                    &series.overview,
+                    &series.network,
+                    &runtime,
+                    &series.poster,
+                    &series.fanart,
+                    &series.refreshed_at,
+                    &series.metadata_title,
+                ],
+            )
+            .await?;
+        if updated == 0 {
             return Ok(false);
         }
-        write_series(&tx, Some(id), series).await?;
         write_titles(&tx, id, series).await?;
         tx.commit().await?;
         Ok(true)
+    }
+
+    /// Troca o que é escolha de quem usa: `monitor_new` e a pasta de
+    /// temporada. `false` se a série não existe.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn set_series_options(
+        &self,
+        id: i64,
+        monitor_new: bool,
+        season_folder: bool,
+    ) -> Result<bool> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .execute(
+                "UPDATE series SET monitor_new = $2, season_folder = $3 WHERE id = $1",
+                &[&id, &monitor_new, &season_folder],
+            )
+            .await?
+            > 0)
     }
 
     /// Apaga a série, e em cascata os episódios, arquivos e grabs. O
@@ -835,66 +836,44 @@ const FILE_COLUMNS: &str = "id, relative_path, size, quality, revision_version, 
 /// [`episode_from`] lê.
 const EPISODE_FIELDS: &str = "season, number, tmdb_id, title, air_date, overview, runtime";
 
-async fn write_series(
-    client: &impl GenericClient,
-    id: Option<i64>,
-    series: &Series,
-) -> Result<i64> {
+async fn insert_series(client: &impl GenericClient, series: &Series) -> Result<i64> {
     let tmdb_id = i64::from(series.tmdb_id);
     let tv_id = series.tvdb_id.map(i64::from);
     let year = series.year.map(i32::from);
     let runtime = i32::try_from(series.runtime).unwrap_or(i32::MAX);
-    let values: [&(dyn tokio_postgres::types::ToSql + Sync); 19] = [
-        &tmdb_id,
-        &tv_id,
-        &series.imdb_id,
-        &series.title,
-        &series.original_title,
-        &series.original_language,
-        &year,
-        &series.status,
-        &series.overview,
-        &series.network,
-        &runtime,
-        &series.poster,
-        &series.fanart,
-        &series.path,
-        &series.season_folder,
-        &series.monitor_new,
-        &series.added,
-        &series.refreshed_at,
-        &series.metadata_title,
-    ];
-    if let Some(id) = id {
-        let mut params = values.to_vec();
-        params.push(&id);
-        client
-            .execute(
-                "UPDATE series SET tmdb_id = $1, tvdb_id = $2, imdb_id = $3, title = $4,
-                     original_title = $5, original_language = $6, year = $7, status = $8,
-                     overview = $9, network = $10, runtime = $11, poster = $12, fanart = $13,
-                     path = $14, season_folder = $15, monitor_new = $16, added = $17,
-                     refreshed_at = $18, metadata_title = $19
-                 WHERE id = $20",
-                &params,
-            )
-            .await?;
-        Ok(id)
-    } else {
-        Ok(client
-            .query_one(
-                "INSERT INTO series (tmdb_id, tvdb_id, imdb_id, title, original_title,
-                     original_language, year, status, overview, network, runtime, poster,
-                     fanart, path, season_folder, monitor_new, added, refreshed_at,
-                     metadata_title)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                     $17, $18, $19)
-                 RETURNING id",
-                &values,
-            )
-            .await?
-            .try_get(0)?)
-    }
+    Ok(client
+        .query_one(
+            "INSERT INTO series (tmdb_id, tvdb_id, imdb_id, title, original_title,
+                 original_language, year, status, overview, network, runtime, poster,
+                 fanart, path, season_folder, monitor_new, added, refreshed_at,
+                 metadata_title)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                 $17, $18, $19)
+             RETURNING id",
+            &[
+                &tmdb_id,
+                &tv_id,
+                &series.imdb_id,
+                &series.title,
+                &series.original_title,
+                &series.original_language,
+                &year,
+                &series.status,
+                &series.overview,
+                &series.network,
+                &runtime,
+                &series.poster,
+                &series.fanart,
+                &series.path,
+                &series.season_folder,
+                &series.monitor_new,
+                &series.added,
+                &series.refreshed_at,
+                &series.metadata_title,
+            ],
+        )
+        .await?
+        .try_get(0)?)
 }
 
 /// Apaga os títulos alternativos de antes e grava os de agora.
@@ -1362,16 +1341,83 @@ mod tests {
         let titles: Vec<_> = list.iter().map(|s| s.series.title.as_str()).collect();
         assert_eq!(titles, ["alfa", "Zeta"]);
 
+        // A atualização de metadados parte de uma leitura velha: o que é de
+        // quem usa fica como a tela deixou.
+        assert!(
+            store
+                .set_series_options(zeta_id, false, false)
+                .await
+                .unwrap()
+        );
+        assert!(store.set_series_priority(zeta_id, true).await.unwrap());
         let mut changed = zeta.clone();
         changed.title = "Zeta Nova".into();
         changed.metadata_title = None;
         changed.alternate_titles = vec!["Outro".into()];
-        assert!(store.update_series(zeta_id, &changed).await.unwrap());
+        changed.path = "/outra/pasta".into();
+        changed.added = None;
+        assert!(changed.monitor_new && changed.season_folder);
+        assert!(
+            store
+                .update_series_metadata(zeta_id, &changed)
+                .await
+                .unwrap()
+        );
         let read = store.series(zeta_id).await.unwrap().unwrap();
-        assert_eq!(read.series, changed);
+        assert_eq!(
+            read.series,
+            Series {
+                path: zeta.path.clone(),
+                added: zeta.added.clone(),
+                monitor_new: false,
+                season_folder: false,
+                ..changed.clone()
+            }
+        );
+        assert!(read.priority);
         assert_eq!(read.episodes.len(), 2);
-        assert!(!store.update_series(zeta_id + 100, &changed).await.unwrap());
+        assert!(
+            !store
+                .update_series_metadata(zeta_id + 100, &changed)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .set_series_options(zeta_id + 100, true, true)
+                .await
+                .unwrap()
+        );
 
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn poda_buscas_de_serie_mantendo_a_ultima() {
+        let Some(db) = TestDb::new("series_poda").await else {
+            return;
+        };
+        let store = &db.store;
+        let id = store.add_series(&series(10, "Um"), &[]).await.unwrap();
+        let run = |at: &str| SeriesSearch {
+            series_id: id,
+            at: at.into(),
+            queries: vec!["S01".into()],
+            releases: 0,
+            picks: Vec::new(),
+            rejections: Vec::new(),
+            error: None,
+        };
+        for at in ["2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"] {
+            store.record_series_search(&run(at)).await.unwrap();
+        }
+        assert_eq!(
+            store.prune_searches("2026-02-01T00:00:00Z").await.unwrap(),
+            1
+        );
+        let left = store.latest_series_searches().await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].at, "2026-01-02T00:00:00Z");
         db.drop().await;
     }
 
@@ -1645,66 +1691,6 @@ mod tests {
         let read = store.series(id).await.unwrap().unwrap();
         assert_eq!(read.files.len(), 2);
         assert_eq!(read.files[0].file.size, 9);
-
-        db.drop().await;
-    }
-
-    #[tokio::test]
-    async fn importa_a_serie_inteira_ou_nada() {
-        let Some(db) = TestDb::new("series_importa").await else {
-            return;
-        };
-        let store = &db.store;
-        let at = "2026-05-05T00:00:00Z";
-        let episodes = [
-            (episode(1, 1), None),
-            (episode(1, 2), None),
-            (episode(1, 3), Some(Skip::Unwanted)),
-        ];
-        // Arquivo que cobre episódio fora da lista: nada fica gravado.
-        let broken = store
-            .import_series(
-                &series(10, "Um"),
-                &episodes,
-                &[(file("Season 1/e9.mkv"), vec![(1, 9)])],
-                at,
-            )
-            .await;
-        assert!(matches!(broken, Err(StoreError::Corrupt(_))));
-        assert!(store.series_list().await.unwrap().is_empty());
-
-        let id = store
-            .import_series(
-                &series(10, "Um"),
-                &episodes,
-                &[(file("Season 1/e1e2.mkv"), vec![(1, 1), (1, 2)])],
-                at,
-            )
-            .await
-            .unwrap();
-        let read = store.series(id).await.unwrap().unwrap();
-        assert_eq!(read.files.len(), 1);
-        let file_id = read.files[0].id;
-        let state: Vec<_> = read
-            .episodes
-            .iter()
-            .map(|e| (e.file_id, e.skip, e.skipped_at.as_deref()))
-            .collect();
-        assert_eq!(
-            state,
-            [
-                (Some(file_id), None, None),
-                (Some(file_id), None, None),
-                (None, Some(Skip::Unwanted), Some(at)),
-            ]
-        );
-        // De novo: série já cadastrada.
-        assert!(
-            store
-                .import_series(&series(10, "Um"), &episodes, &[], at)
-                .await
-                .is_err()
-        );
 
         db.drop().await;
     }

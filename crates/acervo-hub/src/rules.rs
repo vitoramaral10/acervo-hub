@@ -1,10 +1,12 @@
 //! As regras de decisão: tetos, folga no disco, propers, legendas embutidas,
 //! carência, prioridade e seeders por indexador, atraso. Ficam no banco, e a
-//! tela as edita.
+//! tela as edita. Os tamanhos por qualidade não são regra: são a tabela fixa
+//! [`QUALITY_DEFINITIONS`].
 
 use std::collections::BTreeMap;
 
-use acervo_decision::{Delay, Propers, Settings};
+use acervo_decision::{Delay, QualityDefinition, Settings};
+use acervo_parser::Quality;
 use acervo_store::Store;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -31,6 +33,94 @@ impl Default for IndexerRules {
     }
 }
 
+/// Tamanho por minuto de filme ou episódio, em megabytes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Sizes {
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub preferred: Option<f64>,
+}
+
+/// Sem limite de tamanho por minuto: só o mínimo zero.
+const ANY_SIZE: Sizes = Sizes {
+    min: Some(0.0),
+    max: None,
+    preferred: None,
+};
+
+/// Até 100 MB por minuto, preferindo 95.
+const UP_TO_100: Sizes = Sizes {
+    min: Some(0.0),
+    max: Some(100.0),
+    preferred: Some(95.0),
+};
+
+/// Os tamanhos por minuto de cada qualidade. Os valores que estavam no banco quando a
+/// tabela deixou de ser editável — as qualidades de fonte bruta e de 2160p
+/// sem teto, o resto até 100 MB/min.
+pub(crate) const QUALITY_DEFINITIONS: [(Quality, Sizes); 30] = [
+    (Quality::Unknown, UP_TO_100),
+    (Quality::Sdtv, UP_TO_100),
+    (Quality::Dvd, UP_TO_100),
+    (Quality::WebDl1080p, UP_TO_100),
+    (Quality::Hdtv720p, UP_TO_100),
+    (Quality::WebDl720p, UP_TO_100),
+    (Quality::Bluray720p, UP_TO_100),
+    (Quality::Bluray1080p, ANY_SIZE),
+    (Quality::WebDl480p, UP_TO_100),
+    (Quality::Hdtv1080p, UP_TO_100),
+    (Quality::RawHd, ANY_SIZE),
+    (Quality::WebRip480p, UP_TO_100),
+    (Quality::WebRip720p, UP_TO_100),
+    (Quality::WebRip1080p, UP_TO_100),
+    (Quality::Hdtv2160p, ANY_SIZE),
+    (Quality::WebRip2160p, ANY_SIZE),
+    (Quality::WebDl2160p, ANY_SIZE),
+    (Quality::Bluray2160p, ANY_SIZE),
+    (Quality::Bluray480p, UP_TO_100),
+    (Quality::Bluray576p, UP_TO_100),
+    (Quality::BrDisk, ANY_SIZE),
+    (Quality::DvdR, UP_TO_100),
+    (Quality::Workprint, UP_TO_100),
+    (Quality::Cam, UP_TO_100),
+    (Quality::Telesync, UP_TO_100),
+    (Quality::Telecine, UP_TO_100),
+    (Quality::DvdScr, UP_TO_100),
+    (Quality::Regional, UP_TO_100),
+    (Quality::Remux1080p, ANY_SIZE),
+    (Quality::Remux2160p, ANY_SIZE),
+];
+
+/// A tabela no formato que o motor de decisão lê.
+fn quality_definitions() -> Vec<QualityDefinition> {
+    QUALITY_DEFINITIONS
+        .iter()
+        .map(|(quality, sizes)| QualityDefinition {
+            quality: *quality,
+            min_size: sizes.min,
+            max_size: sizes.max,
+            preferred_size: sizes.preferred,
+        })
+        .collect()
+}
+
+/// O que fazer com PROPER e REPACK. Não há upgrade de arquivo: só se
+/// prefere, ou não, a revisão nova entre os releases da mesma busca.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Propers {
+    /// `preferir_e_atualizar` e `nao_atualizar` são os valores de antes,
+    /// quando havia a troca do arquivo pela revisão nova.
+    #[default]
+    #[serde(
+        rename = "preferir",
+        alias = "preferir_e_atualizar",
+        alias = "nao_atualizar"
+    )]
+    Prefer,
+    #[serde(rename = "nao_preferir")]
+    DoNotPrefer,
+}
+
 /// Espera antes de pegar automaticamente.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct DelayRules {
@@ -47,8 +137,7 @@ pub struct DecisionRules {
     pub aceitar_legenda_embutida: bool,
     /// Termos separados por vírgula que liberam legenda embutida.
     pub legendas_embutidas_liberadas: String,
-    /// `preferir_e_atualizar`, `nao_atualizar` ou `nao_preferir`.
-    pub propers: String,
+    pub propers: Propers,
     pub preferir_flags_do_indexador: bool,
     /// Folga que a fila de downloads deixa sempre livre no disco do cliente.
     pub folga_minima_mb: u64,
@@ -67,7 +156,7 @@ impl Default for DecisionRules {
             tamanho_maximo_mb: 0,
             aceitar_legenda_embutida: false,
             legendas_embutidas_liberadas: String::new(),
-            propers: "preferir_e_atualizar".into(),
+            propers: Propers::Prefer,
             preferir_flags_do_indexador: false,
             folga_minima_mb: 100,
             downloads_simultaneos: 5,
@@ -80,31 +169,25 @@ impl Default for DecisionRules {
 
 impl DecisionRules {
     /// Lê o texto guardado.
-    #[must_use]
-    pub fn parse(text: &str) -> Option<Self> {
-        serde_json::from_str(text).ok()
+    ///
+    /// # Errors
+    ///
+    /// JSON fora do formato das regras.
+    pub fn parse(text: &str) -> serde_json::Result<Self> {
+        serde_json::from_str(text)
     }
 
     /// As configurações que o motor lê, com os tamanhos por qualidade.
     #[must_use]
-    pub fn settings(&self, definitions: Vec<acervo_store::QualityDefinition>) -> Settings {
+    pub fn settings(&self) -> Settings {
         Settings {
-            definitions: definitions
-                .into_iter()
-                .map(|d| acervo_decision::QualityDefinition {
-                    quality: d.quality,
-                    min_size: d.min_size,
-                    max_size: d.max_size,
-                    preferred_size: d.preferred_size,
-                })
-                .collect(),
+            definitions: quality_definitions(),
             maximum_size_mb: self.tamanho_maximo_mb,
             allow_hardcoded_subs: self.aceitar_legenda_embutida,
             whitelisted_hardcoded_subs: self.legendas_embutidas_liberadas.clone(),
-            propers: match self.propers.as_str() {
-                "nao_atualizar" => Propers::DoNotUpgrade,
-                "nao_preferir" => Propers::DoNotPrefer,
-                _ => Propers::PreferAndUpgrade,
+            propers: match self.propers {
+                Propers::Prefer => acervo_decision::Propers::DoNotUpgrade,
+                Propers::DoNotPrefer => acervo_decision::Propers::DoNotPrefer,
             },
             prefer_indexer_flags: self.preferir_flags_do_indexador,
         }
@@ -131,18 +214,20 @@ impl DecisionRules {
     }
 }
 
-/// As regras guardadas.
+/// As regras guardadas. Ilegíveis, valem as padrão — com aviso no log:
+/// senão a regra editada na tela some sem ninguém saber por quê.
 ///
 /// # Errors
 ///
 /// Banco inalcançável.
 pub async fn stored(store: &Store) -> Result<DecisionRules> {
-    Ok(store
-        .setting(RULES_KEY)
-        .await?
-        .as_deref()
-        .and_then(DecisionRules::parse)
-        .unwrap_or_default())
+    let Some(text) = store.setting(RULES_KEY).await? else {
+        return Ok(DecisionRules::default());
+    };
+    Ok(DecisionRules::parse(&text).unwrap_or_else(|error| {
+        tracing::warn!("regras de decisão ilegíveis, valem as padrão: {error}");
+        DecisionRules::default()
+    }))
 }
 
 /// # Errors
@@ -167,6 +252,52 @@ mod tests {
             DecisionRules::parse(r#"{"folga_minima_mb": 2048, "pular_checagem_de_espaco": true}"#)
                 .expect("lê");
         assert_eq!(rules.folga_minima_mb, 2048);
+    }
+
+    #[test]
+    fn propers_antigos_viram_preferir() {
+        for old in ["preferir_e_atualizar", "nao_atualizar", "preferir"] {
+            let rules = DecisionRules::parse(&format!(r#"{{"propers": "{old}"}}"#)).expect("lê");
+            assert_eq!(rules.propers, Propers::Prefer, "{old}");
+            assert_eq!(
+                rules.settings().propers,
+                acervo_decision::Propers::DoNotUpgrade
+            );
+        }
+        let rules = DecisionRules::parse(r#"{"propers": "nao_preferir"}"#).expect("lê");
+        assert_eq!(rules.propers, Propers::DoNotPrefer);
+        assert_eq!(
+            serde_json::to_value(&rules).unwrap()["propers"],
+            "nao_preferir"
+        );
+        assert_eq!(
+            serde_json::to_value(DecisionRules::default()).unwrap()["propers"],
+            "preferir"
+        );
+        assert!(DecisionRules::parse(r#"{"propers": "talvez"}"#).is_err());
+    }
+
+    #[test]
+    fn tamanhos_cobrem_toda_qualidade_uma_vez() {
+        for quality in Quality::ALL {
+            assert_eq!(
+                QUALITY_DEFINITIONS
+                    .iter()
+                    .filter(|(q, _)| *q == quality)
+                    .count(),
+                1,
+                "{quality:?}"
+            );
+        }
+        let sizes = |quality| {
+            QUALITY_DEFINITIONS
+                .iter()
+                .find(|(q, _)| *q == quality)
+                .unwrap()
+                .1
+        };
+        assert_eq!(sizes(Quality::WebDl1080p), UP_TO_100);
+        assert_eq!(sizes(Quality::Remux2160p), ANY_SIZE);
     }
 
     #[test]

@@ -4,7 +4,6 @@ members = [
     "crates/acervo-core",
     "crates/acervo-janitor",
     "crates/acervo-fs",
-    "crates/acervo-arr",
     "crates/acervo-clients",
     "crates/acervo-indexers",
     "crates/acervo-api",
@@ -25,7 +24,6 @@ repository = "https://github.com/vitoramaral10/acervo-hub"
 acervo-core = { path = "crates/acervo-core" }
 acervo-janitor = { path = "crates/acervo-janitor" }
 acervo-fs = { path = "crates/acervo-fs" }
-acervo-arr = { path = "crates/acervo-arr" }
 acervo-clients = { path = "crates/acervo-clients" }
 acervo-indexers = { path = "crates/acervo-indexers" }
 acervo-api = { path = "crates/acervo-api" }

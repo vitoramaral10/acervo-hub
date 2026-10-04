@@ -195,18 +195,6 @@ impl Admin for FakeAdmin {
         }
     }
 
-    fn apps(&self) -> Value {
-        json!({ "instancias": [{ "nome": "sonarr", "tipo": "series" }] })
-    }
-
-    async fn sync(
-        &self,
-        indexers: Vec<(String, Capabilities)>,
-        apply: bool,
-    ) -> Result<Value, String> {
-        Ok(json!({ "aplicado": apply, "indexadores": indexers.len() }))
-    }
-
     fn tasks(&self) -> Value {
         json!([{ "id": "limpeza", "nome": "Limpeza", "rodando": false }])
     }
@@ -236,10 +224,6 @@ impl Admin for FakeAdmin {
             return Err("filme fora do catálogo".into());
         }
         Ok(json!({ "filme": "Filme (2020)", "aplicado": apply }))
-    }
-
-    async fn downloads(&self, import: bool) -> Result<Value, String> {
-        Ok(json!({ "downloads": [], "importados": if import { 0 } else { -1 } }))
     }
 
     async fn configuration(&self) -> Result<Value, String> {
@@ -328,6 +312,14 @@ async fn login(base: &str) -> String {
     let cookie = response.headers()[SET_COOKIE].to_str().unwrap().to_owned();
     assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
     cookie.split(';').next().unwrap().to_owned()
+}
+
+/// O status da busca num indexador: 200 se ele está no catálogo servido, 404
+/// se não.
+async fn served(base: &str, cookie: &str, name: &str) -> u16 {
+    get(base, &format!("/ui/api/busca?q=x&indexador={name}"), cookie)
+        .await
+        .0
 }
 
 async fn get(base: &str, path: &str, cookie: &str) -> (u16, Value) {
@@ -572,9 +564,8 @@ async fn adicionar_testa_e_entra_no_catalogo_e_remover_tira() {
         .map(|i| i["nome"].clone())
         .collect();
     assert!(names.contains(&json!("novo")));
-    // Aparece servido pela API Torznab também.
-    let (status, _) = get(&base, &format!("/novo/api?t=caps&apikey={KEY}"), "").await;
-    assert_eq!(status, 200);
+    // Entra no catálogo servido: a busca o alcança pelo nome.
+    assert_eq!(served(&base, &cookie, "novo").await, 200);
 
     // Recusa do administrador vira 422.
     let (status, _) = send(
@@ -595,8 +586,7 @@ async fn adicionar_testa_e_entra_no_catalogo_e_remover_tira() {
     )
     .await;
     assert_eq!(status, 200);
-    let (status, _) = get(&base, &format!("/novo/api?t=caps&apikey={KEY}"), "").await;
-    assert_eq!(status, 404);
+    assert_eq!(served(&base, &cookie, "novo").await, 404);
 }
 
 #[tokio::test]
@@ -612,8 +602,7 @@ async fn desativar_tira_de_circulacao_e_mantem_na_lista() {
     )
     .await;
     assert_eq!(status, 200);
-    let (status, _) = get(&base, &format!("/privado/api?t=caps&apikey={KEY}"), "").await;
-    assert_eq!(status, 404);
+    assert_eq!(served(&base, &cookie, "privado").await, 404);
     let (_, list) = get(&base, "/ui/api/indexadores", &cookie).await;
     let privado = list["indexadores"]
         .as_array()
@@ -633,24 +622,7 @@ async fn desativar_tira_de_circulacao_e_mantem_na_lista() {
     )
     .await;
     assert_eq!(status, 200);
-    let (status, _) = get(&base, &format!("/privado/api?t=caps&apikey={KEY}"), "").await;
-    assert_eq!(status, 200);
-}
-
-#[tokio::test]
-async fn sincronizar_recebe_os_indexadores_servidos() {
-    let base = serve().await;
-    let cookie = login(&base).await;
-    let (status, body) = send(
-        &base,
-        reqwest::Method::POST,
-        "/ui/api/aplicativos/sincronizar",
-        &cookie,
-        json!({ "aplicar": false }),
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert_eq!(body, json!({ "aplicado": false, "indexadores": 1 }));
+    assert_eq!(served(&base, &cookie, "privado").await, 200);
 }
 
 #[tokio::test]
@@ -796,20 +768,6 @@ async fn filmes_lista_e_busca() {
     )
     .await;
     assert!(!body.to_string().contains("certa"));
-
-    let (status, body) = get(&base, "/ui/api/downloads", &cookie).await;
-    assert_eq!(status, 200);
-    assert_eq!(body["importados"], -1);
-    let (status, body) = send(
-        &base,
-        reqwest::Method::POST,
-        "/ui/api/downloads/importar",
-        &cookie,
-        json!({}),
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert_eq!(body["importados"], 0);
 
     // Sem sessão, nada.
     let (status, _) = get(&base, "/ui/api/filmes", "").await;

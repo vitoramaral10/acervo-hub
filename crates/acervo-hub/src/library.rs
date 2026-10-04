@@ -1,10 +1,10 @@
 //! O catálogo como dono dos filmes: status e disponibilidade calculados das
-//! datas, metadados vindos do TMDB e filmes adicionados pelo próprio acervo.
-//! Título, datas e status de todo filme são mantidos a partir do TMDB.
+//! datas, metadados vindos do TMDB e filmes adicionados pela tela. Título,
+//! datas e status de todo filme são mantidos a partir do TMDB.
 
 use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use acervo_core::DownloadHash;
 use acervo_metadata::{MovieMetadata, Tmdb};
@@ -69,9 +69,8 @@ fn today() -> Date {
     OffsetDateTime::now_utc().date()
 }
 
-/// Passa para o filme o que veio da base de metadados, recalculando status
-/// e disponibilidade. O que é escolha de quem usa (monitorado, pasta) fica
-/// como está.
+/// Passa para o filme o que veio da base de metadados, recalculando o
+/// status. O que é escolha de quem usa (monitorado, pasta) fica como está.
 fn apply(movie: &mut Movie, meta: &MovieMetadata) {
     movie.title = meta
         .localized_title
@@ -92,9 +91,7 @@ fn apply(movie: &mut Movie, meta: &MovieMetadata) {
     movie.overview.clone_from(&meta.overview);
     movie.clean_title = Some(clean_movie_title(&meta.title));
     movie.alternate_titles.clone_from(&meta.alternate_titles);
-    let today = today();
-    movie.status = Some(status(movie, today).to_owned());
-    movie.available = is_available(movie, today, 0);
+    movie.status = Some(status(movie, today()).to_owned());
 }
 
 fn extras(meta: &MovieMetadata) -> MovieExtras {
@@ -115,7 +112,9 @@ pub struct RefreshReport {
 }
 
 /// Atualiza os metadados dos filmes que não foram conferidos nas últimas
-/// `stale_hours` horas (zero: todos).
+/// `stale_hours` horas (zero: todos). Grava só as colunas de metadado: o
+/// que a tela ou a importação mudaram enquanto o TMDB respondia fica. Filme
+/// que saiu do catálogo no meio é pulado.
 ///
 /// # Errors
 ///
@@ -156,7 +155,9 @@ pub async fn refresh(store: &Store, tmdb: &Tmdb, stale_hours: i64) -> Result<Ref
         let mut movie = entry.movie.clone();
         apply(&mut movie, &meta);
         if movie != entry.movie {
-            store.update_movie(entry.id, &movie).await?;
+            if !store.update_movie_metadata(entry.id, &movie).await? {
+                continue;
+            }
             report.atualizados.push(label);
         }
         store.set_extras(entry.id, &extras(&meta)).await?;
@@ -168,7 +169,7 @@ pub async fn refresh(store: &Store, tmdb: &Tmdb, stale_hours: i64) -> Result<Ref
 #[derive(Debug, Clone)]
 pub struct AddRequest {
     pub tmdb_id: u32,
-    /// Pasta raiz, como o gerenciador a vê (`/media/movies`).
+    /// Pasta raiz, como o cliente de download a vê (`/media/movies`).
     pub root_folder: String,
     pub monitored: bool,
 }
@@ -199,7 +200,6 @@ pub async fn lookup(tmdb: &Tmdb, tmdb_id: u32) -> Result<(Movie, MovieExtras)> {
         secondary_year: None,
         clean_title: None,
         alternate_titles: Vec::new(),
-        available: false,
         in_cinemas: None,
         digital_release: None,
         physical_release: None,
@@ -232,7 +232,6 @@ pub async fn add(store: &Store, tmdb: &Tmdb, request: &AddRequest) -> Result<i64
     movie.path = format!("{}/{folder}", request.root_folder.trim_end_matches('/'));
     movie.monitored = request.monitored;
     movie.added = Some(now_rfc3339());
-    movie.available = is_available(&movie, today(), 0);
     let id = store.add_movie(&movie, &extras).await?;
     events::record(
         store,
@@ -272,11 +271,12 @@ pub async fn edit(store: &Store, id: i64, change: &MovieEdit) -> Result<CatalogM
         .find(|m| m.id == id)
         .context("filme fora do catálogo")?;
     let mut movie = entry.movie.clone();
-    if let Some(monitored) = change.monitored {
+    if let Some(monitored) = change.monitored
+        && monitored != movie.monitored
+    {
+        store.set_movie_monitored(id, monitored).await?;
         movie.monitored = monitored;
     }
-    movie.available = is_available(&movie, today(), 0);
-    store.update_movie(id, &movie).await?;
     let mut priority = entry.priority;
     if let Some(wanted) = change.priority {
         store.set_movie_priority(id, wanted).await?;
@@ -299,7 +299,39 @@ pub async fn delete_folder(config: &Config, movie_path: &str) -> Result<()> {
     delete_folder_within(config, movie_path, &config.library.root_folders).await
 }
 
+/// A raiz, entre `roots`, de que `folder` é filha direta — só pelo texto:
+/// com nome próprio (não a raiz, não `..`) e sem `.` nem `..` no caminho.
+fn root_of<'a>(folder: &Path, roots: &'a [String]) -> Option<&'a str> {
+    if folder.file_name().is_none()
+        || folder
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return None;
+    }
+    let parent = folder.parent()?;
+    roots
+        .iter()
+        .map(|root| root.trim_end_matches('/'))
+        .find(|root| !root.is_empty() && parent == Path::new(root))
+}
+
+/// A pasta, no disco, ainda é filha direta da raiz depois de resolver os
+/// links simbólicos do caminho. Pasta que não existe: nada a apagar.
+fn still_inside(host: &Path, root: &Path) -> std::io::Result<bool> {
+    let Some(parent) = host.parent() else {
+        return Ok(false);
+    };
+    let parent = match parent.canonicalize() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        other => other?,
+    };
+    Ok(parent == root.canonicalize()?)
+}
+
 /// Apaga uma pasta que está direto numa das `roots`, e não é a própria raiz.
+/// O caminho é conferido como texto e de novo resolvido no disco: um link
+/// simbólico no meio não leva a remoção para fora da raiz.
 ///
 /// # Errors
 ///
@@ -310,18 +342,23 @@ pub(crate) async fn delete_folder_within(
     roots: &[String],
 ) -> Result<()> {
     let folder = Path::new(movie_path);
-    let inside_root = roots.iter().any(|root| {
-        folder
-            .parent()
-            .is_some_and(|p| p == Path::new(root.trim_end_matches('/')))
-    });
-    if !inside_root {
+    let Some(root) = root_of(folder, roots) else {
         bail!("a pasta `{movie_path}` não está direto numa pasta raiz; nada apagado");
-    }
-    let host = config.path_map().to_host(folder)?;
-    tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&host) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-        _ => Ok(()),
+    };
+    let map = config.path_map();
+    let host = map.to_host(folder)?;
+    let root_host = map.to_host(Path::new(root))?;
+    let shown = movie_path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        if !still_inside(&host, &root_host)? {
+            return Err(anyhow::anyhow!(
+                "a pasta `{shown}` resolve para fora da pasta raiz; nada apagado"
+            ));
+        }
+        match std::fs::remove_dir_all(&host) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
     })
     .await??;
     Ok(())
@@ -344,8 +381,8 @@ pub(crate) fn removal_message(folder: &str, removed: &Result<Vec<String>, String
 
 /// Torrents que semeiam os arquivos da pasta do filme. O arquivo da
 /// biblioteca é hardlink do download, então o mesmo inode aparece nos dois
-/// lados — vale para o que o Radarr baixou e para o que o acervo baixou, e
-/// não depende de nome nem de histórico.
+/// lados — vale para qualquer download, do acervo ou de antes dele, e não
+/// depende de nome nem de histórico.
 pub(crate) async fn downloads_of(
     config: &Config,
     movie_path: &str,
@@ -522,6 +559,24 @@ pub async fn remove_because(
     if delete_files {
         delete_folder(config, &entry.movie.path).await?;
     }
+    // O grab que ainda espera na fila sairia com o filme, e o torrent dele
+    // ficaria no cliente sem dono.
+    let queued: Vec<_> = store
+        .grabs()
+        .await?
+        .into_iter()
+        .filter(|g| g.movie_id == id && g.state == acervo_store::GrabState::Downloading)
+        .collect();
+    if !queued.is_empty() {
+        match crate::grab::qbit(config).await {
+            Ok(client) => {
+                for grab in &queued {
+                    crate::grab::drop_queued(config, store, &client, grab).await;
+                }
+            }
+            Err(error) => tracing::warn!("torrents da fila não conferidos: {error:#}"),
+        }
+    }
     store.delete_movie(id).await?;
     let removed = match downloads {
         Ok(found) if found.is_empty() => Ok(Vec::new()),
@@ -619,6 +674,48 @@ mod tests {
     }
 
     #[test]
+    fn pasta_so_vale_filha_direta_da_raiz_sem_ponto_ponto() {
+        let roots = ["/media/movies/".to_owned(), "/outra".to_owned()];
+        let root = |path: &str| root_of(Path::new(path), &roots);
+        assert_eq!(root("/media/movies/Filme (2020)"), Some("/media/movies"));
+        assert_eq!(root("/outra/Filme"), Some("/outra"));
+        for fora in [
+            "/media/movies",
+            "/media/movies/",
+            "/media/movies/..",
+            "/media/movies/../etc",
+            "/media/movies/x/..",
+            "./media/movies/Filme",
+            "/media/movies/Filme/extras",
+            "/media",
+            "/",
+            "Filme",
+        ] {
+            assert_eq!(root(fora), None, "{fora}");
+        }
+        assert_eq!(root_of(Path::new("/Filme"), &[String::new()]), None);
+        // O `.` no meio o caminho já descarta: é a mesma pasta.
+        assert_eq!(root("/media/movies/./Filme"), Some("/media/movies"));
+    }
+
+    #[test]
+    fn link_simbolico_nao_leva_a_remocao_para_fora_da_raiz() {
+        let base = std::env::temp_dir().join(format!("acervo-raiz-{}", std::process::id()));
+        let root = base.join("filmes");
+        let outside = base.join("fora");
+        std::fs::create_dir_all(root.join("Filme")).unwrap();
+        std::fs::create_dir_all(outside.join("dentro")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("atalho")).unwrap();
+
+        assert!(still_inside(&root.join("Filme"), &root).unwrap());
+        // Ainda não existe: nada a apagar, nada a temer.
+        assert!(still_inside(&root.join("Novo"), &root).unwrap());
+        // `filmes/atalho/dentro` é, no disco, `fora/dentro`.
+        assert!(!still_inside(&root.join("atalho").join("dentro"), &root).unwrap());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn so_arquivo_com_outro_link_conta_como_download() {
         let root = std::env::temp_dir().join(format!("acervo-inodes-{}", std::process::id()));
         let movie = root.join("filme");
@@ -653,7 +750,6 @@ mod tests {
             secondary_year: None,
             clean_title: None,
             alternate_titles: Vec::new(),
-            available: false,
             in_cinemas: cinema.map(str::to_owned),
             digital_release: digital.map(str::to_owned),
             physical_release: physical.map(str::to_owned),

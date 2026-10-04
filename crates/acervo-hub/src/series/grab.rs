@@ -446,7 +446,7 @@ pub async fn send(
         .await
         .context("registrando o grab")?;
     crate::stats::grabbed(store, &release.indexer).await;
-    if let Err(error) = start_queued(store, &client).await {
+    if let Err(error) = start_queued(config, store, &client).await {
         tracing::warn!("fila de downloads: {error:#}");
     }
     events::record(
@@ -487,8 +487,15 @@ pub fn deletable(added_on: i64, grabbed_at: &str, shared: bool, files: Option<&[
         && files.is_some_and(|files| files.iter().all(|f| f.nlink <= 1))
 }
 
-/// [`deletable`], lendo o catálogo, o cliente e o disco. Qualquer erro no
-/// caminho é dúvida: `false`.
+/// De quem é um grab: filme ou série, pelo id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Owner {
+    Movie(i64),
+    Series(i64),
+}
+
+/// [`deletable`] para um grab de série, lendo o catálogo, o cliente e o
+/// disco. Qualquer erro no caminho é dúvida: `false`.
 pub(crate) async fn owns(
     config: &Config,
     store: &Store,
@@ -496,18 +503,41 @@ pub(crate) async fn owns(
     grab: &SeriesGrab,
     torrent: &TorrentInfo,
 ) -> bool {
+    owns_torrent(
+        config,
+        store,
+        client,
+        Owner::Series(grab.id),
+        &grab.grabbed_at,
+        torrent,
+    )
+    .await
+}
+
+/// [`deletable`] para o grab `owner`, de filme ou de série, que saiu em
+/// `grabbed_at` com o torrent `torrent`. Qualquer erro no caminho é dúvida:
+/// `false`.
+pub(crate) async fn owns_torrent(
+    config: &Config,
+    store: &Store,
+    client: &QbitClient,
+    owner: Owner,
+    grabbed_at: &str,
+    torrent: &TorrentInfo,
+) -> bool {
+    let hash = &torrent.hash;
     let shared = match (store.series_grabs().await, store.grabs().await) {
         (Ok(series), Ok(movies)) => {
             series
                 .iter()
-                .any(|g| g.id != grab.id && g.hash.eq_ignore_ascii_case(&grab.hash))
+                .any(|g| owner != Owner::Series(g.id) && g.hash.eq_ignore_ascii_case(hash))
                 || movies
                     .iter()
-                    .any(|g| g.hash.eq_ignore_ascii_case(&grab.hash))
+                    .any(|g| owner != Owner::Movie(g.id) && g.hash.eq_ignore_ascii_case(hash))
         }
         _ => return false,
     };
-    let Ok(files) = client.files(&DownloadHash::new(grab.hash.clone())).await else {
+    let Ok(files) = client.files(&DownloadHash::new(hash.clone())).await else {
         return false;
     };
     let map = config.path_map();
@@ -522,12 +552,12 @@ pub(crate) async fn owns(
         .await
         .ok()
         .flatten();
-    deletable(torrent.added_on, &grab.grabbed_at, shared, files.as_deref())
+    deletable(torrent.added_on, grabbed_at, shared, files.as_deref())
 }
 
 /// Apaga do cliente o torrent de um grab que sai ainda na fila, sem nada
-/// baixado: sem grab em andamento, a fila o iniciaria como se fosse de
-/// filme. Só se for dele ([`owns`]); erro vira aviso.
+/// baixado: sem grab em andamento, ele ficaria no cliente sem dono. Só se
+/// for dele ([`owns`]); erro vira aviso.
 pub(crate) async fn drop_queued(
     config: &Config,
     store: &Store,
@@ -643,6 +673,7 @@ pub async fn give_up(
     store
         .update_series_grab(grab.id, GrabState::Failed, Some(reason), Some(&at))
         .await?;
+    crate::grab::watch().forget(&grab.hash);
     if blocklist {
         store
             .block(&acervo_store::Blocked {
@@ -681,8 +712,8 @@ pub async fn give_up(
 }
 
 /// Tira um download de série da fila, como o de filme: apaga do cliente
-/// (com os arquivos) se pedido, bloqueia se pedido e busca de novo os
-/// episódios dele se pedido.
+/// (com os arquivos) se pedido — senão, só tira a tag da fila —, bloqueia se
+/// pedido e busca de novo os episódios dele se pedido.
 ///
 /// # Errors
 ///
@@ -706,12 +737,17 @@ pub async fn remove_download(
         .series(grab.series_id)
         .await?
         .context("a série do download saiu do catálogo")?;
+    let client = qbit(config).await?;
     if remove_from_client {
-        qbit(config)
-            .await?
+        client
             .delete(&[DownloadHash::new(grab.hash.clone())], true)
             .await
             .context("apagando do qBittorrent")?;
+    } else {
+        client
+            .remove_tag(&[&grab.hash], QUEUE_TAG)
+            .await
+            .context("tirando da fila do qBittorrent")?;
     }
     let (reason, kind) = if blocklist {
         ("marcado como falho na tela", Kind::Failed)

@@ -8,7 +8,8 @@ use serde_json::{Map, Value};
 /// Lê o ledger; sem strikes, um vazio.
 ///
 /// Registro ilegível é erro, não recomeço silencioso: perder a contagem faz um
-/// órfão antigo voltar à estaca zero, e ninguém perceberia pelo log.
+/// download sem dono antigo voltar à estaca zero, e ninguém perceberia pelo
+/// log.
 ///
 /// # Errors
 ///
@@ -53,17 +54,11 @@ pub async fn save(store: &Store, ledger: &StrikeLedger) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use acervo_core::{DownloadHash, InstanceName, QueueItem, QueueItemId};
+    use acervo_core::DownloadHash;
     use acervo_janitor::StrikeKey;
 
     fn chave() -> StrikeKey {
-        StrikeKey::for_item(&QueueItem {
-            id: QueueItemId(1),
-            instance: InstanceName::new("filmes"),
-            title: "exemplo".into(),
-            download: Some(DownloadHash::new("aa")),
-            work: None,
-        })
+        StrikeKey::for_download(&DownloadHash::new("aa"))
     }
 
     #[tokio::test]

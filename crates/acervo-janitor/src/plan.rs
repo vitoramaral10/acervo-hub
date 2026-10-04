@@ -5,27 +5,11 @@
 
 use std::fmt;
 
-use acervo_core::{Allocated, DownloadHash, InstanceName, QueueItemId};
+use acervo_core::{Allocated, DownloadHash, InstanceName};
 
 /// Uma ação a executar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Órfão confirmado neste ciclo, ainda abaixo do limite de strikes.
-    StrikeOrphan {
-        item: QueueItemId,
-        instance: InstanceName,
-        title: String,
-        strikes: u32,
-        limit: u32,
-    },
-    /// Órfão que bateu o limite: sai da fila e, conforme a política, do cliente.
-    RemoveOrphan {
-        item: QueueItemId,
-        instance: InstanceName,
-        title: String,
-        download: Option<DownloadHash>,
-        delete_files: bool,
-    },
     /// Seed que perdeu o vínculo com a biblioteca.
     DeleteUnlinked {
         download: DownloadHash,
@@ -55,7 +39,7 @@ pub enum Action {
 /// como "não apagou X", e sem o motivo não se sabe em qual etapa parou.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
-    /// Está em fila de alguma instância — caso da reconciliação de fila.
+    /// É de um grab em andamento do acervo.
     InQueue,
     /// Categoria fora das gerenciadas: download manual.
     UnmanagedCategory,
@@ -67,20 +51,17 @@ pub enum SkipReason {
     RecentlyModified,
     /// Tracker privado dentro da carência de seed.
     SeedGrace,
-    /// Órfão de fila cujo torrent não está no cliente.
-    MissingInClient,
 }
 
 impl fmt::Display for SkipReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
-            Self::InQueue => "está em fila de um *arr",
+            Self::InQueue => "é de um download em andamento do acervo",
             Self::UnmanagedCategory => "categoria fora das gerenciadas (download manual)",
             Self::StillLinked => "ainda tem hardlink na biblioteca",
             Self::NotSeeding => "não está em seeding",
             Self::RecentlyModified => "arquivo mexido recentemente",
             Self::SeedGrace => "privado dentro da carência de seed",
-            Self::MissingInClient => "não encontrado no cliente de download",
         };
         f.write_str(s)
     }
@@ -167,9 +148,7 @@ impl Plan {
         self.actions.iter().filter(|a| {
             matches!(
                 a,
-                Action::DeleteUnlinked { .. }
-                    | Action::DeleteUnowned { .. }
-                    | Action::RemoveOrphan { .. }
+                Action::DeleteUnlinked { .. } | Action::DeleteUnowned { .. }
             )
         })
     }

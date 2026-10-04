@@ -30,7 +30,7 @@ struct Body {
 }
 
 /// `POST /ui/api/busca/enviar {indexador, link}`: baixa pelo indexador (o
-/// mesmo caminho do download que os gerenciadores usam), manda ao cliente
+/// mesmo caminho do download que o grab usa), manda ao cliente
 /// já iniciado e devolve o hash.
 async fn send(State(web): Shared, headers: HeaderMap, Json(body): Json<Body>) -> WebResult {
     let store = enter(&web, &headers, &Method::POST).await?;

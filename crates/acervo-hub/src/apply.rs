@@ -17,31 +17,14 @@ pub struct Outcome {
 /// validado pelas travas, e parar no meio deixaria o acervo num estado parcial
 /// que o próximo ciclo teria de redescobrir. Cada falha é registrada e contada.
 ///
-/// `StrikeOrphan` e `StrikeUnowned` não aparecem aqui: strike não é ação
-/// remota, é estado local, e já foi persistido pelo ledger.
+/// `StrikeUnowned` não aparece aqui: strike não é ação remota, é estado
+/// local, e já foi persistido pelo ledger.
 pub async fn execute(session: &Session, plan: &Plan) -> Outcome {
     let mut outcome = Outcome::default();
 
     for action in &plan.actions {
         let result = match action {
-            Action::StrikeOrphan { .. } | Action::StrikeUnowned { .. } => continue,
-            Action::RemoveOrphan {
-                item,
-                instance,
-                title,
-                delete_files,
-                ..
-            } => {
-                let Some(arr) = session.arrs.get(instance) else {
-                    tracing::error!(%instance, "instância do plano não está na sessão");
-                    outcome.failed += 1;
-                    continue;
-                };
-                tracing::info!(%instance, %title, apaga_arquivos = delete_files, "removendo da fila");
-                arr.remove_queue_item(*item, *delete_files)
-                    .await
-                    .map_err(|e| e.to_string())
-            }
+            Action::StrikeUnowned { .. } => continue,
             Action::DeleteUnlinked {
                 download,
                 name,

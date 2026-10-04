@@ -43,7 +43,7 @@ export function CycleCard({ report }: { report: CycleReport }) {
       </dl>
 
       <div className="grid gap-2">
-        <h3 className="text-xs font-medium text-content-subtle">Gerenciadores lidos</h3>
+        <h3 className="text-xs font-medium text-content-subtle">Fila lida</h3>
         <ul className="flex flex-wrap gap-2">
           {report.instancias.map((instance) => (
             <li key={instance.nome}>
@@ -63,7 +63,6 @@ export function CycleCard({ report }: { report: CycleReport }) {
             {report.acoes.map((action, index) => (
               <li key={`${action.titulo}-${index}`} className="flex items-center justify-between gap-3 px-3 py-2">
                 <span className="min-w-0 truncate" title={action.titulo}>
-                  {action.instancia && <span className="text-content-subtle">[{action.instancia}] </span>}
                   {action.titulo}
                 </span>
                 <span className="shrink-0 text-xs text-content-muted">{action.detalhe}</span>

@@ -61,7 +61,7 @@ export function TasksPage() {
     <>
       <PageHeader
         title="Tarefas"
-        description="O que o serviço roda sozinho: busca dos que faltam, RSS, importação, metadados, a limpeza — que tira da fila o que o gerenciador esqueceu e apaga o seed que perdeu o hardlink com a biblioteca — e, com o Jellyfin configurado, a remoção dos filmes já assistidos. O intervalo se muda aqui, em minutos (0 desliga o agendamento), e vale na hora; cada uma pode rodar agora, fora da hora."
+        description="O que o serviço roda sozinho: busca dos que faltam, RSS, importação, metadados, a limpeza — que apaga o seed que perdeu o hardlink com a biblioteca e o download sem dono — e, com o Jellyfin configurado, a remoção dos filmes já assistidos. O intervalo se muda aqui, em minutos (0 desliga o agendamento), e vale na hora; cada uma pode rodar agora, fora da hora."
       />
 
       <section className="mb-10" aria-labelledby="titulo-agendadas">

@@ -143,7 +143,6 @@ mod tests {
             secondary_year: None,
             clean_title: None,
             alternate_titles: Vec::new(),
-            available: true,
             in_cinemas: None,
             digital_release: None,
             physical_release: None,

@@ -1,8 +1,6 @@
-//! Coleta o inventário de um ciclo: instâncias, cliente de download e disco.
+//! Coleta o inventário de um ciclo: a fila do acervo, o cliente de download
+//! e o disco.
 
-use std::collections::HashMap;
-
-use acervo_arr::ArrClient;
 use acervo_clients::{QbitClient, TorrentInfo, client_path, state_from_qbit};
 use acervo_core::{
     Allocated, Download, DownloadHash, FileFacts, InstanceName, InstanceSnapshot, Inventory,
@@ -18,7 +16,6 @@ use crate::config::Config;
 #[derive(Debug)]
 pub struct Session {
     pub inventory: Inventory,
-    pub arrs: HashMap<InstanceName, ArrClient>,
     pub qbit: QbitClient,
 }
 
@@ -27,19 +24,15 @@ const INTERNAL: &str = "acervo";
 
 /// Lê o mundo.
 ///
-/// Instância que falha **não** interrompe a coleta: ela é registrada como
-/// inalcançável e o planejador aborta depois, com o motivo em mãos. Já o
-/// cliente de download fora do ar é falha dura — sem ele não há o que
-/// reconciliar, e prosseguir faria toda a fila parecer sem torrent.
+/// A fila do acervo entra como uma instância. Se o catálogo não puder ser
+/// lido, ela é registrada como inalcançável e o planejador aborta depois, com
+/// o motivo em mãos: sem os grabs, todo download em andamento pareceria sem
+/// dono. Já o cliente de download fora do ar é falha dura — sem ele não há o
+/// que reconciliar.
 ///
 /// # Errors
 ///
-/// Falha ao autenticar ou consultar o cliente de download, ou ao montar algum
-/// cliente HTTP.
-///
-/// A fila do próprio acervo entra como mais uma instância. Se o catálogo não
-/// puder ser lido, ela é registrada como inalcançável, como qualquer outra:
-/// sem os grabs, todo download em andamento pareceria sem dono.
+/// Falha ao autenticar ou consultar o cliente de download.
 pub async fn collect(config: &Config, store: &Store) -> Result<Session> {
     let qbit_config = config.janitor()?;
     let qbit = QbitClient::login(
@@ -52,7 +45,6 @@ pub async fn collect(config: &Config, store: &Store) -> Result<Session> {
     .context("autenticando no qBittorrent")?;
 
     let mut inventory = Inventory::new(Allocated::ZERO);
-    let mut arrs = HashMap::new();
 
     match internal_snapshot_from(store).await {
         Ok(snapshot) => {
@@ -70,39 +62,6 @@ pub async fn collect(config: &Config, store: &Store) -> Result<Session> {
                 reason,
             });
         }
-    }
-
-    for spec in &config.instances {
-        let name = InstanceName::new(spec.name.clone());
-        let client = ArrClient::new(
-            name.clone(),
-            &spec.url,
-            &spec.api_key,
-            spec.kind.into(),
-            config.http_timeout(),
-        )
-        .with_context(|| format!("montando o cliente da instância `{name}`"))?;
-
-        match client.snapshot().await {
-            Ok(snapshot) => {
-                tracing::info!(
-                    instancia = %name,
-                    fila = snapshot.queue.len(),
-                    obras = snapshot.known_works,
-                    "instância lida"
-                );
-                inventory.snapshots.push(snapshot);
-            }
-            Err(err) => {
-                tracing::warn!(instancia = %name, erro = %err, "instância não respondeu");
-                inventory.unreachable.push(UnreachableInstance {
-                    instance: name.clone(),
-                    reason: err.short(),
-                });
-            }
-        }
-
-        arrs.insert(name, client);
     }
 
     let torrents = qbit.torrents().await.context("listando torrents")?;
@@ -127,11 +86,7 @@ pub async fn collect(config: &Config, store: &Store) -> Result<Session> {
     inventory.library_size = acervo_fs::measure_roots(&config.library.roots);
     tracing::info!(biblioteca = %inventory.library_size, "biblioteca medida");
 
-    Ok(Session {
-        inventory,
-        arrs,
-        qbit,
-    })
+    Ok(Session { inventory, qbit })
 }
 
 async fn internal_snapshot_from(store: &Store) -> Result<InstanceSnapshot, String> {
@@ -311,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn ids_de_filme_e_serie_nao_colidem_e_nenhum_item_e_orfao() {
+    fn ids_de_filme_e_serie_nao_colidem_e_todo_item_tem_dono() {
         let snap = internal_snapshot(
             &[grab(1, "aa", GrabState::Downloading)],
             &[series_grab(1, "bb", GrabState::Downloading)],
@@ -322,6 +277,6 @@ mod tests {
         assert_eq!(snap.queue[1].id, QueueItemId(-1));
         assert_eq!(snap.queue[0].work, Some(WorkId(11)));
         assert_eq!(snap.queue[1].work, Some(WorkId(21)));
-        assert!(snap.queue.iter().all(|i| !i.is_orphaned()));
+        assert!(snap.queue.iter().all(|i| i.work.is_some()));
     }
 }

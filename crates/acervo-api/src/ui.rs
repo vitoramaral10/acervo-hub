@@ -4,7 +4,7 @@
 //! Uma página estática com JS simples, servida pelo próprio binário, e uma
 //! API JSON por baixo. A entrada é por usuário e senha: ela abre uma sessão
 //! cujo token vai num cookie `HttpOnly` + `SameSite=Strict`. Script e
-//! automação podem, em vez disso, mandar a chave da superfície Torznab em
+//! automação podem, em vez disso, mandar a chave de API do servidor em
 //! `X-Api-Key`. Toda ação que muda estado exige o cabeçalho `X-Acervo`, que
 //! um formulário de outra origem não consegue mandar.
 
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::format_description::well_known::Rfc3339;
 
-use crate::{ALL, Entry, Server, TorznabError, constant_time_eq};
+use crate::{ALL, Entry, SearchError, Server, constant_time_eq};
 
 const COOKIE: &str = "acervo_sessao";
 const CSRF_HEADER: &str = "x-acervo";
@@ -34,7 +34,7 @@ const SCRIPT: &str = include_str!("ui/dist/app.js");
 const ICON: &str = include_str!("ui/dist/icone.svg");
 
 /// O que a interface administra e só o binário sabe fazer: a configuração,
-/// o catálogo de definições, os gerenciadores e as tarefas de fundo.
+/// o catálogo de definições e as tarefas de fundo.
 ///
 /// Mensagens de erro vão para a tela e não podem conter valor de setting.
 #[async_trait]
@@ -94,21 +94,6 @@ pub trait Admin: Send + Sync + std::fmt::Debug {
     /// Indexador desconhecido ou falha ao montar ou gravar.
     async fn set_enabled(&self, indexer: &str, enabled: bool) -> Result<Option<Entry>, String>;
 
-    /// Gerenciadores configurados (Sonarr, Radarr).
-    fn apps(&self) -> serde_json::Value;
-
-    /// Planeja e, com `apply`, executa o cadastro dos indexadores nos
-    /// gerenciadores.
-    ///
-    /// # Errors
-    ///
-    /// Configuração incompleta.
-    async fn sync(
-        &self,
-        indexers: Vec<(String, acervo_indexers::Capabilities)>,
-        apply: bool,
-    ) -> Result<serde_json::Value, String>;
-
     /// As tarefas de fundo do serviço — busca, RSS, importação, metadados,
     /// limpeza —, com intervalo, última e próxima execução de cada uma.
     fn tasks(&self) -> serde_json::Value;
@@ -152,13 +137,6 @@ pub trait Admin: Send + Sync + std::fmt::Debug {
     /// Filme desconhecido ou que já tem arquivo, busca que falhou, cliente
     /// inalcançável.
     async fn grab_movie(&self, movie_id: i64, apply: bool) -> Result<serde_json::Value, String>;
-
-    /// Os downloads do acervo; com `import`, importa agora os que terminaram.
-    ///
-    /// # Errors
-    ///
-    /// Banco ou cliente de download inalcançável.
-    async fn downloads(&self, import: bool) -> Result<serde_json::Value, String>;
 
     /// As configurações guardadas pela tela. Segredo nunca volta: só se está
     /// definido.
@@ -296,8 +274,6 @@ pub(crate) fn routes() -> Router<Arc<Server>> {
             "/ui/api/catalogo/{definicao}/settings",
             get(definition_settings),
         )
-        .route("/ui/api/aplicativos", get(apps))
-        .route("/ui/api/aplicativos/sincronizar", post(sync))
         .route("/ui/api/tarefas", get(tasks))
         .route("/ui/api/tarefas/historico", get(task_history))
         .route("/ui/api/tarefas/{id}/rodar", post(run_task))
@@ -307,7 +283,6 @@ pub(crate) fn routes() -> Router<Arc<Server>> {
             get(missing_status).post(search_missing),
         )
         .route("/ui/api/filmes/{id}/pegar", post(grab_movie))
-        .route("/ui/api/downloads", get(downloads))
         .route(
             "/ui/api/configuracoes",
             get(configuration).put(save_configuration),
@@ -316,7 +291,6 @@ pub(crate) fn routes() -> Router<Arc<Server>> {
             "/ui/api/configuracoes/{secao}",
             get(config_section).put(save_config_section),
         )
-        .route("/ui/api/downloads/importar", post(import_downloads))
         .route("/ui/api/indexadores/{nome}/testar", post(test))
         .route(
             "/ui/api/indexadores/{nome}/settings",
@@ -723,36 +697,6 @@ async fn definition_settings(
     Ok(ok(json!({ "settings": views })))
 }
 
-async fn apps(State(server): State<Arc<Server>>, headers: HeaderMap) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::GET).await?;
-    Ok(ok(json!({ "aplicativos": admin(&server)?.apps() })))
-}
-
-#[derive(Deserialize)]
-struct SyncBody {
-    #[serde(default)]
-    aplicar: bool,
-}
-
-async fn sync(
-    State(server): State<Arc<Server>>,
-    headers: HeaderMap,
-    Json(body): Json<SyncBody>,
-) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::POST).await?;
-    let indexers = server
-        .catalog
-        .views()
-        .into_iter()
-        .map(|view| (view.name, view.capabilities))
-        .collect();
-    let report = admin(&server)?
-        .sync(indexers, body.aplicar)
-        .await
-        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
-    Ok(ok(report))
-}
-
 async fn tasks(State(server): State<Arc<Server>>, headers: HeaderMap) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::GET).await?;
     Ok(ok(json!({ "tarefas": admin(&server)?.tasks() })))
@@ -814,11 +758,18 @@ async fn missing_status(
     Ok(ok(admin(&server)?.missing_status()))
 }
 
+#[derive(Deserialize)]
+struct GrabBody {
+    /// Sem ele, só a prévia: o que pegaria.
+    #[serde(default)]
+    aplicar: bool,
+}
+
 async fn grab_movie(
     State(server): State<Arc<Server>>,
     Path(id): Path<i64>,
     headers: HeaderMap,
-    Json(body): Json<SyncBody>,
+    Json(body): Json<GrabBody>,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::POST).await?;
     let report = admin(&server)?
@@ -878,30 +829,6 @@ async fn save_config_section(
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     Ok(ok(body))
-}
-
-async fn downloads(
-    State(server): State<Arc<Server>>,
-    headers: HeaderMap,
-) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::GET).await?;
-    let list = admin(&server)?
-        .downloads(false)
-        .await
-        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
-    Ok(ok(list))
-}
-
-async fn import_downloads(
-    State(server): State<Arc<Server>>,
-    headers: HeaderMap,
-) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::POST).await?;
-    let list = admin(&server)?
-        .downloads(true)
-        .await
-        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
-    Ok(ok(list))
 }
 
 fn test_result(outcome: Result<usize, String>) -> serde_json::Value {
@@ -1012,7 +939,7 @@ async fn search(
         .map_err(|_| UiError(StatusCode::BAD_REQUEST, "categoria inválida".into()))?;
     let query = SearchQuery::general(params.q.trim())
         .with_categories(categories)
-        .with_limit(crate::request::MAX_RESULTS);
+        .with_limit(crate::catalog::MAX_RESULTS);
     let target = params
         .indexador
         .filter(|name| !name.is_empty())
@@ -1022,7 +949,7 @@ async fn search(
         .search(&target, &query)
         .await
         .map_err(|error| match error {
-            TorznabError::NoSuchIndexer => {
+            SearchError::NoSuchIndexer => {
                 UiError(StatusCode::NOT_FOUND, "indexador desconhecido".into())
             }
             other => UiError(StatusCode::BAD_GATEWAY, other.to_string()),

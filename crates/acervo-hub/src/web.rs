@@ -751,10 +751,6 @@ async fn save_rules(
     axum::Json(rules): axum::Json<crate::rules::DecisionRules>,
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::PUT).await?;
-    if !["preferir_e_atualizar", "nao_atualizar", "nao_preferir"].contains(&rules.propers.as_str())
-    {
-        return Err(fail(bad("valor de propers inválido")));
-    }
     if rules.downloads_simultaneos < 1 {
         return Err(fail(bad("downloads simultâneos: o mínimo é 1")));
     }

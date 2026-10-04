@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
-use acervo_core::{Allocated, Download, DownloadState, Inventory, QueueItem};
+use acervo_core::{Allocated, Download, DownloadState, Inventory};
 
 use crate::plan::{Abort, Action, Plan, SkipReason, Skipped};
 use crate::policy::Policy;
@@ -31,16 +31,8 @@ pub fn reconcile(
     let mut skipped = Vec::new();
     let mut reclaim = Allocated::ZERO;
 
-    let mut seen = plan_orphaned_queue(
-        inv,
-        policy,
-        ledger,
-        &mut actions,
-        &mut skipped,
-        &mut reclaim,
-    );
     plan_unlinked_downloads(inv, policy, now, &mut actions, &mut skipped, &mut reclaim);
-    seen.extend(plan_unowned_downloads(
+    let seen = plan_unowned_downloads(
         inv,
         policy,
         ledger,
@@ -48,10 +40,9 @@ pub fn reconcile(
         &mut actions,
         &mut skipped,
         &mut reclaim,
-    ));
+    );
 
-    // Uma poda só, sobre as chaves das duas regras com strike: cada uma
-    // apagaria os strikes da outra se podasse sozinha.
+    // O que não apareceu neste ciclo perde os strikes.
     ledger.retain_only(&seen);
 
     check_batch_is_within_limits(reclaim, inv.library_size, policy)?;
@@ -111,73 +102,12 @@ fn check_batch_is_within_limits(
     Ok(())
 }
 
-/// Passo 1: item de fila sem obra dona. Devolve as chaves de strike vistas.
-fn plan_orphaned_queue(
-    inv: &Inventory,
-    policy: &Policy,
-    ledger: &mut StrikeLedger,
-    actions: &mut Vec<Action>,
-    skipped: &mut Vec<Skipped>,
-    reclaim: &mut Allocated,
-) -> Vec<StrikeKey> {
-    let by_hash = inv.downloads_by_hash();
-    let mut seen = Vec::new();
-
-    for item in inv.queue_items().filter(|i| i.is_orphaned()) {
-        let download = item.download.as_ref().and_then(|h| by_hash.get(h).copied());
-
-        if download.is_none() && policy.skip_orphan_if_missing_in_client {
-            skipped.push(Skipped {
-                what: item.title.clone(),
-                reason: SkipReason::MissingInClient,
-            });
-            continue;
-        }
-
-        let key = StrikeKey::for_item(item);
-        let strikes = ledger.strike(key.clone());
-        seen.push(key);
-
-        if strikes < policy.orphan_strikes {
-            actions.push(Action::StrikeOrphan {
-                item: item.id,
-                instance: item.instance.clone(),
-                title: item.title.clone(),
-                strikes,
-                limit: policy.orphan_strikes,
-            });
-            continue;
-        }
-
-        actions.push(removal_for(item, download, policy));
-        if let Some(d) = download
-            && delete_files_for(d, policy)
-        {
-            *reclaim = *reclaim + d.reclaimable();
-        }
-    }
-
-    seen
-}
-
-fn removal_for(item: &QueueItem, download: Option<&Download>, policy: &Policy) -> Action {
-    Action::RemoveOrphan {
-        item: item.id,
-        instance: item.instance.clone(),
-        title: item.title.clone(),
-        download: item.download.clone(),
-        delete_files: download.is_some_and(|d| delete_files_for(d, policy)),
-    }
-}
-
 fn delete_files_for(download: &Download, policy: &Policy) -> bool {
     !download.private || policy.delete_private_orphans
 }
 
-/// Passo 2: seed fora de fila que perdeu o vínculo com a biblioteca.
-///
-/// Não há sobreposição com o passo 1, por construção: o que está em fila é
-/// pulado aqui, e só seed entra na avaliação.
+/// Passo 1: seed fora de fila que perdeu o vínculo com a biblioteca. O que
+/// está em fila é pulado, e só seed entra na avaliação.
 fn plan_unlinked_downloads(
     inv: &Inventory,
     policy: &Policy,
@@ -208,13 +138,13 @@ fn plan_unlinked_downloads(
     }
 }
 
-/// Passo 3: download fora de fila, sem seed e sem hardlink: ninguém o quer.
+/// Passo 2: download fora de fila, sem seed e sem hardlink: ninguém o quer.
 ///
 /// Cobre o que sobra quando o dono sai de cena (grab desistido, obra apagada):
 /// incompleto, parado ou com erro. O seed é do passo 2. Um strike por ciclo,
 /// com chave pelo hash; só no limite vira remoção. Devolve as chaves vistas.
 ///
-/// Os motivos de pulo que o passo 2 já registra (fila, categoria, estado) não
+/// Os motivos de pulo que o passo 1 já registra (fila, categoria, estado) não
 /// se repetem aqui, para o relatório não contar o mesmo torrent duas vezes.
 fn plan_unowned_downloads(
     inv: &Inventory,

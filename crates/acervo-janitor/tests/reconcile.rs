@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use acervo_core::{
     Allocated, Apparent, Download, DownloadHash, DownloadState, FileFacts, InstanceName,
-    InstanceSnapshot, Inventory, QueueItem, QueueItemId, UnreachableInstance,
+    InstanceSnapshot, Inventory, QueueItem, QueueItemId, UnreachableInstance, WorkId,
 };
 use acervo_janitor::{Abort, Action, Policy, SkipReason, StrikeLedger, reconcile};
 
@@ -58,7 +58,7 @@ fn item(id: i64, instancia: &str, hash: Option<&str>, obra: Option<i64>) -> Queu
         instance: InstanceName::new(instancia),
         title: format!("item {id}"),
         download: hash.map(DownloadHash::new),
-        work: QueueItem::normalize_work(obra),
+        work: obra.map(WorkId),
     }
 }
 
@@ -149,77 +149,9 @@ fn instancia_meio_viva_aborta_o_ciclo() {
 }
 
 #[test]
-fn orfao_pausado_acumula_strikes_e_so_depois_sai() {
-    // Órfão de fila é item sem obra dona, esteja pausado ou não — o caso que
-    // uma regra de "travado" nunca pegava, porque pausado não trava.
-    let mut inv = Inventory::new(Allocated::from_bytes(100 * GIB));
-    inv.snapshots.push(snapshot(
-        "filmes",
-        vec![item(1, "filmes", Some("aa"), Some(0))],
-    ));
-    inv.downloads = vec![Download {
-        state: DownloadState::Paused,
-        ..seed("aa", 1, 4 * GIB)
-    }];
-
-    let politica = politica_aplicando();
-    let mut ledger = StrikeLedger::new();
-
-    for ciclo in 1..=2 {
-        let plano = reconcile(&inv, &politica, &mut ledger, agora()).expect("sem abort");
-        assert!(
-            matches!(plano.actions.as_slice(), [Action::StrikeOrphan { strikes, .. }] if *strikes == ciclo),
-            "ciclo {ciclo} devia só marcar strike, veio {:?}",
-            plano.actions
-        );
-        assert_eq!(plano.reclaim, Allocated::ZERO);
-    }
-
-    let plano = reconcile(&inv, &politica, &mut ledger, agora()).expect("sem abort");
-    assert!(matches!(
-        plano.actions.as_slice(),
-        [Action::RemoveOrphan {
-            delete_files: true,
-            ..
-        }]
-    ));
-    assert_eq!(plano.reclaim, Allocated::from_bytes(4 * GIB));
-}
-
-#[test]
-fn orfao_privado_sai_da_fila_mas_preserva_os_arquivos_por_padrao() {
-    let mut inv = Inventory::new(Allocated::from_bytes(100 * GIB));
-    inv.snapshots.push(snapshot(
-        "filmes",
-        vec![item(1, "filmes", Some("aa"), None)],
-    ));
-    inv.downloads = vec![Download {
-        private: true,
-        category: "tv-sonarr".into(),
-        ..seed("aa", 1, 4 * GIB)
-    }];
-
-    let politica = Policy {
-        orphan_strikes: 1,
-        ..politica_aplicando()
-    };
-
-    let plano = reconcile(&inv, &politica, &mut StrikeLedger::new(), agora()).expect("sem abort");
-
-    assert!(matches!(
-        plano.actions.as_slice(),
-        [Action::RemoveOrphan {
-            delete_files: false,
-            ..
-        }]
-    ));
-    assert_eq!(plano.reclaim, Allocated::ZERO, "não apagou, não liberou");
-}
-
-#[test]
 fn item_em_fila_nunca_e_avaliado_como_seed_solto() {
-    // A separação entre os dois passos: quem está em fila é caso do passo 1.
-    // Sem isso, um download legítimo em andamento entraria na limpeza.
+    // Quem está na fila do acervo é download em andamento: sem esta
+    // separação, ele entraria na limpeza.
     let mut inv = Inventory::new(Allocated::from_bytes(100 * GIB));
     inv.snapshots.push(snapshot(
         "filmes",
@@ -425,27 +357,6 @@ fn incompleto_que_volta_a_ter_grab_perde_os_strikes() {
     // Recomeça do um: os dois strikes de antes não valem mais.
     let plano = reconcile(&solto, &politica, &mut ledger, agora()).unwrap();
     assert_eq!(strikes_de_sem_dono(&plano), [1]);
-}
-
-#[test]
-fn strikes_de_fila_e_de_download_sem_dono_nao_se_apagam_entre_si() {
-    // Cada regra poda o ledger pelas próprias chaves: sem a poda única, a
-    // segunda zeraria os strikes da primeira a cada ciclo e nada sairia.
-    let mut inv = inventario_com(vec![sem_dono("largado", GIB)], vec![]);
-    inv.snapshots.push(snapshot(
-        "filmes",
-        vec![item(1, "filmes", Some("fila"), None)],
-    ));
-    inv.downloads.push(Download {
-        state: DownloadState::Paused,
-        ..seed("fila", 1, GIB)
-    });
-    let mut ledger = StrikeLedger::new();
-
-    reconcile(&inv, &politica_aplicando(), &mut ledger, agora()).unwrap();
-    assert_eq!(ledger.len(), 2);
-    reconcile(&inv, &politica_aplicando(), &mut ledger, agora()).unwrap();
-    assert_eq!(ledger.len(), 2);
 }
 
 #[test]

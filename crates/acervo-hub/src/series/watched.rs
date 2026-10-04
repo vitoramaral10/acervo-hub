@@ -1,8 +1,9 @@
 //! Assistidos de séries, dentro da tarefa `assistidos`: episódio assistido
 //! por algum usuário do Jellyfin há mais que a carência, que não é favorito
 //! e cuja série não é favorita, perde o arquivo e fica `watched`. Arquivo
-//! multi-episódio só sai quando todos os episódios dele foram assistidos. O
-//! torrent fica semeando até a limpeza, como nos filmes.
+//! multi-episódio só sai quando todos os episódios dele foram assistidos. Só
+//! sai o arquivo que chegou antes de assistirem, como nos filmes. O torrent
+//! fica semeando até a limpeza.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -278,6 +279,18 @@ pub async fn run(
                 motivo,
             };
             match verdict {
+                Verdict::Delete { at, .. }
+                    if !crate::watched::watched_after_added(
+                        at,
+                        file.file.date_added.as_deref(),
+                    ) =>
+                {
+                    report
+                        .pulados
+                        .push(skip(crate::watched::before_added_reason(
+                            file.file.date_added.as_deref(),
+                        )));
+                }
                 Verdict::Delete { user, at } => {
                     let reason = format!("assistido por {user} em {}", human(at));
                     match delete_file(config, store, entry, file, &episode_ids).await {

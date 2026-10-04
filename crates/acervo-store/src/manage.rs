@@ -281,4 +281,51 @@ impl Store {
             .await?
             > 0)
     }
+
+    /// Apaga os bloqueios automáticos vencidos: os de mensagem em `messages`
+    /// gravados antes de `before` (RFC 3339, UTC). Devolve quantos saíram.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn delete_blocks(&self, messages: &[&str], before: &str) -> Result<u64> {
+        let client = self.pool.get().await?;
+        let messages: Vec<&str> = messages.to_vec();
+        Ok(client
+            .execute(
+                "DELETE FROM blocklist WHERE message = ANY($1) AND at < $2",
+                &[&messages, &before],
+            )
+            .await?)
+    }
+
+    /// Apaga as buscas de filme e de série feitas antes de `before` (RFC
+    /// 3339, UTC), menos a mais recente de cada obra, que a tela mostra.
+    /// Devolve quantas saíram.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn prune_searches(&self, before: &str) -> Result<u64> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let movies = tx
+            .execute(
+                "DELETE FROM searches s WHERE s.at < $1 AND EXISTS (
+                     SELECT 1 FROM searches n
+                     WHERE n.movie_id = s.movie_id AND (n.at, n.id) > (s.at, s.id))",
+                &[&before],
+            )
+            .await?;
+        let series = tx
+            .execute(
+                "DELETE FROM series_searches s WHERE s.at < $1 AND EXISTS (
+                     SELECT 1 FROM series_searches n
+                     WHERE n.series_id = s.series_id AND (n.at, n.id) > (s.at, s.id))",
+                &[&before],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(movies + series)
+    }
 }

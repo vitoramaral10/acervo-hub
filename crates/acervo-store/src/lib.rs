@@ -9,8 +9,10 @@ mod manage;
 mod series;
 mod tasks;
 
+use std::time::Duration;
+
 use acervo_parser::{Quality, QualityModel, Revision};
-use deadpool_postgres::{GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod};
+use deadpool_postgres::{GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use serde::Serialize;
 use tokio_postgres::{NoTls, Row};
 
@@ -69,7 +71,7 @@ pub struct Movie {
     /// `announced`, `inCinemas` ou `released`.
     pub status: Option<String>,
     pub monitored: bool,
-    /// Pasta do filme, como o gerenciador a vê.
+    /// Pasta do filme, como o cliente de download a vê.
     pub path: String,
     pub added: Option<String>,
     pub file: Option<MovieFile>,
@@ -82,8 +84,6 @@ pub struct Movie {
     pub clean_title: Option<String>,
     /// Títulos alternativos e traduções.
     pub alternate_titles: Vec<String>,
-    /// Já passou da disponibilidade mínima.
-    pub available: bool,
     /// Estreia no cinema, `AAAA-MM-DD`.
     pub in_cinemas: Option<String>,
     pub digital_release: Option<String>,
@@ -91,7 +91,7 @@ pub struct Movie {
     pub overview: Option<String>,
 }
 
-/// O que só a base de metadados sabe e o gerenciador não expõe.
+/// O que só a base de metadados sabe.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MovieExtras {
     /// Título em inglês: o que dá nome à pasta e ao arquivo.
@@ -163,15 +163,6 @@ pub struct CatalogSubtitle {
     pub subtitle: Subtitle,
 }
 
-/// Tamanhos por minuto de filme, em megabytes, de uma qualidade.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct QualityDefinition {
-    pub quality: Quality,
-    pub min_size: Option<f64>,
-    pub max_size: Option<f64>,
-    pub preferred_size: Option<f64>,
-}
-
 /// O que a busca pegou.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchPick {
@@ -241,7 +232,7 @@ pub struct Grab {
     pub grabbed_at: String,
     pub state: GrabState,
     pub message: Option<String>,
-    /// Onde o arquivo foi ligado, como o gerenciador vê.
+    /// Onde o arquivo foi ligado, como o cliente de download vê.
     pub imported_path: Option<String>,
     pub finished_at: Option<String>,
     /// Arquivo que o filme tinha quando o grab saiu: um upgrade o troca.
@@ -707,7 +698,34 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (indexer, day)
     );
 ",
+    // Saem os gerenciadores *arr, a sincronização com eles e o passo da
+    // limpeza que cruzava a fila deles: a seção e os campos que só eles
+    // usavam. A configuração recusa campo e seção desconhecidos, e o serviço
+    // não subiria com eles no banco.
+    //
+    // Saem também os tamanhos por qualidade editáveis, que viraram tabela
+    // fixa no código, e a disponibilidade guardada do filme, que se calcula
+    // das datas.
+    r"
+    DELETE FROM config_sections WHERE name = 'gerenciadores';
+    UPDATE config_sections SET value = value - 'public_url' WHERE name = 'servidor';
+    UPDATE config_sections SET value = value - 'skip_orphan_if_missing_in_client'
+        WHERE name = 'limpeza';
+    DROP TABLE quality_definitions;
+    ALTER TABLE movies DROP COLUMN available;
+",
 ];
+
+/// Quanto uma consulta pode levar. A maior consulta real (o catálogo de
+/// séries inteiro, com episódios e arquivos) leva menos de um segundo; o
+/// teto existe para uma conexão presa não segurar uma tarefa para sempre.
+const STATEMENT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Quanto se espera para abrir uma conexão com o banco.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Quanto se espera por uma conexão do pool, e para criar ou reciclar uma.
+const POOL_WAIT: Duration = Duration::from_secs(30);
 
 /// Chave do lock consultivo que serializa as migrações: o serviço e um
 /// comando avulso podem subir juntos.
@@ -746,7 +764,20 @@ impl Store {
     /// # Errors
     ///
     /// Banco inalcançável ou migração que falha.
-    pub async fn with_config(config: tokio_postgres::Config) -> Result<Self> {
+    pub async fn with_config(mut config: tokio_postgres::Config) -> Result<Self> {
+        // As opções que vieram (o `search_path` dos testes) ficam; o teto de
+        // cada consulta vai junto.
+        let options = match config.get_options() {
+            Some(options) if !options.trim().is_empty() => format!(
+                "{options} -c statement_timeout={}",
+                STATEMENT_TIMEOUT.as_millis()
+            ),
+            _ => format!("-c statement_timeout={}", STATEMENT_TIMEOUT.as_millis()),
+        };
+        config.options(options);
+        if config.get_connect_timeout().is_none() {
+            config.connect_timeout(CONNECT_TIMEOUT);
+        }
         let manager = Manager::from_config(
             config,
             NoTls,
@@ -756,6 +787,10 @@ impl Store {
         );
         let pool = Pool::builder(manager)
             .max_size(8)
+            .runtime(Runtime::Tokio1)
+            .wait_timeout(Some(POOL_WAIT))
+            .create_timeout(Some(POOL_WAIT))
+            .recycle_timeout(Some(POOL_WAIT))
             .build()
             .map_err(|e| StoreError::Url(e.to_string()))?;
         let store = Self { pool };
@@ -795,32 +830,6 @@ impl Store {
     /// Falha de leitura ou registro inconsistente.
     pub async fn movies(&self) -> Result<Vec<CatalogMovie>> {
         read_movies(&self.pool.get().await?).await
-    }
-
-    /// Tamanhos por qualidade.
-    ///
-    /// # Errors
-    ///
-    /// Falha de leitura ou qualidade desconhecida.
-    pub async fn quality_definitions(&self) -> Result<Vec<QualityDefinition>> {
-        let client = self.pool.get().await?;
-        let rows = client
-            .query(
-                "SELECT quality, min_size, max_size, preferred_size
-                 FROM quality_definitions ORDER BY quality",
-                &[],
-            )
-            .await?;
-        rows.iter()
-            .map(|row| {
-                Ok(QualityDefinition {
-                    quality: quality(row.try_get(0)?)?,
-                    min_size: row.try_get(1)?,
-                    max_size: row.try_get(2)?,
-                    preferred_size: row.try_get(3)?,
-                })
-            })
-            .collect()
     }
 
     /// Grava uma busca.
@@ -910,30 +919,74 @@ impl Store {
     pub async fn add_movie(&self, movie: &Movie, extras: &MovieExtras) -> Result<i64> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
-        let id = write_movie(&tx, None, movie).await?;
+        let id = insert_movie(&tx, movie).await?;
         write_extras(&tx, id, extras).await?;
         tx.commit().await?;
         Ok(id)
     }
 
-    /// Regrava um filme do acervo.
+    /// Regrava só o que vem da base de metadados — títulos, datas, status,
+    /// duração, sinopse —, nunca o que é de quem usa (monitorado, pasta,
+    /// prioridade) nem o arquivo: a atualização roda junto com a tela e a
+    /// importação, e uma leitura velha não pode desfazer o que elas
+    /// gravaram. `false` se o filme saiu do catálogo no meio.
     ///
     /// # Errors
     ///
-    /// Filme inexistente ou falha de escrita.
-    pub async fn update_movie(&self, id: i64, movie: &Movie) -> Result<()> {
+    /// Falha de escrita.
+    pub async fn update_movie_metadata(&self, id: i64, movie: &Movie) -> Result<bool> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
-        let exists = tx
-            .query_opt("SELECT 1 FROM movies WHERE id = $1", &[&id])
-            .await?
-            .is_some();
-        if !exists {
-            return Err(StoreError::Corrupt(format!("filme {id} não existe")));
+        let year = movie.year.map(i32::from);
+        let runtime = i32::try_from(movie.runtime).unwrap_or(i32::MAX);
+        let secondary_year = movie.secondary_year.map(i32::from);
+        let updated = tx
+            .execute(
+                "UPDATE movies SET imdb_id = $2, title = $3, original_title = $4,
+                     original_language = $5, year = $6, status = $7, runtime = $8,
+                     secondary_year = $9, clean_title = $10, in_cinemas = $11,
+                     digital_release = $12, physical_release = $13, overview = $14
+                 WHERE id = $1",
+                &[
+                    &id,
+                    &movie.imdb_id,
+                    &movie.title,
+                    &movie.original_title,
+                    &movie.original_language,
+                    &year,
+                    &movie.status,
+                    &runtime,
+                    &secondary_year,
+                    &movie.clean_title,
+                    &movie.in_cinemas,
+                    &movie.digital_release,
+                    &movie.physical_release,
+                    &movie.overview,
+                ],
+            )
+            .await?;
+        if updated == 0 {
+            return Ok(false);
         }
-        write_movie(&tx, Some(id), movie).await?;
+        write_titles(&tx, id, movie).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(true)
+    }
+
+    /// Liga ou desliga o monitorado do filme. `false` se ele não existe.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn set_movie_monitored(&self, id: i64, monitored: bool) -> Result<bool> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .execute(
+                "UPDATE movies SET monitored = $2 WHERE id = $1",
+                &[&id, &monitored],
+            )
+            .await?
+            > 0)
     }
 
     /// Troca o arquivo do filme no catálogo (`None` tira). O disco não é
@@ -1087,20 +1140,8 @@ impl Store {
             > 0)
     }
 
-    /// Tira uma legenda do catálogo. O disco é com quem chama.
-    ///
-    /// # Errors
-    ///
-    /// Falha de escrita.
-    pub async fn delete_subtitle(&self, id: i64) -> Result<bool> {
-        let client = self.pool.get().await?;
-        Ok(client
-            .execute("DELETE FROM subtitle_files WHERE id = $1", &[&id])
-            .await?
-            > 0)
-    }
-
-    /// Grava o que só a base de metadados sabe.
+    /// Grava o que só a base de metadados sabe. Filme que saiu do catálogo
+    /// não é erro: não há o que gravar.
     ///
     /// # Errors
     ///
@@ -1285,69 +1326,50 @@ fn narrow<T: TryFrom<i32>>(value: i32, what: &str) -> Result<T> {
     T::try_from(value).map_err(|_| StoreError::Corrupt(format!("{what} {value}")))
 }
 
-async fn write_movie(client: &impl GenericClient, id: Option<i64>, movie: &Movie) -> Result<i64> {
+async fn insert_movie(client: &impl GenericClient, movie: &Movie) -> Result<i64> {
     let tmdb_id = i64::from(movie.tmdb_id);
     let year = movie.year.map(i32::from);
     let runtime = i32::try_from(movie.runtime).unwrap_or(i32::MAX);
     let secondary_year = movie.secondary_year.map(i32::from);
-    let values: [&(dyn tokio_postgres::types::ToSql + Sync); 18] = [
-        &tmdb_id,
-        &movie.imdb_id,
-        &movie.title,
-        &movie.original_title,
-        &movie.original_language,
-        &year,
-        &movie.status,
-        &movie.monitored,
-        &movie.path,
-        &movie.added,
-        &runtime,
-        &secondary_year,
-        &movie.clean_title,
-        &movie.available,
-        &movie.in_cinemas,
-        &movie.digital_release,
-        &movie.physical_release,
-        &movie.overview,
-    ];
-    let id: i64 = if let Some(id) = id {
-        let mut params = values.to_vec();
-        params.push(&id);
-        client
-            .execute(
-                "UPDATE movies SET tmdb_id = $1, imdb_id = $2, title = $3, original_title = $4,
-                     original_language = $5, year = $6, status = $7, monitored = $8,
-                     path = $9, added = $10, runtime = $11, secondary_year = $12,
-                     clean_title = $13, available = $14, in_cinemas = $15,
-                     digital_release = $16, physical_release = $17, overview = $18
-                 WHERE id = $19",
-                &params,
-            )
-            .await?;
-        id
-    } else {
-        client
-            .query_one(
-                "INSERT INTO movies (tmdb_id, imdb_id, title, original_title, original_language,
-                     year, status, monitored, path, added, runtime, secondary_year,
-                     clean_title, available, in_cinemas, digital_release, physical_release,
-                     overview)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                     $17, $18)
-                 RETURNING id",
-                &values,
-            )
-            .await?
-            .try_get(0)?
-    };
-
-    write_children(client, id, movie).await?;
+    let id: i64 = client
+        .query_one(
+            "INSERT INTO movies (tmdb_id, imdb_id, title, original_title, original_language,
+                 year, status, monitored, path, added, runtime, secondary_year,
+                 clean_title, in_cinemas, digital_release, physical_release, overview)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                 $17)
+             RETURNING id",
+            &[
+                &tmdb_id,
+                &movie.imdb_id,
+                &movie.title,
+                &movie.original_title,
+                &movie.original_language,
+                &year,
+                &movie.status,
+                &movie.monitored,
+                &movie.path,
+                &movie.added,
+                &runtime,
+                &secondary_year,
+                &movie.clean_title,
+                &movie.in_cinemas,
+                &movie.digital_release,
+                &movie.physical_release,
+                &movie.overview,
+            ],
+        )
+        .await?
+        .try_get(0)?;
+    write_titles(client, id, movie).await?;
+    if let Some(file) = &movie.file {
+        insert_file(client, id, file).await?;
+    }
     Ok(id)
 }
 
-/// Títulos alternativos e arquivo do filme: apaga os de antes e grava os de
-/// agora.
-async fn write_children(client: &impl GenericClient, id: i64, movie: &Movie) -> Result<()> {
+/// Títulos alternativos do filme: apaga os de antes e grava os de agora.
+async fn write_titles(client: &impl GenericClient, id: i64, movie: &Movie) -> Result<()> {
     client
         .execute("DELETE FROM movie_titles WHERE movie_id = $1", &[&id])
         .await?;
@@ -1358,12 +1380,6 @@ async fn write_children(client: &impl GenericClient, id: i64, movie: &Movie) -> 
                 &[&id, title],
             )
             .await?;
-    }
-    client
-        .execute("DELETE FROM movie_files WHERE movie_id = $1", &[&id])
-        .await?;
-    if let Some(file) = &movie.file {
-        insert_file(client, id, file).await?;
     }
     Ok(())
 }
@@ -1451,7 +1467,7 @@ async fn read_movies(client: &impl GenericClient) -> Result<Vec<CatalogMovie>> {
         .query(
             "SELECT m.id, m.tmdb_id, m.imdb_id, m.title, m.original_title, m.original_language,
                     m.year, m.status, m.monitored, m.path, m.added,
-                    m.runtime, m.secondary_year, m.clean_title, m.available,
+                    m.runtime, m.secondary_year, m.clean_title,
                     m.in_cinemas, m.digital_release, m.physical_release, m.overview,
                     m.metadata_title, m.poster, m.fanart, m.metadata_refreshed_at, m.priority,
                     f.relative_path AS f_relative_path, f.size AS f_size,
@@ -1493,7 +1509,6 @@ async fn read_movies(client: &impl GenericClient) -> Result<Vec<CatalogMovie>> {
                     .map(|y| narrow(y, "ano"))
                     .transpose()?,
                 clean_title: row.try_get("clean_title")?,
-                available: row.try_get("available")?,
                 alternate_titles: Vec::new(),
                 in_cinemas: row.try_get("in_cinemas")?,
                 digital_release: row.try_get("digital_release")?,
@@ -1569,6 +1584,51 @@ pub mod testing {
     }
 
     impl TestDb {
+        /// Um banco parado logo antes da primeira migração cujo texto contém
+        /// `marker`, com `setup` (SQL) rodado nele; depois, migrado até o fim
+        /// como o serviço faria ao subir. `None` quando não há banco de teste
+        /// configurado.
+        ///
+        /// # Panics
+        ///
+        /// Banco configurado mas inalcançável, `marker` sem migração ou
+        /// `setup` que falha.
+        pub async fn before(name: &str, marker: &str, setup: &str) -> Option<Self> {
+            let Ok(url) = std::env::var("ACERVO_TEST_DATABASE_URL") else {
+                eprintln!("ACERVO_TEST_DATABASE_URL ausente: teste de banco pulado");
+                return None;
+            };
+            let schema = format!("teste_{name}_{}", std::process::id());
+            let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+                .await
+                .expect("conectando ao banco de teste");
+            tokio::spawn(connection);
+            let before = super::MIGRATIONS
+                .iter()
+                .position(|m| m.contains(marker))
+                .expect("migração do marcador");
+            let mut sql = format!(
+                "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema};
+                 SET search_path = {schema};"
+            );
+            for migration in &super::MIGRATIONS[..before] {
+                sql.push_str(migration);
+            }
+            sql.push_str("CREATE TABLE schema_version (version INTEGER NOT NULL);");
+            sql.push_str("INSERT INTO schema_version VALUES (");
+            sql.push_str(&before.to_string());
+            sql.push_str(");");
+            sql.push_str(setup);
+            client
+                .batch_execute(&sql)
+                .await
+                .expect("montando o banco antigo");
+            let mut config: tokio_postgres::Config = url.parse().expect("endereço de teste");
+            config.options(format!("-c search_path={schema}"));
+            let store = Store::with_config(config).await.expect("migrando");
+            Some(Self { store, schema, url })
+        }
+
         /// `None` quando não há banco de teste configurado.
         ///
         /// # Panics
@@ -1653,7 +1713,6 @@ mod tests {
             secondary_year: None,
             clean_title: Some(title.to_lowercase()),
             alternate_titles: vec![format!("{title} alternativo"), format!("{title} 2")],
-            available: true,
             in_cinemas: Some("2020-01-10".into()),
             digital_release: None,
             physical_release: Some("2020-04-01".into()),
@@ -1796,6 +1855,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poda_buscas_velhas_e_bloqueios_vencidos() {
+        let Some(db) = TestDb::new("poda").await else {
+            return;
+        };
+        let store = &db.store;
+        let um = added(store, movie(10, "Um", false)).await;
+        let dois = added(store, movie(20, "Dois", false)).await;
+        let run = |movie_id: i64, at: &str| SearchRun {
+            movie_id,
+            at: at.into(),
+            releases: 1,
+            pick: None,
+            rejections: Vec::new(),
+            error: None,
+        };
+        // Um: três velhas e uma nova; Dois: só velhas — a mais recente fica.
+        for at in [
+            "2026-01-01T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+            "2026-01-03T00:00:00Z",
+            "2026-03-01T00:00:00Z",
+        ] {
+            store.record_search(&run(um, at)).await.unwrap();
+        }
+        for at in ["2026-01-01T00:00:00Z", "2026-01-05T00:00:00Z"] {
+            store.record_search(&run(dois, at)).await.unwrap();
+        }
+        // Duas no mesmo instante: a de id maior é a mais recente.
+        store
+            .record_search(&run(dois, "2026-01-05T00:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.prune_searches("2026-02-01T00:00:00Z").await.unwrap(),
+            5
+        );
+        let left = store.latest_searches().await.unwrap();
+        assert_eq!(left.len(), 2);
+        assert_eq!(
+            store.prune_searches("2026-02-01T00:00:00Z").await.unwrap(),
+            0
+        );
+
+        let block = |message: &str, at: &str| Blocked {
+            id: 0,
+            movie_id: Some(um),
+            series_id: None,
+            source_title: "Um.2020.1080p".into(),
+            indexer: None,
+            quality: None,
+            size: None,
+            hash: None,
+            at: at.into(),
+            message: Some(message.into()),
+        };
+        store
+            .block(&block("sem seeds", "2026-01-01T00:00:00Z"))
+            .await
+            .unwrap();
+        store
+            .block(&block("sem seeds", "2026-03-01T00:00:00Z"))
+            .await
+            .unwrap();
+        store
+            .block(&block("marcado como falho na tela", "2026-01-01T00:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .delete_blocks(&["sem seeds", "outro"], "2026-02-01T00:00:00Z")
+                .await
+                .unwrap(),
+            1
+        );
+        let messages: Vec<_> = store
+            .blocklist()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|b| (b.message.unwrap(), b.at))
+            .collect();
+        assert_eq!(messages.len(), 2);
+        assert!(messages.contains(&("sem seeds".into(), "2026-03-01T00:00:00Z".into())));
+        db.drop().await;
+    }
+
+    #[tokio::test]
     async fn migracao_renomeia_as_buscas_sem_perder_dados() {
         let Some(url) = std::env::var("ACERVO_TEST_DATABASE_URL").ok() else {
             eprintln!("ACERVO_TEST_DATABASE_URL ausente: teste de banco pulado");
@@ -1885,16 +2031,36 @@ mod tests {
                 subtitles: Vec::new(),
             }
         );
-        // Regravar troca o arquivo e mantém o resto.
-        let changed = Movie {
-            monitored: false,
+        // A atualização de metadados parte de uma leitura velha: grava só o
+        // que é da base, nunca monitorado, pasta, prioridade nem arquivo.
+        assert!(store.set_movie_monitored(id, false).await.unwrap());
+        assert!(store.set_movie_priority(id, true).await.unwrap());
+        let stale = Movie {
+            title: "Um Novo".into(),
+            year: Some(2021),
+            monitored: true,
+            path: "/outro/lugar".into(),
             file: None,
-            ..with_file
+            alternate_titles: vec!["Outro".into()],
+            overview: Some("Sinopse nova".into()),
+            ..with_file.clone()
         };
-        store.update_movie(id, &changed).await.unwrap();
+        assert!(store.update_movie_metadata(id, &stale).await.unwrap());
         let movies = store.movies().await.unwrap();
-        assert_eq!(movies[1].movie, changed);
-        assert!(store.update_movie(999, &changed).await.is_err());
+        let read = movies.iter().find(|m| m.id == id).unwrap();
+        assert_eq!(read.movie.title, "Um Novo");
+        assert_eq!(read.movie.year, Some(2021));
+        assert_eq!(read.movie.overview.as_deref(), Some("Sinopse nova"));
+        assert_eq!(read.movie.alternate_titles, ["Outro"]);
+        assert!(!read.movie.monitored);
+        assert_eq!(read.movie.path, with_file.path);
+        assert_eq!(read.movie.file, with_file.file);
+        assert!(read.priority);
+        assert_eq!(read.extras, extras);
+        // O filme que saiu no meio é pulado, sem erro.
+        assert!(!store.update_movie_metadata(999, &stale).await.unwrap());
+        assert!(!store.set_movie_monitored(999, true).await.unwrap());
+        store.set_extras(999, &extras).await.unwrap();
         db.drop().await;
     }
 
@@ -1935,8 +2101,6 @@ mod tests {
                      quality_profile_id, root_folder, minimum_availability)
                  SELECT 'lista', 'tmdb', '{{}}', true, true, false, id, '/filmes', 'released'
                  FROM quality_profiles;
-             INSERT INTO quality_definitions (quality, min_size, max_size)
-                 VALUES (3, 1.5, 100);
              INSERT INTO movies (tmdb_id, imdb_id, title, path, monitored, quality_profile_id,
                      source, source_id, runtime, available, in_cinemas, overview, tags,
                      metadata_title, poster)
@@ -1973,10 +2137,6 @@ mod tests {
         assert_eq!(file.quality.quality, Quality::WebDl1080p);
         assert_eq!(file.languages, ["English"]);
         assert_eq!(file.release_group.as_deref(), Some("GRUPO"));
-        // Os tamanhos por qualidade ficam.
-        let definitions = store.quality_definitions().await.unwrap();
-        assert_eq!(definitions.len(), 1);
-        assert_eq!(definitions[0].max_size, Some(100.0));
         for gone in [
             "quality_profiles",
             "tags",
@@ -2145,10 +2305,9 @@ mod tests {
         assert_eq!(entry.subtitles.len(), 1);
         assert_eq!(entry.subtitles[0].id, sub_id);
         assert_eq!(entry.subtitles[0].subtitle, sub);
-        // Regravar o filme (monitorado, metadados) não perde a legenda.
-        let mut changed = entry.movie.clone();
-        changed.monitored = false;
-        store.update_movie(id, &changed).await.unwrap();
+        // Mudar o monitorado e os metadados não perde a legenda.
+        store.set_movie_monitored(id, false).await.unwrap();
+        store.update_movie_metadata(id, &entry.movie).await.unwrap();
         let movies = store.movies().await.unwrap();
         assert_eq!(
             movies.iter().find(|m| m.id == id).unwrap().subtitles.len(),

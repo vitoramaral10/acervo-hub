@@ -13,7 +13,7 @@ use anyhow::Result;
 use serde_json::{Map, Value};
 use tokio::sync::watch;
 
-use crate::config::{self, Config, GERENCIADORES, SERVIDOR, TAREFAS};
+use crate::config::{self, Config, SERVIDOR, TAREFAS};
 
 pub struct Settings {
     store: Store,
@@ -52,23 +52,10 @@ fn hide(object: &mut Map<String, Value>, field: &str) {
 /// A seção como a API a devolve: cada segredo vira `{"definida": bool}`.
 #[must_use]
 pub fn mask(section: &str, mut value: Value) -> Value {
-    let secrets = config::secrets(section);
-    match &mut value {
-        Value::Object(object) => {
-            for field in secrets {
-                hide(object, field);
-            }
+    if let Value::Object(object) = &mut value {
+        for field in config::secrets(section) {
+            hide(object, field);
         }
-        Value::Array(items) => {
-            for item in items {
-                if let Value::Object(object) = item {
-                    for field in secrets {
-                        hide(object, field);
-                    }
-                }
-            }
-        }
-        _ => {}
     }
     value
 }
@@ -78,36 +65,6 @@ pub fn mask(section: &str, mut value: Value) -> Value {
 /// vazio não pode apagá-lo.
 fn merge(section: &str, current: Value, incoming: Value) -> Result<Value, String> {
     let secrets = config::secrets(section);
-    if section == GERENCIADORES {
-        let Value::Array(items) = incoming else {
-            return Err("gerenciadores: envie uma lista".into());
-        };
-        let current = match current {
-            Value::Array(items) => items,
-            _ => Vec::new(),
-        };
-        let mut merged = Vec::with_capacity(items.len());
-        for item in items {
-            let Value::Object(mut item) = item else {
-                return Err("gerenciadores: cada item precisa ser um objeto".into());
-            };
-            // O mesmo gerenciador, pelo nome: a chave guardada continua.
-            let saved = current
-                .iter()
-                .find(|old| old.get("name") == item.get("name"))
-                .and_then(Value::as_object);
-            for field in secrets {
-                if item.get(*field).is_none_or(blank) {
-                    match saved.and_then(|old| old.get(*field)) {
-                        Some(value) => item.insert((*field).to_owned(), value.clone()),
-                        None => item.remove(*field),
-                    };
-                }
-            }
-            merged.push(Value::Object(item));
-        }
-        return Ok(Value::Array(merged));
-    }
     let Value::Object(incoming) = incoming else {
         return Err(format!("{section}: envie um objeto"));
     };
@@ -133,7 +90,7 @@ fn merge(section: &str, current: Value, incoming: Value) -> Result<Value, String
     }
     // Endereço em branco é "sem endereço", não uma URL vazia.
     if section == SERVIDOR {
-        for field in ["public_url", "flaresolverr_url", "proxy_url"] {
+        for field in ["flaresolverr_url", "proxy_url"] {
             if merged
                 .get(field)
                 .and_then(Value::as_str)
@@ -274,32 +231,6 @@ mod tests {
                 .is_err()
         );
 
-        // Gerenciadores: a chave segue o nome.
-        settings
-            .save_section(
-                "gerenciadores",
-                json!([{ "name": "series", "kind": "series", "url": "http://s:8989", "api_key": "k1" }]),
-            )
-            .await
-            .unwrap();
-        let view = settings
-            .save_section(
-                "gerenciadores",
-                json!([{ "name": "series", "kind": "series", "url": "http://s2:8989", "api_key": "" }]),
-            )
-            .await
-            .unwrap();
-        assert_eq!(view[0]["api_key"], json!({ "definida": true }));
-        assert_eq!(settings.get().instances[0].api_key, "k1");
-        let renamed = settings
-            .save_section(
-                "gerenciadores",
-                json!([{ "name": "outro", "kind": "series", "url": "http://s2:8989" }]),
-            )
-            .await
-            .unwrap_err();
-        assert!(renamed.contains("chave"), "{renamed}");
-
         // Intervalo de uma tarefa só: as outras ficam como estavam.
         settings
             .save_section("tarefas", json!({ "intervalos": { "rss": 45 } }))
@@ -315,6 +246,74 @@ mod tests {
         // O banco guarda o mesmo que a memória.
         let reloaded = Settings::load(db.store.clone()).await.unwrap();
         assert_eq!(*reloaded.get(), *settings.get());
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn secoes_gravadas_antes_da_saida_dos_gerenciadores_migram_e_carregam() {
+        // O banco de produção antes da migração: a seção dos gerenciadores e
+        // os campos que só eles usavam, um filme com a disponibilidade
+        // guardada e os tamanhos por qualidade editáveis.
+        let setup = r#"
+            INSERT INTO config_sections (name, value, updated_at) VALUES
+              ('gerenciadores',
+               '[{"name": "series", "kind": "series", "url": "http://s:8989", "api_key": "k"}]',
+               '2026-09-01T00:00:00Z'),
+              ('servidor',
+               '{"api_key": "0123456789abcdef", "public_url": "http://acervo:9797",
+                 "http_timeout_seconds": 45, "catalogos": [], "catalogos_reserva": []}',
+               '2026-09-01T00:00:00Z'),
+              ('limpeza',
+               '{"orphan_strikes": 2, "skip_orphan_if_missing_in_client": false,
+                 "managed_categories": ["acervo"], "delete_private_orphans": false}',
+               '2026-09-01T00:00:00Z'),
+              ('tarefas', '{"intervalos": {"rss": 45}}', '2026-09-01T00:00:00Z');
+            INSERT INTO quality_definitions (quality, min_size, max_size, preferred_size)
+                VALUES (3, 0, 100, 95);
+            INSERT INTO movies (tmdb_id, title, path, monitored, available)
+                VALUES (1, 'Um', '/media/movies/Um', true, true);
+        "#;
+        // Sem a migração, essas seções derrubariam a subida do serviço.
+        let antigas = [
+            ("gerenciadores".to_owned(), json!([])),
+            (
+                "servidor".to_owned(),
+                json!({ "public_url": "http://acervo:9797" }),
+            ),
+            (
+                "limpeza".to_owned(),
+                json!({ "skip_orphan_if_missing_in_client": true }),
+            ),
+        ];
+        for secao in antigas {
+            assert!(Config::from_sections([secao]).is_err());
+        }
+
+        let Some(db) = acervo_store::testing::TestDb::before(
+            "secoes_antigas",
+            "DELETE FROM config_sections WHERE name = 'gerenciadores'",
+            setup,
+        )
+        .await
+        else {
+            return;
+        };
+        let rows = db.store.config_sections().await.unwrap();
+        let names: Vec<&str> = rows.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(!names.contains(&"gerenciadores"), "{names:?}");
+        let config = Config::from_sections(rows).unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.server.api_key, "0123456789abcdef");
+        assert_eq!(config.server.http_timeout_seconds, 45);
+        assert_eq!(config.policy.orphan_strikes, 2);
+        assert_eq!(config.policy.managed_categories, ["acervo"]);
+        assert_eq!(config.tasks.minutes("rss"), 45);
+        // O handle do serviço sobe com elas, e o filme antigo continua lá.
+        let settings = Settings::load(db.store.clone()).await.unwrap();
+        assert_eq!(*settings.get(), config);
+        let movies = db.store.movies().await.unwrap();
+        assert_eq!(movies.len(), 1);
+        assert_eq!(movies[0].movie.title, "Um");
         db.drop().await;
     }
 

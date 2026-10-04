@@ -482,7 +482,6 @@ mod tests {
                 secondary_year: None,
                 clean_title: None,
                 alternate_titles: Vec::new(),
-                available: true,
                 in_cinemas: Some("2026-06-01".into()),
                 digital_release: digital.map(str::to_owned),
                 physical_release: None,

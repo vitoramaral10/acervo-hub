@@ -12,13 +12,16 @@ use futures::future::{BoxFuture, FutureExt, Shared, join_all};
 use time::OffsetDateTime;
 use tokio::time::{Duration, Instant};
 
-use crate::TorznabError;
+use crate::SearchError;
 
 /// Nome reservado para a busca em todos os indexadores de uma vez.
 pub const ALL: &str = "all";
 
 /// Nome reservado para as rotas da interface web.
 pub const UI: &str = "ui";
+
+/// Maior página que uma busca devolve.
+pub(crate) const MAX_RESULTS: u16 = 100;
 
 /// Um indexador e as capacidades que ele anunciou.
 ///
@@ -135,8 +138,8 @@ pub struct IndexerView {
 /// Por quanto tempo uma busca com termo é reaproveitada.
 const SEARCH_TTL: Duration = Duration::from_secs(30 * 60);
 
-/// Por quanto tempo o feed recente (busca sem termo, o RSS dos gerenciadores)
-/// é reaproveitado: menos que o intervalo de RSS deles, para ninguém ver um
+/// Por quanto tempo o feed recente (busca sem termo, o RSS de filmes e o de
+/// séries) é reaproveitado: menos que o intervalo do RSS, para ninguém ver um
 /// feed envelhecido.
 const RECENT_TTL: Duration = Duration::from_secs(5 * 60);
 
@@ -152,9 +155,9 @@ struct Slot {
 /// Consultas reaproveitadas, por indexador e consulta já reduzida.
 ///
 /// Quem pede o que já está a caminho espera a mesma resposta, e quem pede o
-/// que chegou há pouco a recebe sem ir ao tracker: o gerenciador de séries,
-/// o de filmes e a busca dos que faltam passam por aqui, e cada tracker vê uma
-/// requisição só. Erro não fica guardado — a próxima consulta tenta de novo.
+/// que chegou há pouco a recebe sem ir ao tracker: o RSS de filmes, o de
+/// séries, a busca dos que faltam e a da tela passam por aqui, e cada tracker
+/// vê uma requisição só. Erro não fica guardado — a próxima consulta tenta de novo.
 #[derive(Default)]
 struct Requests {
     slots: HashMap<(String, String), Slot>,
@@ -332,9 +335,9 @@ impl Catalog {
             }
             outcome.map(Arc::new)
         };
-        // Tarefa própria: se quem pediu desiste (o gerenciador corta em 100 s
-        // e o tracker leva quase isso), a busca termina assim mesmo, e a
-        // próxima tentativa encontra a resposta pronta.
+        // Tarefa própria: se quem pediu desiste (a tela fecha, a requisição
+        // cai), a busca termina assim mesmo, e a próxima tentativa encontra a
+        // resposta pronta.
         let task = tokio::spawn(fetch);
         let fetch = async move {
             task.await
@@ -363,7 +366,7 @@ impl Catalog {
         self.read().is_empty()
     }
 
-    fn targets(&self, target: &str) -> Result<Vec<Entry>, TorznabError> {
+    fn targets(&self, target: &str) -> Result<Vec<Entry>, SearchError> {
         let entries = self.read();
         if target == ALL {
             return Ok(entries.values().cloned().collect());
@@ -371,7 +374,7 @@ impl Catalog {
         entries
             .get(target)
             .map(|entry| vec![entry.clone()])
-            .ok_or(TorznabError::NoSuchIndexer)
+            .ok_or(SearchError::NoSuchIndexer)
     }
 
     /// Indexadores, com capacidades e saúde, em ordem de nome.
@@ -475,10 +478,10 @@ impl Catalog {
     ///
     /// Indexador desconhecido (inclusive `all`), ou falha do indexador — link
     /// fora da origem dele, sessão recusada, resposta que não é `.torrent`.
-    pub async fn download(&self, name: &str, link: &url::Url) -> Result<Vec<u8>, TorznabError> {
+    pub async fn download(&self, name: &str, link: &url::Url) -> Result<Vec<u8>, SearchError> {
         match self.resolve_download(name, link).await? {
             ResolvedDownload::Torrent(bytes) => Ok(bytes),
-            ResolvedDownload::Magnet(_) => Err(TorznabError::DownloadFailed),
+            ResolvedDownload::Magnet(_) => Err(SearchError::DownloadFailed),
         }
     }
 
@@ -492,12 +495,12 @@ impl Catalog {
         &self,
         name: &str,
         link: &url::Url,
-    ) -> Result<ResolvedDownload, TorznabError> {
+    ) -> Result<ResolvedDownload, SearchError> {
         let entry = self
             .read()
             .get(name)
             .cloned()
-            .ok_or(TorznabError::NoSuchIndexer)?;
+            .ok_or(SearchError::NoSuchIndexer)?;
         // Em espera, nem a requisição sai: o 429 pede que o tracker não seja
         // consultado, e o download também conta.
         if let Some(until) = self.waiting_until(name) {
@@ -508,13 +511,13 @@ impl Catalog {
             self.record(name, Err(&error));
             match self.waiting_until(name) {
                 Some(until) if error.rate_limited().is_some() => waiting(name, until),
-                _ => TorznabError::DownloadFailed,
+                _ => SearchError::DownloadFailed,
             }
         })
     }
 
-    /// Busca recente num indexador só, sem termo — o que o gerenciador faz no
-    /// RSS. Serve de teste: exercita login, página e parser de uma vez.
+    /// Busca recente num indexador só, sem termo — o que o RSS faz. Serve de
+    /// teste: exercita login, página e parser de uma vez.
     ///
     /// # Errors
     ///
@@ -545,7 +548,7 @@ impl Catalog {
     /// # Errors
     ///
     /// Indexador desconhecido.
-    pub fn capabilities(&self, target: &str) -> Result<Capabilities, TorznabError> {
+    pub fn capabilities(&self, target: &str) -> Result<Capabilities, SearchError> {
         let targets = self.targets(target)?;
         Ok(merge(targets.iter().map(|entry| &entry.capabilities)))
     }
@@ -565,7 +568,7 @@ impl Catalog {
     /// e "tracker fora do ar" pedem reações opostas. Indexador em espera por
     /// 429 não é consultado e não conta como falha; só se **todos** os que
     /// seriam consultados estão em espera a busca devolve erro.
-    pub async fn search(&self, target: &str, query: &SearchQuery) -> Result<Page, TorznabError> {
+    pub async fn search(&self, target: &str, query: &SearchQuery) -> Result<Page, SearchError> {
         let eligible: Vec<_> = self
             .targets(target)?
             .into_iter()
@@ -592,7 +595,7 @@ impl Catalog {
         if consulted == 0
             && let Some(until) = resume
         {
-            return Err(TorznabError::AllWaiting {
+            return Err(SearchError::AllWaiting {
                 until: clock(until),
             });
         }
@@ -615,20 +618,20 @@ impl Catalog {
         }
 
         if consulted > 0 && page.failures.len() == consulted {
-            return Err(TorznabError::AllFailed(consulted));
+            return Err(SearchError::AllFailed(consulted));
         }
 
         page.releases
             .sort_by_key(|release| Reverse(release.published));
         let offset = usize::try_from(query.offset).unwrap_or(usize::MAX);
-        let limit = usize::from(query.limit.unwrap_or(crate::request::MAX_RESULTS));
+        let limit = usize::from(query.limit.unwrap_or(MAX_RESULTS));
         page.releases = page.releases.into_iter().skip(offset).take(limit).collect();
         Ok(page)
     }
 }
 
-fn waiting(name: &str, until: OffsetDateTime) -> TorznabError {
-    TorznabError::IndexerWaiting {
+fn waiting(name: &str, until: OffsetDateTime) -> SearchError {
+    SearchError::IndexerWaiting {
         indexer: name.to_owned(),
         until: clock(until),
     }

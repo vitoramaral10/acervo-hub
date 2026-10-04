@@ -105,8 +105,8 @@ fn target(entry: &CatalogMovie, remote: &Remote, now: time::OffsetDateTime) -> T
     }
 }
 
-/// Os indexadores daqui, com prioridade e seeders mínimos do cadastro deles
-/// no gerenciador (`<nome> (acervo-hub)`).
+/// Os indexadores servidos, com a prioridade e os seeders mínimos das
+/// regras.
 pub(crate) fn indexers(served: &[String], rules: &DecisionRules) -> Vec<Indexer> {
     served
         .iter()
@@ -152,7 +152,7 @@ pub(crate) fn summarize(decisions: &[Decision], movie: i64) -> Vec<(String, usiz
 }
 
 /// Tudo o que a decisão precisa, lido uma vez: a biblioteca como alvos, os
-/// indexadores servidos e a configuração do gerenciador.
+/// indexadores servidos e as regras.
 pub(crate) struct Decider {
     pub library: Vec<Target>,
     /// Os filmes prioritários: buscados antes dos outros.
@@ -187,12 +187,8 @@ impl Decider {
     #[allow(clippy::too_many_lines)] // Leitura em sequência; dividir só espalharia.
     pub async fn load(store: &Store, catalog: &Catalog) -> Result<Self> {
         let rules = crate::rules::stored(store).await?;
-        let (movies, definitions, grabs, blocked) = tokio::try_join!(
-            store.movies(),
-            store.quality_definitions(),
-            store.grabs(),
-            store.blocklist(),
-        )?;
+        let (movies, grabs, blocked) =
+            tokio::try_join!(store.movies(), store.grabs(), store.blocklist())?;
         if movies.is_empty() {
             bail!("catálogo vazio: adicione filmes antes");
         }
@@ -223,7 +219,7 @@ impl Decider {
         }
         Ok(Self {
             indexers: indexers(&served, &remote.rules),
-            settings: remote.rules.settings(definitions),
+            settings: remote.rules.settings(),
             delay: remote.rules.delay(),
             // Bloqueio por falta de seeds expira; a linha fica na tela.
             blocklist: blocked
@@ -413,8 +409,8 @@ impl Progress {
 
 /// Busca até `limit` filmes que faltam (todos, sem `limit`), começando pelos
 /// que estão há mais tempo sem busca, e pega o escolhido de cada um.
-/// `catalog` é o dos indexadores servidos: dentro do serviço, a busca divide
-/// sessão e consultas guardadas com os gerenciadores. Filme com download em
+/// `catalog` é o dos indexadores servidos: a busca divide sessão e consultas
+/// guardadas com o RSS e a tela. Filme com download em
 /// andamento não entra: já tem o que esperar.
 ///
 /// `turn` prova que quem chama tomou a vez em [`Progress::start`]; o
@@ -502,14 +498,17 @@ pub async fn search(
                         .parsed
                         .as_ref()
                         .map_or(acervo_parser::Quality::Unknown, |p| p.quality.quality);
-                    if let Err(error) =
-                        crate::grab::send(config, store, catalog, movie.id, release, quality, None)
-                            .await
+                    // Os que só esperam na fila dão lugar ao novo: a troca.
+                    let olds = downloading.get(&movie.id).map_or(&[][..], Vec::as_slice);
+                    let swapping: Vec<i64> = olds.iter().map(|g| g.id).collect();
+                    if let Err(error) = crate::grab::send(
+                        config, store, catalog, movie.id, release, quality, None, &swapping,
+                    )
+                    .await
                     {
                         tracing::warn!(filme = label(movie), "grab automático falhou: {error:#}");
                     } else {
                         tracing::info!(filme = label(movie), release = release.title, "pegou");
-                        let olds = downloading.get(&movie.id).map_or(&[][..], Vec::as_slice);
                         if let Err(error) =
                             crate::grab::swap_out(config, store, olds, &release.title).await
                         {
