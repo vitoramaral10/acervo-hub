@@ -131,14 +131,17 @@ fn merge(section: &str, current: Value, incoming: Value) -> Result<Value, String
         }
         merged.insert(field, value);
     }
-    // Endereço público em branco é "sem endereço", não uma URL vazia.
-    if section == SERVIDOR
-        && merged
-            .get("public_url")
-            .and_then(Value::as_str)
-            .is_some_and(|url| url.trim().is_empty())
-    {
-        merged.insert("public_url".into(), Value::Null);
+    // Endereço em branco é "sem endereço", não uma URL vazia.
+    if section == SERVIDOR {
+        for field in ["public_url", "flaresolverr_url", "proxy_url"] {
+            if merged
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|url| url.trim().is_empty())
+            {
+                merged.insert(field.into(), Value::Null);
+            }
+        }
     }
     Ok(Value::Object(merged))
 }

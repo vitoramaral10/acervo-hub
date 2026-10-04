@@ -6,22 +6,22 @@
 //! tela": todo cadastro se edita e se remove pela interface.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use acervo_api::{Accounts, Admin, ApiKey, Catalog, DefinitionView, Entry, SettingView};
-use acervo_indexers::{
-    Capabilities, CardigannClient, CardigannDefinition, SettingInfo, SettingInfoKind, TorznabClient,
-};
+use acervo_indexers::{Capabilities, CardigannDefinition, SettingInfo, SettingInfoKind};
 use acervo_store::{IndexerRecord, Store};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::config::{Config, SERVIDOR};
+use crate::config::{Config, SERVIDOR, ServerConfig};
 use crate::decide::Progress;
-use crate::definitions::Definitions;
+use crate::registry::{
+    CARDIGANN, FLARESOLVERR_OPTIONS, Registry, TORZNAB, USE_FLARESOLVERR, USE_PROXY, build,
+    cardigann, check_reserved, reserved, scan, torznab,
+};
 use crate::settings::Settings;
 use crate::tasks::{BUSCA, Tasks};
 
@@ -113,9 +113,6 @@ async fn downloads_json(store: &Store) -> Result<serde_json::Value> {
     ))
 }
 
-/// Nome da "definição" que adiciona um endpoint Torznab qualquer.
-const TORZNAB: &str = "torznab";
-const CARDIGANN: &str = "cardigann";
 /// Como a tela rotula um indexador cadastrado.
 const ORIGIN: &str = "cadastro";
 
@@ -127,13 +124,21 @@ const ORIGIN: &str = "cadastro";
 pub async fn run(store: Store, bind: &str) -> Result<()> {
     let settings = Arc::new(Settings::load(store.clone()).await?);
     let records = store.indexers().await.context("lendo os indexadores")?;
-    let catalog = Catalog::new(entries(&settings.get(), &records).await)?;
+    let rows = store
+        .definitions()
+        .await
+        .context("lendo as definições do banco")?;
+    let registry = Arc::new(Registry::new(&settings.get(), &rows, records));
+    drop(rows);
+    let catalog = Catalog::new(entries(&settings.get(), &registry).await)?;
+    // Cada consulta que sai vira estatística do indexador.
+    catalog.observe_with(crate::stats::observer(store.clone()));
     let database = Database::connected(store);
     // O andamento da busca dos que faltam, que a tela de filmes acompanha.
     let missing = Arc::new(Progress::default());
     let tasks = Arc::new(Tasks::new(
         database.clone(),
-        crate::tasks::service(&settings, &database, &catalog, &missing),
+        crate::tasks::service(&settings, &database, &catalog, &missing, &registry),
     ));
     tasks.start().await;
     // Configuração salva pela tela: o agendador recalcula os intervalos.
@@ -165,7 +170,14 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         searches: tokio::sync::Mutex::default(),
         series_searches: tokio::sync::Mutex::default(),
     });
-    let admin = HubAdmin::new(settings, catalog.clone(), database, missing, tasks, records);
+    let admin = HubAdmin::new(
+        settings,
+        catalog.clone(),
+        database,
+        missing,
+        tasks,
+        registry,
+    );
     tracing::info!(indexadores = catalog.len(), bind = %bind, "servindo Torznab e a interface web");
 
     let listener = tokio::net::TcpListener::bind(bind)
@@ -176,6 +188,8 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         acervo_api::router_with_admin(catalog, api_key, Some(Arc::new(admin)), accounts)
             .merge(crate::web::router(Arc::clone(&web)))
             .merge(crate::agenda::router(Arc::clone(&web)))
+            .merge(crate::stats::router(Arc::clone(&web)))
+            .merge(crate::manual::router(Arc::clone(&web)))
             .merge(crate::series::web::router(web)),
     )
     .with_graceful_shutdown(shutdown())
@@ -184,16 +198,32 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
     Ok(())
 }
 
+/// Os indexadores servidos, lidos do banco — para os comandos avulsos, que
+/// não sobem o serviço.
+///
+/// # Errors
+///
+/// Banco inalcançável.
+pub async fn stored_entries(config: &Config, store: &Store) -> Result<Vec<Entry>> {
+    let records = store.indexers().await.context("lendo os indexadores")?;
+    let rows = store
+        .definitions()
+        .await
+        .context("lendo as definições do banco")?;
+    let registry = Registry::new(config, &rows, records);
+    Ok(entries(config, &registry).await)
+}
+
 /// Os indexadores servidos: os cadastros ativos que sobem.
 ///
 /// Cadastro que não sobe — definição ilegível, endpoint que não responde
 /// `caps` — fica de fora, com o motivo no log, sem derrubar os outros nem a
 /// subida: a tela continua de pé para consertá-lo, e ele aparece lá como
 /// desativado até ser reativado.
-pub async fn entries(config: &Config, records: &[IndexerRecord]) -> Vec<Entry> {
+pub async fn entries(config: &Config, registry: &Registry) -> Vec<Entry> {
     let mut entries = Vec::new();
-    for record in records.iter().filter(|record| record.enabled) {
-        match build(record, config.http_timeout()).await {
+    for record in registry.records().iter().filter(|record| record.enabled) {
+        match build(record, config, registry).await {
             Ok(entry) => entries.push(entry),
             Err(error) => tracing::error!(
                 indexer = record.name,
@@ -202,97 +232,6 @@ pub async fn entries(config: &Config, records: &[IndexerRecord]) -> Vec<Entry> {
         }
     }
     entries
-}
-
-fn load_definition(path: &Path) -> Result<CardigannDefinition> {
-    let yaml = std::fs::read_to_string(path)
-        .with_context(|| format!("lendo a definição `{}`", path.display()))?;
-    CardigannDefinition::from_yaml_v11(&yaml)
-        .with_context(|| format!("carregando a definição `{}`", path.display()))
-}
-
-fn definition_path(record: &IndexerRecord) -> Result<PathBuf> {
-    record
-        .definition
-        .as_deref()
-        .map(PathBuf::from)
-        .context("cadastro Cardigann sem arquivo de definição")
-}
-
-/// Monta o cliente de um cadastro, sem olhar se ele está ativo.
-async fn build(record: &IndexerRecord, timeout: Duration) -> Result<Entry> {
-    match record.kind.as_str() {
-        CARDIGANN => {
-            let definition = load_definition(&definition_path(record)?)?;
-            cardigann(record, definition, timeout)
-        }
-        TORZNAB => torznab(record, timeout).await,
-        other => anyhow::bail!("tipo de indexador desconhecido: {other}"),
-    }
-}
-
-fn cardigann(
-    record: &IndexerRecord,
-    definition: CardigannDefinition,
-    timeout: Duration,
-) -> Result<Entry> {
-    // O nome servido é o id da definição: arquivo trocado por outro com id
-    // diferente não pode servir sob o nome velho.
-    anyhow::ensure!(
-        definition.id() == record.name,
-        "a definição agora tem o id `{}`, e o cadastro é `{}`",
-        definition.id(),
-        record.name
-    );
-    // O link escolhido, guardado como URL; ausente é o primeiro.
-    let link = match &record.url {
-        Some(url) => definition
-            .links()
-            .iter()
-            .position(|link| link.as_str() == url)
-            .with_context(|| format!("o link `{url}` não está mais na definição"))?,
-        None => 0,
-    };
-    let capabilities = definition.capabilities().clone();
-    let client = CardigannClient::new(definition, link, record.settings.clone(), timeout)
-        .with_context(|| format!("configurando a definição de `{}`", record.name))?;
-    Ok(Entry {
-        indexer: Arc::new(client),
-        capabilities,
-    })
-}
-
-/// Intervalo mínimo entre duas requisições ao mesmo endpoint Torznab.
-fn request_interval(record: &IndexerRecord) -> Result<Duration> {
-    let seconds = match record.settings.get("request_interval_seconds") {
-        Some(text) => text
-            .parse::<f64>()
-            .context("`request_interval_seconds` não é um número")?,
-        None => 2.0,
-    };
-    anyhow::ensure!(
-        seconds.is_finite() && (0.0..=3600.0).contains(&seconds),
-        "`request_interval_seconds` precisa ficar entre 0 e 3600"
-    );
-    Ok(Duration::from_secs_f64(seconds))
-}
-
-async fn torznab(record: &IndexerRecord, timeout: Duration) -> Result<Entry> {
-    let client = TorznabClient::new(
-        record.name.clone(),
-        record.url.as_deref().unwrap_or_default(),
-        record.settings.get("api_key").cloned(),
-        timeout,
-        request_interval(record)?,
-    )?;
-    let capabilities = client
-        .capabilities()
-        .await
-        .context("lendo as capacidades")?;
-    Ok(Entry {
-        indexer: Arc::new(client),
-        capabilities,
-    })
 }
 
 fn valid_name(name: &str) -> bool {
@@ -321,25 +260,46 @@ struct HubAdmin {
     missing: Arc<Progress>,
     /// As tarefas de fundo; o botão de buscar os que faltam dispara a `busca`.
     tasks: Arc<Tasks>,
-    /// Refeito quando os diretórios de catálogo mudam.
-    definitions: RwLock<Definitions>,
-    /// Os cadastros, espelhados em memória: as consultas da tela são
-    /// síncronas, e só este admin grava a tabela enquanto o serviço roda.
-    records: RwLock<BTreeMap<String, IndexerRecord>>,
-    /// Serializa as gravações: duas mudanças simultâneas não podem se apagar.
-    write: tokio::sync::Mutex<()>,
+    /// Os cadastros e o catálogo de definições, divididos com a tarefa que
+    /// atualiza as definições.
+    registry: Arc<Registry>,
 }
 
-/// As definições oferecidas: as dos diretórios de catálogo e as dos
-/// cadastros, mesmo fora deles.
-fn scan(config: &Config, records: &BTreeMap<String, IndexerRecord>) -> Definitions {
-    let mut definitions = Definitions::scan(&config.server.catalogs);
-    for record in records.values() {
-        if let Some(path) = &record.definition {
-            definitions.include(Path::new(path));
-        }
+/// Os dois settings do cadastro que não são da definição: proxy e
+/// `FlareSolverr`.
+fn network_views(record: Option<&IndexerRecord>, with_flaresolverr: bool) -> Vec<SettingView> {
+    let value = |name: &str| record.and_then(|record| record.settings.get(name).cloned());
+    let mut views = vec![plain(
+        USE_PROXY,
+        "Sair pelo proxy do servidor",
+        "checkbox",
+        Some(value(USE_PROXY).unwrap_or_else(|| "false".into())),
+    )];
+    if with_flaresolverr {
+        views.push(SettingView {
+            name: USE_FLARESOLVERR.into(),
+            label: "Usar o FlareSolverr diante do desafio do Cloudflare".into(),
+            kind: "select",
+            options: FLARESOLVERR_OPTIONS
+                .iter()
+                .map(|o| (*o).to_owned())
+                .collect(),
+            secret: false,
+            is_set: true,
+            value: Some(value(USE_FLARESOLVERR).unwrap_or_else(|| FLARESOLVERR_OPTIONS[0].into())),
+        });
     }
-    definitions
+    views
+}
+
+/// A rede do servidor mudou: os clientes precisam ser remontados.
+fn network_changed(before: &ServerConfig, after: &ServerConfig) -> bool {
+    before.http_timeout_seconds != after.http_timeout_seconds
+        || before.proxy_url != after.proxy_url
+        || before.proxy_username != after.proxy_username
+        || before.proxy_password != after.proxy_password
+        || before.flaresolverr_url != after.flaresolverr_url
+        || before.flaresolverr_timeout_s != after.flaresolverr_timeout_s
 }
 
 impl HubAdmin {
@@ -349,30 +309,20 @@ impl HubAdmin {
         database: Database,
         missing: Arc<Progress>,
         tasks: Arc<Tasks>,
-        records: Vec<IndexerRecord>,
+        registry: Arc<Registry>,
     ) -> Self {
-        let records: BTreeMap<_, _> = records
-            .into_iter()
-            .map(|record| (record.name.clone(), record))
-            .collect();
         Self {
-            definitions: RwLock::new(scan(&settings.get(), &records)),
-            records: RwLock::new(records),
             settings,
             catalog,
             database,
             missing,
             tasks,
-            write: tokio::sync::Mutex::new(()),
+            registry,
         }
     }
 
     fn record(&self, name: &str) -> Option<IndexerRecord> {
-        self.records
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(name)
-            .cloned()
+        self.registry.record(name)
     }
 
     fn store(&self) -> Result<&Store, String> {
@@ -399,28 +349,27 @@ impl HubAdmin {
                 "indexador desconhecido".into()
             });
         }
-        self.records
+        self.registry
+            .records
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(record.name.clone(), record);
         Ok(())
     }
 
-    /// Remonta todos os indexadores servidos — o timeout HTTP mudou, e ele
-    /// mora dentro de cada cliente.
+    /// Remonta todos os indexadores servidos — o timeout HTTP, o proxy ou
+    /// o `FlareSolverr` mudaram, e eles moram dentro de cada cliente.
     async fn reload_catalog(&self) {
         let records: Vec<_> = self
-            .records
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
+            .registry
+            .records()
+            .into_iter()
             .filter(|record| record.enabled)
-            .cloned()
             .collect();
-        let timeout = self.timeout();
+        let config = self.settings.get();
         for record in records {
             self.catalog.remove(&record.name);
-            match build(&record, timeout).await {
+            match build(&record, &config, &self.registry).await {
                 Ok(entry) => {
                     if let Err(error) = self.catalog.insert(entry) {
                         tracing::error!(indexer = record.name, "fora do catálogo: {error}");
@@ -493,26 +442,27 @@ fn message(error: &anyhow::Error) -> String {
 impl Admin for HubAdmin {
     fn settings(&self, indexer: &str) -> Option<Vec<SettingView>> {
         let record = self.record(indexer)?;
-        match record.kind.as_str() {
-            CARDIGANN => {
-                let definition = load_definition(&definition_path(&record).ok()?).ok()?;
-                let views: Vec<_> = definition
-                    .settings()
-                    .iter()
-                    .map(|info| view(info, record.settings.get(&info.name)))
-                    .collect();
-                (!views.is_empty()).then_some(views)
-            }
-            _ => Some(vec![
-                plain("url", "URL do endpoint Torznab", "text", record.url.clone()),
-                plain(
-                    "api_key",
-                    "Chave de API",
-                    "password",
-                    record.settings.get("api_key").cloned(),
-                ),
-            ]),
+        if record.kind == CARDIGANN {
+            let definition = self.registry.definition(&record).ok()?;
+            let mut views: Vec<_> = definition
+                .settings()
+                .iter()
+                .map(|info| view(info, record.settings.get(&info.name)))
+                .collect();
+            views.extend(network_views(Some(&record), true));
+            return Some(views);
         }
+        let mut views = vec![
+            plain("url", "URL do endpoint Torznab", "text", record.url.clone()),
+            plain(
+                "api_key",
+                "Chave de API",
+                "password",
+                record.settings.get("api_key").cloned(),
+            ),
+        ];
+        views.extend(network_views(Some(&record), false));
+        Some(views)
     }
 
     async fn update(
@@ -520,11 +470,27 @@ impl Admin for HubAdmin {
         indexer: &str,
         values: BTreeMap<String, String>,
     ) -> Result<Entry, String> {
-        let _guard = self.write.lock().await;
+        let _guard = self.registry.write.lock().await;
         let mut record = self.record(indexer).ok_or("indexador desconhecido")?;
+        let config = self.settings.get();
+        let mut values = values;
+        let reserved_values: Vec<(String, String)> = values
+            .keys()
+            .filter(|name| reserved(name))
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|name| values.remove_entry(&name))
+            .collect();
+        for (name, value) in reserved_values {
+            if name == USE_FLARESOLVERR && record.kind != CARDIGANN {
+                return Err(format!("setting desconhecido: {name}"));
+            }
+            check_reserved(&name, &value)?;
+            record.settings.insert(name, value);
+        }
         let entry = if record.kind == CARDIGANN {
-            let path = definition_path(&record).map_err(|e| message(&e))?;
-            let definition = load_definition(&path).map_err(|e| message(&e))?;
+            let definition = self.registry.definition(&record).map_err(|e| message(&e))?;
             let declared = definition.settings();
             for (name, value) in values {
                 let info = declared
@@ -538,7 +504,7 @@ impl Admin for HubAdmin {
                 }
                 record.settings.insert(name, value);
             }
-            cardigann(&record, definition, self.timeout()).map_err(|e| message(&e))?
+            cardigann(&record, definition, &config).map_err(|e| message(&e))?
         } else {
             for (name, value) in values {
                 // Em branco mantém o atual, como qualquer segredo.
@@ -552,9 +518,7 @@ impl Admin for HubAdmin {
                     _ => return Err(format!("setting desconhecido: {name}")),
                 }
             }
-            torznab(&record, self.timeout())
-                .await
-                .map_err(|e| message(&e))?
+            torznab(&record, &config).await.map_err(|e| message(&e))?
         };
         // Monta antes de gravar: credencial que não sobe não substitui a boa.
         self.persist(record, false).await?;
@@ -573,7 +537,8 @@ impl Admin for HubAdmin {
             .into_iter()
             .map(|view| view.name)
             .collect();
-        self.records
+        self.registry
+            .records
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .keys()
@@ -595,10 +560,7 @@ impl Admin for HubAdmin {
             reason: None,
             added: false,
         }];
-        let definitions = self
-            .definitions
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
+        let definitions = self.registry.definitions();
         list.extend(definitions.iter().map(|known| DefinitionView {
             id: known.header.id.clone(),
             name: known.header.name.clone(),
@@ -630,25 +592,22 @@ impl Admin for HubAdmin {
                 plain("api_key", "Chave de API", "password", None),
             ]);
         }
-        let path = {
-            let definitions = self
-                .definitions
-                .read()
-                .unwrap_or_else(PoisonError::into_inner);
+        let yaml = {
+            let definitions = self.registry.definitions();
             let known = definitions.get(definition)?;
             if known.refusal.is_some() {
                 return None;
             }
-            known.path.clone()
+            known.yaml().ok()?
         };
-        let parsed = load_definition(&path).ok()?;
-        Some(
-            parsed
-                .settings()
-                .iter()
-                .map(|info| view(info, None))
-                .collect(),
-        )
+        let parsed = CardigannDefinition::from_yaml_v11(&yaml).ok()?;
+        let mut views: Vec<_> = parsed
+            .settings()
+            .iter()
+            .map(|info| view(info, None))
+            .collect();
+        views.extend(network_views(None, true));
+        Some(views)
     }
 
     async fn add(
@@ -656,7 +615,8 @@ impl Admin for HubAdmin {
         definition: &str,
         values: BTreeMap<String, String>,
     ) -> Result<Entry, String> {
-        let _guard = self.write.lock().await;
+        let _guard = self.registry.write.lock().await;
+        let config = self.settings.get();
         if definition == TORZNAB {
             let field = |name: &str| {
                 values
@@ -684,7 +644,11 @@ impl Admin for HubAdmin {
             if !key.is_empty() {
                 record.settings.insert("api_key".into(), key);
             }
-            let entry = torznab(&record, self.timeout())
+            if let Some(value) = values.get(USE_PROXY) {
+                check_reserved(USE_PROXY, value)?;
+                record.settings.insert(USE_PROXY.into(), value.clone());
+            }
+            let entry = torznab(&record, &config)
                 .await
                 .map_err(|e| format!("o endpoint não respondeu às capacidades: {e:#}"))?;
             self.persist(record, true).await?;
@@ -693,9 +657,8 @@ impl Admin for HubAdmin {
         }
 
         let known = self
-            .definitions
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
+            .registry
+            .definitions()
             .get(definition)
             .cloned()
             .ok_or("definição desconhecida")?;
@@ -705,10 +668,16 @@ impl Admin for HubAdmin {
         if self.record(definition).is_some() {
             return Err(format!("{definition} já está adicionado"));
         }
-        let parsed = load_definition(&known.path).map_err(|e| message(&e))?;
+        let yaml = known.yaml().map_err(|e| message(&e))?;
+        let parsed = CardigannDefinition::from_yaml_v11(&yaml).map_err(|e| e.to_string())?;
         let declared = parsed.settings();
         let mut settings = BTreeMap::new();
         for (name, value) in values {
+            if reserved(&name) {
+                check_reserved(&name, &value)?;
+                settings.insert(name, value);
+                continue;
+            }
             if !declared.iter().any(|info| info.name == name) {
                 return Err(format!("setting desconhecido: {name}"));
             }
@@ -716,23 +685,28 @@ impl Admin for HubAdmin {
                 settings.insert(name, value);
             }
         }
+        // Só a definição local fica fixada no arquivo; a do banco e a da
+        // reserva seguem a precedência, e a atualização as alcança.
         let record = IndexerRecord {
             name: definition.to_owned(),
             kind: CARDIGANN.into(),
-            definition: Some(known.path.display().to_string()),
+            definition: known
+                .is_local()
+                .then(|| known.path().map(|path| path.display().to_string()))
+                .flatten(),
             url: None,
             settings,
             enabled: true,
             added_at: Some(now()),
         };
-        let entry = cardigann(&record, parsed, self.timeout()).map_err(|e| message(&e))?;
+        let entry = cardigann(&record, parsed, &config).map_err(|e| message(&e))?;
         self.persist(record, true).await?;
         tracing::info!(indexer = definition, "indexador adicionado pela interface");
         Ok(entry)
     }
 
     async fn remove(&self, indexer: &str) -> Result<(), String> {
-        let _guard = self.write.lock().await;
+        let _guard = self.registry.write.lock().await;
         if !self
             .store()?
             .delete_indexer(indexer)
@@ -741,7 +715,8 @@ impl Admin for HubAdmin {
         {
             return Err("indexador desconhecido".into());
         }
-        self.records
+        self.registry
+            .records
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(indexer);
@@ -750,7 +725,7 @@ impl Admin for HubAdmin {
     }
 
     async fn set_enabled(&self, indexer: &str, enabled: bool) -> Result<Option<Entry>, String> {
-        let _guard = self.write.lock().await;
+        let _guard = self.registry.write.lock().await;
         let mut record = self.record(indexer).ok_or("indexador desconhecido")?;
         record.enabled = enabled;
         if !enabled {
@@ -758,7 +733,7 @@ impl Admin for HubAdmin {
             return Ok(None);
         }
         // Monta antes de gravar: se não sobe, continua desativado.
-        let entry = build(&record, self.timeout())
+        let entry = build(&record, &self.settings.get(), &self.registry)
             .await
             .map_err(|e| message(&e))?;
         self.persist(record, false).await?;
@@ -841,7 +816,7 @@ impl Admin for HubAdmin {
     async fn downloads(&self, import: bool) -> Result<serde_json::Value, String> {
         let store = self.store()?;
         let imported = if import {
-            let _guard = self.write.lock().await;
+            let _guard = self.registry.write.lock().await;
             Some(
                 crate::grab::import_downloads(
                     &self.settings.get(),
@@ -909,18 +884,25 @@ impl Admin for HubAdmin {
         let saved = self.settings.save_section(section, value).await?;
         if section == SERVIDOR {
             let after = self.settings.get();
-            if after.server.catalogs != before.server.catalogs {
+            let catalogs = after.server.catalogs != before.server.catalogs
+                || after.server.reserve_catalogs != before.server.reserve_catalogs;
+            if catalogs {
+                let rows = self
+                    .store()?
+                    .definitions()
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let records = self
+                    .registry
                     .records
                     .read()
                     .unwrap_or_else(PoisonError::into_inner)
                     .clone();
-                *self
-                    .definitions
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner) = scan(&after, &records);
+                self.registry.set_definitions(scan(&after, &rows, &records));
             }
-            if after.server.http_timeout_seconds != before.server.http_timeout_seconds {
+            // A precedência mudou: a definição de um indexador em uso pode
+            // ser outra agora.
+            if catalogs || network_changed(&before.server, &after.server) {
                 self.reload_catalog().await;
             }
         }
@@ -982,13 +964,14 @@ mod tests {
             .await
             .unwrap();
         let records = db.store.indexers().await.unwrap();
+        let registry = Arc::new(Registry::new(&settings.get(), &[], records));
         let admin = HubAdmin::new(
             Arc::clone(&settings),
             Catalog::default(),
             Database::connected(db.store.clone()),
             Arc::default(),
             Arc::default(),
-            records,
+            registry,
         );
         (admin, settings)
     }
@@ -1013,7 +996,7 @@ mod tests {
         let stored = db.store.indexers().await.unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].settings["cookie"], "do-cadastro");
-        assert_eq!(entries(&settings.get(), &stored).await.len(), 1);
+        assert_eq!(entries(&settings.get(), &admin.registry).await.len(), 1);
 
         // Segredo em branco mantém; o resto troca, e nada volta com valor.
         admin
@@ -1033,6 +1016,37 @@ mod tests {
             "do-cadastro"
         );
 
+        // Proxy e FlareSolverr são do cadastro, não da definição.
+        let views = admin.settings("cookie-privado").unwrap();
+        let flaresolverr = views.iter().find(|s| s.name == USE_FLARESOLVERR).unwrap();
+        assert_eq!(flaresolverr.value.as_deref(), Some("automático"));
+        assert_eq!(flaresolverr.options, FLARESOLVERR_OPTIONS);
+        admin
+            .update("cookie-privado", values(&[(USE_FLARESOLVERR, "sim")]))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.store.indexers().await.unwrap()[0].settings[USE_FLARESOLVERR],
+            "sim"
+        );
+        // Pedir o proxy sem o servidor ter um não monta, e nada muda.
+        let error = admin
+            .update("cookie-privado", values(&[(USE_PROXY, "true")]))
+            .await
+            .unwrap_err();
+        assert!(error.contains("proxy"), "{error}");
+        assert!(
+            !db.store.indexers().await.unwrap()[0]
+                .settings
+                .contains_key(USE_PROXY)
+        );
+        assert!(
+            admin
+                .update("cookie-privado", values(&[(USE_FLARESOLVERR, "talvez")]))
+                .await
+                .is_err()
+        );
+
         // Desativado: fora do catálogo servido, ainda listado.
         assert!(
             admin
@@ -1043,11 +1057,7 @@ mod tests {
         );
         admin.catalog.remove("cookie-privado");
         assert_eq!(admin.disabled(), [("cookie-privado".to_owned(), ORIGIN)]);
-        assert!(
-            entries(&settings.get(), &db.store.indexers().await.unwrap())
-                .await
-                .is_empty()
-        );
+        assert!(entries(&settings.get(), &admin.registry).await.is_empty());
 
         admin.remove("cookie-privado").await.unwrap();
         assert_eq!(admin.origin("cookie-privado"), None);

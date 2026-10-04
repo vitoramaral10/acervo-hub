@@ -354,3 +354,103 @@ async fn link_de_tracker_privado_passa_por_aqui_e_devolve_o_torrent() {
     .await;
     assert_eq!(status, 404);
 }
+
+/// Indexador cujo link de download leva a um magnet (a página só o oferece).
+#[derive(Debug)]
+struct MagnetOnly;
+
+const MAGNET: &str = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=S%C3%A9rie";
+
+#[async_trait]
+impl Indexer for MagnetOnly {
+    fn name(&self) -> &'static str {
+        "so-magnet"
+    }
+
+    async fn search(&self, _query: &SearchQuery) -> Result<Vec<Release>, IndexerError> {
+        Ok(Vec::new())
+    }
+
+    fn proxies_downloads(&self) -> bool {
+        true
+    }
+
+    async fn resolve_download(
+        &self,
+        _url: &url::Url,
+    ) -> Result<acervo_indexers::ResolvedDownload, IndexerError> {
+        Ok(acervo_indexers::ResolvedDownload::Magnet(
+            url::Url::parse(MAGNET).unwrap(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn download_que_resolve_para_magnet_redireciona_para_ele() {
+    let base = serve(vec![Entry {
+        indexer: Arc::new(MagnetOnly),
+        capabilities: caps(&["q"]),
+    }])
+    .await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let response = client
+        .get(format!(
+            "{base}/so-magnet/download?apikey={KEY}&link=https%3A%2F%2Fso-magnet.invalid%2Fdl%2F1"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 301);
+    assert_eq!(response.headers()["location"].to_str().unwrap(), MAGNET);
+}
+
+#[derive(Debug, Default)]
+struct Recorder(Mutex<Vec<acervo_api::QueryRecord>>);
+
+impl acervo_api::QueryObserver for Recorder {
+    fn observe(&self, record: acervo_api::QueryRecord) {
+        self.0.lock().unwrap().push(record);
+    }
+}
+
+#[tokio::test]
+async fn cada_consulta_que_sai_e_avisada_com_sucesso_ou_falha() {
+    let catalog = Catalog::new([
+        Entry {
+            indexer: fake("bom", false),
+            capabilities: caps(&["q"]),
+        },
+        Entry {
+            indexer: fake("ruim", true),
+            capabilities: caps(&["q"]),
+        },
+    ])
+    .unwrap();
+    let recorder = Arc::new(Recorder::default());
+    catalog.observe_with(Arc::clone(&recorder) as Arc<dyn acervo_api::QueryObserver>);
+    let query = SearchQuery::general("x");
+    catalog.search("all", &query).await.unwrap();
+    // A mesma consulta logo depois vem do que foi guardado: não sai de novo.
+    catalog.search("bom", &query).await.unwrap();
+    assert!(catalog.test("ruim").await.is_err());
+
+    let mut seen: Vec<_> = recorder
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|record| (record.indexer.clone(), record.ok, record.rate_limited))
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        [
+            ("bom".to_owned(), true, false),
+            ("ruim".to_owned(), false, false),
+            ("ruim".to_owned(), false, false),
+        ]
+    );
+}

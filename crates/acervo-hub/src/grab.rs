@@ -18,6 +18,7 @@ use acervo_api::Catalog;
 use acervo_clients::{
     AddOptions, NewTorrent, QbitClient, QbitError, client_path, info_hash, magnet_hash,
 };
+use acervo_indexers::ResolvedDownload;
 use acervo_store::{Grab, GrabState, MovieFile, Store};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -363,6 +364,7 @@ pub async fn send(
         })
         .await
         .context("registrando o grab")?;
+    crate::stats::grabbed(store, &release.indexer).await;
     // Já registrado: a fila sabe o tamanho mesmo de um magnet sem metadados.
     if let Err(error) = start_queued(store, &client).await {
         tracing::warn!("fila de downloads: {error:#}");
@@ -396,17 +398,39 @@ pub(crate) async fn fetch_torrent(
     catalog: &Catalog,
     release: &acervo_indexers::Release,
 ) -> Result<(NewTorrent, String)> {
-    Ok(if release.download_url.scheme() == "magnet" {
-        let link = release.download_url.to_string();
-        let hash = magnet_hash(&link).context("link magnet sem infohash")?;
-        (NewTorrent::Magnet(link), hash)
+    resolve(catalog, &release.indexer, &release.download_url).await
+}
+
+/// O link de download de um indexador resolvido pela sessão dele: o
+/// `.torrent`, ou o magnet quando a página só oferece isso. Magnet direto
+/// nem passa pelo indexador.
+///
+/// # Errors
+///
+/// Magnet sem infohash, indexador fora do ar ou `.torrent` inválido.
+pub(crate) async fn resolve(
+    catalog: &Catalog,
+    indexer: &str,
+    link: &url::Url,
+) -> Result<(NewTorrent, String)> {
+    let resolved = if link.scheme() == "magnet" {
+        ResolvedDownload::Magnet(link.clone())
     } else {
-        let bytes = catalog
-            .download(&release.indexer, &release.download_url)
+        catalog
+            .resolve_download(indexer, link)
             .await
-            .map_err(|error| anyhow::anyhow!("baixando o .torrent: {error}"))?;
-        let hash = info_hash(&bytes).context("o indexador não devolveu um .torrent válido")?;
-        (NewTorrent::File(bytes), hash)
+            .map_err(|error| anyhow::anyhow!("baixando o .torrent: {error}"))?
+    };
+    Ok(match resolved {
+        ResolvedDownload::Magnet(magnet) => {
+            let magnet = magnet.to_string();
+            let hash = magnet_hash(&magnet).context("link magnet sem infohash")?;
+            (NewTorrent::Magnet(magnet), hash)
+        }
+        ResolvedDownload::Torrent(bytes) => {
+            let hash = info_hash(&bytes).context("o indexador não devolveu um .torrent válido")?;
+            (NewTorrent::File(bytes), hash)
+        }
     })
 }
 
@@ -445,7 +469,17 @@ pub(crate) async fn add_queued(
     match added {
         // O mesmo release de um grab que falhou, ou de um registro que não
         // chegou ao banco: o torrent já está no cliente, só falta o grab.
-        Err(QbitError::AddRefused) if adopt && client.torrent(hash).await?.is_some() => {}
+        // O mandado à mão pela busca é de quem o mandou: nenhum grab o adota.
+        Err(QbitError::AddRefused) if adopt => match client.torrent(hash).await? {
+            Some(torrent) if torrent.category == config.library.manual_category => {
+                bail!(
+                    "o torrent já está no cliente, mandado à mão (categoria {})",
+                    torrent.category
+                );
+            }
+            Some(_) => {}
+            None => Err(QbitError::AddRefused).context("mandando o torrent ao qBittorrent")?,
+        },
         added => added.context("mandando o torrent ao qBittorrent")?,
     }
     Ok(())

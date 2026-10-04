@@ -12,7 +12,7 @@ mod ui;
 
 use std::sync::Arc;
 
-use acervo_indexers::Release;
+use acervo_indexers::{Release, ResolvedDownload};
 use axum::Router;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -20,7 +20,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use time::OffsetDateTime;
 
-pub use catalog::{ALL, Catalog, CatalogError, Entry, Health, IndexerView, Page, UI};
+pub use catalog::{
+    ALL, Catalog, CatalogError, Entry, Health, IndexerView, Page, QueryObserver, QueryRecord, UI,
+};
 pub use ui::{Accounts, Admin, DefinitionView, SettingView, authorize_ui, ui_json};
 
 /// A chave da superfície, lida a cada requisição: trocada pela tela, a nova
@@ -277,7 +279,12 @@ async fn download(
         .map(|(_, value)| value.as_str())
         .ok_or(TorznabError::MissingParameter("link"))?;
     let link = url::Url::parse(link).map_err(|_| TorznabError::IncorrectParameter("link"))?;
-    let torrent = server.catalog.download(&indexer, &link).await?;
+    let torrent = match server.catalog.resolve_download(&indexer, &link).await? {
+        ResolvedDownload::Torrent(bytes) => bytes,
+        // O consumidor segue o redirect até o magnet, como faz com o do
+        // agregador de referência.
+        ResolvedDownload::Magnet(magnet) => return Ok(magnet_redirect(&magnet)),
+    };
     let mut response = (StatusCode::OK, torrent).into_response();
     let headers = response.headers_mut();
     headers.insert(
@@ -289,6 +296,16 @@ async fn download(
         headers.insert(header::CONTENT_DISPOSITION, value);
     }
     Ok(response)
+}
+
+/// `301` para o magnet: a forma que os consumidores Torznab entendem de
+/// "este download é um magnet".
+pub(crate) fn magnet_redirect(magnet: &url::Url) -> Response {
+    let mut response = StatusCode::MOVED_PERMANENTLY.into_response();
+    if let Ok(location) = HeaderValue::from_str(magnet.as_str()) {
+        response.headers_mut().insert(header::LOCATION, location);
+    }
+    response
 }
 
 fn xml(status: StatusCode, media_type: &'static str, body: String) -> Response {

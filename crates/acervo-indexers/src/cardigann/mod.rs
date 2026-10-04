@@ -23,12 +23,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::cookie::{CookieStore, Jar};
-use reqwest::header::{CONTENT_TYPE, COOKIE, HeaderValue, LOCATION, REFERER};
+use reqwest::header::{CONTENT_TYPE, COOKIE, HeaderValue, LOCATION, REFERER, USER_AGENT};
 use scraper::{ElementRef, Html, Selector};
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use url::Url;
 
+use crate::network::{self, CHALLENGE_PAGE, Challenge, Clearance, Network};
 use crate::{
     Capabilities, Indexer, IndexerError, RateBudget, Release, ResolvedDownload, SearchMode,
     SearchQuery,
@@ -46,6 +47,7 @@ use template::{Template, Value, Vars, url_encode};
 const MAX_PAGE: usize = 8 * 1024 * 1024;
 const MAX_TORRENT: usize = 10 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 5;
+const USER_AGENT_DEFAULT: &str = "Mozilla/5.0 (compatible; acervo-hub)";
 
 /// Definição validada e compilada. URLs, settings e templates nunca vão a Debug.
 // Os booleanos são chaves independentes do YAML, não estados de uma máquina.
@@ -268,6 +270,29 @@ pub struct CardigannClient {
     session: Arc<Mutex<Session>>,
     /// Maior página já vista por rota: o tamanho de página do site, aprendido.
     page_sizes: Arc<std::sync::Mutex<BTreeMap<String, usize>>>,
+    timeout: Duration,
+    net: Arc<Net>,
+}
+
+/// A rede do indexador e o que o `FlareSolverr` já conseguiu nele.
+#[derive(Default)]
+struct Net {
+    network: Network,
+    /// Cliente para falar com o `FlareSolverr`: sem proxy nem cookies.
+    solver: Option<reqwest::Client>,
+    /// Cookies e user-agent que passaram no último desafio. Valem até o
+    /// próximo; um só desafio por vez é resolvido.
+    clearance: std::sync::Mutex<Option<Clearance>>,
+    solving: Mutex<()>,
+}
+
+impl Net {
+    fn clearance(&self) -> Option<Clearance> {
+        self.clearance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 #[derive(Default)]
@@ -380,13 +405,7 @@ impl CardigannClient {
             return Err(invalid("timeout", "timeout deve ser maior que zero"));
         }
         let jar = Arc::new(Jar::default());
-        let http = reqwest::Client::builder()
-            .timeout(timeout)
-            .cookie_provider(Arc::clone(&jar))
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("Mozilla/5.0 (compatible; acervo-hub)")
-            .build()
-            .map_err(IndexerError::Build)?;
+        let http = http_client(timeout, &jar, None)?;
         let budget = Arc::new(RateBudget::new(definition.delay));
         Ok(Self {
             definition: Arc::new(definition),
@@ -397,7 +416,34 @@ impl CardigannClient {
             budget,
             session: Arc::new(Mutex::new(Session::default())),
             page_sizes: Arc::default(),
+            timeout,
+            net: Arc::default(),
         })
+    }
+
+    /// O mesmo cliente saindo pelo proxy dado e tratando o desafio do
+    /// Cloudflare como `network` manda. Busca, login e download passam todos
+    /// por aqui.
+    ///
+    /// # Errors
+    ///
+    /// Proxy que o cliente HTTP não aceita.
+    pub fn with_network(mut self, network: Network) -> Result<Self, IndexerError> {
+        self.http = http_client(self.timeout, &self.jar, network.proxy.as_ref())?;
+        let solver = match &network.flaresolverr {
+            Some(_) => Some(
+                reqwest::Client::builder()
+                    .build()
+                    .map_err(IndexerError::Build)?,
+            ),
+            None => None,
+        };
+        self.net = Arc::new(Net {
+            network,
+            solver,
+            ..Net::default()
+        });
+        Ok(self)
     }
 
     #[must_use]
@@ -742,11 +788,7 @@ impl CardigannClient {
         if let Some(cookie) = cookie {
             request = request.header(COOKIE, cookie.clone());
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| self.transport(&error))?;
-        self.not_limited(response)
+        self.send(request).await
     }
 
     async fn post_with(
@@ -764,11 +806,160 @@ impl CardigannClient {
         if let Some(cookie) = cookie {
             request = request.header(COOKIE, cookie.clone());
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| self.transport(&error))?;
+        self.send(request).await
+    }
+
+    /// Toda requisição sai por aqui: aplica o que o `FlareSolverr` conseguiu,
+    /// reconhece o desafio do Cloudflare na resposta e, se der, o vence e
+    /// refaz a requisição. 429 vira erro, como em [`Self::not_limited`].
+    async fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, IndexerError> {
+        let request = request.build().map_err(|error| self.transport(&error))?;
+        if self.net.network.challenge == Challenge::Always && self.net.clearance().is_none() {
+            self.solve(&request, true).await?;
+        }
+        let retry = request.try_clone();
+        let response = self.execute(request).await?;
+        let Some(response) = self.screen(response).await? else {
+            let retry = match (self.net.network.challenge, &self.net.network.flaresolverr) {
+                (Challenge::Never, _) => {
+                    return Err(self.challenge(
+                        "o site pede o desafio do Cloudflare; o FlareSolverr está desligado neste indexador",
+                    ));
+                }
+                (_, None) => {
+                    return Err(self.challenge(
+                        "o site pede o desafio do Cloudflare; configure o FlareSolverr",
+                    ));
+                }
+                (_, Some(_)) => retry.ok_or_else(|| {
+                    self.challenge("o desafio do Cloudflare caiu num envio que não dá para refazer")
+                })?,
+            };
+            self.solve(&retry, false).await?;
+            let again = self.execute(retry).await?;
+            return match self.screen(again).await? {
+                Some(response) => self.not_limited(response),
+                None => Err(self.challenge(
+                    "o desafio do Cloudflare voltou mesmo com os cookies do FlareSolverr",
+                )),
+            };
+        };
         self.not_limited(response)
+    }
+
+    /// Envia com o user-agent e os cookies do último desafio vencido. Cookie
+    /// posto à mão (login por cookie) tira os do jar do envio, então os do
+    /// desafio vão junto dele.
+    async fn execute(
+        &self,
+        mut request: reqwest::Request,
+    ) -> Result<reqwest::Response, IndexerError> {
+        if let Some(clearance) = self.net.clearance() {
+            let headers = request.headers_mut();
+            if let Some(agent) = clearance
+                .user_agent
+                .as_deref()
+                .and_then(|agent| HeaderValue::from_str(agent).ok())
+            {
+                headers.insert(USER_AGENT, agent);
+            }
+            if let Some(current) = headers.get(COOKIE).and_then(|value| value.to_str().ok()) {
+                let mut joined = current.trim().trim_end_matches(';').to_owned();
+                for (name, value) in &clearance.cookies {
+                    let _ = write!(joined, "; {name}={value}");
+                }
+                if let Ok(value) = HeaderValue::from_str(&joined) {
+                    headers.insert(COOKIE, value);
+                }
+            }
+        }
+        self.http
+            .execute(request)
+            .await
+            .map_err(|error| self.transport(&error))
+    }
+
+    /// `None` se a resposta é o desafio. Os 403 e 503 são lidos para
+    /// procurá-lo; o que não é desafio volta remontado, igual ao original.
+    async fn screen(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<Option<reqwest::Response>, IndexerError> {
+        let status = response.status();
+        if status != reqwest::StatusCode::FORBIDDEN
+            && status != reqwest::StatusCode::SERVICE_UNAVAILABLE
+        {
+            return Ok(Some(response));
+        }
+        let headers = response.headers().clone();
+        let version = response.version();
+        let body = self
+            .read_limited(response, CHALLENGE_PAGE, "página de até 2 MiB")
+            .await?;
+        if network::is_challenge(status, &headers, &String::from_utf8_lossy(&body)) {
+            tracing::debug!(indexer = self.definition.id, "desafio do Cloudflare");
+            return Ok(None);
+        }
+        let mut rebuilt = http::Response::new(body);
+        *rebuilt.status_mut() = status;
+        *rebuilt.version_mut() = version;
+        *rebuilt.headers_mut() = headers;
+        Ok(Some(reqwest::Response::from(rebuilt)))
+    }
+
+    /// Pede ao `FlareSolverr` que vença o desafio desta requisição e guarda o
+    /// que ele devolveu: os cookies no jar, o user-agent para os próximos
+    /// envios.
+    ///
+    /// Com `if_missing`, o envio antecipado: se outro envio já venceu o
+    /// desafio enquanto este esperava a vez, não pede de novo.
+    async fn solve(
+        &self,
+        request: &reqwest::Request,
+        if_missing: bool,
+    ) -> Result<(), IndexerError> {
+        let (Some(solver), Some(http)) = (&self.net.network.flaresolverr, &self.net.solver) else {
+            return Err(
+                self.challenge("o site pede o desafio do Cloudflare; configure o FlareSolverr")
+            );
+        };
+        let _turn = self.net.solving.lock().await;
+        if if_missing && self.net.clearance().is_some() {
+            return Ok(());
+        }
+        let clearance = network::solve(
+            solver,
+            http,
+            &self.definition.id,
+            request,
+            self.net.network.proxy.as_ref(),
+        )
+        .await?;
+        for (name, value) in &clearance.cookies {
+            self.jar
+                .add_cookie_str(&format!("{name}={value}; Path=/"), request.url());
+        }
+        tracing::info!(
+            indexer = self.definition.id,
+            cookies = clearance.cookies.len(),
+            "desafio do Cloudflare vencido pelo FlareSolverr"
+        );
+        *self
+            .net
+            .clearance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(clearance);
+        Ok(())
+    }
+
+    fn challenge(&self, reason: &'static str) -> IndexerError {
+        IndexerError::Challenge {
+            indexer: self.definition.id.clone(),
+            reason,
+        }
     }
 
     /// 429 vira erro na hora, em qualquer requisição (busca, login, página
@@ -840,11 +1031,7 @@ impl CardigannClient {
                 self.seed_login_cookies(login);
                 let request = self.post_request(&url, &self.login_headers(login)).await?;
                 let request = self.form_body(request, &form);
-                let response = request
-                    .send()
-                    .await
-                    .map_err(|error| self.transport(&error))?;
-                let response = self.not_limited(response)?;
+                let response = self.send(request).await?;
                 let page = self.follow(response, url, None, Expect::Any).await?;
                 self.check_login_errors(login, &page.body)?;
             }
@@ -859,11 +1046,7 @@ impl CardigannClient {
                 for (name, value) in self.login_headers(login) {
                     request = request.header(name, value);
                 }
-                let response = request
-                    .send()
-                    .await
-                    .map_err(|error| self.transport(&error))?;
-                let response = self.not_limited(response)?;
+                let response = self.send(request).await?;
                 let page = self.follow(response, url, None, Expect::Any).await?;
                 self.check_login_errors(login, &page.body)?;
             }
@@ -969,11 +1152,7 @@ impl CardigannClient {
         } else {
             self.form_body(request, &pairs)
         };
-        let response = request
-            .send()
-            .await
-            .map_err(|error| self.transport(&error))?;
-        let response = self.not_limited(response)?;
+        let response = self.send(request).await?;
         let page = self.follow(response, submit, None, Expect::Any).await?;
         self.check_login_errors(login, &page.body)
     }
@@ -1686,6 +1865,25 @@ impl Indexer for CardigannClient {
         }
         Err(self.login_error("o site não reconheceu a sessão no download"))
     }
+}
+
+/// O cliente HTTP do indexador: redirect desligado (um redirect para outra
+/// origem levaria cookie e settings junto), o jar da sessão e, se houver, o
+/// proxy.
+fn http_client(
+    timeout: Duration,
+    jar: &Arc<Jar>,
+    proxy: Option<&network::Proxy>,
+) -> Result<reqwest::Client, IndexerError> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .cookie_provider(Arc::clone(jar))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(USER_AGENT_DEFAULT);
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy.reqwest()?);
+    }
+    builder.build().map_err(IndexerError::Build)
 }
 
 fn matches_any(selectors: &[Css], body: &str) -> bool {

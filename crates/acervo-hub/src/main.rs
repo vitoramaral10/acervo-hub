@@ -26,10 +26,12 @@ mod events;
 mod grab;
 mod ledger;
 mod library;
+mod manual;
 mod mediainfo;
 mod metadata;
 mod movies;
 mod naming;
+mod registry;
 mod rename;
 mod report;
 mod rules;
@@ -37,6 +39,7 @@ mod search;
 mod series;
 mod serve;
 mod settings;
+mod stats;
 mod subtitles;
 mod sync;
 mod tasks;
@@ -308,7 +311,6 @@ async fn movies_command(
     store: acervo_store::Store,
     action: MoviesAction,
 ) -> Result<bool> {
-    let records = store.indexers().await?;
     Ok(match action {
         MoviesAction::Check => movies::check(config, &store).await? > 0,
         MoviesAction::Grab { tmdb, apply } => {
@@ -318,7 +320,7 @@ async fn movies_command(
                 .into_iter()
                 .find(|m| m.movie.tmdb_id == tmdb)
                 .ok_or_else(|| anyhow::anyhow!("TMDB {tmdb} não está no catálogo"))?;
-            let catalog = acervo_api::Catalog::new(serve::entries(config, &records).await)?;
+            let catalog = acervo_api::Catalog::new(serve::stored_entries(config, &store).await?)?;
             let report = grab::grab(config, &store, &catalog, movie.id, apply).await?;
             print_grab(&report);
             report.escolhido.is_none()
@@ -388,7 +390,7 @@ async fn movies_command(
             !report.falhas.is_empty()
         }
         MoviesAction::Rss { apply } => {
-            let catalog = acervo_api::Catalog::new(serve::entries(config, &records).await)?;
+            let catalog = acervo_api::Catalog::new(serve::stored_entries(config, &store).await?)?;
             let grabs = automatic::rss(config, &store, &catalog, apply).await?;
             if grabs.is_empty() {
                 println!("nada entre os releases recentes serve à biblioteca");

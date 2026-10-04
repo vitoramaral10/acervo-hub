@@ -327,6 +327,14 @@ pub enum IndexerError {
         indexer: String,
         field: &'static str,
     },
+
+    /// O site respondeu com o desafio do Cloudflare e ele não foi vencido:
+    /// sem `FlareSolverr`, com ele desligado, ou com ele falhando.
+    #[error("`{indexer}`: {reason}")]
+    Challenge {
+        indexer: String,
+        reason: &'static str,
+    },
 }
 
 impl IndexerError {

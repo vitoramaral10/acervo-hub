@@ -2,11 +2,11 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 
 use acervo_indexers::{
-    Capabilities, Category, Indexer, IndexerError, IndexerFailure, Release, SearchMode,
-    SearchQuery, SearchSupport,
+    Capabilities, Category, Indexer, IndexerError, IndexerFailure, Release, ResolvedDownload,
+    SearchMode, SearchQuery, SearchSupport,
 };
 use futures::future::{BoxFuture, FutureExt, Shared, join_all};
 use time::OffsetDateTime;
@@ -169,6 +169,24 @@ impl std::fmt::Debug for Requests {
     }
 }
 
+/// Uma consulta que de fato foi ao indexador — a reaproveitada não conta.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryRecord {
+    pub indexer: String,
+    pub ok: bool,
+    /// O indexador respondeu 429.
+    pub rate_limited: bool,
+    pub elapsed: std::time::Duration,
+}
+
+/// Quem quer saber de cada consulta: a estatística por indexador. Chamado
+/// fora de qualquer lock, e não pode bloquear.
+pub trait QueryObserver: Send + Sync + std::fmt::Debug {
+    fn observe(&self, record: QueryRecord);
+}
+
+type Observer = Arc<OnceLock<Arc<dyn QueryObserver>>>;
+
 /// Catálogo compartilhado entre as rotas. Clones veem as mesmas entradas, a
 /// mesma saúde e as mesmas consultas guardadas; trocar a credencial de um
 /// indexador troca para todos.
@@ -177,6 +195,23 @@ pub struct Catalog {
     entries: Arc<RwLock<BTreeMap<String, Entry>>>,
     health: Arc<Mutex<HashMap<String, Health>>>,
     requests: Arc<Mutex<Requests>>,
+    observer: Observer,
+}
+
+fn notify(
+    observer: &Observer,
+    name: &str,
+    started: std::time::Instant,
+    outcome: Result<(), &IndexerError>,
+) {
+    if let Some(observer) = observer.get() {
+        observer.observe(QueryRecord {
+            indexer: name.to_owned(),
+            ok: outcome.is_ok(),
+            rate_limited: outcome.err().and_then(IndexerError::rate_limited).is_some(),
+            elapsed: started.elapsed(),
+        });
+    }
 }
 
 /// Resultado de uma consulta servida: página já cortada e falhas parciais.
@@ -213,7 +248,14 @@ impl Catalog {
             entries: Arc::new(RwLock::new(catalog)),
             health: Arc::default(),
             requests: Arc::default(),
+            observer: Arc::default(),
         })
+    }
+
+    /// Passa a avisar `observer` de cada consulta feita — de qualquer clone.
+    /// Só o primeiro vale.
+    pub fn observe_with(&self, observer: Arc<dyn QueryObserver>) {
+        let _ = self.observer.set(observer);
     }
 
     // Nenhum lock atravessa `await`: as entradas são copiadas (são `Arc`) e
@@ -267,10 +309,13 @@ impl Catalog {
         let indexer = Arc::clone(&entry.indexer);
         let health = Arc::clone(&self.health);
         let slots = Arc::clone(&self.requests);
+        let observer = Arc::clone(&self.observer);
         let slot_key = key.clone();
         let started = now;
         let fetch = async move {
+            let clock = std::time::Instant::now();
             let outcome = indexer.search(&query).await;
+            notify(&observer, &name, clock, outcome.as_ref().map(|_| ()));
             record(&health, &name, outcome.as_ref().map(Vec::len));
             let outcome = outcome.map_err(|error| error.to_string());
             if outcome.is_err() {
@@ -422,13 +467,32 @@ impl Catalog {
             .is_some_and(|entry| entry.indexer.proxies_downloads())
     }
 
-    /// Baixa um `.torrent` pela sessão do indexador.
+    /// Baixa um `.torrent` pela sessão do indexador. O link que resolve para
+    /// um magnet é falha aqui: quem aceita magnet usa
+    /// [`Catalog::resolve_download`].
     ///
     /// # Errors
     ///
     /// Indexador desconhecido (inclusive `all`), ou falha do indexador — link
     /// fora da origem dele, sessão recusada, resposta que não é `.torrent`.
     pub async fn download(&self, name: &str, link: &url::Url) -> Result<Vec<u8>, TorznabError> {
+        match self.resolve_download(name, link).await? {
+            ResolvedDownload::Torrent(bytes) => Ok(bytes),
+            ResolvedDownload::Magnet(_) => Err(TorznabError::DownloadFailed),
+        }
+    }
+
+    /// Resolve o link de download pela sessão do indexador: o `.torrent`, ou
+    /// o magnet quando é só isso que a página oferece.
+    ///
+    /// # Errors
+    ///
+    /// Os de [`Catalog::download`].
+    pub async fn resolve_download(
+        &self,
+        name: &str,
+        link: &url::Url,
+    ) -> Result<ResolvedDownload, TorznabError> {
         let entry = self
             .read()
             .get(name)
@@ -439,7 +503,7 @@ impl Catalog {
         if let Some(until) = self.waiting_until(name) {
             return Err(waiting(name, until));
         }
-        entry.indexer.download(link).await.map_err(|error| {
+        entry.indexer.resolve_download(link).await.map_err(|error| {
             tracing::warn!(indexer = name, %error, "download falhou");
             self.record(name, Err(&error));
             match self.waiting_until(name) {
@@ -465,11 +529,13 @@ impl Catalog {
         if let Some(until) = self.waiting_until(name) {
             return Err(waiting(name, until).to_string());
         }
+        let clock = std::time::Instant::now();
         let outcome = entry
             .indexer
             .search(&SearchQuery::general(""))
             .await
             .map(|releases| releases.len());
+        notify(&self.observer, name, clock, outcome.as_ref().map(|_| ()));
         self.record(name, outcome.as_ref().map(|count| *count));
         outcome.map_err(|error| error.to_string())
     }

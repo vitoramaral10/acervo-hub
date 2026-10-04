@@ -30,7 +30,8 @@ pub const TAREFAS: &str = "tarefas";
 #[must_use]
 pub fn secrets(section: &str) -> &'static [&'static str] {
     match section {
-        SERVIDOR | JELLYFIN | GERENCIADORES => &["api_key"],
+        SERVIDOR => &["api_key", "proxy_password"],
+        JELLYFIN | GERENCIADORES => &["api_key"],
         QBITTORRENT => &["password"],
         _ => &[],
     }
@@ -56,6 +57,11 @@ pub struct Config {
 /// Onde o XEM responde, se a seção não disser outro.
 pub const XEM_URL: &str = "https://thexem.info";
 
+/// O arquivo compactado da branch principal do repositório oficial de
+/// definições: um download só, em vez de uma requisição por arquivo à API.
+pub const DEFINITIONS_URL: &str =
+    "https://codeload.github.com/Prowlarr/Indexers/tar.gz/refs/heads/master";
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
@@ -66,14 +72,33 @@ pub struct ServerConfig {
     /// Como os gerenciadores alcançam este serviço — o endereço que `sync`
     /// cadastra neles. Em Compose, o nome do serviço na rede interna.
     pub public_url: Option<String>,
-    /// Diretórios de definições Cardigann que a interface oferece para
-    /// adicionar. O primeiro que tiver um id vence.
+    /// Diretórios locais de definições Cardigann — as customizadas. Valem
+    /// acima de tudo e nunca são trocadas pelas do repositório. O primeiro
+    /// que tiver um id vence.
     #[serde(rename = "catalogos")]
     pub catalogs: Vec<PathBuf>,
+    /// Diretórios de reserva — o catálogo antigo, copiado do agregador de
+    /// referência. Valem abaixo das definições baixadas para o banco.
+    #[serde(rename = "catalogos_reserva")]
+    pub reserve_catalogs: Vec<PathBuf>,
+    /// De onde a tarefa `definicoes` baixa o arquivo `.tar.gz` do repositório
+    /// de definições; dentro dele, as de `definitions/v11`.
+    #[serde(rename = "definicoes_url")]
+    pub definitions_url: String,
     /// Timeout de cada chamada HTTP, em segundos.
     pub http_timeout_seconds: u64,
     /// Endereço base do XEM, de onde vem a numeração de cena das séries.
     pub xem_url: String,
+    /// O `FlareSolverr`, que vence o desafio do Cloudflare. Sem ele, o desafio
+    /// é erro.
+    pub flaresolverr_url: Option<String>,
+    /// Quanto o `FlareSolverr` pode levar num desafio, em segundos.
+    pub flaresolverr_timeout_s: u64,
+    /// Proxy dos indexadores marcados para usá-lo: `http://`, `https://` ou
+    /// `socks5://`, sem credencial — ela tem campo próprio.
+    pub proxy_url: Option<String>,
+    pub proxy_username: String,
+    pub proxy_password: String,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -83,9 +108,42 @@ impl std::fmt::Debug for ServerConfig {
             .debug_struct("ServerConfig")
             .field("public_url", &self.public_url)
             .field("catalogs", &self.catalogs)
+            .field("reserve_catalogs", &self.reserve_catalogs)
+            .field("definitions_url", &self.definitions_url)
             .field("http_timeout_seconds", &self.http_timeout_seconds)
             .field("xem_url", &self.xem_url)
+            .field("flaresolverr_url", &self.flaresolverr_url)
+            .field("flaresolverr_timeout_s", &self.flaresolverr_timeout_s)
+            .field("proxy_url", &self.proxy_url)
+            .field("proxy_username", &self.proxy_username)
             .finish_non_exhaustive()
+    }
+}
+
+impl ServerConfig {
+    /// Definições, `FlareSolverr` e proxy: URLs e faixas.
+    fn validate_network(&self) -> Result<(), String> {
+        check_url("servidor: endereço das definições", &self.definitions_url)?;
+        if let Some(url) = &self.flaresolverr_url {
+            check_url("servidor: endereço do FlareSolverr", url)?;
+        }
+        if !(1..=300).contains(&self.flaresolverr_timeout_s) {
+            return Err(
+                "servidor: o timeout do FlareSolverr precisa ficar entre 1 e 300 segundos".into(),
+            );
+        }
+        if let Some(url) = &self.proxy_url {
+            let parsed = url::Url::parse(url).map_err(|_| "servidor: proxy: URL inválida")?;
+            if !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h") {
+                return Err("servidor: proxy: use http://, https:// ou socks5://".into());
+            }
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                return Err(
+                    "servidor: proxy: tire usuário e senha da URL; eles têm campo próprio".into(),
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -95,8 +153,15 @@ impl Default for ServerConfig {
             api_key: String::new(),
             public_url: None,
             catalogs: Vec::new(),
+            reserve_catalogs: Vec::new(),
+            definitions_url: DEFINITIONS_URL.into(),
             http_timeout_seconds: 30,
             xem_url: XEM_URL.into(),
+            flaresolverr_url: None,
+            flaresolverr_timeout_s: 60,
+            proxy_url: None,
+            proxy_username: String::new(),
+            proxy_password: String::new(),
         }
     }
 }
@@ -193,6 +258,9 @@ impl From<InstanceKind> for ArrKind {
     }
 }
 
+/// A categoria padrão da busca manual.
+pub const MANUAL_CATEGORY: &str = "manual";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LibraryConfig {
@@ -208,6 +276,11 @@ pub struct LibraryConfig {
     /// Categoria do cliente de download para o que o acervo pega. Separada da
     /// do gerenciador, para ele não tentar importar o que não pegou.
     pub category: String,
+    /// Categoria do que a busca manual manda ao cliente. Fica fora das
+    /// gerenciadas pela limpeza e de qualquer grab do acervo: o torrent é
+    /// de quem o mandou.
+    #[serde(rename = "categoria_manual")]
+    pub manual_category: String,
     /// Caminho como o cliente vê → caminho no host.
     pub paths: BTreeMap<String, String>,
 }
@@ -219,8 +292,32 @@ impl Default for LibraryConfig {
             root_folders: vec!["/media/movies".into()],
             series_root: "/media/series".into(),
             category: "acervo".into(),
+            manual_category: MANUAL_CATEGORY.into(),
             paths: BTreeMap::new(),
         }
+    }
+}
+
+impl LibraryConfig {
+    /// A categoria da busca manual: preenchida, diferente da do acervo e
+    /// fora das gerenciadas pela limpeza.
+    fn validate_manual(&self, managed: &[String]) -> Result<(), String> {
+        let manual = self.manual_category.trim();
+        if manual.is_empty() {
+            return Err("biblioteca: informe a categoria da busca manual".into());
+        }
+        if manual == self.category.trim() {
+            return Err(
+                "biblioteca: a categoria da busca manual precisa ser outra que a do acervo".into(),
+            );
+        }
+        if managed.iter().any(|c| c.trim() == manual) {
+            return Err(format!(
+                "biblioteca: a categoria da busca manual ({manual}) está entre as gerenciadas \
+                 pela limpeza; tire-a de lá ou escolha outra"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -286,7 +383,7 @@ impl PolicyConfig {
 
 /// Ids das tarefas de fundo com o intervalo padrão, em minutos. Zero desliga
 /// o agendamento; "rodar agora" continua valendo.
-pub const TASK_DEFAULTS: [(&str, u64); 7] = [
+pub const TASK_DEFAULTS: [(&str, u64); 8] = [
     // Sem intervalo, só pelo botão.
     ("busca", 0),
     ("rss", 30),
@@ -296,6 +393,8 @@ pub const TASK_DEFAULTS: [(&str, u64); 7] = [
     ("assistidos", 15),
     // A numeração de cena muda pouco: uma vez por dia.
     ("cena", 24 * 60),
+    // As definições do repositório oficial, uma vez por dia.
+    ("definicoes", 24 * 60),
 ];
 
 /// Teto de qualquer intervalo: 30 dias.
@@ -433,6 +532,7 @@ impl Config {
             }
         }
         check_url("servidor: endereço do XEM", &server.xem_url)?;
+        server.validate_network()?;
         if !(1..=600).contains(&server.http_timeout_seconds) {
             return Err("servidor: o timeout HTTP precisa ficar entre 1 e 600 segundos".into());
         }
@@ -469,6 +569,7 @@ impl Config {
         if library.category.trim().is_empty() {
             return Err("biblioteca: informe a categoria do cliente de download".into());
         }
+        library.validate_manual(&self.policy.managed_categories)?;
         if library
             .paths
             .iter()
@@ -619,6 +720,11 @@ mod tests {
         assert_eq!(config.library.root_folders, ["/media/movies"]);
         assert_eq!(config.library.series_root, "/media/series");
         assert_eq!(config.library.category, "acervo");
+        assert_eq!(config.library.manual_category, "manual");
+        assert_eq!(config.tasks.minutes("definicoes"), 1440);
+        assert_eq!(config.server.definitions_url, DEFINITIONS_URL);
+        assert_eq!(config.server.flaresolverr_timeout_s, 60);
+        assert!(config.server.flaresolverr_url.is_none() && config.server.proxy_url.is_none());
         assert_eq!(config.http_timeout(), Duration::from_secs(30));
         assert!(config.qbittorrent().is_none() && config.jellyfin().is_none());
         assert!(config.janitor().is_err());
@@ -719,6 +825,20 @@ mod tests {
         assert!(erro(|c| c.jellyfin.url = "http://j:8096".into()).contains("chave"));
         assert!(erro(|c| c.library.series_root = "series".into()).contains("séries"));
         assert!(erro(|c| c.server.xem_url = "ftp://xem".into()).contains("XEM"));
+        assert!(erro(|c| c.server.flaresolverr_url = Some("nada".into())).contains("FlareSolverr"));
+        assert!(erro(|c| c.server.flaresolverr_timeout_s = 0).contains("FlareSolverr"));
+        assert!(erro(|c| c.server.proxy_url = Some("ftp://p:21".into())).contains("socks5"));
+        assert!(
+            erro(|c| c.server.proxy_url = Some("socks5://u:s@p:1080".into())).contains("usuário")
+        );
+        assert!(erro(|c| c.library.manual_category = "acervo".into()).contains("manual"));
+        assert!(
+            erro(|c| c.policy.managed_categories = vec!["manual".into()]).contains("gerenciadas")
+        );
+        let mut proxied = valid();
+        proxied.server.proxy_url = Some("socks5://proxy:1080".into());
+        proxied.server.flaresolverr_url = Some("http://flaresolverr:8191".into());
+        assert!(proxied.validate().is_ok());
         assert!(valid().validate().is_ok());
     }
 

@@ -42,6 +42,8 @@ pub const BUSCA: &str = "busca";
 pub const ASSISTIDOS: &str = "assistidos";
 /// Id da tarefa que baixa a numeração de cena (XEM).
 pub const CENA: &str = "cena";
+/// Id da tarefa que baixa as definições do repositório oficial.
+pub const DEFINICOES: &str = "definicoes";
 
 /// Por que uma execução começou.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,6 +472,7 @@ pub fn service(
     database: &Database,
     catalog: &Catalog,
     progress: &Arc<Progress>,
+    registry: &Arc<crate::registry::Registry>,
 ) -> Vec<Task> {
     vec![
         Task {
@@ -550,6 +553,19 @@ pub fn service(
             job: Arc::new(Scene {
                 settings: Arc::clone(settings),
                 database: database.clone(),
+            }),
+        },
+        Task {
+            id: DEFINICOES,
+            name: "Atualização das definições",
+            interval: interval(settings, DEFINICOES),
+            // Não soma o download à subida: o catálogo de agora já serve.
+            first: First::AfterInterval,
+            job: Arc::new(DefinitionsUpdate {
+                settings: Arc::clone(settings),
+                database: database.clone(),
+                catalog: catalog.clone(),
+                registry: Arc::clone(registry),
             }),
         },
     ]
@@ -964,6 +980,42 @@ impl Job for Scene {
         );
         Ok(Outcome {
             ok: report.falhas.is_empty(),
+            summary,
+            detail: Some(serde_json::to_value(&report)?),
+        })
+    }
+}
+
+/// Baixa as definições v11 do repositório oficial para o banco e troca a de
+/// cada indexador em uso que mudou, sem reiniciar.
+#[derive(Debug)]
+struct DefinitionsUpdate {
+    settings: Arc<Settings>,
+    database: Database,
+    catalog: Catalog,
+    registry: Arc<crate::registry::Registry>,
+}
+
+#[async_trait]
+impl Job for DefinitionsUpdate {
+    async fn run(&self, _: Trigger) -> Result<Outcome> {
+        let store = store(&self.database)?;
+        let config = self.settings.get();
+        let downloaded =
+            crate::definitions::download(&config.server.definitions_url, config.http_timeout())
+                .await?;
+        let report = crate::registry::apply_update(
+            &config,
+            store,
+            &self.catalog,
+            &self.registry,
+            downloaded,
+            &now_rfc3339(),
+        )
+        .await?;
+        let (ok, summary) = report.summary();
+        Ok(Outcome {
+            ok,
             summary,
             detail: Some(serde_json::to_value(&report)?),
         })

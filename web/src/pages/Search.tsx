@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   ArrowDown,
   ArrowUp,
@@ -10,8 +10,10 @@ import {
   Magnet,
   Search as SearchIcon,
   SearchX,
+  Send,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
+import { toast } from 'sonner'
 import { PageHeader } from '@/components/PageHeader'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -279,8 +281,8 @@ function ResultsTable({
               <SortHeader label="Tamanho" column="tamanho" sort={sort} onSort={onSort} className="w-28 text-right" />
               <SortHeader label="Seeders" column="seeders" sort={sort} onSort={onSort} className="w-24 text-right" />
               <SortHeader label="Idade" column="idade" sort={sort} onSort={onSort} className="w-32 text-right" />
-              <th scope="col" className="w-12 px-3 py-2.5">
-                <span className="sr-only">Baixar</span>
+              <th scope="col" className="w-24 px-3 py-2.5">
+                <span className="sr-only">Ações</span>
               </th>
             </tr>
           </thead>
@@ -292,6 +294,33 @@ function ResultsTable({
         </table>
       </div>
     </div>
+  )
+}
+
+/**
+ * Manda o resultado ao qBittorrent, na categoria da busca manual: fora da
+ * limpeza e de qualquer grab do acervo. Magnet também vale.
+ */
+function SendButton({ release, size }: { release: Release; size: 'icon-sm' | 'icon' }) {
+  const send = useMutation({
+    mutationFn: () => api.sendToClient(release.indexador, release.link),
+    onSuccess: (result) =>
+      toast.success(`Mandado ao qBittorrent na categoria «${result.categoria}»`, { description: release.titulo }),
+    onError: (error: Error) => toast.error(error.message, { description: release.titulo }),
+  })
+  return (
+    <Tooltip content="Mandar ao qBittorrent (categoria da busca manual)">
+      <Button
+        variant={size === 'icon' ? 'secondary' : 'ghost'}
+        size={size}
+        loading={send.isPending}
+        disabled={send.isSuccess}
+        onClick={() => send.mutate()}
+        aria-label={`Mandar ${release.titulo} ao qBittorrent`}
+      >
+        {!send.isPending && <Send aria-hidden="true" />}
+      </Button>
+    </Tooltip>
   )
 }
 
@@ -350,16 +379,19 @@ function ResultRow({ release }: { release: Release }) {
           '—'
         )}
       </td>
-      <td className="px-3 py-3 text-right">
-        {download && (
-          <Tooltip content={magnet ? 'Abrir magnet' : 'Baixar .torrent'}>
-            <Button asChild variant="ghost" size="icon-sm">
-              <a href={download} download={magnet ? undefined : ''} aria-label={`Baixar ${release.titulo}`}>
-                {magnet ? <Magnet aria-hidden="true" /> : <Download aria-hidden="true" />}
-              </a>
-            </Button>
-          </Tooltip>
-        )}
+      <td className="px-3 py-3">
+        <div className="flex justify-end gap-1">
+          {release.link && <SendButton release={release} size="icon-sm" />}
+          {download && (
+            <Tooltip content={magnet ? 'Abrir magnet' : 'Baixar .torrent'}>
+              <Button asChild variant="ghost" size="icon-sm">
+                <a href={download} download={magnet ? undefined : ''} aria-label={`Baixar ${release.titulo}`}>
+                  {magnet ? <Magnet aria-hidden="true" /> : <Download aria-hidden="true" />}
+                </a>
+              </Button>
+            </Tooltip>
+          )}
+        </div>
       </td>
     </tr>
   )
@@ -391,13 +423,16 @@ function ResultCard({ release }: { release: Release }) {
           {release.publicado && <span>{formatAgo(release.publicado)}</span>}
         </p>
       </div>
-      {download && (
-        <Button asChild variant="secondary" size="icon">
-          <a href={download} download={magnet ? undefined : ''} aria-label={`Baixar ${release.titulo}`}>
-            {magnet ? <Magnet aria-hidden="true" /> : <Download aria-hidden="true" />}
-          </a>
-        </Button>
-      )}
+      <div className="flex flex-col gap-2">
+        {release.link && <SendButton release={release} size="icon" />}
+        {download && (
+          <Button asChild variant="secondary" size="icon">
+            <a href={download} download={magnet ? undefined : ''} aria-label={`Baixar ${release.titulo}`}>
+              {magnet ? <Magnet aria-hidden="true" /> : <Download aria-hidden="true" />}
+            </a>
+          </Button>
+        )}
+      </div>
     </li>
   )
 }

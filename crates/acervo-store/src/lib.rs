@@ -4,6 +4,7 @@
 
 mod accounts;
 mod config;
+mod definitions;
 mod manage;
 mod series;
 mod tasks;
@@ -15,6 +16,7 @@ use tokio_postgres::{NoTls, Row};
 
 pub use accounts::SESSION_DAYS;
 pub use config::IndexerRecord;
+pub use definitions::{DefinitionRow, IndexerDayStats, StatsDelta};
 pub use manage::{Blocked, HistoryEvent, HistoryPage, NewHistory};
 pub use series::{
     CatalogEpisode, CatalogEpisodeFile, CatalogSeries, Episode, EpisodeFile, EpisodeSync,
@@ -680,6 +682,29 @@ const MIGRATIONS: &[&str] = &[
         season INTEGER NOT NULL,
         episode INTEGER NOT NULL,
         PRIMARY KEY (series_id, scene_season, scene_episode, season, episode)
+    );
+",
+    // As definições Cardigann baixadas do repositório oficial: o serviço não
+    // tem diretório gravável. `sha` é o SHA-256 do YAML.
+    //
+    // E a estatística de cada indexador por dia (UTC): consultas que saíram,
+    // quantas falharam, quantas foram 429, os grabs e o tempo somado.
+    r"
+    CREATE TABLE definitions (
+        id TEXT PRIMARY KEY,
+        yaml TEXT NOT NULL,
+        sha TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE indexer_stats (
+        indexer TEXT NOT NULL,
+        day DATE NOT NULL,
+        queries INTEGER NOT NULL DEFAULT 0,
+        failures INTEGER NOT NULL DEFAULT 0,
+        rate_limited INTEGER NOT NULL DEFAULT 0,
+        grabs INTEGER NOT NULL DEFAULT 0,
+        total_ms BIGINT NOT NULL DEFAULT 0,
+        PRIMARY KEY (indexer, day)
     );
 ",
 ];

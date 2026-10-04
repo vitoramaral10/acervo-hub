@@ -445,6 +445,7 @@ pub async fn send(
         })
         .await
         .context("registrando o grab")?;
+    crate::stats::grabbed(store, &release.indexer).await;
     if let Err(error) = start_queued(store, &client).await {
         tracing::warn!("fila de downloads: {error:#}");
     }

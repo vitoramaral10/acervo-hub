@@ -197,8 +197,15 @@ function ServerForm({ data, save, saving }: FormProps<'servidor'>) {
   const [generated, setGenerated] = useState(false)
   const [publicUrl, setPublicUrl] = useState(data.public_url ?? '')
   const [catalogs, setCatalogs] = useState(data.catalogos.join('\n'))
+  const [reserve, setReserve] = useState(data.catalogos_reserva.join('\n'))
+  const [definitionsUrl, setDefinitionsUrl] = useState(data.definicoes_url)
   const [timeout, setTimeoutSeconds] = useState(String(data.http_timeout_seconds))
   const [xemUrl, setXemUrl] = useState(data.xem_url)
+  const [flaresolverrUrl, setFlaresolverrUrl] = useState(data.flaresolverr_url ?? '')
+  const [flaresolverrTimeout, setFlaresolverrTimeout] = useState(String(data.flaresolverr_timeout_s))
+  const [proxyUrl, setProxyUrl] = useState(data.proxy_url ?? '')
+  const [proxyUser, setProxyUser] = useState(data.proxy_username)
+  const [proxyPassword, setProxyPassword] = useState('')
   return (
     <form
       noValidate
@@ -208,10 +215,17 @@ function ServerForm({ data, save, saving }: FormProps<'servidor'>) {
         const value: SectionInput<'servidor'> = {
           public_url: publicUrl.trim() || null,
           catalogos: lines(catalogs),
+          catalogos_reserva: lines(reserve),
+          definicoes_url: definitionsUrl.trim(),
           http_timeout_seconds: whole(timeout),
           xem_url: xemUrl.trim(),
+          flaresolverr_url: flaresolverrUrl.trim() || null,
+          flaresolverr_timeout_s: whole(flaresolverrTimeout),
+          proxy_url: proxyUrl.trim() || null,
+          proxy_username: proxyUser.trim(),
         }
         if (key.trim()) value.api_key = key.trim()
+        if (proxyPassword) value.proxy_password = proxyPassword
         save(value)
       }}
     >
@@ -274,8 +288,8 @@ function ServerForm({ data, save, saving }: FormProps<'servidor'>) {
       </Field>
       <Field
         id="servidor-catalogos"
-        label="Diretórios de definições Cardigann"
-        help="Um por linha. O que a tela de indexadores oferece para adicionar; o primeiro que tiver um id vence."
+        label="Diretórios locais de definições Cardigann"
+        help="Um por linha: as definições customizadas. Valem acima de tudo e nunca são trocadas pelas do repositório; entre eles, o primeiro que tiver um id vence."
       >
         <LinesInput
           id="servidor-catalogos"
@@ -285,6 +299,100 @@ function ServerForm({ data, save, saving }: FormProps<'servidor'>) {
           describedBy="servidor-catalogos-ajuda"
         />
       </Field>
+      <Field
+        id="servidor-reserva"
+        label="Diretórios de reserva (catálogo antigo)"
+        help="Um por linha. Valem abaixo das definições que a tarefa «Atualização das definições» baixa do repositório oficial; servem enquanto ela não rodou."
+      >
+        <LinesInput
+          id="servidor-reserva"
+          value={reserve}
+          onChange={setReserve}
+          placeholder="/etc/acervo-hub/catalogo"
+          describedBy="servidor-reserva-ajuda"
+        />
+      </Field>
+      <Field
+        id="servidor-definicoes"
+        label="Arquivo do repositório de definições"
+        help="O .tar.gz da branch; a tarefa lê as definições de definitions/v11 dele."
+      >
+        <Input
+          id="servidor-definicoes"
+          type="url"
+          spellCheck={false}
+          value={definitionsUrl}
+          onChange={(event) => setDefinitionsUrl(event.target.value)}
+          aria-describedby="servidor-definicoes-ajuda"
+        />
+      </Field>
+      <Field
+        id="servidor-flaresolverr"
+        label="FlareSolverr"
+        help="Vence o desafio do Cloudflare (resposta 403 ou 503 com «Just a moment...»). Em branco, o desafio vira erro. Cada indexador escolhe se o usa."
+      >
+        <Input
+          id="servidor-flaresolverr"
+          type="url"
+          spellCheck={false}
+          value={flaresolverrUrl}
+          onChange={(event) => setFlaresolverrUrl(event.target.value)}
+          placeholder="http://flaresolverr:8191"
+          aria-describedby="servidor-flaresolverr-ajuda"
+        />
+      </Field>
+      <Field
+        id="servidor-flaresolverr-timeout"
+        label="Timeout do FlareSolverr (segundos)"
+        help="Quanto ele pode levar para vencer um desafio."
+      >
+        <Input
+          id="servidor-flaresolverr-timeout"
+          type="number"
+          min={1}
+          max={300}
+          value={flaresolverrTimeout}
+          onChange={(event) => setFlaresolverrTimeout(event.target.value)}
+          aria-describedby="servidor-flaresolverr-timeout-ajuda"
+          className="w-28 tabular-nums"
+        />
+      </Field>
+      <Field
+        id="servidor-proxy"
+        label="Proxy dos indexadores"
+        help="http://, https:// ou socks5://, sem usuário e senha na URL. Só os indexadores marcados para usá-lo saem por ele — busca, login e download."
+      >
+        <Input
+          id="servidor-proxy"
+          type="url"
+          spellCheck={false}
+          value={proxyUrl}
+          onChange={(event) => setProxyUrl(event.target.value)}
+          placeholder="socks5://proxy:1080"
+          aria-describedby="servidor-proxy-ajuda"
+        />
+      </Field>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field id="servidor-proxy-usuario" label="Usuário do proxy" help="Em branco, sem autenticação.">
+          <Input
+            id="servidor-proxy-usuario"
+            spellCheck={false}
+            autoComplete="off"
+            value={proxyUser}
+            onChange={(event) => setProxyUser(event.target.value)}
+            aria-describedby="servidor-proxy-usuario-ajuda"
+          />
+        </Field>
+        <Field id="servidor-proxy-senha" label="Senha do proxy" help="Em branco mantém a guardada.">
+          <SecretInput
+            id="servidor-proxy-senha"
+            defined={data.proxy_password.definida}
+            value={proxyPassword}
+            onChange={setProxyPassword}
+            describedBy="servidor-proxy-senha-ajuda"
+          />
+        </Field>
+      </div>
       <Field id="servidor-timeout" label="Timeout HTTP (segundos)" help="De cada chamada a tracker, cliente e gerenciador.">
         <Input
           id="servidor-timeout"
@@ -579,6 +687,7 @@ function LibraryForm({ data, save, saving }: FormProps<'biblioteca'>) {
   const [roots, setRoots] = useState(data.roots.join('\n'))
   const [folders, setFolders] = useState(data.root_folders.join('\n'))
   const [category, setCategory] = useState(data.category)
+  const [manualCategory, setManualCategory] = useState(data.categoria_manual)
   const [paths, setPaths] = useState(Object.entries(data.paths))
   return (
     <form
@@ -590,6 +699,7 @@ function LibraryForm({ data, save, saving }: FormProps<'biblioteca'>) {
           roots: lines(roots),
           root_folders: lines(folders),
           category: category.trim(),
+          categoria_manual: manualCategory.trim(),
           paths: Object.fromEntries(
             paths.map(([from, to]) => [from.trim(), to.trim()]).filter(([from, to]) => from && to),
           ),
@@ -633,6 +743,20 @@ function LibraryForm({ data, save, saving }: FormProps<'biblioteca'>) {
           value={category}
           onChange={(event) => setCategory(event.target.value)}
           aria-describedby="biblioteca-categoria-ajuda"
+          className="max-w-60"
+        />
+      </Field>
+      <Field
+        id="biblioteca-categoria-manual"
+        label="Categoria da busca manual"
+        help="Para o que você manda ao cliente pela tela Busca. Fica fora das categorias gerenciadas da limpeza: ela nunca apaga esses torrents, e nenhum grab do acervo os adota."
+      >
+        <Input
+          id="biblioteca-categoria-manual"
+          spellCheck={false}
+          value={manualCategory}
+          onChange={(event) => setManualCategory(event.target.value)}
+          aria-describedby="biblioteca-categoria-manual-ajuda"
           className="max-w-60"
         />
       </Field>

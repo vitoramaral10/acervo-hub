@@ -1042,6 +1042,9 @@ async fn search(
                 "publicado": timestamp(release.published),
                 "detalhes": release.info_url.as_ref().map(url::Url::as_str),
                 "download": download_link(&server, release),
+                // O link do indexador, para mandar ao cliente por
+                // `/ui/api/busca/enviar`.
+                "link": release.download_url.as_str(),
             })
         })
         .collect();
@@ -1069,11 +1072,19 @@ async fn download(
     guard(&server, &headers, &Method::GET).await?;
     let link = url::Url::parse(&params.link)
         .map_err(|_| UiError(StatusCode::BAD_REQUEST, "link inválido".into()))?;
-    let torrent = server
+    let torrent = match server
         .catalog
-        .download(&params.indexador, &link)
+        .resolve_download(&params.indexador, &link)
         .await
-        .map_err(|error| UiError(StatusCode::BAD_GATEWAY, error.to_string()))?;
+        .map_err(|error| UiError(StatusCode::BAD_GATEWAY, error.to_string()))?
+    {
+        acervo_indexers::ResolvedDownload::Torrent(bytes) => bytes,
+        acervo_indexers::ResolvedDownload::Magnet(magnet) => {
+            let mut response = crate::magnet_redirect(&magnet);
+            secure_headers(response.headers_mut());
+            return Ok(response);
+        }
+    };
     // Nome de arquivo só com caracteres seguros: vem do título do tracker.
     let base: String = params
         .nome

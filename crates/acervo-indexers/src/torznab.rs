@@ -22,6 +22,7 @@ pub struct TorznabClient {
     api_key: Option<String>,
     http: reqwest::Client,
     budget: Arc<RateBudget>,
+    timeout: Duration,
 }
 
 impl std::fmt::Debug for TorznabClient {
@@ -73,7 +74,22 @@ impl TorznabClient {
             api_key,
             http,
             budget: Arc::new(RateBudget::new(request_interval)),
+            timeout,
         })
+    }
+
+    /// O mesmo cliente saindo pelo proxy dado.
+    ///
+    /// # Errors
+    ///
+    /// Proxy que o cliente HTTP não aceita.
+    pub fn with_proxy(mut self, proxy: Option<&crate::Proxy>) -> Result<Self, IndexerError> {
+        let mut builder = reqwest::Client::builder().timeout(self.timeout);
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(proxy.reqwest()?);
+        }
+        self.http = builder.build().map_err(IndexerError::Build)?;
+        Ok(self)
     }
 
     #[must_use]

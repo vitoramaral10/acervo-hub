@@ -22,7 +22,7 @@ pub async fn run(
     indexer: Option<&str>,
     categories: &[u32],
 ) -> Result<usize> {
-    let catalog = Catalog::new(crate::serve::entries(config, &store.indexers().await?).await)?;
+    let catalog = Catalog::new(crate::serve::stored_entries(config, store).await?)?;
     let query = SearchQuery::general(term).with_categories(categories.iter().copied());
     let page = catalog
         .search(indexer.unwrap_or(ALL), &query)

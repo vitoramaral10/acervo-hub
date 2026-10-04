@@ -7,6 +7,7 @@
 mod aggregate;
 mod cardigann;
 mod model;
+mod network;
 mod rate;
 mod torznab;
 
@@ -18,5 +19,6 @@ pub use model::{
     Capabilities, Category, IndexerError, Release, ResolvedDownload, SearchMode, SearchQuery,
     SearchSupport,
 };
+pub use network::{Challenge, FlareSolverr, Network, Proxy};
 pub use rate::RateBudget;
 pub use torznab::TorznabClient;

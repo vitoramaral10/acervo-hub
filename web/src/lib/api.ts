@@ -84,6 +84,37 @@ export interface Release {
   publicado: string | null
   detalhes: string | null
   download: string
+  /** O link do indexador, para mandar ao cliente pela busca. */
+  link: string
+}
+
+/** Um dia da série de um indexador. */
+export interface IndexerStatsDay {
+  dia: string
+  consultas: number
+  falhas: number
+  grabs: number
+}
+
+/** Os números de um indexador na janela pedida. */
+export interface IndexerStats {
+  nome: string
+  consultas: number
+  falhas: number
+  /** Respostas 429. */
+  limitadas: number
+  grabs: number
+  /** De 0 a 1. */
+  taxa_falha: number
+  tempo_medio_ms: number | null
+  serie: IndexerStatsDay[]
+}
+
+export interface SentToClient {
+  ok: boolean
+  hash: string
+  categoria: string
+  magnet: boolean
 }
 
 export interface SearchResponse {
@@ -260,9 +291,18 @@ export interface ServerSection {
   api_key: Secret
   public_url: string | null
   catalogos: string[]
+  /** O catálogo antigo: vale abaixo das definições baixadas do repositório. */
+  catalogos_reserva: string[]
+  /** O `.tar.gz` do repositório de definições. */
+  definicoes_url: string
   http_timeout_seconds: number
   /** Base do XEM, de onde vem a numeração de cena. */
   xem_url: string
+  flaresolverr_url: string | null
+  flaresolverr_timeout_s: number
+  proxy_url: string | null
+  proxy_username: string
+  proxy_password: Secret
 }
 
 export interface DownloadClientSection {
@@ -288,6 +328,8 @@ export interface LibrarySection {
   roots: string[]
   root_folders: string[]
   category: string
+  /** Categoria do que a busca manual manda ao cliente; fora da limpeza. */
+  categoria_manual: string
   paths: Record<string, string>
 }
 
@@ -373,6 +415,10 @@ export const api = {
   section: <N extends SectionName>(name: N) => request<Sections[N]>('GET', `/ui/api/configuracoes/${name}`),
   saveSection: <N extends SectionName>(name: N, value: SectionInput<N>) =>
     request<Sections[N]>('PUT', `/ui/api/configuracoes/${name}`, value),
+  indexerStats: (dias: number) =>
+    request<{ dias: number; indexadores: IndexerStats[] }>('GET', `/ui/api/indexadores/estatisticas?dias=${dias}`),
+  sendToClient: (indexador: string, link: string) =>
+    request<SentToClient>('POST', '/ui/api/busca/enviar', { indexador, link }),
   search: (params: { q: string; indexador: string; cat: string }) => {
     const query = new URLSearchParams()
     query.set('q', params.q)

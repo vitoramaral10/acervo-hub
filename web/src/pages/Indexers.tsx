@@ -30,7 +30,8 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Badge, Skeleton, Switch, Tooltip } from '@/components/ui/misc'
-import { type Indexer, api } from '@/lib/api'
+import { StatsSparkline } from '@/components/StatsSparkline'
+import { type Indexer, type IndexerStats, api } from '@/lib/api'
 import { formatAgo, formatClock, formatCount } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
@@ -54,6 +55,13 @@ export function IndexersPage() {
   const indexers = useQuery({ queryKey: ['indexadores'], queryFn: api.indexers, refetchInterval: 30_000 })
   const [editing, setEditing] = useState<string | null>(null)
   const [adding, setAdding] = useState(false)
+  const [days, setDays] = useState<7 | 30>(7)
+  const stats = useQuery({
+    queryKey: ['estatisticas', days],
+    queryFn: () => api.indexerStats(days),
+    refetchInterval: 60_000,
+  })
+  const statsByName = new Map((stats.data?.indexadores ?? []).map((item) => [item.nome, item]))
   const list = indexers.data?.indexadores ?? []
   const failing = list.filter((indexer) => statusOf(indexer) === 'failing').length
   const working = list.filter((indexer) => statusOf(indexer) === 'ok').length
@@ -63,7 +71,7 @@ export function IndexersPage() {
     <>
       <PageHeader
         title="Indexadores"
-        description="Estado desde que o serviço subiu. Cada busca — do Sonarr ou daqui — atualiza esta tela."
+        description="Saúde desde que o serviço subiu; consultas, falhas e grabs por dia ficam guardados. Cada busca — do Sonarr ou daqui — atualiza esta tela."
         action={
           <div className="flex gap-2">
             <Button onClick={() => void indexers.refetch()} loading={indexers.isFetching && !indexers.isPending}>
@@ -100,15 +108,39 @@ export function IndexersPage() {
         </div>
       ) : (
         <>
-          <dl className="mb-6 grid grid-cols-3 gap-3 sm:max-w-lg">
-            <Stat label="Ativos" value={active} />
-            <Stat label="Funcionando" value={working} tone={working > 0 ? 'success' : undefined} />
-            <Stat label="Com falha" value={failing} tone={failing > 0 ? 'danger' : undefined} />
-          </dl>
+          <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
+            <dl className="grid grid-cols-3 gap-3 sm:w-lg">
+              <Stat label="Ativos" value={active} />
+              <Stat label="Funcionando" value={working} tone={working > 0 ? 'success' : undefined} />
+              <Stat label="Com falha" value={failing} tone={failing > 0 ? 'danger' : undefined} />
+            </dl>
+            <div role="group" aria-label="Período da estatística" className="inline-flex rounded-md border border-border bg-surface p-0.5">
+              {([7, 30] as const).map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  aria-pressed={days === option}
+                  onClick={() => setDays(option)}
+                  className={cn(
+                    'rounded-sm px-3 py-1 text-sm transition-colors focus-visible:outline-2 focus-visible:outline-ring',
+                    days === option ? 'bg-accent-soft font-medium text-accent-soft-fg' : 'text-content-muted hover:text-content',
+                  )}
+                >
+                  {option} dias
+                </button>
+              ))}
+            </div>
+          </div>
           <ul className="grid gap-4 lg:grid-cols-2">
             {list.map((indexer) => (
               <li key={indexer.nome}>
-                <IndexerCard indexer={indexer} onEdit={() => setEditing(indexer.nome)} />
+                <IndexerCard
+                  indexer={indexer}
+                  stats={statsByName.get(indexer.nome)}
+                  statsLoading={stats.isPending}
+                  days={days}
+                  onEdit={() => setEditing(indexer.nome)}
+                />
               </li>
             ))}
           </ul>
@@ -138,7 +170,76 @@ function Stat({ label, value, tone }: { label: string; value: number; tone?: 'su
   )
 }
 
-function IndexerCard({ indexer, onEdit }: { indexer: Indexer; onEdit: () => void }) {
+/** Os números do período e o gráfico por dia. */
+function StatsBlock({
+  name,
+  stats,
+  loading,
+  days,
+}: {
+  name: string
+  stats: IndexerStats | undefined
+  loading: boolean
+  days: number
+}) {
+  if (loading) return <Skeleton className="h-[104px] rounded-md" />
+  if (!stats || (stats.consultas === 0 && stats.grabs === 0)) {
+    return (
+      <p className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-content-subtle">
+        Nenhuma consulta nos últimos {days} dias.
+      </p>
+    )
+  }
+  const rate = Math.round(stats.taxa_falha * 100)
+  return (
+    <section aria-label={`Estatística de ${name} nos últimos ${days} dias`} className="grid gap-3 rounded-md bg-bg px-3 py-3">
+      <dl className="grid grid-cols-4 gap-3 text-sm">
+        <div>
+          <dt className="text-xs text-content-subtle">Consultas</dt>
+          <dd className="mt-0.5 font-medium tabular-nums">{formatCount(stats.consultas)}</dd>
+        </div>
+        <div>
+          <dt className="text-xs text-content-subtle">Falhas</dt>
+          <dd className={cn('mt-0.5 font-medium tabular-nums', rate >= 20 && 'text-danger')}>
+            {rate}%
+            {stats.limitadas > 0 && (
+              <span className="ml-1 text-xs font-normal text-content-subtle">({formatCount(stats.limitadas)}× 429)</span>
+            )}
+          </dd>
+        </div>
+        <div>
+          <dt className="text-xs text-content-subtle">Tempo médio</dt>
+          <dd className="mt-0.5 font-medium tabular-nums">
+            {stats.tempo_medio_ms == null
+              ? '—'
+              : stats.tempo_medio_ms >= 1000
+                ? `${(stats.tempo_medio_ms / 1000).toFixed(1)} s`
+                : `${stats.tempo_medio_ms} ms`}
+          </dd>
+        </div>
+        <div>
+          <dt className="text-xs text-content-subtle">Grabs</dt>
+          <dd className="mt-0.5 font-medium tabular-nums">{formatCount(stats.grabs)}</dd>
+        </div>
+      </dl>
+      <StatsSparkline series={stats.serie} label={name} />
+    </section>
+  )
+}
+
+function IndexerCard({
+  indexer,
+  stats,
+  statsLoading,
+  days,
+  onEdit,
+}: {
+  indexer: Indexer
+  stats: IndexerStats | undefined
+  statsLoading: boolean
+  days: number
+  onEdit: () => void
+}) {
   const queryClient = useQueryClient()
   const status = STATUS[statusOf(indexer)]
   const test = useMutation({
@@ -262,6 +363,8 @@ function IndexerCard({ indexer, onEdit }: { indexer: Indexer; onEdit: () => void
         </div>
       </dl>
       )}
+
+      <StatsBlock name={indexer.nome} stats={stats} loading={statsLoading} days={days} />
 
       {health.falhas_seguidas > 0 && health.ultimo_erro && (
         <p className="rounded-md bg-danger-bg px-3 py-2 text-sm text-danger">
