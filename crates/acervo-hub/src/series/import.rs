@@ -211,7 +211,8 @@ impl Importer<'_> {
             // grab), senão a nova busca devolveria o mesmo hash, ainda em
             // `missingFiles`. Sem bloqueio: a culpa não é do release.
             if matches!(failure, Failure::Lost(_)) {
-                self.drop_torrent(grab, &torrent, "arquivos sumidos").await?;
+                self.drop_torrent(grab, &torrent, "arquivos sumidos")
+                    .await?;
             }
             return Err(failure);
         }
