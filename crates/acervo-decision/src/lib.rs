@@ -19,8 +19,8 @@ mod rank;
 mod specs;
 
 pub use episodes::{
-    BlockedEpisode, EpisodeDecision, EpisodeEngine, EpisodeState, EpisodeTarget, Scope,
-    SeriesTarget, pick,
+    BlockedEpisode, EpisodeDecision, EpisodeEngine, EpisodeState, EpisodeTarget, SceneMapping,
+    Scope, SeriesTarget, catalog_to_scene, pick, pick_prefer_pack, scene_to_catalog,
 };
 pub use rank::compare;
 

@@ -244,6 +244,9 @@ pub struct SeriesEdit {
     /// apagados e assistidos não voltam.
     #[serde(default, rename = "buscar")]
     pub monitor: Option<Monitor>,
+    /// Passa na frente na fila e na busca.
+    #[serde(default, rename = "prioritario")]
+    pub priority: Option<bool>,
 }
 
 /// Muda uma série.
@@ -262,6 +265,11 @@ pub async fn edit(store: &Store, id: i64, change: &SeriesEdit) -> Result<()> {
     }
     if series != entry.series {
         store.update_series(id, &series).await?;
+    }
+    if let Some(priority) = change.priority
+        && priority != entry.priority
+    {
+        store.set_series_priority(id, priority).await?;
     }
     if let Some(monitor) = change.monitor {
         let episodes: Vec<(i64, &Episode)> =

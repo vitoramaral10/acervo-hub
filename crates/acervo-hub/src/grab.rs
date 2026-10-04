@@ -104,6 +104,38 @@ fn pick_starts(
     picked
 }
 
+/// [`pick_starts`] com os prioritários antes: eles escolhem primeiro, e o
+/// resto escolhe com o que sobrou de espaço e de vaga. Dentro de cada grupo,
+/// a regra é a mesma: menor primeiro, pulando quem não cabe.
+fn pick_starts_prioritized(
+    candidates: &[(String, u64)],
+    priority: &HashSet<String>,
+    active_left: &[u64],
+    free: u64,
+    reserve: u64,
+    limit: usize,
+) -> Vec<String> {
+    let group = |wanted: bool| -> Vec<(String, u64)> {
+        candidates
+            .iter()
+            .filter(|(hash, _)| priority.contains(hash) == wanted)
+            .cloned()
+            .collect()
+    };
+    let (first, rest) = (group(true), group(false));
+    let mut picked = pick_starts(&first, active_left, free, reserve, limit);
+    // O que saiu agora passa a contar como ativo: desconta espaço e vaga.
+    let mut busy = active_left.to_vec();
+    busy.extend(
+        first
+            .iter()
+            .filter(|(hash, _)| picked.contains(hash))
+            .map(|(_, need)| *need),
+    );
+    picked.extend(pick_starts(&rest, &busy, free, reserve, limit));
+    picked
+}
+
 /// Inicia os torrents da fila que cabem no disco, do menor para o maior,
 /// pulando quem não cabe, sem passar do limite de downloads simultâneos das
 /// regras (disco mecânico não aguenta dezenas de escritas aleatórias). O
@@ -144,6 +176,17 @@ pub(crate) async fn start_queued(store: &Store, client: &QbitClient) -> Result<V
         }
     };
     let torrents = client.torrents().await?;
+    let priority = store.priority_hashes().await?;
+    // Prioritário que o próprio cliente segura na fila dele (limite de
+    // downloads ativos do qBittorrent) sobe para o topo dela.
+    let held: Vec<&str> = torrents
+        .iter()
+        .filter(|t| t.state == "queuedDL" && priority.contains(&t.hash))
+        .map(|t| t.hash.as_str())
+        .collect();
+    if let Err(error) = client.top_priority(&held).await {
+        tracing::warn!("topo da fila do cliente: {error}");
+    }
     // Só os do acervo: grab em andamento, filme ou série. Sem `amount_left`
     // (cliente antigo), cai na conta pelo tamanho.
     let active_left: Vec<u64> = torrents
@@ -185,12 +228,17 @@ pub(crate) async fn start_queued(store: &Store, client: &QbitClient) -> Result<V
         queue.push((torrent.hash.clone(), need));
     }
     let mut started = Vec::new();
-    for hash in pick_starts(&queue, &active_left, free, reserve, limit) {
+    for hash in pick_starts_prioritized(&queue, &priority, &active_left, free, reserve, limit) {
         let Some(torrent) = torrents.iter().find(|t| t.hash == hash) else {
             continue;
         };
         client.start(&[&hash]).await?;
         client.remove_tag(&[&hash], QUEUE_TAG).await?;
+        if priority.contains(&hash)
+            && let Err(error) = client.top_priority(&[&hash]).await
+        {
+            tracing::warn!(torrent = %torrent.name, "topo da fila do cliente: {error}");
+        }
         tracing::info!(torrent = %torrent.name, "iniciado da fila");
         started.push(torrent.name.clone());
     }
@@ -495,6 +543,74 @@ pub struct ImportLine {
     pub destino: Option<String>,
 }
 
+/// O que a importação de um filme ligou: o destino como o cliente vê, o
+/// caminho relativo, o tamanho, o caminho no host e as legendas.
+struct Imported {
+    shown: String,
+    relative: String,
+    size: u64,
+    host: PathBuf,
+    subtitles: Vec<acervo_store::Subtitle>,
+}
+
+/// Liga as legendas do torrent ao lado do vídeo do filme, com o nome dele.
+/// Falha numa legenda vira aviso: ela não segura a importação.
+async fn link_movie_subtitles(
+    map: &acervo_fs::PathMap,
+    torrent: &acervo_clients::TorrentInfo,
+    files: &[acervo_clients::TorrentFile],
+    folder: &str,
+    video: &str,
+    known: &[acervo_store::CatalogSubtitle],
+) -> Vec<acervo_store::Subtitle> {
+    let found: Vec<&acervo_clients::TorrentFile> = files
+        .iter()
+        .filter(|f| {
+            crate::subtitles::subtitle_extension(&f.name).is_some()
+                && !crate::series::grab::is_sample_or_extra(&f.name)
+        })
+        .collect();
+    let (dir, stem) = crate::series::import::split_video(video);
+    let originals: Vec<&str> = found.iter().map(|f| f.name.as_str()).collect();
+    let named = crate::subtitles::names(stem, &originals, &HashSet::new());
+    let mut linked = Vec::new();
+    for (file, named) in found.into_iter().zip(named) {
+        let relative = format!("{dir}{}", named.name);
+        // O que está no destino hoje, se o catálogo o conhece.
+        let origin = known
+            .iter()
+            .find(|s| s.subtitle.relative_path == relative)
+            .map(|s| s.subtitle.origin);
+        let done = match (
+            map.to_host(&client_path(torrent, file)),
+            map.to_host(&PathBuf::from(folder).join(&relative)),
+        ) {
+            (Ok(source), Ok(target)) => tokio::task::spawn_blocking(move || {
+                crate::subtitles::place(&source, &target, origin)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r),
+            (Err(error), _) | (_, Err(error)) => Err(error.into()),
+        };
+        match done {
+            Ok(true) => linked.push(acervo_store::Subtitle {
+                relative_path: relative,
+                language: named.language.map(str::to_owned),
+                forced: named.forced,
+                origin: acervo_store::SubtitleOrigin::Import,
+            }),
+            Ok(false) => tracing::warn!(
+                legenda = file.name,
+                destino = relative,
+                "legenda posta à mão no lugar: a do torrent não entra"
+            ),
+            Err(error) => tracing::warn!(legenda = file.name, "legenda não importada: {error:#}"),
+        }
+    }
+    linked
+}
+
 /// O arquivo principal do torrent: o maior vídeo que não é amostra.
 pub(crate) fn main_video(
     files: &[acervo_clients::TorrentFile],
@@ -636,10 +752,11 @@ pub(crate) fn stalled(torrent: &acervo_clients::TorrentInfo, now: time::OffsetDa
         && quiet
 }
 
-/// O bloqueio ainda vale? O de "sem seeds" expira em 7 dias; qualquer outro
-/// é para sempre. A linha fica, para a tela de bloqueados.
+/// O bloqueio ainda vale? O de "sem seeds" e o de torrent desregistrado
+/// expiram em 7 dias; qualquer outro é para sempre. A linha fica, para a
+/// tela de bloqueados.
 pub(crate) fn still_blocks(blocked: &acervo_store::Blocked, now: time::OffsetDateTime) -> bool {
-    if blocked.message.as_deref() != Some(NO_SEEDS) {
+    if !matches!(blocked.message.as_deref(), Some(NO_SEEDS | UNREGISTERED)) {
         return true;
     }
     // Data ilegível: na dúvida, bloqueia.
@@ -649,7 +766,125 @@ pub(crate) fn still_blocks(blocked: &acervo_store::Blocked, now: time::OffsetDat
     }
 }
 
-/// Por que um download não importou.
+/// A mensagem da falha de torrent que o tracker não reconhece mais (o
+/// avulso apagado quando sai o pacote). Marca a expiração do bloqueio, como
+/// a de [`NO_SEEDS`]: não mude sem migrar as linhas que já a guardam.
+pub(crate) const UNREGISTERED: &str = "o tracker não reconhece mais o torrent";
+
+/// As frases com que os trackers dizem que o torrent deixou de existir
+/// neles, comparadas sem caixa. Frase inteira: "not registered" sozinho
+/// aparece em mensagem de usuário, não de torrent.
+const UNREGISTERED_PHRASES: &[&str] = &[
+    "unregistered torrent",
+    "torrent not registered",
+    "torrent not found",
+    "torrent não registrado",
+    "torrent nao registrado",
+];
+
+/// Todo tracker de verdade (não DHT, `PeX` nem LSD) não funciona (estado 4)
+/// e algum deles diz, com uma das frases, que não conhece o torrent. Sem
+/// tracker de verdade, não.
+pub(crate) fn unregistered(trackers: &[acervo_clients::Tracker]) -> bool {
+    let real: Vec<&acervo_clients::Tracker> = trackers.iter().filter(|t| t.is_real()).collect();
+    !real.is_empty()
+        && real.iter().all(|t| t.status == 4)
+        && real.iter().any(|t| {
+            let msg = t.msg.to_lowercase();
+            UNREGISTERED_PHRASES.iter().any(|p| msg.contains(p))
+        })
+}
+
+/// Os hashes que os trackers deram por desregistrados na volta anterior.
+/// Só a segunda volta seguida conta: uma resposta ruim do tracker não
+/// derruba o download.
+#[derive(Debug, Default)]
+pub(crate) struct Suspects(HashSet<String>);
+
+impl Suspects {
+    /// Registra o que se viu agora. `true` se é a segunda volta seguida; sem
+    /// a condição, o hash é esquecido.
+    pub fn observe(&mut self, hash: &str, now: bool) -> bool {
+        if now {
+            !self.0.insert(hash.to_owned())
+        } else {
+            self.0.remove(hash);
+            false
+        }
+    }
+}
+
+static SUSPECTS: std::sync::LazyLock<std::sync::Mutex<Suspects>> =
+    std::sync::LazyLock::new(std::sync::Mutex::default);
+
+/// O torrent perdeu o registro no tracker: ativo, incompleto, sem seed
+/// conectado, ativo há 30 min, e [`unregistered`] em duas voltas seguidas.
+/// Só consulta os trackers de quem passa pelo resto. Sem `record` (a volta
+/// que só mostra), não conta a volta. Erro na consulta é "não sei": `false`,
+/// sem mudar o que se lembra.
+pub(crate) async fn gone_from_tracker(
+    client: &QbitClient,
+    torrent: &acervo_clients::TorrentInfo,
+    record: bool,
+) -> bool {
+    let candidate = is_active(torrent)
+        && torrent.num_seeds == 0
+        && torrent.time_active >= STALL.whole_seconds();
+    let now = if candidate {
+        match client.trackers(&torrent.hash).await {
+            Ok(trackers) => unregistered(&trackers),
+            Err(error) => {
+                tracing::warn!(torrent = %torrent.name, "trackers ilegíveis: {error}");
+                return false;
+            }
+        }
+    } else {
+        false
+    };
+    let mut suspects = SUSPECTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if record {
+        suspects.observe(&torrent.hash, now)
+    } else {
+        now && suspects.0.contains(&torrent.hash)
+    }
+}
+
+/// Nenhum arquivo do torrent tem outro link (biblioteca de alguém, outro
+/// seed): só assim ele pode sair do cliente. Leitura duvidosa (`None`) é
+/// "não".
+pub(crate) fn no_other_link(files: Option<&[crate::series::remove::OnDisk]>) -> bool {
+    files.is_some_and(|files| files.iter().all(|f| f.nlink <= 1))
+}
+
+/// [`no_other_link`], lendo os arquivos do torrent no cliente e no disco.
+async fn only_link(
+    config: &Config,
+    client: &QbitClient,
+    torrent: &acervo_clients::TorrentInfo,
+) -> bool {
+    let Ok(files) = client
+        .files(&acervo_core::DownloadHash::new(torrent.hash.clone()))
+        .await
+    else {
+        return false;
+    };
+    let map = config.path_map();
+    let Some(paths) = files
+        .iter()
+        .map(|file| map.to_host(&client_path(torrent, file)).ok())
+        .collect::<Option<Vec<PathBuf>>>()
+    else {
+        return false;
+    };
+    let found = tokio::task::spawn_blocking(move || crate::series::remove::stat_all(&paths))
+        .await
+        .ok()
+        .flatten();
+    no_other_link(found.as_deref())
+}
+
 /// Por quanto tempo um torrent recém-mandado pode ainda não aparecer no
 /// cliente: o qBittorrent 5 responde ao `add` antes de listá-lo, e a nova
 /// busca roda dentro da mesma volta da importação que o procura.
@@ -855,7 +1090,7 @@ pub async fn import_downloads(
             detalhe: None,
             destino: None,
         };
-        let outcome: Result<Option<(String, String, u64, PathBuf)>, Failure> = async {
+        let outcome: Result<Option<Imported>, Failure> = async {
             let torrent = client
                 .torrent(&grab.hash)
                 .await
@@ -888,6 +1123,30 @@ pub async fn import_downloads(
                     "o cliente marcou o torrent com `{}`",
                     torrent.state
                 )));
+            }
+            if gone_from_tracker(&client, &torrent, apply).await {
+                tracing::info!(
+                    filme = line.filme,
+                    release = grab.title,
+                    "o tracker não reconhece mais o torrent"
+                );
+                // Como o sem seeds: bloqueio e nova busca vêm do
+                // `Failure::Download`; o torrent morto sai do cliente, se
+                // nenhum arquivo dele tem outro link.
+                if apply {
+                    if only_link(config, &client, &torrent).await {
+                        client
+                            .delete(&[acervo_core::DownloadHash::new(grab.hash.clone())], true)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    } else {
+                        tracing::warn!(
+                            release = grab.title,
+                            "torrent desregistrado com arquivo ligado em outro lugar: fica no cliente"
+                        );
+                    }
+                }
+                return Err(Failure::Download(UNREGISTERED.into()));
             }
             if stalled(&torrent, time::OffsetDateTime::now_utc()) {
                 tracing::info!(
@@ -948,7 +1207,13 @@ pub async fn import_downloads(
             let destination_host = map.to_host(&destination).map_err(|e| e.to_string())?;
             let shown = destination.display().to_string();
             if !apply {
-                return Ok(Some((shown, relative, size, destination_host)));
+                return Ok(Some(Imported {
+                    shown,
+                    relative,
+                    size,
+                    host: destination_host,
+                    subtitles: Vec::new(),
+                }));
             }
             let installed = destination_host.clone();
             tokio::task::spawn_blocking(move || {
@@ -957,7 +1222,23 @@ pub async fn import_downloads(
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| format!("{e:#}"))?;
-            Ok(Some((shown, relative, size, destination_host)))
+            let subtitles =
+                link_movie_subtitles(
+                    &map,
+                    &torrent,
+                    &files,
+                    &movie.path,
+                    &relative,
+                    &entry.subtitles,
+                )
+                .await;
+            Ok(Some(Imported {
+                shown,
+                relative,
+                size,
+                host: destination_host,
+                subtitles,
+            }))
         }
         .await;
 
@@ -976,15 +1257,58 @@ pub async fn import_downloads(
                         .await?;
                 }
             }
-            Ok(Some((destination, _, _, _))) if !apply => {
+            Ok(Some(imported)) if !apply => {
                 line.estado = "importaria";
-                line.destino = Some(destination);
+                line.destino = Some(imported.shown);
             }
-            Ok(Some((destination, relative, size, host))) => {
+            Ok(Some(Imported {
+                shown: destination,
+                relative,
+                size,
+                host,
+                subtitles,
+            })) => {
                 let probe = crate::mediainfo::probe(&host).await;
                 store
                     .set_movie_file(entry.id, Some(&imported_file(&grab, relative, size, probe)))
                     .await?;
+                // As legendas antigas que não viraram as de agora: a do
+                // torrent sai do disco; a posta à mão fica, e continua no
+                // catálogo (como do disco). As novas entram no catálogo.
+                let mut kept = Vec::new();
+                for old in &entry.subtitles {
+                    let path = &old.subtitle.relative_path;
+                    if subtitles.iter().any(|s| &s.relative_path == path) {
+                        continue;
+                    }
+                    let Ok(host) = map.to_host(&PathBuf::from(&movie.path).join(path)) else {
+                        continue;
+                    };
+                    let origin = Some(old.subtitle.origin);
+                    let gone = tokio::task::spawn_blocking(move || {
+                        crate::subtitles::remove_if_from_torrent(&host, origin)
+                    })
+                    .await;
+                    match gone {
+                        Ok(Ok(true)) => {}
+                        Ok(Ok(false)) => kept.push(acervo_store::Subtitle {
+                            origin: acervo_store::SubtitleOrigin::Disk,
+                            ..old.subtitle.clone()
+                        }),
+                        Ok(Err(error)) => {
+                            tracing::warn!(legenda = path, "antiga não apagada: {error}");
+                        }
+                        Err(error) => tracing::warn!(legenda = path, "antiga não apagada: {error}"),
+                    }
+                }
+                for subtitle in subtitles.iter().chain(&kept) {
+                    if let Err(error) = store.add_movie_subtitle(entry.id, subtitle).await {
+                        tracing::warn!(
+                            legenda = subtitle.relative_path,
+                            "legenda fora do catálogo: {error}"
+                        );
+                    }
+                }
                 store
                     .update_grab(grab.id, GrabState::Imported, None, Some(&destination), &at)
                     .await?;
@@ -1077,6 +1401,26 @@ mod tests {
         // Sem ativos, o orçamento é 90: o de 50 cabe e o de 70 não, depois dele.
         assert_eq!(pick_starts(&queue(&[50, 70]), &[], 100, 10, 10), ["h50"]);
         assert!(pick_starts(&queue(&[50]), &[60], 100, 10, 10).is_empty());
+    }
+
+    #[test]
+    fn prioritarios_escolhem_antes_e_o_resto_com_o_que_sobra() {
+        let priority = HashSet::from(["h40".to_owned(), "h95".to_owned()]);
+        // Orçamento 90: o prioritário de 40 primeiro (o de 95 não cabe), e
+        // dos outros, menor primeiro, com os 50 que sobram: 5 e 30.
+        let picked =
+            pick_starts_prioritized(&queue(&[80, 5, 40, 30, 95]), &priority, &[], 100, 10, 10);
+        assert_eq!(picked, ["h40", "h5", "h30"]);
+        // A vaga também: com uma só, é do prioritário, mesmo sendo maior.
+        let picked = pick_starts_prioritized(&queue(&[5, 40]), &priority, &[], 100, 10, 1);
+        assert_eq!(picked, ["h40"]);
+        // Sem prioritário, é a regra de sempre.
+        let picked =
+            pick_starts_prioritized(&queue(&[80, 5, 40, 30]), &HashSet::new(), &[], 100, 10, 10);
+        assert_eq!(
+            picked,
+            pick_starts(&queue(&[80, 5, 40, 30]), &[], 100, 10, 10)
+        );
     }
 
     #[test]
@@ -1173,6 +1517,99 @@ mod tests {
         let outra = blocked(Some("o torrent sumiu do cliente"));
         assert!(still_blocks(&outra, at("2027-10-01T00:00:00Z")));
         assert!(still_blocks(&blocked(None), at("2027-10-01T00:00:00Z")));
+    }
+
+    fn tracker(url: &str, status: i64, msg: &str) -> acervo_clients::Tracker {
+        serde_json::from_value(serde_json::json!({ "url": url, "status": status, "msg": msg }))
+            .unwrap()
+    }
+
+    #[test]
+    fn desregistrado_so_com_todos_os_trackers_reais_parados_e_a_frase() {
+        let dht = tracker("** [DHT] **", 0, "");
+        let real = |status, msg| tracker("https://tracker.example.invalid/a", status, msg);
+        for msg in [
+            "Unregistered torrent",
+            "Torrent not registered with this tracker",
+            "torrent not found",
+            "Torrent não registrado",
+            "TORRENT NAO REGISTRADO",
+        ] {
+            assert!(unregistered(&[dht.clone(), real(4, msg)]), "{msg}");
+        }
+        // Só "not registered", sem a frase inteira, não conta.
+        assert!(!unregistered(&[real(4, "user not registered")]));
+        assert!(!unregistered(&[real(4, "unregistered")]));
+        // Outro tracker de verdade ainda funcionando: não.
+        assert!(!unregistered(&[
+            real(4, "Unregistered torrent"),
+            tracker("https://outro.example.invalid/a", 2, ""),
+        ]));
+        // Todos parados, um com a frase e outro com outro motivo: sim.
+        assert!(unregistered(&[
+            real(4, "Unregistered torrent"),
+            tracker("https://outro.example.invalid/a", 4, "timed out"),
+        ]));
+        // Funcionando, ou falhando por outro motivo, não conta.
+        assert!(!unregistered(&[real(2, "unregistered torrent")]));
+        assert!(!unregistered(&[real(4, "timed out")]));
+        // DHT com a mensagem não é tracker; sem tracker de verdade, não.
+        assert!(!unregistered(&[tracker(
+            "** [DHT] **",
+            4,
+            "unregistered torrent"
+        )]));
+        assert!(!unregistered(&[]));
+    }
+
+    #[test]
+    fn desregistrado_so_na_segunda_volta_seguida() {
+        let mut suspects = Suspects::default();
+        assert!(!suspects.observe("h", true));
+        assert!(suspects.observe("h", true));
+        // A condição some: esquece, e recomeça do zero.
+        assert!(!suspects.observe("h", false));
+        assert!(!suspects.observe("h", true));
+        assert!(suspects.observe("h", true));
+        // Cada hash por si.
+        assert!(!suspects.observe("outro", true));
+    }
+
+    #[test]
+    fn bloqueio_de_desregistrado_expira_como_o_sem_seeds() {
+        let blocked = acervo_store::Blocked {
+            id: 1,
+            movie_id: Some(1),
+            series_id: None,
+            source_title: "Filme.2020.1080p".into(),
+            indexer: None,
+            quality: None,
+            size: None,
+            hash: None,
+            at: "2026-10-01T00:00:00Z".into(),
+            message: Some(UNREGISTERED.into()),
+        };
+        assert!(still_blocks(&blocked, at("2026-10-07T23:59:59Z")));
+        assert!(!still_blocks(&blocked, at("2026-10-08T00:00:00Z")));
+    }
+
+    #[test]
+    fn torrent_so_sai_sem_outro_link() {
+        use crate::series::remove::OnDisk;
+        let one = OnDisk {
+            dev: 1,
+            ino: 1,
+            nlink: 1,
+        };
+        let linked = OnDisk {
+            dev: 1,
+            ino: 2,
+            nlink: 2,
+        };
+        assert!(no_other_link(Some(&[one])));
+        assert!(no_other_link(Some(&[])));
+        assert!(!no_other_link(Some(&[one, linked])));
+        assert!(!no_other_link(None));
     }
 
     #[test]

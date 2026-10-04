@@ -551,3 +551,70 @@ async fn arquivos_trazem_indice_e_prioridade_e_a_prioridade_se_muda() {
     // Lista vazia não chama o cliente.
     cliente.set_file_priority(&hash, &[], 0).await.unwrap();
 }
+
+#[tokio::test]
+async fn topo_da_fila_manda_os_hashes_juntos_e_fila_desligada_nao_e_erro() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/topPrio"))
+        .and(header("referer", server.uri() + "/"))
+        .and(body_string_contains("hashes=aa%7Cbb"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    cliente.top_priority(&["aa", "bb"]).await.expect("no topo");
+    // Lista vazia não chama o cliente.
+    cliente.top_priority(&[]).await.unwrap();
+
+    let desligada = MockServer::start().await;
+    let cliente = sessao(&desligada).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/topPrio"))
+        .respond_with(
+            ResponseTemplate::new(409).set_body_string("Torrent queueing must be enabled"),
+        )
+        .mount(&desligada)
+        .await;
+    cliente
+        .top_priority(&["aa"])
+        .await
+        .expect("fila do cliente desligada não é erro");
+
+    let quebrado = MockServer::start().await;
+    let cliente = sessao(&quebrado).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/topPrio"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&quebrado)
+        .await;
+    assert!(cliente.top_priority(&["aa"]).await.is_err());
+}
+
+#[tokio::test]
+async fn trackers_trazem_estado_e_mensagem() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrents/trackers"))
+        .and(query_param("hash", "a1b2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"url": "** [DHT] **", "status": 0, "tier": "", "num_peers": 3,
+             "num_seeds": -1, "num_leeches": -1, "num_downloaded": -1, "msg": ""},
+            {"url": "** [PeX] **", "status": 0, "tier": "", "num_peers": 0,
+             "num_seeds": -1, "num_leeches": -1, "num_downloaded": -1, "msg": ""},
+            {"url": "https://tracker.example.invalid/announce", "status": 4, "tier": 0,
+             "num_peers": 0, "num_seeds": 0, "num_leeches": 0, "num_downloaded": 0,
+             "msg": "Unregistered torrent"},
+        ])))
+        .mount(&server)
+        .await;
+    let trackers = cliente.trackers("a1b2").await.unwrap();
+    assert_eq!(trackers.len(), 3);
+    assert!(!trackers[0].is_real());
+    assert!(!trackers[1].is_real());
+    assert!(trackers[2].is_real());
+    assert_eq!(trackers[2].status, 4);
+    assert_eq!(trackers[2].msg, "Unregistered torrent");
+}

@@ -170,16 +170,16 @@ async fn delete_file(
     file: &acervo_store::CatalogEpisodeFile,
     episode_ids: &[i64],
 ) -> Result<()> {
-    let path = PathBuf::from(&entry.series.path).join(&file.file.relative_path);
-    let host = config.path_map().to_host(&path)?;
+    let map = config.path_map();
+    // O vídeo e as legendas dele.
+    let hosts = std::iter::once(file.file.relative_path.clone())
+        .chain(super::subtitle_paths(entry, file.id))
+        .map(|relative| map.to_host(&PathBuf::from(&entry.series.path).join(relative)))
+        .collect::<Result<Vec<PathBuf>, _>>()?;
     store
         .set_skip(episode_ids, Some(Skip::Watched), &now_rfc3339())
         .await?;
-    tokio::task::spawn_blocking(move || match std::fs::remove_file(&host) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-        _ => Ok(()),
-    })
-    .await??;
+    tokio::task::spawn_blocking(move || super::remove_files(&hosts)).await??;
     store.delete_episode_file(file.id).await?;
     Ok(())
 }

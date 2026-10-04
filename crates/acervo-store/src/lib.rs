@@ -17,8 +17,8 @@ pub use accounts::SESSION_DAYS;
 pub use config::IndexerRecord;
 pub use manage::{Blocked, HistoryEvent, HistoryPage, NewHistory};
 pub use series::{
-    CatalogEpisode, CatalogEpisodeFile, CatalogSeries, Episode, EpisodeFile, EpisodeSync, Series,
-    SeriesGrab, SeriesPick, SeriesSearch, Skip, default_skip,
+    CatalogEpisode, CatalogEpisodeFile, CatalogSeries, Episode, EpisodeFile, EpisodeSync,
+    SceneMapping, Series, SeriesGrab, SeriesPick, SeriesSearch, Skip, default_skip,
 };
 pub use tasks::{NewTaskRun, TaskRun};
 
@@ -106,6 +106,59 @@ pub struct CatalogMovie {
     pub id: i64,
     pub movie: Movie,
     pub extras: MovieExtras,
+    /// Passa na frente na fila e na busca. Muda só por
+    /// [`Store::set_movie_priority`].
+    pub priority: bool,
+    /// As legendas ao lado do arquivo, com `owner` = id do filme.
+    pub subtitles: Vec<CatalogSubtitle>,
+}
+
+/// Uma legenda importada ao lado do vídeo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subtitle {
+    /// De onde veio: só a da importação é do torrent com certeza.
+    pub origin: SubtitleOrigin,
+    /// Relativo à pasta do filme ou da série, como o vídeo.
+    pub relative_path: String,
+    /// `pt-BR`, `pt`, `en`...; `None` se o nome não dizia.
+    pub language: Option<String>,
+    pub forced: bool,
+}
+
+/// De onde uma legenda veio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SubtitleOrigin {
+    /// Hardlink feito pela importação, de um arquivo do torrent.
+    #[serde(rename = "importacao")]
+    Import,
+    /// Achada no disco (verificar, renomear): pode ter sido posta à mão.
+    #[serde(rename = "disco")]
+    Disk,
+}
+
+impl SubtitleOrigin {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Import => "importacao",
+            Self::Disk => "disco",
+        }
+    }
+
+    pub(crate) fn parse(text: &str) -> Result<Self> {
+        match text {
+            "importacao" => Ok(Self::Import),
+            "disco" => Ok(Self::Disk),
+            other => Err(StoreError::Corrupt(format!("origem de legenda `{other}`"))),
+        }
+    }
+}
+
+/// Uma legenda do catálogo: `owner` é o filme ou o arquivo de episódio.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogSubtitle {
+    pub id: i64,
+    pub owner: i64,
+    pub subtitle: Subtitle,
 }
 
 /// Tamanhos por minuto de filme, em megabytes, de uma qualidade.
@@ -573,6 +626,62 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX series_searches_by_series ON series_searches(series_id, at);
 ",
+    // Prioridade: o filme ou a série que passa na frente na fila do acervo,
+    // na do cliente e na busca dos que faltam.
+    r"
+    ALTER TABLE movies ADD COLUMN priority BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE series ADD COLUMN priority BOOLEAN NOT NULL DEFAULT FALSE;
+",
+    // Numeração de cena (XEM): o par (temporada, episódio) com que o release
+    // sai, e o do catálogo. Só os pares que diferem; sem linha, é o mesmo.
+    r"
+    CREATE TABLE scene_mappings (
+        series_id BIGINT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+        scene_season INTEGER NOT NULL,
+        scene_episode INTEGER NOT NULL,
+        season INTEGER NOT NULL,
+        episode INTEGER NOT NULL,
+        PRIMARY KEY (series_id, scene_season, scene_episode)
+    );
+",
+    // Legendas importadas ao lado do vídeo: de um filme ou de um arquivo de
+    // episódio, nunca dos dois. Saem com o dono; o disco é com quem chama.
+    r"
+    CREATE TABLE subtitle_files (
+        id BIGSERIAL PRIMARY KEY,
+        movie_id BIGINT REFERENCES movies(id) ON DELETE CASCADE ON UPDATE CASCADE,
+        episode_file_id BIGINT REFERENCES episode_files(id) ON DELETE CASCADE,
+        relative_path TEXT NOT NULL,
+        language TEXT,
+        forced BOOLEAN NOT NULL DEFAULT FALSE,
+        CHECK ((movie_id IS NULL) <> (episode_file_id IS NULL)),
+        UNIQUE (movie_id, relative_path),
+        UNIQUE (episode_file_id, relative_path)
+    );
+    CREATE INDEX subtitle_files_by_episode_file ON subtitle_files(episode_file_id);
+",
+    // De onde a legenda veio: da importação (hardlink do torrent) ou do
+    // disco (posta à mão, achada pelo verificar ou pelo renomear). Só a da
+    // importação o upgrade apaga sem olhar os links.
+    r"
+    ALTER TABLE subtitle_files
+        ADD COLUMN origin TEXT NOT NULL DEFAULT 'importacao'
+            CHECK (origin IN ('importacao', 'disco'));
+",
+    // Numeração de cena 1:N: um par de cena pode ser mais de um episódio do
+    // catálogo (o duplo), então a chave leva o alvo. O mapa se refaz na
+    // próxima volta da tarefa `cena`.
+    r"
+    DROP TABLE scene_mappings;
+    CREATE TABLE scene_mappings (
+        series_id BIGINT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+        scene_season INTEGER NOT NULL,
+        scene_episode INTEGER NOT NULL,
+        season INTEGER NOT NULL,
+        episode INTEGER NOT NULL,
+        PRIMARY KEY (series_id, scene_season, scene_episode, season, episode)
+    );
+",
 ];
 
 /// Chave do lock consultivo que serializa as migrações: o serviço e um
@@ -813,11 +922,157 @@ impl Store {
         let tx = client.transaction().await?;
         tx.execute("DELETE FROM movie_files WHERE movie_id = $1", &[&movie_id])
             .await?;
+        tx.execute(
+            "DELETE FROM subtitle_files WHERE movie_id = $1",
+            &[&movie_id],
+        )
+        .await?;
         if let Some(file) = file {
             insert_file(&tx, movie_id, file).await?;
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Liga ou desliga a prioridade do filme. `false` se ele não existe.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn set_movie_priority(&self, id: i64, priority: bool) -> Result<bool> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .execute(
+                "UPDATE movies SET priority = $2 WHERE id = $1",
+                &[&id, &priority],
+            )
+            .await?
+            > 0)
+    }
+
+    /// Troca só o caminho do arquivo do filme (renomeado no disco). `false`
+    /// se o filme não tem arquivo.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn set_movie_file_path(&self, movie_id: i64, relative_path: &str) -> Result<bool> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .execute(
+                "UPDATE movie_files SET relative_path = $2 WHERE movie_id = $1",
+                &[&movie_id, &relative_path],
+            )
+            .await?
+            > 0)
+    }
+
+    /// Os hashes dos grabs em andamento (de filme ou de série) cuja obra é
+    /// prioritária.
+    ///
+    /// # Errors
+    ///
+    /// Falha de leitura.
+    pub async fn priority_hashes(&self) -> Result<std::collections::HashSet<String>> {
+        let client = self.pool.get().await?;
+        client
+            .query(
+                "SELECT g.hash FROM grabs g JOIN movies m ON m.id = g.movie_id
+                 WHERE g.state = 'downloading' AND m.priority
+                 UNION
+                 SELECT g.hash FROM series_grabs g JOIN series s ON s.id = g.series_id
+                 WHERE g.state = 'downloading' AND s.priority",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|row| Ok(row.try_get(0)?))
+            .collect()
+    }
+
+    /// Registra uma legenda ao lado do vídeo do filme; o mesmo caminho é
+    /// regravado no lugar. Devolve o id.
+    ///
+    /// # Errors
+    ///
+    /// Filme inexistente ou falha de escrita.
+    pub async fn add_movie_subtitle(&self, movie_id: i64, subtitle: &Subtitle) -> Result<i64> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .query_one(
+                "INSERT INTO subtitle_files (movie_id, relative_path, language, forced, origin)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (movie_id, relative_path) DO UPDATE SET
+                     language = EXCLUDED.language, forced = EXCLUDED.forced,
+                     origin = EXCLUDED.origin
+                 RETURNING id",
+                &[
+                    &movie_id,
+                    &subtitle.relative_path,
+                    &subtitle.language,
+                    &subtitle.forced,
+                    &subtitle.origin.as_str(),
+                ],
+            )
+            .await?
+            .try_get(0)?)
+    }
+
+    /// Registra uma legenda de um arquivo de episódio. Devolve o id.
+    ///
+    /// # Errors
+    ///
+    /// Arquivo inexistente ou falha de escrita.
+    pub async fn add_episode_subtitle(&self, file_id: i64, subtitle: &Subtitle) -> Result<i64> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .query_one(
+                "INSERT INTO subtitle_files (episode_file_id, relative_path, language, forced,
+                     origin)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (episode_file_id, relative_path) DO UPDATE SET
+                     language = EXCLUDED.language, forced = EXCLUDED.forced,
+                     origin = EXCLUDED.origin
+                 RETURNING id",
+                &[
+                    &file_id,
+                    &subtitle.relative_path,
+                    &subtitle.language,
+                    &subtitle.forced,
+                    &subtitle.origin.as_str(),
+                ],
+            )
+            .await?
+            .try_get(0)?)
+    }
+
+    /// Troca o caminho de uma legenda (renomeada no disco).
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita, ou caminho já usado pelo mesmo dono.
+    pub async fn set_subtitle_path(&self, id: i64, relative_path: &str) -> Result<bool> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .execute(
+                "UPDATE subtitle_files SET relative_path = $2 WHERE id = $1",
+                &[&id, &relative_path],
+            )
+            .await?
+            > 0)
+    }
+
+    /// Tira uma legenda do catálogo. O disco é com quem chama.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn delete_subtitle(&self, id: i64) -> Result<bool> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .execute("DELETE FROM subtitle_files WHERE id = $1", &[&id])
+            .await?
+            > 0)
     }
 
     /// Grava o que só a base de metadados sabe.
@@ -1173,7 +1428,7 @@ async fn read_movies(client: &impl GenericClient) -> Result<Vec<CatalogMovie>> {
                     m.year, m.status, m.monitored, m.path, m.added,
                     m.runtime, m.secondary_year, m.clean_title, m.available,
                     m.in_cinemas, m.digital_release, m.physical_release, m.overview,
-                    m.metadata_title, m.poster, m.fanart, m.metadata_refreshed_at,
+                    m.metadata_title, m.poster, m.fanart, m.metadata_refreshed_at, m.priority,
                     f.relative_path AS f_relative_path, f.size AS f_size,
                     f.quality AS f_quality, f.revision_version AS f_revision_version,
                     f.revision_real AS f_revision_real, f.is_repack AS f_is_repack,
@@ -1226,6 +1481,8 @@ async fn read_movies(client: &impl GenericClient) -> Result<Vec<CatalogMovie>> {
                 fanart: row.try_get("fanart")?,
                 refreshed_at: row.try_get("metadata_refreshed_at")?,
             },
+            priority: row.try_get("priority")?,
+            subtitles: Vec::new(),
         });
     }
     let titles = client
@@ -1237,7 +1494,38 @@ async fn read_movies(client: &impl GenericClient) -> Result<Vec<CatalogMovie>> {
             entry.movie.alternate_titles.push(title);
         }
     }
+    let subtitles = client
+        .query(
+            &format!(
+                "SELECT {SUBTITLE_COLUMNS}, movie_id FROM subtitle_files
+                 WHERE movie_id IS NOT NULL ORDER BY relative_path"
+            ),
+            &[],
+        )
+        .await?;
+    for row in &subtitles {
+        if let Some(entry) = movies.iter_mut().find(|m| m.id == row.get::<_, i64>(5)) {
+            entry.subtitles.push(subtitle_from(row, 5)?);
+        }
+    }
     Ok(movies)
+}
+
+/// Colunas de `subtitle_files`, na ordem que [`subtitle_from`] lê; o dono
+/// vem logo depois, na coluna `owner`.
+pub(crate) const SUBTITLE_COLUMNS: &str = "id, relative_path, language, forced, origin";
+
+pub(crate) fn subtitle_from(row: &Row, owner: usize) -> Result<CatalogSubtitle> {
+    Ok(CatalogSubtitle {
+        id: row.try_get(0)?,
+        owner: row.try_get(owner)?,
+        subtitle: Subtitle {
+            relative_path: row.try_get(1)?,
+            language: row.try_get(2)?,
+            forced: row.try_get(3)?,
+            origin: SubtitleOrigin::parse(row.try_get(4)?)?,
+        },
+    })
 }
 
 /// Banco de teste: cada teste ganha um schema próprio, apagado no fim.
@@ -1558,6 +1846,8 @@ mod tests {
                 id: without,
                 movie: movie(20, "Dois", false),
                 extras: MovieExtras::default(),
+                priority: false,
+                subtitles: Vec::new(),
             }
         );
         assert_eq!(
@@ -1566,6 +1856,8 @@ mod tests {
                 id,
                 movie: with_file.clone(),
                 extras: extras.clone(),
+                priority: false,
+                subtitles: Vec::new(),
             }
         );
         // Regravar troca o arquivo e mantém o resto.
@@ -1754,5 +2046,144 @@ mod tests {
         assert!(store.unblock(blocked).await.unwrap());
 
         db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn prioridade_caminho_e_legendas_do_filme() {
+        let Some(db) = TestDb::new("filme_extras").await else {
+            return;
+        };
+        let store = &db.store;
+        let id = added(store, movie(10, "Um", true)).await;
+        let other = added(store, movie(20, "Dois", false)).await;
+        assert!(!store.movies().await.unwrap()[1].priority);
+        assert!(store.set_movie_priority(id, true).await.unwrap());
+        assert!(!store.set_movie_priority(9999, true).await.unwrap());
+        let movies = store.movies().await.unwrap();
+        let entry = movies.iter().find(|m| m.id == id).unwrap();
+        assert!(entry.priority);
+
+        // Só o grab em andamento de obra prioritária.
+        let grab = |movie_id: i64, hash: &str| Grab {
+            id: 0,
+            movie_id,
+            hash: hash.into(),
+            title: "Um.2020.1080p.WEB-DL-GRUPO".into(),
+            indexer: "tracker".into(),
+            quality: Quality::WebDl1080p,
+            size: 1,
+            grabbed_at: "2026-01-01T00:00:00Z".into(),
+            state: GrabState::Downloading,
+            message: None,
+            imported_path: None,
+            finished_at: None,
+            replaces: None,
+        };
+        store.record_grab(&grab(id, "aa")).await.unwrap();
+        store.record_grab(&grab(other, "bb")).await.unwrap();
+        let done = store.record_grab(&grab(id, "cc")).await.unwrap();
+        store
+            .update_grab(
+                done,
+                GrabState::Imported,
+                None,
+                None,
+                "2026-01-02T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.priority_hashes().await.unwrap(),
+            std::collections::HashSet::from(["aa".to_owned()])
+        );
+
+        let sub = Subtitle {
+            relative_path: "Um (2020).pt-BR.srt".into(),
+            language: Some("pt-BR".into()),
+            forced: false,
+            origin: SubtitleOrigin::Import,
+        };
+        let sub_id = store.add_movie_subtitle(id, &sub).await.unwrap();
+        assert!(
+            store
+                .set_movie_file_path(id, "Um (2020) novo.mkv")
+                .await
+                .unwrap()
+        );
+        assert!(!store.set_movie_file_path(other, "x.mkv").await.unwrap());
+        let movies = store.movies().await.unwrap();
+        let entry = movies.iter().find(|m| m.id == id).unwrap();
+        assert_eq!(
+            entry.movie.file.as_ref().unwrap().relative_path,
+            "Um (2020) novo.mkv"
+        );
+        assert_eq!(entry.subtitles.len(), 1);
+        assert_eq!(entry.subtitles[0].id, sub_id);
+        assert_eq!(entry.subtitles[0].subtitle, sub);
+        // Regravar o filme (monitorado, metadados) não perde a legenda.
+        let mut changed = entry.movie.clone();
+        changed.monitored = false;
+        store.update_movie(id, &changed).await.unwrap();
+        let movies = store.movies().await.unwrap();
+        assert_eq!(
+            movies.iter().find(|m| m.id == id).unwrap().subtitles.len(),
+            1
+        );
+        // Trocar o arquivo leva as legendas do antigo.
+        store.set_movie_file(id, None).await.unwrap();
+        let movies = store.movies().await.unwrap();
+        assert!(
+            movies
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap()
+                .subtitles
+                .is_empty()
+        );
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn migracao_da_prioridade_nasce_falsa_nos_que_existem() {
+        let Some(url) = std::env::var("ACERVO_TEST_DATABASE_URL").ok() else {
+            eprintln!("ACERVO_TEST_DATABASE_URL ausente: teste de banco pulado");
+            return;
+        };
+        let schema = format!("teste_prioridade_{}", std::process::id());
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        let before = MIGRATIONS
+            .iter()
+            .position(|m| m.contains("ADD COLUMN priority"))
+            .unwrap();
+        let mut setup = format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path = {schema};"
+        );
+        for migration in &MIGRATIONS[..before] {
+            setup.push_str(migration);
+        }
+        let _ = write!(
+            setup,
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES ({before});
+             INSERT INTO movies (tmdb_id, title, path, monitored) VALUES (1, 'Um', '/f/Um', true);
+             INSERT INTO series (tmdb_id, title, path, season_folder, monitor_new)
+                 VALUES (2, 'Dois', '/s/Dois', true, true);"
+        );
+        client.batch_execute(&setup).await.unwrap();
+        let mut config: tokio_postgres::Config = url.parse().unwrap();
+        config.options(format!("-c search_path={schema}"));
+        let store = Store::with_config(config).await.unwrap();
+        let movies = store.movies().await.unwrap();
+        assert!(!movies[0].priority);
+        let series = store.series_list().await.unwrap();
+        assert!(!series[0].priority);
+        assert!(series[0].scene.is_empty() && series[0].subtitles.is_empty());
+        client
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
     }
 }

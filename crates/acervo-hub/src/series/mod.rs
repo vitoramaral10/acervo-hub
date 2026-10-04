@@ -16,6 +16,7 @@ pub mod library;
 pub mod migrate;
 pub mod naming;
 pub mod remove;
+pub mod scene;
 pub mod search;
 pub mod watched;
 pub mod web;
@@ -167,7 +168,59 @@ pub(crate) fn target(entry: &CatalogSeries, queued: &HashSet<i64>, today: Date) 
                 state: state(entry, e, queued),
             })
             .collect(),
+        scene: scene(entry),
     }
+}
+
+/// O par existe como episódio da série: é o `exists` da tradução de cena.
+pub(crate) fn has_episode(entry: &CatalogSeries) -> impl Fn(u16, u16) -> bool + '_ {
+    move |season, number| {
+        entry
+            .episodes
+            .iter()
+            .any(|e| e.episode.season == season && e.episode.number == number)
+    }
+}
+
+/// A numeração de cena da série, como a decisão a lê.
+pub(crate) fn scene(entry: &CatalogSeries) -> Vec<acervo_decision::SceneMapping> {
+    entry
+        .scene
+        .iter()
+        .map(|m| acervo_decision::SceneMapping {
+            scene_season: m.scene_season,
+            scene_episode: m.scene_episode,
+            season: m.season,
+            episode: m.episode,
+        })
+        .collect()
+}
+
+/// As legendas de um arquivo de episódio, relativas à pasta da série.
+pub(crate) fn subtitle_paths(entry: &CatalogSeries, file_id: i64) -> Vec<String> {
+    entry
+        .subtitles
+        .iter()
+        .filter(|s| s.owner == file_id)
+        .map(|s| s.subtitle.relative_path.clone())
+        .collect()
+}
+
+/// Apaga do disco os arquivos (caminho no host) e devolve o inode de cada um
+/// que existia. Arquivo que já não estava lá não é erro. Bloqueia.
+pub(crate) fn remove_files(paths: &[std::path::PathBuf]) -> std::io::Result<Vec<(u64, u64)>> {
+    use std::os::unix::fs::MetadataExt;
+    let mut inodes = Vec::new();
+    for host in paths {
+        if let Ok(meta) = std::fs::metadata(host) {
+            inodes.push((meta.dev(), meta.ino()));
+        }
+        match std::fs::remove_file(host) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
+    Ok(inodes)
 }
 
 /// O título de pasta e arquivo: o da base de metadados, em inglês.

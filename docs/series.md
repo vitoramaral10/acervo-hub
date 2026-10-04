@@ -146,3 +146,52 @@ Comando único, `series import-sonarr <url> <chave>`, idempotente:
 - cada arquivo entra com caminho, tamanho, qualidade, idiomas, grupo e nome do release;
 - episódio do gerenciador que o TMDB não tem (numeração diferente) entra no relatório e
   não no catálogo.
+
+## Prioridade
+
+Série (ou filme) marcada `prioritario` passa na frente: na fila do acervo os prioritários
+escolhem antes (dentro de cada grupo, "menor primeiro, pulando quem não cabe"), no
+qBittorrent vão ao topo da fila dele (`topPrio`) ao iniciar e sempre que ficam em
+`queuedDL`, e na busca dos que faltam entram primeiro.
+
+## Numeração de cena (XEM)
+
+Tarefa `cena`, uma vez por dia: as séries do catálogo que o XEM mapeia ganham os pares
+(temporada e episódio de cena → do catálogo) em `scene_mappings`. Um par de cena pode ter
+vários alvos (o episódio duplo), e aí guarda também o de identidade; o par cujo único alvo
+é ele mesmo não entra. A decisão, a escolha de arquivos e a importação traduzem o episódio
+avulso antes de casar, mas o par cru que existe como episódio no catálogo vale como está
+(a menos que ele mesmo esteja entre os alvos, como no duplo). A busca por episódio pede o
+número de cena. Pacote de temporada não é traduzido, e o verificar disco também não: o
+arquivo da biblioteca já está na numeração do catálogo. O endereço do XEM fica em Servidor (`xem_url`).
+
+## Renomear e verificar disco
+
+- **Renomear** põe os arquivos no nome que a importação daria hoje, só com `rename(2)`:
+  mesmo inode (o torrent segue semeando), destino existente é erro, nada sai da pasta, a
+  pasta de temporada nasce e a vazia sai, as legendas vão junto. Depois da tarefa
+  `metadados`, o que tinha `TBA` e ganhou título é renomeado sozinho (evento `renamed`).
+- **Verificar disco** liga o vídeo que o catálogo não conhece e casa sem ambiguidade com
+  episódio sem arquivo (na tela, dispensado inclusive, que perde o `skip`), tira do
+  catálogo o arquivo que sumiu e registra a legenda solta ao lado de um vídeo conhecido
+  (como `disco`). Nunca mexe no disco. A importação roda isso sozinha uma vez por hora,
+  nas séries cuja pasta mudou, só ligando, e nunca a episódio dispensado.
+
+## Legendas
+
+Legenda separada no torrent (`.srt`, `.ass`, `.ssa`, `.sub`/`.idx`, `.vtt`) vira hardlink
+ao lado do vídeo, como `<stem do vídeo>.<idioma>[.forced].<ext>` (idioma pelo fim do nome,
+em `pt-BR`, `pt` ou `en`), e fica em `subtitle_files` com a origem (`importacao` ou
+`disco`). Num pacote, a legenda de episódio escolhido baixa junto (casada pelo caminho, ou
+pelo vídeo da mesma pasta). Apagar o arquivo apaga as legendas; renomear leva junto, com as
+do disco que seguem o nome do vídeo. No upgrade de filme só a legenda do torrent (da
+importação, ou com outro link) é trocada ou apagada; a posta à mão fica.
+
+## Torrent desregistrado
+
+Na importação, download ativo há 30 min, incompleto e sem seed conectado tem os trackers
+consultados. Todos os trackers reais sem funcionar (estado 4) e algum dizendo, com a frase
+inteira, que não conhece o torrent (`unregistered torrent`, `torrent not registered`,
+`torrent not found`, `torrent não registrado`), em duas voltas seguidas, é falha de
+download como o "sem seeds": sai do cliente só se nenhum arquivo dele tem outro link,
+bloqueia por 7 dias e busca de novo; numa série, a nova busca prefere o pacote.

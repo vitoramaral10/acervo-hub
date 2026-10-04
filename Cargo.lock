@@ -97,6 +97,7 @@ dependencies = [
  "clap",
  "fancy-regex",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "time",

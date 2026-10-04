@@ -53,6 +53,9 @@ pub struct Config {
     pub tasks: TasksConfig,
 }
 
+/// Onde o XEM responde, se a seção não disser outro.
+pub const XEM_URL: &str = "https://thexem.info";
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
@@ -69,6 +72,8 @@ pub struct ServerConfig {
     pub catalogs: Vec<PathBuf>,
     /// Timeout de cada chamada HTTP, em segundos.
     pub http_timeout_seconds: u64,
+    /// Endereço base do XEM, de onde vem a numeração de cena das séries.
+    pub xem_url: String,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -79,6 +84,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("public_url", &self.public_url)
             .field("catalogs", &self.catalogs)
             .field("http_timeout_seconds", &self.http_timeout_seconds)
+            .field("xem_url", &self.xem_url)
             .finish_non_exhaustive()
     }
 }
@@ -90,6 +96,7 @@ impl Default for ServerConfig {
             public_url: None,
             catalogs: Vec::new(),
             http_timeout_seconds: 30,
+            xem_url: XEM_URL.into(),
         }
     }
 }
@@ -279,7 +286,7 @@ impl PolicyConfig {
 
 /// Ids das tarefas de fundo com o intervalo padrão, em minutos. Zero desliga
 /// o agendamento; "rodar agora" continua valendo.
-pub const TASK_DEFAULTS: [(&str, u64); 6] = [
+pub const TASK_DEFAULTS: [(&str, u64); 7] = [
     // Sem intervalo, só pelo botão.
     ("busca", 0),
     ("rss", 30),
@@ -287,6 +294,8 @@ pub const TASK_DEFAULTS: [(&str, u64); 6] = [
     ("metadados", 360),
     ("limpeza", 60),
     ("assistidos", 15),
+    // A numeração de cena muda pouco: uma vez por dia.
+    ("cena", 24 * 60),
 ];
 
 /// Teto de qualquer intervalo: 30 dias.
@@ -423,6 +432,7 @@ impl Config {
                 return Err("servidor: o endereço público não leva query".into());
             }
         }
+        check_url("servidor: endereço do XEM", &server.xem_url)?;
         if !(1..=600).contains(&server.http_timeout_seconds) {
             return Err("servidor: o timeout HTTP precisa ficar entre 1 e 600 segundos".into());
         }
@@ -603,6 +613,8 @@ mod tests {
         assert_eq!(config.tasks.minutes("rss"), 30);
         assert_eq!(config.tasks.minutes("limpeza"), 60);
         assert_eq!(config.tasks.minutes("assistidos"), 15);
+        assert_eq!(config.tasks.minutes("cena"), 1440);
+        assert_eq!(config.server.xem_url, "https://thexem.info");
         assert_eq!(config.tasks.search_limit, 5);
         assert_eq!(config.library.root_folders, ["/media/movies"]);
         assert_eq!(config.library.series_root, "/media/series");
@@ -706,6 +718,7 @@ mod tests {
         );
         assert!(erro(|c| c.jellyfin.url = "http://j:8096".into()).contains("chave"));
         assert!(erro(|c| c.library.series_root = "series".into()).contains("séries"));
+        assert!(erro(|c| c.server.xem_url = "ftp://xem".into()).contains("XEM"));
         assert!(valid().validate().is_ok());
     }
 

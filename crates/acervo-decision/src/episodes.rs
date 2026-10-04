@@ -60,6 +60,91 @@ pub struct SeriesTarget {
     /// Idioma original, para o perfil.
     pub language: Language,
     pub episodes: Vec<EpisodeTarget>,
+    /// Numeração de cena (XEM): o release com estes números é, no
+    /// catálogo, outro episódio.
+    pub scene: Vec<SceneMapping>,
+}
+
+/// Um par da numeração de cena: o release sai como
+/// `scene_season`/`scene_episode`, e no catálogo é `season`/`episode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneMapping {
+    pub scene_season: u16,
+    pub scene_episode: u16,
+    pub season: u16,
+    pub episode: u16,
+}
+
+/// Os episódios do catálogo que um par de cena quer dizer. `exists` diz se
+/// um par existe como episódio no catálogo.
+///
+/// - sem mapeamento, o par vale como veio;
+/// - com mapeamento que inclui o próprio par (o episódio duplo: S01E01 de
+///   cena é E01 e E02), valem todos os alvos;
+/// - com mapeamento que não o inclui, o par cru que existe no catálogo vale
+///   como está (o catálogo já numera como a cena); só o que não existe é
+///   traduzido.
+fn scene_pair(
+    scene: &[SceneMapping],
+    season: u16,
+    number: u16,
+    exists: &impl Fn(u16, u16) -> bool,
+) -> Vec<(u16, u16)> {
+    let targets: Vec<(u16, u16)> = scene
+        .iter()
+        .filter(|m| m.scene_season == season && m.scene_episode == number)
+        .map(|m| (m.season, m.episode))
+        .collect();
+    if targets.is_empty() || (!targets.contains(&(season, number)) && exists(season, number)) {
+        vec![(season, number)]
+    } else {
+        targets
+    }
+}
+
+/// Os episódios do catálogo que um nome de cena (temporada e números) quer
+/// dizer, pela regra de [`scene_pair`] em cada número, sem repetição. Pode
+/// cruzar temporada (S01E13 de cena é a S02E01 do catálogo).
+#[must_use]
+pub fn scene_to_catalog(
+    scene: &[SceneMapping],
+    season: u16,
+    episodes: &[u16],
+    exists: impl Fn(u16, u16) -> bool,
+) -> Vec<(u16, u16)> {
+    let mut out: Vec<(u16, u16)> = Vec::new();
+    for &number in episodes {
+        for pair in scene_pair(scene, season, number, &exists) {
+            if !out.contains(&pair) {
+                out.push(pair);
+            }
+        }
+    }
+    out
+}
+
+/// O número de cena de um episódio do catálogo, se ele tem um diferente:
+/// o par de cena que, pela regra de [`scene_to_catalog`], vira este
+/// episódio. `None` se não há, ou se o próprio número é um deles.
+#[must_use]
+pub fn catalog_to_scene(
+    scene: &[SceneMapping],
+    season: u16,
+    episode: u16,
+    exists: impl Fn(u16, u16) -> bool,
+) -> Option<(u16, u16)> {
+    let valid: Vec<(u16, u16)> = scene
+        .iter()
+        .filter(|m| m.season == season && m.episode == episode)
+        .map(|m| (m.scene_season, m.scene_episode))
+        .filter(|&(s, n)| scene_pair(scene, s, n, &exists).contains(&(season, episode)))
+        .collect();
+    // O próprio número entre os de cena (o primeiro episódio do duplo):
+    // busca-se como está.
+    if valid.contains(&(season, episode)) {
+        return None;
+    }
+    valid.first().copied()
 }
 
 /// O que foi buscado: release de outra série é recusado.
@@ -311,8 +396,15 @@ fn readable(parsed: &ParsedEpisode) -> bool {
 }
 
 /// Episódios do alvo que o release cobre. Multi-temporada não traz a lista
-/// de temporadas, então cobre todas menos a 0.
+/// de temporadas, então cobre todas menos a 0. Episódio avulso passa antes
+/// pela numeração de cena; pacote de temporada, não.
 fn covered<'a>(parsed: &ParsedEpisode, series: &'a SeriesTarget) -> Vec<&'a EpisodeTarget> {
+    let numbered = scene_to_catalog(&series.scene, parsed.season, &parsed.episodes, |s, n| {
+        series
+            .episodes
+            .iter()
+            .any(|e| e.season == s && e.number == n)
+    });
     series
         .episodes
         .iter()
@@ -322,7 +414,7 @@ fn covered<'a>(parsed: &ParsedEpisode, series: &'a SeriesTarget) -> Vec<&'a Epis
             } else if parsed.full_season || parsed.partial_season {
                 e.season == parsed.season
             } else {
-                e.season == parsed.season && parsed.episodes.contains(&e.number)
+                numbered.contains(&(e.season, e.number))
             }
         })
         .collect()
@@ -360,14 +452,44 @@ fn state_checks(covered: &[&EpisodeTarget], wanted: &mut Vec<i64>, out: &mut Vec
 /// no seguinte.
 #[must_use]
 pub fn pick(decisions: &[EpisodeDecision]) -> Vec<(&EpisodeDecision, Vec<i64>)> {
-    let approved: Vec<&EpisodeDecision> = decisions.iter().filter(|d| d.approved()).collect();
+    let mut taken = HashSet::new();
+    pick_from(decisions, |_| true, &mut taken)
+}
+
+/// Pacote de temporada (ou de várias).
+fn is_pack(decision: &EpisodeDecision) -> bool {
+    decision
+        .parsed
+        .as_ref()
+        .is_some_and(|p| p.full_season || p.multi_season)
+}
+
+/// Como [`pick`], mas os pacotes escolhem primeiro: o avulso só leva o que
+/// nenhum pacote aprovado cobre. É a busca depois que o tracker apagou o
+/// avulso porque o pacote saiu.
+#[must_use]
+pub fn pick_prefer_pack(decisions: &[EpisodeDecision]) -> Vec<(&EpisodeDecision, Vec<i64>)> {
+    let mut taken = HashSet::new();
+    let mut chosen = pick_from(decisions, is_pack, &mut taken);
+    chosen.extend(pick_from(decisions, |d| !is_pack(d), &mut taken));
+    chosen
+}
+
+fn pick_from<'a>(
+    decisions: &'a [EpisodeDecision],
+    keep: impl Fn(&EpisodeDecision) -> bool,
+    taken: &mut HashSet<i64>,
+) -> Vec<(&'a EpisodeDecision, Vec<i64>)> {
+    let approved: Vec<&EpisodeDecision> = decisions
+        .iter()
+        .filter(|d| d.approved() && keep(d))
+        .collect();
     let mut series: Vec<Option<i64>> = Vec::new();
     for decision in &approved {
         if !series.contains(&decision.series) {
             series.push(decision.series);
         }
     }
-    let mut taken: HashSet<i64> = HashSet::new();
     let mut chosen = Vec::new();
     for id in series {
         let mut group: Vec<&EpisodeDecision> = approved
@@ -431,6 +553,7 @@ mod tests {
             runtime: 40,
             language: Language::English,
             episodes,
+            scene: Vec::new(),
         }
     }
 
@@ -764,5 +887,100 @@ mod tests {
             .map(|(d, wanted)| (d.release, wanted))
             .collect();
         assert_eq!(chosen, [(1, vec![101]), (0, vec![102])]);
+    }
+
+    #[test]
+    fn numeracao_de_cena_vira_a_do_catalogo() {
+        let map = |ss, se, s, e| SceneMapping {
+            scene_season: ss,
+            scene_episode: se,
+            season: s,
+            episode: e,
+        };
+        let scene = [map(1, 13, 2, 1), map(1, 14, 2, 2)];
+        let none = |_: u16, _: u16| false;
+        assert_eq!(
+            scene_to_catalog(&scene, 1, &[12, 13], none),
+            [(1, 12), (2, 1)]
+        );
+        assert_eq!(scene_to_catalog(&[], 1, &[13], none), [(1, 13)]);
+        assert_eq!(catalog_to_scene(&scene, 2, 2, none), Some((1, 14)));
+        assert_eq!(catalog_to_scene(&scene, 2, 3, none), None);
+        // O par cru que existe no catálogo vale como está: o catálogo já
+        // numera como a cena.
+        let has_s01e13 = |s: u16, n: u16| (s, n) == (1, 13);
+        assert_eq!(scene_to_catalog(&scene, 1, &[13], has_s01e13), [(1, 13)]);
+        assert_eq!(catalog_to_scene(&scene, 2, 1, has_s01e13), None);
+
+        // O duplo: S01E01 de cena é E01 e E02 no catálogo, e S01E02 de cena
+        // é o E03. O par cru existe, mas está entre os alvos: valem todos.
+        let double = [map(1, 1, 1, 1), map(1, 1, 1, 2), map(1, 2, 1, 3)];
+        let all = |s: u16, n: u16| s == 1 && n <= 3;
+        assert_eq!(scene_to_catalog(&double, 1, &[1], all), [(1, 1), (1, 2)]);
+        // O E02 do catálogo se busca como S01E01 de cena. O S01E02 de cena,
+        // porém, existe como episódio no catálogo: vale como está, e o E03
+        // não tem número de cena que o traga.
+        assert_eq!(catalog_to_scene(&double, 1, 2, all), Some((1, 1)));
+        assert_eq!(scene_to_catalog(&double, 1, &[2], all), [(1, 2)]);
+        assert_eq!(catalog_to_scene(&double, 1, 3, all), None);
+        assert_eq!(catalog_to_scene(&double, 1, 1, all), None);
+        let mut duplo = series(
+            1,
+            SHOW,
+            vec![
+                episode(1, 1, EpisodeState::Wanted),
+                episode(1, 2, EpisodeState::Wanted),
+                episode(1, 3, EpisodeState::Wanted),
+            ],
+        );
+        duplo.scene = double.to_vec();
+        let decisions = rss(&[duplo], &[release("Some.Show.S01E01.1080p.WEB-DL-GRP")]);
+        assert_eq!(decisions[0].covers, [101, 102]);
+
+        // O release S01E13 de cena é o S02E01 do catálogo.
+        let mut target = series(
+            1,
+            SHOW,
+            vec![episode(1, 12, have()), episode(2, 1, EpisodeState::Wanted)],
+        );
+        target.scene = scene.to_vec();
+        let library = [target];
+        let decisions = rss(&library, &[release("Some.Show.S01E13.1080p.WEB-DL-GRP")]);
+        assert!(decisions[0].approved(), "{:?}", decisions[0].rejections);
+        assert_eq!(decisions[0].covers, [201]);
+        assert_eq!(decisions[0].wanted, [201]);
+    }
+
+    #[test]
+    fn depois_do_avulso_apagado_o_pacote_vem_primeiro() {
+        let library = [series(
+            1,
+            SHOW,
+            vec![
+                episode(1, 1, EpisodeState::Wanted),
+                episode(1, 2, EpisodeState::Wanted),
+            ],
+        )];
+        // O avulso PROPER ganha no rank e o `pick` comum o pega primeiro.
+        let decisions = rss(
+            &library,
+            &[
+                release("Some.Show.S01.1080p.WEB-DL.x264-GRP"),
+                release("Some.Show.S01E01.PROPER.1080p.WEB-DL.x264-GRP"),
+            ],
+        );
+        let normal: Vec<usize> = pick(&decisions).iter().map(|(d, _)| d.release).collect();
+        assert_eq!(normal, [1, 0]);
+        let chosen: Vec<(usize, Vec<i64>)> = pick_prefer_pack(&decisions)
+            .into_iter()
+            .map(|(d, wanted)| (d.release, wanted))
+            .collect();
+        assert_eq!(chosen, [(0, vec![101, 102])]);
+        // Sem pacote aprovado, o avulso ainda serve.
+        let decisions = rss(
+            &library,
+            &[release("Some.Show.S01E01.PROPER.1080p.WEB-DL.x264-GRP")],
+        );
+        assert_eq!(pick_prefer_pack(&decisions).len(), 1);
     }
 }

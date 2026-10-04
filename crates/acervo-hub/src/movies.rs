@@ -61,6 +61,8 @@ pub struct MovieView {
     pub sinopse: Option<String>,
     pub status: Option<String>,
     pub monitorado: bool,
+    /// Passa na frente na fila e na busca.
+    pub prioritario: bool,
     pub pasta: String,
     pub adicionado: Option<String>,
     pub arquivo: Option<FileView>,
@@ -133,6 +135,7 @@ fn view(
         sinopse: movie.overview,
         status: movie.status,
         monitorado: movie.monitored,
+        prioritario: entry.priority,
         pasta: movie.path,
         adicionado: movie.added,
         arquivo,

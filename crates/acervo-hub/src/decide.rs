@@ -155,6 +155,8 @@ pub(crate) fn summarize(decisions: &[Decision], movie: i64) -> Vec<(String, usiz
 /// indexadores servidos e a configuração do gerenciador.
 pub(crate) struct Decider {
     pub library: Vec<Target>,
+    /// Os filmes prioritários: buscados antes dos outros.
+    pub priority: std::collections::HashSet<i64>,
     indexers: Vec<Indexer>,
     settings: Settings,
     blocklist: Vec<BlockedRelease>,
@@ -233,6 +235,7 @@ impl Decider {
                     indexer: b.indexer,
                 })
                 .collect(),
+            priority: movies.iter().filter(|m| m.priority).map(|m| m.id).collect(),
             library,
         })
     }
@@ -459,8 +462,14 @@ pub async fn search(
                 .is_none_or(|olds| olds.iter().all(|g| waiting.contains(&g.hash)))
         })
         .collect();
-    // Nunca buscados primeiro; depois, o que está há mais tempo sem busca.
-    wanted.sort_by_key(|t| last_run.get(&t.id).copied().unwrap_or(""));
+    // Prioritários primeiro; em cada grupo, nunca buscados primeiro e depois
+    // o que está há mais tempo sem busca.
+    wanted.sort_by_key(|t| {
+        (
+            !decider.priority.contains(&t.id),
+            last_run.get(&t.id).copied().unwrap_or(""),
+        )
+    });
     if let Some(limit) = limit {
         wanted.truncate(limit);
     }

@@ -40,6 +40,8 @@ const SUMMARY_CHARS: usize = 300;
 pub const BUSCA: &str = "busca";
 /// Id da tarefa que apaga os filmes assistidos no Jellyfin.
 pub const ASSISTIDOS: &str = "assistidos";
+/// Id da tarefa que baixa a numeração de cena (XEM).
+pub const CENA: &str = "cena";
 
 /// Por que uma execução começou.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -503,6 +505,7 @@ pub fn service(
                 settings: Arc::clone(settings),
                 database: database.clone(),
                 catalog: catalog.clone(),
+                disk: tokio::sync::Mutex::default(),
             }),
         },
         Task {
@@ -535,6 +538,16 @@ pub fn service(
             // intervalo pega o que houver.
             first: First::AfterInterval,
             job: Arc::new(Watched {
+                settings: Arc::clone(settings),
+                database: database.clone(),
+            }),
+        },
+        Task {
+            id: CENA,
+            name: "Numeração de cena (XEM)",
+            interval: interval(settings, CENA),
+            first: First::Now,
+            job: Arc::new(Scene {
                 settings: Arc::clone(settings),
                 database: database.clone(),
             }),
@@ -715,12 +728,49 @@ impl Job for Rss {
     }
 }
 
+/// De quanto em quanto tempo a importação também verifica o disco das
+/// séries.
+const DISK_EVERY: Duration = Duration::from_secs(3600);
+
+/// A última verificação de disco: quando foi e a marca da pasta de cada
+/// série naquela hora. Só em memória: reiniciar verifica tudo de novo.
+#[derive(Debug, Default)]
+struct DiskCheck {
+    at: Option<Instant>,
+    stamps: std::collections::HashMap<i64, std::time::SystemTime>,
+}
+
 /// Importa os downloads do acervo que terminaram.
 #[derive(Debug)]
 struct Import {
     settings: Arc<Settings>,
     database: Database,
     catalog: Catalog,
+    disk: tokio::sync::Mutex<DiskCheck>,
+}
+
+impl Import {
+    /// Uma vez por hora, no fim da importação: liga o arquivo novo que
+    /// apareceu na pasta de uma série (só o sem ambiguidade; nada sai do
+    /// catálogo). Devolve quantos ligou.
+    async fn check_disk(
+        &self,
+        config: &crate::config::Config,
+        store: &acervo_store::Store,
+    ) -> usize {
+        let mut disk = self.disk.lock().await;
+        if disk.at.is_some_and(|at| at.elapsed() < DISK_EVERY) {
+            return 0;
+        }
+        disk.at = Some(Instant::now());
+        match crate::verify::new_files(config, store, &mut disk.stamps).await {
+            Ok(n) => n,
+            Err(error) => {
+                tracing::warn!("verificar disco: {error:#}");
+                0
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -775,11 +825,18 @@ impl Job for Import {
         .filter(|(n, _, _)| *n > 0)
         .map(|(n, one, many)| count(n, one, many))
         .collect();
-        let summary = if parts.is_empty() {
+        let mut summary = if parts.is_empty() {
             "nenhum download do acervo".to_owned()
         } else {
             parts.join(", ")
         };
+        let found = self.check_disk(&config, store).await;
+        if found > 0 {
+            summary = format!(
+                "{summary}; {}",
+                count(found, "ligado do disco", "ligados do disco")
+            );
+        }
         Ok(Outcome::new(failed == 0, summary))
     }
 
@@ -831,6 +888,12 @@ impl Job for Metadata {
                 count(series.falhas.len(), "falha", "falhas"),
             );
         }
+        // Episódio que entrou como `TBA` e ganhou título: o arquivo acompanha.
+        match crate::rename::titled_files(&config, store).await {
+            Ok(0) => {}
+            Ok(n) => summary = format!("{summary}; {}", count(n, "renomeado", "renomeados")),
+            Err(error) => tracing::warn!("renomear depois dos metadados: {error:#}"),
+        }
         if !series.atualizadas.is_empty() || !series.falhas.is_empty() {
             detail.get_or_insert_with(|| json!({}))["series"] = json!({
                 "atualizadas": series.atualizadas,
@@ -876,6 +939,34 @@ impl Job for Cleanup {
             .janitor()
             .err()
             .map(|error| format!("{error:#}"))
+    }
+}
+
+/// Baixa do XEM a numeração de cena das séries do catálogo. Falha aqui só
+/// deixa o mapa como estava.
+#[derive(Debug)]
+struct Scene {
+    settings: Arc<Settings>,
+    database: Database,
+}
+
+#[async_trait]
+impl Job for Scene {
+    async fn run(&self, _: Trigger) -> Result<Outcome> {
+        let store = store(&self.database)?;
+        let config = self.settings.get();
+        let report = crate::series::scene::refresh(&config, store).await?;
+        let summary = format!(
+            "{}, {}, {}",
+            count(report.com_mapa, "série com mapa", "séries com mapa"),
+            count(report.atualizadas.len(), "atualizada", "atualizadas"),
+            count(report.falhas.len(), "falha", "falhas"),
+        );
+        Ok(Outcome {
+            ok: report.falhas.is_empty(),
+            summary,
+            detail: Some(serde_json::to_value(&report)?),
+        })
     }
 }
 

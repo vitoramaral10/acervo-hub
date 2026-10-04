@@ -254,6 +254,9 @@ pub async fn add(store: &Store, tmdb: &Tmdb, request: &AddRequest) -> Result<i64
 pub struct MovieEdit {
     #[serde(default, rename = "monitorado")]
     pub monitored: Option<bool>,
+    /// Passa na frente na fila e na busca.
+    #[serde(default, rename = "prioritario")]
+    pub priority: Option<bool>,
 }
 
 /// Muda um filme.
@@ -274,7 +277,16 @@ pub async fn edit(store: &Store, id: i64, change: &MovieEdit) -> Result<CatalogM
     }
     movie.available = is_available(&movie, today(), 0);
     store.update_movie(id, &movie).await?;
-    Ok(CatalogMovie { movie, ..entry })
+    let mut priority = entry.priority;
+    if let Some(wanted) = change.priority {
+        store.set_movie_priority(id, wanted).await?;
+        priority = wanted;
+    }
+    Ok(CatalogMovie {
+        movie,
+        priority,
+        ..entry
+    })
 }
 
 /// Apaga a pasta de um filme. Ela tem de estar direto numa pasta raiz, e não
@@ -432,13 +444,18 @@ pub async fn delete_file(config: &Config, store: &Store, id: i64) -> Result<()> 
         .file
         .clone()
         .context("o filme não tem arquivo")?;
-    let path = Path::new(&entry.movie.path).join(&file.relative_path);
-    let host = config.path_map().to_host(&path)?;
-    tokio::task::spawn_blocking(move || match std::fs::remove_file(&host) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-        _ => Ok(()),
-    })
-    .await??;
+    let map = config.path_map();
+    // O vídeo e as legendas dele.
+    let hosts = std::iter::once(file.relative_path.clone())
+        .chain(
+            entry
+                .subtitles
+                .iter()
+                .map(|s| s.subtitle.relative_path.clone()),
+        )
+        .map(|relative| map.to_host(&Path::new(&entry.movie.path).join(relative)))
+        .collect::<Result<Vec<PathBuf>, _>>()?;
+    tokio::task::spawn_blocking(move || crate::series::remove_files(&hosts)).await??;
     store.set_movie_file(id, None).await?;
     events::record(
         store,

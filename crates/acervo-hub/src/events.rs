@@ -31,6 +31,8 @@ pub enum Kind {
     SeriesDeleted,
     /// Download tirado da fila sem importar.
     Ignored,
+    /// Arquivo da biblioteca renomeado.
+    Renamed,
 }
 
 impl Kind {
@@ -47,6 +49,7 @@ impl Kind {
             Self::SeriesAdded => "series_added",
             Self::SeriesDeleted => "series_deleted",
             Self::Ignored => "ignored",
+            Self::Renamed => "renamed",
         }
     }
 
@@ -62,6 +65,7 @@ impl Kind {
             Self::SeriesAdded => "Série adicionada",
             Self::SeriesDeleted => "Série removida",
             Self::Ignored => "Download descartado",
+            Self::Renamed => "Arquivo renomeado",
         }
     }
 }
@@ -174,7 +178,7 @@ impl Gotify {
                 Kind::MovieDeleted | Kind::FileDeleted | Kind::SeriesDeleted => {
                     self.eventos.removido
                 }
-                Kind::MovieAdded | Kind::SeriesAdded | Kind::Ignored => false,
+                Kind::MovieAdded | Kind::SeriesAdded | Kind::Ignored | Kind::Renamed => false,
             }
     }
 

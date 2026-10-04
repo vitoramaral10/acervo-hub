@@ -108,6 +108,28 @@ pub struct TorrentFile {
     pub progress: f64,
 }
 
+/// Um tracker do torrent, como `torrents/trackers` o reporta. DHT, `PeX` e
+/// LSD vêm na mesma lista, com a URL `** [DHT] **` e afins.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Tracker {
+    pub url: String,
+    /// 0 desligado (DHT, `PeX`, LSD), 1 ainda não contatado, 2 funcionando,
+    /// 3 atualizando, 4 não funciona.
+    #[serde(default)]
+    pub status: i64,
+    /// O que o tracker respondeu por último.
+    #[serde(default)]
+    pub msg: String,
+}
+
+impl Tracker {
+    /// Tracker de verdade, não DHT, `PeX` nem LSD.
+    #[must_use]
+    pub fn is_real(&self) -> bool {
+        !self.url.starts_with("** [")
+    }
+}
+
 fn normal_priority() -> u8 {
     1
 }

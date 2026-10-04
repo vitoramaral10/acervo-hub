@@ -54,6 +54,63 @@ pub(crate) fn routes() -> Router<Arc<Web>> {
             post(search_now),
         )
         .route("/ui/api/biblioteca/series/{id}/historico", get(history))
+        .route("/ui/api/biblioteca/series/{id}/renomear", post(rename))
+        .route("/ui/api/biblioteca/series/{id}/verificar", post(verify))
+}
+
+/// `?aplicar=true` faz; sem ele, só mostra o plano.
+#[derive(Deserialize, Default)]
+pub(crate) struct ApplyQuery {
+    #[serde(default)]
+    pub aplicar: bool,
+}
+
+async fn rename(
+    State(web): Shared,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Query(q): Query<ApplyQuery>,
+) -> WebResult {
+    let store = enter(&web, &headers, &Method::POST).await?;
+    let entry = store
+        .series(id)
+        .await
+        .map_err(|e| fail(bad(e)))?
+        .ok_or_else(|| fail(bad("série fora do catálogo")))?;
+    let disk = crate::rename::disk_subtitles(&web.config(), &entry.series.path).await;
+    let plan = crate::rename::series_plan(&entry, &disk);
+    let plan = if q.aplicar {
+        crate::rename::apply_series(&web.config(), store, &entry, plan)
+            .await
+            .map_err(|e| fail(anyhow_bad(&e)))?
+    } else {
+        plan
+    };
+    ok(&json!({
+        "aplicado": q.aplicar,
+        "renomeados": plan.iter().filter(|r| r.feito).count(),
+        "erros": plan.iter().filter(|r| r.erro.is_some()).count(),
+        "plano": plan,
+    }))
+}
+
+async fn verify(
+    State(web): Shared,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Query(q): Query<ApplyQuery>,
+) -> WebResult {
+    let store = enter(&web, &headers, &Method::POST).await?;
+    let check = crate::verify::series(
+        &web.config(),
+        store,
+        id,
+        q.aplicar,
+        crate::verify::Mode::MANUAL,
+    )
+    .await
+    .map_err(|e| fail(anyhow_bad(&e)))?;
+    ok(&serde_json::to_value(&check).map_err(|e| fail(bad(e)))?)
 }
 
 fn grid(poster: Option<&String>) -> Option<String> {
@@ -133,6 +190,7 @@ fn summary(entry: &CatalogSeries, queued: &HashSet<i64>) -> Value {
         "pasta": series.path,
         "pasta_de_temporada": series.season_folder,
         "monitorar_novos": series.monitor_new,
+        "prioritario": entry.priority,
         "adicionada": series.added,
         "atualizada": series.refreshed_at,
         "episodios": totals.json(),
@@ -641,6 +699,8 @@ mod tests {
     #[test]
     fn rotas_de_series_convivem_com_as_de_filmes() {
         // Rota repetida ou ambígua faz o axum entrar em pânico ao juntar.
-        let _ = crate::web::routes().merge(super::routes());
+        let _ = crate::web::routes()
+            .merge(super::routes())
+            .merge(crate::agenda::routes());
     }
 }

@@ -128,18 +128,14 @@ pub async fn delete_episodes(
     let mut inodes = HashSet::new();
     for file in entry.files.iter().filter(|f| file_ids.contains(&f.id)) {
         let path = PathBuf::from(&entry.series.path).join(&file.file.relative_path);
-        let host = map.to_host(&path)?;
-        let gone = tokio::task::spawn_blocking(move || {
-            let inode = std::fs::metadata(&host)
-                .ok()
-                .map(|meta| (meta.dev(), meta.ino()));
-            match std::fs::remove_file(&host) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-                _ => Ok(inode),
-            }
-        })
-        .await?
-        .with_context(|| format!("apagando `{}`", path.display()))?;
+        // O vídeo e as legendas dele: também elas são hardlink do torrent.
+        let hosts = std::iter::once(file.file.relative_path.clone())
+            .chain(super::subtitle_paths(&entry, file.id))
+            .map(|relative| map.to_host(&PathBuf::from(&entry.series.path).join(relative)))
+            .collect::<Result<Vec<PathBuf>, _>>()?;
+        let gone = tokio::task::spawn_blocking(move || super::remove_files(&hosts))
+            .await?
+            .with_context(|| format!("apagando `{}`", path.display()))?;
         inodes.extend(gone);
         store.delete_episode_file(file.id).await?;
         let covered: Vec<i64> = entry

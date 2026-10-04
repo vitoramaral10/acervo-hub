@@ -128,6 +128,15 @@ pub(crate) fn routes() -> Router<Arc<Web>> {
             "/ui/api/biblioteca/filmes/{id}/historico",
             get(movie_history),
         )
+        .route(
+            "/ui/api/biblioteca/filmes/{id}/renomear",
+            post(rename_movie),
+        )
+        .route(
+            "/ui/api/biblioteca/filmes/{id}/verificar",
+            post(verify_movie),
+        )
+        .route("/ui/api/biblioteca/filmes/verificar", post(verify_movies))
         .route("/ui/api/biblioteca/fila", get(queue))
         .route(
             "/ui/api/biblioteca/fila/{id}",
@@ -373,6 +382,67 @@ async fn delete_file(State(web): Shared, Path(id): Path<i64>, headers: HeaderMap
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     ok(&json!({ "ok": true }))
+}
+
+async fn movie_entry(store: &Store, id: i64) -> Result<acervo_store::CatalogMovie, Response> {
+    store
+        .movies()
+        .await
+        .map_err(|e| fail(bad(e)))?
+        .into_iter()
+        .find(|m| m.id == id)
+        .ok_or_else(|| fail(bad("filme fora do catálogo")))
+}
+
+async fn rename_movie(
+    State(web): Shared,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Query(q): Query<crate::series::web::ApplyQuery>,
+) -> WebResult {
+    let store = enter(&web, &headers, &Method::POST).await?;
+    let entry = movie_entry(store, id).await?;
+    let disk = crate::rename::disk_subtitles(&web.config(), &entry.movie.path).await;
+    let plan = crate::rename::movie_plan(&entry, &disk);
+    let plan = if q.aplicar {
+        crate::rename::apply_movie(&web.config(), store, &entry, plan)
+            .await
+            .map_err(|e| fail(anyhow_bad(&e)))?
+    } else {
+        plan
+    };
+    ok(&json!({
+        "aplicado": q.aplicar,
+        "renomeados": plan.iter().filter(|r| r.feito).count(),
+        "erros": plan.iter().filter(|r| r.erro.is_some()).count(),
+        "plano": plan,
+    }))
+}
+
+async fn verify_movie(
+    State(web): Shared,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Query(q): Query<crate::series::web::ApplyQuery>,
+) -> WebResult {
+    let store = enter(&web, &headers, &Method::POST).await?;
+    let entry = movie_entry(store, id).await?;
+    let check = crate::verify::movie(&web.config(), store, &entry, q.aplicar)
+        .await
+        .map_err(|e| fail(anyhow_bad(&e)))?;
+    ok(&serde_json::to_value(&check).map_err(|e| fail(bad(e)))?)
+}
+
+async fn verify_movies(
+    State(web): Shared,
+    headers: HeaderMap,
+    Query(q): Query<crate::series::web::ApplyQuery>,
+) -> WebResult {
+    let store = enter(&web, &headers, &Method::POST).await?;
+    let list = crate::verify::all_movies(&web.config(), store, q.aplicar)
+        .await
+        .map_err(|e| fail(anyhow_bad(&e)))?;
+    ok(&json!({ "aplicado": q.aplicar, "total": list.len(), "filmes": list }))
 }
 
 pub(crate) fn age_hours(release: &acervo_indexers::Release) -> Option<f64> {

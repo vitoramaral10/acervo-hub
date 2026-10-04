@@ -11,7 +11,7 @@ mod dto;
 pub mod jellyfin;
 mod torrent;
 
-pub use dto::{TorrentFile, TorrentInfo};
+pub use dto::{TorrentFile, TorrentInfo, Tracker};
 pub use torrent::{info_hash, magnet_hash};
 
 #[derive(Debug, thiserror::Error)]
@@ -348,6 +348,42 @@ impl QbitClient {
             ],
         )
         .await
+    }
+
+    /// Põe torrents no topo da fila do próprio cliente (`queuedDL` sai
+    /// antes dos outros). Com a fila do cliente desligada (409), não há o que
+    /// subir: não é erro.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status inesperado.
+    pub async fn top_priority(&self, hashes: &[&str]) -> Result<(), QbitError> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let path = "api/v2/torrents/topPrio";
+        let joined = hashes.join("|");
+        match self
+            .post_status(path, &[("hashes", joined.as_str())])
+            .await?
+        {
+            status if status.is_success() => Ok(()),
+            reqwest::StatusCode::CONFLICT => Ok(()),
+            status => Err(QbitError::Status {
+                status,
+                path: path.into(),
+            }),
+        }
+    }
+
+    /// Os trackers de um torrent, com o estado e a última mensagem de cada.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status não-2xx.
+    pub async fn trackers(&self, hash: &str) -> Result<Vec<Tracker>, QbitError> {
+        self.get("api/v2/torrents/trackers", &[("hash", hash)])
+            .await
     }
 
     /// Apaga torrents, opcionalmente com os arquivos.

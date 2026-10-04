@@ -10,6 +10,7 @@ use std::time::Duration;
 use acervo_api::Catalog;
 use acervo_clients::{NewTorrent, QbitClient, TorrentFile, TorrentInfo, client_path};
 use acervo_core::DownloadHash;
+use acervo_decision::{SceneMapping, scene_to_catalog};
 use acervo_parser::{ParsedEpisode, parse_episode_path, parse_episode_title};
 use acervo_store::{CatalogSeries, GrabState, SeriesGrab, Store};
 use anyhow::{Context, Result, bail};
@@ -44,8 +45,11 @@ pub struct Choice {
     /// `index` do arquivo no torrent.
     pub index: usize,
     pub priority: u8,
-    /// Os episódios do catálogo que o arquivo traz (vazio fora dos vídeos).
+    /// Os episódios do catálogo que o arquivo traz (vazio fora dos vídeos e
+    /// das legendas).
     pub episodes: Vec<i64>,
+    /// Legenda, não vídeo: vai junto do vídeo dos mesmos episódios.
+    pub subtitle: bool,
 }
 
 fn is_video(name: &str) -> bool {
@@ -56,7 +60,7 @@ fn is_video(name: &str) -> bool {
 }
 
 /// Amostra ou extra: pelo nome do arquivo ou por uma das pastas.
-fn is_sample_or_extra(name: &str) -> bool {
+pub(crate) fn is_sample_or_extra(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let mut parts: Vec<&str> = lower.split('/').collect();
     let file = parts.pop().unwrap_or_default();
@@ -68,16 +72,73 @@ fn is_sample_or_extra(name: &str) -> bool {
             .any(|dir| *dir == "sample" || *dir == "samples" || EXTRAS.contains(dir))
 }
 
-/// Os episódios do catálogo que um nome lido cobre.
-fn episodes_of(parsed: &ParsedEpisode, episodes: &[(i64, u16, u16)]) -> Vec<i64> {
+/// Os episódios do catálogo que um nome lido cobre, já na numeração do
+/// catálogo (a de cena traduzida).
+pub(crate) fn episodes_of(
+    parsed: &ParsedEpisode,
+    episodes: &[(i64, u16, u16)],
+    scene: &[SceneMapping],
+) -> Vec<i64> {
     if parsed.episodes.is_empty() {
         return Vec::new();
     }
+    let numbered = scene_to_catalog(scene, parsed.season, &parsed.episodes, |s, n| {
+        episodes
+            .iter()
+            .any(|(_, season, number)| (*season, *number) == (s, n))
+    });
     episodes
         .iter()
-        .filter(|(_, season, number)| *season == parsed.season && parsed.episodes.contains(number))
+        .filter(|(_, season, number)| numbered.contains(&(*season, *number)))
         .map(|(id, _, _)| *id)
         .collect()
+}
+
+/// Os episódios de uma legenda: pelo caminho dela (nome e pasta, como os
+/// vídeos); senão por uma das pastas (da mais perto para a mais longe);
+/// senão pelo vídeo da mesma pasta cujo stem é o começo do nome dela; senão,
+/// se o torrent tem um vídeo só, os dele.
+fn subtitle_episodes(
+    name: &str,
+    videos: &[(&str, Vec<i64>)],
+    episodes: &[(i64, u16, u16)],
+    scene: &[SceneMapping],
+) -> Vec<i64> {
+    let read = |text: &str| {
+        parse_episode_title(text)
+            .map(|p| episodes_of(&p, episodes, scene))
+            .unwrap_or_default()
+    };
+    let by_path = parse_episode_path(name)
+        .map(|p| episodes_of(&p, episodes, scene))
+        .unwrap_or_default();
+    if !by_path.is_empty() {
+        return by_path;
+    }
+    let mut parts: Vec<&str> = name.split('/').collect();
+    let file = parts.pop().unwrap_or_default();
+    for dir in parts.iter().rev() {
+        let by_dir = read(dir);
+        if !by_dir.is_empty() {
+            return by_dir;
+        }
+    }
+    let folder = parts.join("/");
+    if let Some((_, covered)) = videos.iter().find(|(video, covered)| {
+        let (dir, video_file) = video.rsplit_once('/').unwrap_or(("", video));
+        let stem = video_file.rsplit_once('.').map_or(video_file, |(s, _)| s);
+        !covered.is_empty()
+            && dir == folder
+            && file
+                .strip_prefix(stem)
+                .is_some_and(|rest| rest.starts_with('.'))
+    }) {
+        return covered.clone();
+    }
+    match videos {
+        [(_, covered)] => covered.clone(),
+        _ => Vec::new(),
+    }
 }
 
 /// A escolha de arquivos, sem IO: cada vídeo é lido pelo caminho (o nome e,
@@ -92,10 +153,11 @@ pub fn choose_files(
     episodes: &[(i64, u16, u16)],
     wanted: &HashSet<i64>,
     release: &str,
+    scene: &[SceneMapping],
 ) -> Vec<Choice> {
     let single = parse_episode_title(release)
         .filter(|p| !p.episodes.is_empty() && !p.full_season && !p.multi_season)
-        .map(|p| episodes_of(&p, episodes))
+        .map(|p| episodes_of(&p, episodes, scene))
         .unwrap_or_default();
     let candidates: Vec<TorrentFile> = files
         .iter()
@@ -103,7 +165,14 @@ pub fn choose_files(
         .cloned()
         .collect();
     let main = crate::grab::main_video(&candidates).map(|f| f.index);
-    files
+    let priority = |covered: &[i64]| {
+        if covered.iter().any(|e| wanted.contains(e)) {
+            NORMAL
+        } else {
+            0
+        }
+    };
+    let mut choices: Vec<Choice> = files
         .iter()
         .map(|file| {
             if !is_video(&file.name) || is_sample_or_extra(&file.name) {
@@ -111,26 +180,42 @@ pub fn choose_files(
                     index: file.index,
                     priority: 0,
                     episodes: Vec::new(),
+                    subtitle: false,
                 };
             }
             let mut covered = parse_episode_path(&file.name)
-                .map(|p| episodes_of(&p, episodes))
+                .map(|p| episodes_of(&p, episodes, scene))
                 .unwrap_or_default();
             if covered.is_empty() && main == Some(file.index) {
                 covered.clone_from(&single);
             }
-            let priority = if covered.iter().any(|e| wanted.contains(e)) {
-                NORMAL
-            } else {
-                0
-            };
             Choice {
                 index: file.index,
-                priority,
+                priority: priority(&covered),
                 episodes: covered,
+                subtitle: false,
             }
         })
-        .collect()
+        .collect();
+    // Legenda de episódio escolhido baixa junto.
+    let videos: Vec<(&str, Vec<i64>)> = files
+        .iter()
+        .zip(&choices)
+        .filter(|(_, c)| !c.episodes.is_empty())
+        .map(|(f, c)| (f.name.as_str(), c.episodes.clone()))
+        .collect();
+    for (file, choice) in files.iter().zip(choices.iter_mut()) {
+        if crate::subtitles::subtitle_extension(&file.name).is_none()
+            || is_sample_or_extra(&file.name)
+        {
+            continue;
+        }
+        let covered = subtitle_episodes(&file.name, &videos, episodes, scene);
+        choice.priority = priority(&covered);
+        choice.episodes = covered;
+        choice.subtitle = true;
+    }
+    choices
 }
 
 /// Os episódios da série como a escolha os lê.
@@ -152,7 +237,17 @@ pub(crate) struct Selection {
 }
 
 impl Selection {
-    /// Os arquivos escolhidos, com o destino de cada um.
+    /// Os vídeos escolhidos, com o destino de cada um.
+    pub fn videos(&self) -> impl Iterator<Item = (&TorrentFile, &Choice)> {
+        self.chosen().filter(|(_, c)| !c.subtitle)
+    }
+
+    /// As legendas escolhidas.
+    pub fn subtitles(&self) -> impl Iterator<Item = (&TorrentFile, &Choice)> {
+        self.chosen().filter(|(_, c)| c.subtitle)
+    }
+
+    /// Os arquivos escolhidos (vídeos e legendas), com o destino de cada um.
     pub fn chosen(&self) -> impl Iterator<Item = (&TorrentFile, &Choice)> {
         self.files.iter().filter_map(|file| {
             self.choices
@@ -196,7 +291,13 @@ pub(crate) async fn apply_selection(
         return Ok(None);
     }
     let wanted: HashSet<i64> = wanted.iter().copied().collect();
-    let choices = choose_files(&files, &numbers(entry), &wanted, release);
+    let choices = choose_files(
+        &files,
+        &numbers(entry),
+        &wanted,
+        release,
+        &super::scene(entry),
+    );
     let current = |index: usize| files.iter().find(|f| f.index == index).map(|f| f.priority);
     let off: Vec<usize> = choices
         .iter()
@@ -266,7 +367,7 @@ pub(crate) async fn prepare(
     )
     .await?;
     Ok(selection
-        .filter(|s| s.chosen().next().is_some())
+        .filter(|s| s.videos().next().is_some())
         .map(|s| s.need()))
 }
 
@@ -461,6 +562,12 @@ pub(crate) async fn drop_queued(
 /// Episódios do catálogo que um nome de release cobre: pacote, a
 /// temporada; multi-temporada, todas menos a 0.
 pub(crate) fn covered(parsed: &ParsedEpisode, entry: &CatalogSeries) -> Vec<i64> {
+    let numbered = scene_to_catalog(
+        &super::scene(entry),
+        parsed.season,
+        &parsed.episodes,
+        super::has_episode(entry),
+    );
     entry
         .episodes
         .iter()
@@ -471,7 +578,7 @@ pub(crate) fn covered(parsed: &ParsedEpisode, entry: &CatalogSeries) -> Vec<i64>
             } else if parsed.full_season || parsed.partial_season {
                 e.season == parsed.season
             } else {
-                e.season == parsed.season && parsed.episodes.contains(&e.number)
+                numbered.contains(&(e.season, e.number))
             }
         })
         .map(|e| e.id)
@@ -661,22 +768,165 @@ mod tests {
         files.push(file(12, "Show.S01.1080p.WEB-DL-GRP/Show.S01E10.nfo", 1));
         // E01–E09 em Tenho; só o E10 em Quero.
         let wanted = HashSet::from([110]);
-        let choices = choose_files(&files, &season_one(), &wanted, "Show.S01.1080p.WEB-DL-GRP");
+        let choices = choose_files(
+            &files,
+            &season_one(),
+            &wanted,
+            "Show.S01.1080p.WEB-DL-GRP",
+            &[],
+        );
         let on: Vec<usize> = choices
             .iter()
             .filter(|c| c.priority > 0)
             .map(|c| c.index)
             .collect();
-        assert_eq!(on, [9]);
+        // O vídeo do E10 e a legenda dele.
+        assert_eq!(on, [9, 10]);
         assert_eq!(choices[9].episodes, [110]);
         // Os outros vídeos sabem que episódio são, mas não baixam.
         assert_eq!(choices[0].episodes, [101]);
         assert_eq!(choices[0].priority, 0);
-        // Legenda, amostra e o resto ficam com zero.
-        for index in [10, 11, 12] {
+        // A legenda do episódio escolhido baixa junto.
+        assert_eq!(choices[10].priority, NORMAL);
+        assert!(choices[10].subtitle);
+        assert_eq!(choices[10].episodes, [110]);
+        // Amostra e o resto ficam com zero.
+        for index in [11, 12] {
             assert_eq!(choices[index].priority, 0, "arquivo {index}");
             assert!(choices[index].episodes.is_empty());
         }
+    }
+
+    #[test]
+    fn legenda_casa_pelo_nome_pela_pasta_ou_pelo_video() {
+        let files = [
+            file(0, "Show.S01/Show.S01E01.1080p.mkv", 1_000),
+            file(1, "Show.S01/Show.S01E02.1080p.mkv", 1_000),
+            // Pelo nome.
+            file(2, "Show.S01/Subs/Show.S01E02.por.srt", 1),
+            // Pela pasta.
+            file(3, "Show.S01/Subs/Show.S01E01.1080p/2_English.srt", 1),
+            // Pelo stem do vídeo.
+            file(4, "Show.S01/Show.S01E01.1080p.pt-BR.srt", 1),
+            // Sem como saber, num pacote: fica.
+            file(5, "Show.S01/Subs/English.srt", 1),
+        ];
+        let episodes = [(1, 1, 1), (2, 1, 2)];
+        let choices = choose_files(
+            &files,
+            &episodes,
+            &HashSet::from([1]),
+            "Show.S01.1080p",
+            &[],
+        );
+        let state: Vec<(u8, Vec<i64>)> = choices
+            .iter()
+            .map(|c| (c.priority, c.episodes.clone()))
+            .collect();
+        assert_eq!(
+            state,
+            [
+                (NORMAL, vec![1]),
+                (0, vec![2]),
+                (0, vec![2]),
+                (NORMAL, vec![1]),
+                (NORMAL, vec![1]),
+                (0, vec![]),
+            ]
+        );
+        // Avulso: a legenda sem episódio no nome é do vídeo único.
+        let single = [
+            file(0, "Show.S01E01.1080p/video.mkv", 1_000),
+            file(1, "Show.S01E01.1080p/Subs/English.srt", 1),
+        ];
+        let choices = choose_files(
+            &single,
+            &episodes,
+            &HashSet::from([1]),
+            "Show.S01E01.1080p",
+            &[],
+        );
+        assert_eq!(choices[1].priority, NORMAL);
+    }
+
+    #[test]
+    fn legenda_de_pacote_pelo_caminho_e_pelo_video_da_mesma_pasta() {
+        let files = [
+            // O número só no nome, a temporada só na pasta.
+            file(0, "Show/Season 1/01 - Piloto.mkv", 1_000),
+            file(1, "Show/Season 2/01 - Abertura.mkv", 1_000),
+            file(2, "Show/Season 1/01.srt", 1),
+            file(3, "Show/Season 2/01.srt", 1),
+            file(4, "Show/Season 2/01 - Abertura.pt-BR.srt", 1),
+        ];
+        let episodes = [(11, 1, 1), (21, 2, 1)];
+        let choices = choose_files(&files, &episodes, &HashSet::from([21]), "Show", &[]);
+        let got: Vec<(u8, Vec<i64>)> = choices
+            .iter()
+            .map(|c| (c.priority, c.episodes.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (0, vec![11]),
+                (NORMAL, vec![21]),
+                (0, vec![11]),
+                (NORMAL, vec![21]),
+                (NORMAL, vec![21]),
+            ]
+        );
+        // Pelo stem, sem número no nome nem na pasta: a pasta tem de ser a
+        // mesma do vídeo.
+        let videos = [("a/x.mkv", vec![1]), ("b/x.mkv", vec![2])];
+        let numbered = [(1, 1, 1), (2, 1, 2)];
+        assert_eq!(
+            subtitle_episodes("b/x.eng.srt", &videos, &numbered, &[]),
+            [2]
+        );
+        assert!(subtitle_episodes("c/x.eng.srt", &videos, &numbered, &[]).is_empty());
+    }
+
+    #[test]
+    fn par_de_cena_que_existe_no_catalogo_vale_como_esta() {
+        let scene = [SceneMapping {
+            scene_season: 1,
+            scene_episode: 13,
+            season: 2,
+            episode: 1,
+        }];
+        let files = [file(0, "Show.S01E13.1080p.mkv", 1_000)];
+        // O catálogo tem S01E13: o arquivo é ele, não o S02E01.
+        let episodes = [(7, 1, 13), (8, 2, 1)];
+        let choices = choose_files(
+            &files,
+            &episodes,
+            &HashSet::from([7]),
+            "Show.S01E13",
+            &scene,
+        );
+        assert_eq!(choices[0].episodes, [7]);
+    }
+
+    #[test]
+    fn arquivo_com_numeracao_de_cena_vira_o_episodio_do_catalogo() {
+        let scene = [SceneMapping {
+            scene_season: 1,
+            scene_episode: 13,
+            season: 2,
+            episode: 1,
+        }];
+        let files = [file(0, "Show.S01E13.1080p.mkv", 1_000)];
+        // O catálogo não tem S01E13: traduz.
+        let episodes = [(7, 1, 12), (8, 2, 1)];
+        let choices = choose_files(
+            &files,
+            &episodes,
+            &HashSet::from([8]),
+            "Show.S01E13",
+            &scene,
+        );
+        assert_eq!(choices[0].episodes, [8]);
+        assert_eq!(choices[0].priority, NORMAL);
     }
 
     #[test]
@@ -719,6 +969,7 @@ mod tests {
             &episodes,
             &HashSet::from([7]),
             "Show.S02E05.720p.HDTV-GRP",
+            &[],
         );
         assert_eq!(choices[0].priority, NORMAL);
         assert_eq!(choices[0].episodes, [7]);
@@ -729,11 +980,17 @@ mod tests {
     fn multi_episodio_baixa_se_cruza_algum_quero() {
         let files = [file(0, "Show.S01E01E02.1080p.mkv", 2_000)];
         let episodes = [(1, 1, 1), (2, 1, 2)];
-        let choices = choose_files(&files, &episodes, &HashSet::from([2]), "Show.S01E01E02");
+        let choices = choose_files(
+            &files,
+            &episodes,
+            &HashSet::from([2]),
+            "Show.S01E01E02",
+            &[],
+        );
         assert_eq!(choices[0].priority, NORMAL);
         assert_eq!(choices[0].episodes, [1, 2]);
         // Nada em Quero: tudo zero, inclusive o vídeo.
-        let choices = choose_files(&files, &episodes, &HashSet::new(), "Show.S01E01E02");
+        let choices = choose_files(&files, &episodes, &HashSet::new(), "Show.S01E01E02", &[]);
         assert_eq!(choices[0].priority, 0);
     }
 }

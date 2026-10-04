@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use acervo_api::{ALL, Catalog};
 use acervo_decision::{
     BlockedEpisode, EpisodeDecision, EpisodeEngine, EpisodeState, Indexer, Mode, Scope,
-    SeriesTarget, Settings, pick,
+    SeriesTarget, Settings, pick, pick_prefer_pack,
 };
 use acervo_indexers::SearchQuery;
 use acervo_store::{CatalogSeries, SeriesPick, SeriesSearch, Store};
@@ -93,6 +93,24 @@ pub fn plan(target: &SeriesTarget, only: Option<&HashSet<i64>>) -> Vec<Query> {
     queries
 }
 
+/// O plano de quem prefere o pacote: toda temporada (fora a 0) com episódio
+/// em Quero já exibido é buscada inteira, mesmo em andamento — a busca de
+/// temporada traz o pacote e os avulsos.
+#[must_use]
+pub fn pack_plan(target: &SeriesTarget, only: Option<&HashSet<i64>>) -> Vec<Query> {
+    let mut queries: Vec<Query> = Vec::new();
+    for query in plan(target, only) {
+        let query = match query {
+            Query::Episode(season, _) if season > 0 => Query::Season(season),
+            other => other,
+        };
+        if !queries.contains(&query) {
+            queries.push(query);
+        }
+    }
+    queries
+}
+
 /// Indexadores, configurações e bloqueios: o que o motor lê além da série.
 pub(crate) struct Parts {
     indexers: Vec<Indexer>,
@@ -156,7 +174,11 @@ pub async fn fetch(
     match query {
         Query::Series => {}
         Query::Season(season) => search = search.with_episode(season, ""),
-        Query::Episode(season, number) => search = search.with_episode(season, number.to_string()),
+        Query::Episode(season, number) => {
+            // O tracker conhece o episódio pelo número de cena, se há um.
+            let (season, number) = scene_number(entry, season, number);
+            search = search.with_episode(season, number.to_string());
+        }
     }
     if let Some(tvdb) = entry.series.tvdb_id {
         search = search.with_tvdb_id(u64::from(tvdb));
@@ -166,6 +188,19 @@ pub async fn fetch(
         .await
         .map(|page| page.releases)
         .map_err(|error| error.to_string())
+}
+
+/// O número com que se busca um episódio: o de cena, se a série tem um
+/// diferente para ele; senão, o do catálogo.
+#[must_use]
+pub fn scene_number(entry: &CatalogSeries, season: u16, number: u16) -> (u16, u16) {
+    acervo_decision::catalog_to_scene(
+        &super::scene(entry),
+        season,
+        number,
+        super::has_episode(entry),
+    )
+    .unwrap_or((season, number))
 }
 
 /// Motivo de rejeição e quantos releases ele barrou, do mais comum ao menos.
@@ -225,6 +260,7 @@ impl Searcher<'_> {
         entry: &CatalogSeries,
         queued: &mut HashSet<i64>,
         only: Option<&HashSet<i64>>,
+        prefer_pack: bool,
     ) -> SeriesSearch {
         let mut run = SeriesSearch {
             series_id: entry.id,
@@ -237,7 +273,13 @@ impl Searcher<'_> {
         };
         let mut counts = BTreeMap::new();
         let mut errors = Vec::new();
-        for query in plan(&super::target(entry, queued, self.today), only) {
+        let target = super::target(entry, queued, self.today);
+        let queries = if prefer_pack {
+            pack_plan(&target, only)
+        } else {
+            plan(&target, only)
+        };
+        for query in queries {
             run.queries.push(query.label());
             let releases = match fetch(self.catalog, entry, query).await {
                 Ok(releases) => releases,
@@ -254,7 +296,12 @@ impl Searcher<'_> {
                 Mode::Automatic,
             );
             summarize(&decisions, &mut counts);
-            for (decision, wanted) in pick(&decisions) {
+            let chosen = if prefer_pack {
+                pick_prefer_pack(&decisions)
+            } else {
+                pick(&decisions)
+            };
+            for (decision, wanted) in chosen {
                 let release = &releases[decision.release];
                 let quality = decision
                     .quality
@@ -341,14 +388,21 @@ pub async fn missing(
         .iter()
         .filter(|entry| !plan(&super::target(entry, &queued, searcher.today), None).is_empty())
         .collect();
-    wanted.sort_by_key(|entry| latest.get(&entry.id).map_or("", String::as_str));
+    // Prioritárias primeiro; em cada grupo, a que está há mais tempo sem
+    // busca primeiro.
+    wanted.sort_by_key(|entry| {
+        (
+            !entry.priority,
+            latest.get(&entry.id).map_or("", String::as_str),
+        )
+    });
     if let Some(limit) = limit {
         wanted.truncate(limit);
     }
     turn.add_total(wanted.len());
     let mut lines = Vec::new();
     for entry in wanted {
-        let run = searcher.search(entry, &mut queued, None).await;
+        let run = searcher.search(entry, &mut queued, None, false).await;
         store.record_series_search(&run).await?;
         lines.push(SeriesLine::from(entry, &run));
         turn.advance();
@@ -369,6 +423,23 @@ pub async fn series_now(
     series_id: i64,
     only: Option<&HashSet<i64>>,
 ) -> Result<SeriesLine> {
+    series_now_with(config, store, catalog, series_id, only, false).await
+}
+
+/// [`series_now`]; com `prefer_pack`, cada temporada é buscada inteira e o
+/// pacote escolhe antes do avulso.
+///
+/// # Errors
+///
+/// Os de [`series_now`].
+pub async fn series_now_with(
+    config: &Config,
+    store: &Store,
+    catalog: &Catalog,
+    series_id: i64,
+    only: Option<&HashSet<i64>>,
+    prefer_pack: bool,
+) -> Result<SeriesLine> {
     let _guard = SEARCH_LOCK.lock().await;
     let Some(entry) = store.series(series_id).await? else {
         bail!("série fora do catálogo");
@@ -381,7 +452,9 @@ pub async fn series_now(
         today: super::today(),
     };
     let mut queued = super::queued(&store.series_grabs().await?);
-    let run = searcher.search(&entry, &mut queued, only).await;
+    let run = searcher
+        .search(&entry, &mut queued, only, prefer_pack)
+        .await;
     store.record_series_search(&run).await?;
     Ok(SeriesLine::from(&entry, &run))
 }
@@ -540,6 +613,7 @@ mod tests {
             runtime: 45,
             language: Language::English,
             episodes,
+            scene: Vec::new(),
         }
     }
 
@@ -580,6 +654,12 @@ mod tests {
         let specials = series(vec![episode(9, 0, 1, true, EpisodeState::Wanted)]);
         assert_eq!(plan(&specials, None), [Query::Episode(0, 1)]);
         assert_eq!(Query::Season(1).label(), "S01");
+        // Preferindo o pacote, a temporada em andamento vai inteira.
+        assert_eq!(
+            pack_plan(&target, None),
+            [Query::Season(1), Query::Season(2)]
+        );
+        assert_eq!(pack_plan(&specials, None), [Query::Episode(0, 1)]);
         assert_eq!(Query::Episode(2, 10).label(), "S02E10");
     }
 }

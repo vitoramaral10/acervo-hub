@@ -37,6 +37,8 @@ time = { workspace = true, features = ["formatting", "macros"] }
 tracing-subscriber.workspace = true
 url.workspace = true
 reqwest.workspace = true
+# `renameat2` com `RENAME_NOREPLACE`: renomear sem sobrescrever.
+rustix.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true

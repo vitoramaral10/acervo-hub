@@ -12,7 +12,9 @@ use deadpool_postgres::GenericClient;
 use serde::Serialize;
 use tokio_postgres::Row;
 
-use crate::{GrabState, Result, Store, StoreError, narrow, quality, small};
+use crate::{
+    CatalogSubtitle, GrabState, Result, Store, StoreError, narrow, quality, small, subtitle_from,
+};
 
 /// Por que um episódio não é buscado.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -137,6 +139,23 @@ pub struct CatalogSeries {
     pub series: Series,
     pub episodes: Vec<CatalogEpisode>,
     pub files: Vec<CatalogEpisodeFile>,
+    /// Passa na frente na fila e na busca. Muda só por
+    /// [`Store::set_series_priority`].
+    pub priority: bool,
+    /// Numeração de cena da série, por temporada e episódio de cena.
+    pub scene: Vec<SceneMapping>,
+    /// Legendas dos arquivos, com `owner` = id em [`CatalogSeries::files`].
+    pub subtitles: Vec<CatalogSubtitle>,
+}
+
+/// Um par da numeração de cena (XEM): o release sai como
+/// `scene_season`/`scene_episode`, e no catálogo é `season`/`episode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SceneMapping {
+    pub scene_season: u16,
+    pub scene_episode: u16,
+    pub season: u16,
+    pub episode: u16,
 }
 
 /// O que [`Store::sync_episodes`] mudou.
@@ -175,6 +194,86 @@ pub struct SeriesGrab {
 }
 
 impl Store {
+    /// Liga ou desliga a prioridade da série. `false` se ela não existe.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn set_series_priority(&self, id: i64, priority: bool) -> Result<bool> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .execute(
+                "UPDATE series SET priority = $2 WHERE id = $1",
+                &[&id, &priority],
+            )
+            .await?
+            > 0)
+    }
+
+    /// Troca a numeração de cena da série pela de agora, numa transação. Um
+    /// par de cena pode ter vários alvos (episódio duplo); a linha repetida
+    /// inteira entra uma vez só.
+    ///
+    /// # Errors
+    ///
+    /// Série inexistente ou falha de escrita.
+    pub async fn set_scene_mappings(
+        &self,
+        series_id: i64,
+        mappings: &[SceneMapping],
+    ) -> Result<()> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        tx.execute(
+            "DELETE FROM scene_mappings WHERE series_id = $1",
+            &[&series_id],
+        )
+        .await?;
+        let mut seen = HashSet::new();
+        for m in mappings {
+            if !seen.insert(*m) {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO scene_mappings (series_id, scene_season, scene_episode, season,
+                     episode)
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &series_id,
+                    &i32::from(m.scene_season),
+                    &i32::from(m.scene_episode),
+                    &i32::from(m.season),
+                    &i32::from(m.episode),
+                ],
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Troca só o caminho de um arquivo de episódio (renomeado no disco).
+    /// `false` se o arquivo não é da série.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita, ou caminho que já é de outro arquivo da série.
+    pub async fn set_episode_file_path(
+        &self,
+        series_id: i64,
+        file_id: i64,
+        relative_path: &str,
+    ) -> Result<bool> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .execute(
+                "UPDATE episode_files SET relative_path = $3 WHERE id = $2 AND series_id = $1",
+                &[&series_id, &file_id, &relative_path],
+            )
+            .await?
+            > 0)
+    }
+
     /// Cadastra a série com os episódios que a base anuncia, numa transação.
     /// Cada episódio entra com `skip` de [`default_skip`].
     ///
@@ -1022,7 +1121,7 @@ async fn read_series(client: &impl GenericClient, id: Option<i64>) -> Result<Vec
         .query(
             "SELECT id, tmdb_id, tvdb_id, imdb_id, title, original_title, original_language,
                     year, status, overview, network, runtime, poster, fanart, path,
-                    season_folder, monitor_new, added, refreshed_at, metadata_title
+                    season_folder, monitor_new, added, refreshed_at, metadata_title, priority
              FROM series
              WHERE ($1::BIGINT IS NULL OR id = $1)
              ORDER BY lower(title), id",
@@ -1039,6 +1138,9 @@ async fn read_series(client: &impl GenericClient, id: Option<i64>) -> Result<Vec
             series: series_from(row)?,
             episodes: Vec::new(),
             files: Vec::new(),
+            priority: row.try_get(20)?,
+            scene: Vec::new(),
+            subtitles: Vec::new(),
         });
     }
 
@@ -1091,7 +1193,51 @@ async fn read_series(client: &impl GenericClient, id: Option<i64>) -> Result<Vec
             all[at].files.push(file_from(&row)?);
         }
     }
+    read_scene_and_subtitles(client, id, &index, &mut all).await?;
     Ok(all)
+}
+
+/// A numeração de cena e as legendas das séries de `read_series`.
+async fn read_scene_and_subtitles(
+    client: &impl GenericClient,
+    id: Option<i64>,
+    index: &HashMap<i64, usize>,
+    all: &mut [CatalogSeries],
+) -> Result<()> {
+    for row in client
+        .query(
+            "SELECT series_id, scene_season, scene_episode, season, episode FROM scene_mappings
+             WHERE ($1::BIGINT IS NULL OR series_id = $1)
+             ORDER BY scene_season, scene_episode, season, episode",
+            &[&id],
+        )
+        .await?
+    {
+        if let Some(&at) = index.get(&row.try_get::<_, i64>(0)?) {
+            all[at].scene.push(SceneMapping {
+                scene_season: narrow(row.try_get(1)?, "temporada de cena")?,
+                scene_episode: narrow(row.try_get(2)?, "episódio de cena")?,
+                season: narrow(row.try_get(3)?, "temporada")?,
+                episode: narrow(row.try_get(4)?, "episódio")?,
+            });
+        }
+    }
+    for row in client
+        .query(
+            "SELECT s.id, s.relative_path, s.language, s.forced, s.origin, s.episode_file_id,
+                    f.series_id
+             FROM subtitle_files s JOIN episode_files f ON f.id = s.episode_file_id
+             WHERE ($1::BIGINT IS NULL OR f.series_id = $1)
+             ORDER BY s.relative_path",
+            &[&id],
+        )
+        .await?
+    {
+        if let Some(&at) = index.get(&row.try_get::<_, i64>(6)?) {
+            all[at].subtitles.push(subtitle_from(&row, 5)?);
+        }
+    }
+    Ok(())
 }
 
 /// O `skip` de um episódio que entra no catálogo: especiais (temporada 0) e,
@@ -1832,6 +1978,124 @@ mod tests {
 
         store.delete_series(id).await.unwrap();
         assert!(store.latest_series_searches().await.unwrap().is_empty());
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Um cenário só: prioridade, cena, caminho e legendas.
+    async fn prioridade_cena_caminho_e_legendas_da_serie() {
+        let Some(db) = TestDb::new("series_extras").await else {
+            return;
+        };
+        let store = &db.store;
+        let id = store
+            .add_series(&series(10, "Um"), &[episode(1, 1), episode(2, 1)])
+            .await
+            .unwrap();
+        let read = store.series(id).await.unwrap().unwrap();
+        assert!(!read.priority);
+        assert!(read.scene.is_empty() && read.subtitles.is_empty());
+
+        assert!(store.set_series_priority(id, true).await.unwrap());
+        assert!(!store.set_series_priority(id + 100, true).await.unwrap());
+        assert!(store.series(id).await.unwrap().unwrap().priority);
+
+        let map = |ss, se, s, e| SceneMapping {
+            scene_season: ss,
+            scene_episode: se,
+            season: s,
+            episode: e,
+        };
+        store
+            .set_scene_mappings(
+                id,
+                &[
+                    map(1, 13, 2, 1),
+                    map(1, 1, 1, 2),
+                    map(1, 13, 2, 1),
+                    map(1, 1, 1, 1),
+                ],
+            )
+            .await
+            .unwrap();
+        let read = store.series(id).await.unwrap().unwrap();
+        // O duplo guarda os dois alvos; a linha repetida entra uma vez; ordem
+        // por cena e alvo.
+        assert_eq!(
+            read.scene,
+            [map(1, 1, 1, 1), map(1, 1, 1, 2), map(1, 13, 2, 1)]
+        );
+        // Trocar substitui tudo.
+        store
+            .set_scene_mappings(id, &[map(3, 1, 2, 5)])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.series(id).await.unwrap().unwrap().scene,
+            [map(3, 1, 2, 5)]
+        );
+
+        let ids: Vec<i64> = read.episodes.iter().map(|e| e.id).collect();
+        let (file_id, _) = store
+            .add_episode_file(id, &file("Season 1/e1 TBA.mkv"), &ids[..1])
+            .await
+            .unwrap();
+        let sub = crate::Subtitle {
+            relative_path: "Season 1/e1 TBA.pt-BR.srt".into(),
+            language: Some("pt-BR".into()),
+            forced: false,
+            origin: crate::SubtitleOrigin::Disk,
+        };
+        let sub_id = store.add_episode_subtitle(file_id, &sub).await.unwrap();
+        // O mesmo caminho é regravado no lugar.
+        assert_eq!(
+            store.add_episode_subtitle(file_id, &sub).await.unwrap(),
+            sub_id
+        );
+        assert!(
+            store
+                .set_episode_file_path(id, file_id, "Season 1/e1 Piloto.mkv")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .set_episode_file_path(id + 100, file_id, "x.mkv")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .set_subtitle_path(sub_id, "Season 1/e1 Piloto.pt-BR.srt")
+                .await
+                .unwrap()
+        );
+        let read = store.series(id).await.unwrap().unwrap();
+        assert_eq!(read.files[0].file.relative_path, "Season 1/e1 Piloto.mkv");
+        assert_eq!(read.subtitles.len(), 1);
+        assert_eq!(read.subtitles[0].owner, file_id);
+        assert_eq!(
+            read.subtitles[0].subtitle.origin,
+            crate::SubtitleOrigin::Disk
+        );
+        assert_eq!(
+            read.subtitles[0].subtitle.relative_path,
+            "Season 1/e1 Piloto.pt-BR.srt"
+        );
+        // O arquivo sai e leva a legenda.
+        store.delete_episode_file(file_id).await.unwrap();
+        assert!(
+            store
+                .series(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .subtitles
+                .is_empty()
+        );
+
+        // A série sai e leva a cena.
+        store.delete_series(id).await.unwrap();
         db.drop().await;
     }
 }

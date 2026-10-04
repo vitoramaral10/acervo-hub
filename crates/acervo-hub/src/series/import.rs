@@ -22,7 +22,7 @@ use super::naming::{TBA, episode_path};
 use crate::config::Config;
 use crate::decide::now_rfc3339;
 use crate::events::{self, Event, Kind};
-use crate::grab::{NO_SEEDS, QUEUE_TAG, QUEUED, install, left, qbit, stalled};
+use crate::grab::{NO_SEEDS, QUEUE_TAG, QUEUED, UNREGISTERED, install, left, qbit, stalled};
 
 /// Quanto se espera pelo título do episódio depois da exibição.
 const TITLE_WAIT: Duration = Duration::hours(48);
@@ -124,6 +124,15 @@ impl Step {
     }
 }
 
+/// A pasta (com a barra final, ou vazia) e o stem de um caminho de vídeo.
+pub(crate) fn split_video(video: &str) -> (&str, &str) {
+    let (dir, file) = match video.rfind('/') {
+        Some(at) => (&video[..=at], &video[at + 1..]),
+        None => ("", video),
+    };
+    (dir, file.rsplit_once('.').map_or(file, |(stem, _)| stem))
+}
+
 /// O andamento como a fila mostra.
 fn progress(torrent: &TorrentInfo) -> String {
     if torrent.has_tag(QUEUE_TAG) {
@@ -144,6 +153,54 @@ struct Importer<'a> {
 }
 
 impl Importer<'_> {
+    /// Liga as legendas ao lado do vídeo do arquivo `file_id` e as registra.
+    /// Falha numa legenda vira aviso: ela não segura a importação.
+    async fn link_subtitles(
+        &self,
+        torrent: &TorrentInfo,
+        entry: &CatalogSeries,
+        file_id: i64,
+        video: &str,
+        files: &[&TorrentFile],
+    ) {
+        if files.is_empty() {
+            return;
+        }
+        let map = self.config.path_map();
+        let folder = PathBuf::from(&entry.series.path);
+        let (dir, stem) = split_video(video);
+        let originals: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+        let named = crate::subtitles::names(stem, &originals, &HashSet::new());
+        for (file, named) in files.iter().zip(named) {
+            let relative = format!("{dir}{}", named.name);
+            let linked = match (
+                map.to_host(&client_path(torrent, file)),
+                map.to_host(&folder.join(&relative)),
+            ) {
+                (Ok(source), Ok(target)) => {
+                    tokio::task::spawn_blocking(move || crate::grab::link(&source, &target))
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|r| r)
+                }
+                (Err(error), _) | (_, Err(error)) => Err(error.into()),
+            };
+            if let Err(error) = linked {
+                tracing::warn!(legenda = file.name, "legenda não importada: {error:#}");
+                continue;
+            }
+            let subtitle = acervo_store::Subtitle {
+                relative_path: relative,
+                language: named.language.map(str::to_owned),
+                forced: named.forced,
+                origin: acervo_store::SubtitleOrigin::Import,
+            };
+            if let Err(error) = self.store.add_episode_subtitle(file_id, &subtitle).await {
+                tracing::warn!(legenda = file.name, "legenda fora do catálogo: {error}");
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)] // A sequência da importação; dividir só espalharia.
     async fn step(&self, grab: &SeriesGrab, entry: &CatalogSeries) -> Result<Step, Failure> {
         let torrent = self
@@ -182,6 +239,28 @@ impl Importer<'_> {
                 torrent.state
             )));
         }
+        if crate::grab::gone_from_tracker(&self.client, &torrent, self.apply).await {
+            tracing::info!(
+                serie = entry.series.title,
+                release = grab.title,
+                "o tracker não reconhece mais o torrent"
+            );
+            // Como o sem seeds: só sai do cliente se é só deste grab.
+            if self.apply {
+                if super::grab::owns(self.config, self.store, &self.client, grab, &torrent).await {
+                    self.client
+                        .delete(&[DownloadHash::new(grab.hash.clone())], true)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                } else {
+                    tracing::warn!(
+                        release = grab.title,
+                        "torrent desregistrado, mas não é só deste grab: fica no cliente"
+                    );
+                }
+            }
+            return Err(Failure::Download(UNREGISTERED.into()));
+        }
         if stalled(&torrent, OffsetDateTime::now_utc()) {
             tracing::info!(
                 serie = entry.series.title,
@@ -218,7 +297,8 @@ impl Importer<'_> {
         else {
             return Ok(Step::waiting("aguardando os metadados do torrent"));
         };
-        let chosen: Vec<(&TorrentFile, &Choice)> = selection.chosen().collect();
+        let chosen: Vec<(&TorrentFile, &Choice)> = selection.videos().collect();
+        let subtitles: Vec<(&TorrentFile, &Choice)> = selection.subtitles().collect();
         if chosen.is_empty() {
             // Nunca baixou nada: não há o que semear. Mas só sai se o torrent
             // é deste grab e de mais ninguém; na dúvida, fica no cliente.
@@ -367,12 +447,25 @@ impl Importer<'_> {
             // Só os em Quero ganham o arquivo: o que já tem arquivo ou foi
             // dispensado não é religado (não há upgrade), e o antigo fica.
             let linked = to_link(&entry.episodes, &wanted, &choice.episodes);
-            let (_, replaced) = self
+            let (file_id, replaced) = self
                 .store
                 .add_episode_file(entry.id, &record, &linked)
                 .await
                 .map_err(|e| format!("gravando o arquivo: {e}"))?;
             for old in replaced {
+                // O antigo sai com as legendas dele que vieram do torrent; a
+                // posta à mão fica no disco.
+                for sub in entry.subtitles.iter().filter(|s| s.owner == old.id) {
+                    let path = PathBuf::from(&series.path).join(&sub.subtitle.relative_path);
+                    if let Ok(host) = map.to_host(&path)
+                        && let Err(error) = crate::subtitles::remove_if_from_torrent(
+                            &host,
+                            Some(sub.subtitle.origin),
+                        )
+                    {
+                        tracing::warn!(arquivo = %host.display(), "legenda antiga não apagada: {error}");
+                    }
+                }
                 let path = PathBuf::from(&series.path).join(&old.file.relative_path);
                 match map.to_host(&path) {
                     Ok(host) => match std::fs::remove_file(&host) {
@@ -384,6 +477,17 @@ impl Importer<'_> {
                     Err(error) => tracing::warn!("antigo fora do mapa: {error}"),
                 }
             }
+            // As legendas do torrent que são destes episódios vão ao lado.
+            let own: Vec<&TorrentFile> = subtitles
+                .iter()
+                .filter(|(_, sub)| {
+                    !sub.episodes.is_empty()
+                        && sub.episodes.iter().all(|e| choice.episodes.contains(e))
+                })
+                .map(|(f, _)| *f)
+                .collect();
+            self.link_subtitles(&torrent, entry, file_id, &record.relative_path, &own)
+                .await;
             events::record(
                 self.store,
                 Event {
@@ -464,8 +568,17 @@ async fn finish(
                 give_up(store, grab, entry, &error, true, Kind::Failed).await?;
                 if let Some(catalog) = catalog {
                     let only: HashSet<i64> = grab.episode_ids.iter().copied().collect();
-                    match super::search::series_now(config, store, catalog, entry.id, Some(&only))
-                        .await
+                    // O avulso que o tracker apagou deu lugar ao pacote.
+                    let prefer_pack = error == UNREGISTERED;
+                    match super::search::series_now_with(
+                        config,
+                        store,
+                        catalog,
+                        entry.id,
+                        Some(&only),
+                        prefer_pack,
+                    )
+                    .await
                     {
                         Ok(found) => tracing::info!(
                             serie = found.serie,

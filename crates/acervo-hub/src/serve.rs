@@ -175,6 +175,7 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         listener,
         acervo_api::router_with_admin(catalog, api_key, Some(Arc::new(admin)), accounts)
             .merge(crate::web::router(Arc::clone(&web)))
+            .merge(crate::agenda::router(Arc::clone(&web)))
             .merge(crate::series::web::router(web)),
     )
     .with_graceful_shutdown(shutdown())

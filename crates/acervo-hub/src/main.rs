@@ -14,6 +14,7 @@ use std::process::ExitCode;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod agenda;
 mod apply;
 mod automatic;
 mod collect;
@@ -29,14 +30,17 @@ mod mediainfo;
 mod metadata;
 mod movies;
 mod naming;
+mod rename;
 mod report;
 mod rules;
 mod search;
 mod series;
 mod serve;
 mod settings;
+mod subtitles;
 mod sync;
 mod tasks;
+mod verify;
 mod watched;
 mod web;
 
