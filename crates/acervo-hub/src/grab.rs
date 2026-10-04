@@ -234,6 +234,11 @@ fn pick_starts(
 /// [`pick_starts`] com os prioritários antes: eles escolhem primeiro, e o
 /// resto escolhe com o que sobrou de espaço e de vaga. Dentro de cada grupo,
 /// a regra é a mesma: menor primeiro, pulando quem não cabe.
+///
+/// Com `client_queues` (o próprio cliente limita os downloads ativos), o
+/// prioritário não espera vaga, só espaço: o cliente segura o excesso na fila
+/// dele, e ele vai para o topo dela ([`client_queue_moves`]). Sem isso, a vaga
+/// do acervo é a única trava, e vale para todos.
 fn pick_starts_prioritized(
     candidates: &[(String, u64)],
     priority: &HashSet<String>,
@@ -241,6 +246,7 @@ fn pick_starts_prioritized(
     free: u64,
     reserve: u64,
     limit: usize,
+    client_queues: bool,
 ) -> Vec<String> {
     let group = |wanted: bool| -> Vec<(String, u64)> {
         candidates
@@ -250,7 +256,8 @@ fn pick_starts_prioritized(
             .collect()
     };
     let (first, rest) = (group(true), group(false));
-    let mut picked = pick_starts(&first, active_left, free, reserve, limit);
+    let first_limit = if client_queues { usize::MAX } else { limit };
+    let mut picked = pick_starts(&first, active_left, free, reserve, first_limit);
     // O que saiu agora passa a contar como ativo: desconta espaço e vaga.
     let mut busy = active_left.to_vec();
     busy.extend(
@@ -261,6 +268,70 @@ fn pick_starts_prioritized(
     );
     picked.extend(pick_starts(&rest, &busy, free, reserve, limit));
     picked
+}
+
+/// Os `topPrio` que deixam a fila de downloads do cliente na ordem do
+/// acervo: prioritários primeiro, depois do menor para o maior. Vale para
+/// todo torrent que está nela, do acervo ou não.
+///
+/// O tamanho é o total, não o que falta: o que falta muda a cada volta e
+/// faria a fila girar sem parar. Cada `topPrio` leva um torrent ao topo,
+/// então os `m` primeiros da ordem desejada sobem do último para o primeiro.
+/// `m` é o menor que basta: o resto, na ordem em que já está, precisa ser o
+/// resto da ordem desejada. Fila já em ordem não gera chamada nenhuma.
+fn client_queue_moves(
+    torrents: &[acervo_clients::TorrentInfo],
+    priority: &HashSet<String>,
+    size: impl Fn(&acervo_clients::TorrentInfo) -> u64,
+) -> Vec<String> {
+    let mut current: Vec<&acervo_clients::TorrentInfo> =
+        torrents.iter().filter(|t| t.priority > 0).collect();
+    current.sort_by_key(|t| t.priority);
+    let mut wanted = current.clone();
+    wanted.sort_by_key(|t| (!priority.contains(&t.hash), size(t), t.priority));
+    let wanted: Vec<&str> = wanted.iter().map(|t| t.hash.as_str()).collect();
+    let current: Vec<&str> = current.iter().map(|t| t.hash.as_str()).collect();
+    let moves = (0..=wanted.len())
+        .find(|&m| {
+            let top = &wanted[..m];
+            current
+                .iter()
+                .filter(|h| !top.contains(h))
+                .eq(wanted[m..].iter())
+        })
+        .unwrap_or(wanted.len());
+    wanted[..moves]
+        .iter()
+        .rev()
+        .map(|h| (*h).to_owned())
+        .collect()
+}
+
+/// Se o cliente segura na fila dele o que passar de `limit` downloads: só
+/// quando o limite dele não passa do nosso. Com limite maior, ou sem fila, a
+/// vaga do acervo é a única trava.
+async fn client_holds_excess(client: &QbitClient, limit: usize) -> Result<bool> {
+    Ok(client
+        .download_slots()
+        .await?
+        .is_some_and(|slots| slots <= limit))
+}
+
+/// Põe a fila do próprio cliente (limite de downloads ativos do
+/// qBittorrent) na mesma regra da do acervo ([`client_queue_moves`]). Falha
+/// só avisa: a ordem é ajuste, não condição para iniciar nada.
+async fn order_client_queue(
+    client: &QbitClient,
+    torrents: &[acervo_clients::TorrentInfo],
+    priority: &HashSet<String>,
+    size: impl Fn(&acervo_clients::TorrentInfo) -> u64,
+) {
+    for hash in client_queue_moves(torrents, priority, size) {
+        if let Err(error) = client.top_priority(&[&hash]).await {
+            tracing::warn!("ordem da fila do cliente: {error}");
+            return;
+        }
+    }
 }
 
 /// Inicia os torrents da fila que cabem no disco, do menor para o maior,
@@ -314,16 +385,7 @@ pub(crate) async fn start_queued(
     // O que foi apagado, ou ficou por ter link, não entra na conta.
     torrents.retain(|t| !t.has_tag(QUEUE_TAG) || known.contains_key(&t.hash));
     let priority = store.priority_hashes().await?;
-    // Prioritário que o próprio cliente segura na fila dele (limite de
-    // downloads ativos do qBittorrent) sobe para o topo dela.
-    let held: Vec<&str> = torrents
-        .iter()
-        .filter(|t| t.state == "queuedDL" && priority.contains(&t.hash))
-        .map(|t| t.hash.as_str())
-        .collect();
-    if let Err(error) = client.top_priority(&held).await {
-        tracing::warn!("topo da fila do cliente: {error}");
-    }
+    order_client_queue(client, &torrents, &priority, size).await;
     // Só os do acervo: grab em andamento, filme ou série. Sem `amount_left`
     // (cliente antigo), cai na conta pelo tamanho.
     let active_left: Vec<u64> = torrents
@@ -339,7 +401,14 @@ pub(crate) async fn start_queued(
         .collect();
     let rules = crate::rules::stored(store).await?;
     let limit = rules.max_downloads();
-    if active_left.len() >= limit {
+    // No limite, só prioritário sai da fila, e só se o cliente segura o
+    // excesso; sem nenhum, nem vale montá-la.
+    let client_queues = client_holds_excess(client, limit).await?;
+    let at_limit = active_left.len() >= limit;
+    let waiting = |t: &acervo_clients::TorrentInfo| {
+        !at_limit || (client_queues && priority.contains(&t.hash))
+    };
+    if !torrents.iter().any(|t| t.has_tag(QUEUE_TAG) && waiting(t)) {
         return Ok(Vec::new());
     }
     let reserve = rules.folga_minima_mb << 20;
@@ -347,7 +416,7 @@ pub(crate) async fn start_queued(
     let mut queue = Vec::new();
     for torrent in torrents
         .iter()
-        .filter(|t| t.has_tag(QUEUE_TAG) && size(t) > 0)
+        .filter(|t| t.has_tag(QUEUE_TAG) && size(t) > 0 && waiting(t))
     {
         // De série, só sai da fila com os arquivos escolhidos; e o que falta
         // baixar é só o deles.
@@ -365,7 +434,15 @@ pub(crate) async fn start_queued(
         queue.push((torrent.hash.clone(), need));
     }
     let mut started = Vec::new();
-    for hash in pick_starts_prioritized(&queue, &priority, &active_left, free, reserve, limit) {
+    for hash in pick_starts_prioritized(
+        &queue,
+        &priority,
+        &active_left,
+        free,
+        reserve,
+        limit,
+        client_queues,
+    ) {
         let Some(torrent) = torrents.iter().find(|t| t.hash == hash) else {
             continue;
         };
@@ -1892,15 +1969,29 @@ mod tests {
         let priority = HashSet::from(["h40".to_owned(), "h95".to_owned()]);
         // Orçamento 90: o prioritário de 40 primeiro (o de 95 não cabe), e
         // dos outros, menor primeiro, com os 50 que sobram: 5 e 30.
-        let picked =
-            pick_starts_prioritized(&queue(&[80, 5, 40, 30, 95]), &priority, &[], 100, 10, 10);
+        let picked = pick_starts_prioritized(
+            &queue(&[80, 5, 40, 30, 95]),
+            &priority,
+            &[],
+            100,
+            10,
+            10,
+            true,
+        );
         assert_eq!(picked, ["h40", "h5", "h30"]);
         // A vaga também: com uma só, é do prioritário, mesmo sendo maior.
-        let picked = pick_starts_prioritized(&queue(&[5, 40]), &priority, &[], 100, 10, 1);
+        let picked = pick_starts_prioritized(&queue(&[5, 40]), &priority, &[], 100, 10, 1, true);
         assert_eq!(picked, ["h40"]);
         // Sem prioritário, é a regra de sempre.
-        let picked =
-            pick_starts_prioritized(&queue(&[80, 5, 40, 30]), &HashSet::new(), &[], 100, 10, 10);
+        let picked = pick_starts_prioritized(
+            &queue(&[80, 5, 40, 30]),
+            &HashSet::new(),
+            &[],
+            100,
+            10,
+            10,
+            true,
+        );
         assert_eq!(
             picked,
             pick_starts(&queue(&[80, 5, 40, 30]), &[], 100, 10, 10)
@@ -1914,6 +2005,95 @@ mod tests {
         assert_eq!(picked, ["h5", "h30", "h40"]);
         let picked = pick_starts(&queue(&[95, 20]), &[], 100, 10, 10);
         assert_eq!(picked, ["h20"]);
+    }
+
+    #[test]
+    fn prioritario_nao_espera_vaga_so_espaco() {
+        let priority = HashSet::from(["h40".to_owned(), "h95".to_owned()]);
+        // Limite 1 já ocupado: o prioritário de 40 sai mesmo assim; o de 95
+        // não cabe no orçamento, e os outros esperam vaga.
+        let picked =
+            pick_starts_prioritized(&queue(&[5, 40, 95]), &priority, &[1], 100, 10, 1, true);
+        assert_eq!(picked, ["h40"]);
+        // Sem a fila do cliente para segurar o excesso, a vaga vale para todos.
+        let picked =
+            pick_starts_prioritized(&queue(&[5, 40, 95]), &priority, &[1], 100, 10, 1, false);
+        assert!(picked.is_empty());
+    }
+
+    /// Torrent na fila do cliente, na posição dada (0 é fora dela).
+    fn na_fila(hash: &str, size: u64, position: i64) -> acervo_clients::TorrentInfo {
+        serde_json::from_value(serde_json::json!({
+            "hash": hash, "name": hash, "state": "queuedDL", "save_path": "/d",
+            "size": size, "priority": position,
+        }))
+        .unwrap()
+    }
+
+    fn moves(torrents: &[acervo_clients::TorrentInfo], priority: &[&str]) -> Vec<String> {
+        let priority = priority.iter().map(|h| (*h).to_owned()).collect();
+        client_queue_moves(torrents, &priority, |t| t.size)
+    }
+
+    /// A fila depois de aplicar os `topPrio`, como o cliente faria.
+    fn aplicar(torrents: &[acervo_clients::TorrentInfo], top: &[String]) -> Vec<String> {
+        let mut order: Vec<&acervo_clients::TorrentInfo> =
+            torrents.iter().filter(|t| t.priority > 0).collect();
+        order.sort_by_key(|t| t.priority);
+        let mut order: Vec<String> = order.iter().map(|t| t.hash.clone()).collect();
+        for hash in top {
+            order.retain(|h| h != hash);
+            order.insert(0, hash.clone());
+        }
+        order
+    }
+
+    #[test]
+    fn fila_do_cliente_em_ordem_nao_gera_chamada() {
+        let fila = [na_fila("a", 10, 1), na_fila("b", 20, 2), na_fila("c", 5, 0)];
+        assert!(moves(&fila, &[]).is_empty());
+    }
+
+    #[test]
+    fn torrent_novo_no_fim_da_fila_sobe_ao_lugar_dele() {
+        // O de 15 acabou de entrar no fim; só ele e os menores que ele sobem.
+        let fila = [
+            na_fila("a", 10, 1),
+            na_fila("b", 20, 2),
+            na_fila("c", 30, 3),
+            na_fila("novo", 15, 4),
+        ];
+        let top = moves(&fila, &[]);
+        assert_eq!(top, ["novo", "a"]);
+        assert_eq!(aplicar(&fila, &top), ["a", "novo", "b", "c"]);
+    }
+
+    #[test]
+    fn prioritario_vai_ao_topo_da_fila_do_cliente() {
+        let fila = [
+            na_fila("a", 10, 1),
+            na_fila("b", 20, 2),
+            na_fila("grande", 90, 3),
+            na_fila("fora", 1, -1),
+        ];
+        let top = moves(&fila, &["grande"]);
+        assert_eq!(top, ["grande"]);
+        assert_eq!(aplicar(&fila, &top), ["grande", "a", "b"]);
+        // Fora da fila (completo ou fila desligada) nunca é movido.
+        assert!(!moves(&fila, &["fora"]).contains(&"fora".to_owned()));
+    }
+
+    #[test]
+    fn fila_embaralhada_fica_em_ordem() {
+        let fila = [
+            na_fila("e", 50, 1),
+            na_fila("b", 20, 2),
+            na_fila("d", 40, 3),
+            na_fila("a", 10, 4),
+            na_fila("c", 30, 5),
+        ];
+        let top = moves(&fila, &["d"]);
+        assert_eq!(aplicar(&fila, &top), ["d", "a", "b", "c", "e"]);
     }
 
     fn at(text: &str) -> time::OffsetDateTime {

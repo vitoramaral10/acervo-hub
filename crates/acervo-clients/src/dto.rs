@@ -53,6 +53,10 @@ pub struct TorrentInfo {
     /// Quando entrou no cliente, em segundos Unix; zero se não veio.
     #[serde(default)]
     pub added_on: i64,
+    /// Posição na fila de downloads do cliente, 1 primeiro; zero ou negativo
+    /// é fora dela (completo, ou fila do cliente desligada).
+    #[serde(default)]
+    pub priority: i64,
 }
 
 impl TorrentInfo {
@@ -153,6 +157,15 @@ pub(crate) struct ServerState {
 pub(crate) struct Preferences {
     #[serde(default)]
     pub preallocate_all: bool,
+    #[serde(default)]
+    pub queueing_enabled: bool,
+    /// Downloads ativos ao mesmo tempo; negativo é sem limite.
+    #[serde(default)]
+    pub max_active_downloads: i64,
+    /// Torrents ativos ao mesmo tempo, baixando ou semeando; negativo é sem
+    /// limite.
+    #[serde(default)]
+    pub max_active_torrents: i64,
 }
 
 #[cfg(test)]
