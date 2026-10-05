@@ -497,6 +497,44 @@ async fn iniciar_cai_no_resume_do_4x() {
 }
 
 #[tokio::test]
+async fn verificar_de_novo_manda_os_hashes_juntos_e_lista_vazia_nao_chama() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/recheck"))
+        .and(header("referer", server.uri() + "/"))
+        .and(body_string_contains("hashes=aa%7Cbb"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    cliente
+        .recheck(&["aa", "bb"])
+        .await
+        .expect("verificação pedida");
+    // Lista vazia não chama o cliente: o `expect(1)` acima confere.
+    cliente.recheck(&[]).await.expect("nada a pedir");
+}
+
+#[tokio::test]
+async fn verificar_de_novo_recusado_vira_erro_com_o_caminho() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/recheck"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+
+    let error = cliente.recheck(&["aa"]).await.unwrap_err();
+    assert!(
+        matches!(&error, QbitError::Status { path, .. } if path == "api/v2/torrents/recheck"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn preferencia_de_preallocacao_lida_e_ligada() {
     let server = MockServer::start().await;
     let cliente = sessao(&server).await;

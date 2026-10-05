@@ -24,6 +24,7 @@ mod decide;
 mod definitions;
 mod events;
 mod grab;
+mod heal;
 mod health;
 mod ledger;
 mod library;

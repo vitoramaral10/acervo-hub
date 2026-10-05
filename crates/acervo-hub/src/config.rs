@@ -334,7 +334,7 @@ impl PolicyConfig {
 
 /// Ids das tarefas de fundo com o intervalo padrão, em minutos. Zero desliga
 /// o agendamento; "rodar agora" continua valendo.
-pub const TASK_DEFAULTS: [(&str, u64); 7] = [
+pub const TASK_DEFAULTS: [(&str, u64); 8] = [
     // Sem intervalo, só pelo botão.
     ("busca", 0),
     ("rss", 30),
@@ -345,6 +345,9 @@ pub const TASK_DEFAULTS: [(&str, u64); 7] = [
     ("cena", 24 * 60),
     // As definições do repositório oficial, uma vez por dia.
     ("definicoes", 24 * 60),
+    // A conferência do disco: o que sumiu da biblioteca volta pelo mesmo
+    // torrent. Ler o catálogo inteiro no disco a cada 6 h basta.
+    ("disco", 6 * 60),
 ];
 
 /// Teto de qualquer intervalo: 30 dias.
@@ -630,6 +633,7 @@ mod tests {
         assert_eq!(config.library.category, "acervo");
         assert_eq!(config.library.manual_category, "manual");
         assert_eq!(config.tasks.minutes("definicoes"), 1440);
+        assert_eq!(config.tasks.minutes("disco"), 360);
         assert_eq!(config.server.definitions_url, DEFINITIONS_URL);
         assert_eq!(config.server.flaresolverr_timeout_s, 60);
         assert!(config.server.flaresolverr_url.is_none() && config.server.proxy_url.is_none());

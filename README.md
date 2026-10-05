@@ -118,9 +118,14 @@ por volta, roda a fila.
 O que o cliente diz uma vez só não derruba o download:
 
 - **Arquivos sumidos** (`missingFiles`) e **erro do cliente com espaço livre** tentam de
-  novo até persistirem 30 minutos observados pelo processo. Depois, o arquivo sumido vira
-  falha sem bloqueio, e o torrent sai do cliente (se nenhum arquivo tem outro link); o erro,
-  falha com bloqueio de 7 dias.
+  novo até persistirem 30 minutos observados pelo processo. Na primeira vez que o cliente
+  diz `missingFiles`, o acervo manda verificar o torrent de novo, e o mesmo torrent baixa o
+  que falta. Só se persistir 30 minutos depois disso o arquivo sumido vira falha sem
+  bloqueio, e o torrent sai do cliente (se nenhum arquivo tem outro link); o erro, falha com
+  bloqueio de 7 dias.
+- **Terminado, mas fora do disco**: o cliente dá o torrent por completo e o vídeo não está
+  lá. O acervo manda verificar o torrent de novo e espera; se o arquivo continuar sumido
+  depois disso, fica "em atenção".
 - **Disco cheio** devolve o torrent à fila, com o que já baixou.
 - **Sem seeds**: além do que o cliente diz, o torrent precisa estar ativo e sem seed há 30
   minutos observados; torrent que sai de parado ou da fila recomeça a contagem.
@@ -173,6 +178,25 @@ confiável: fila do acervo ilegível, catálogo vazio, lote maior que o teto abs
 fração da biblioteca, biblioteca que mede zero. Uma vez por dia, a limpeza também poda o
 banco: as buscas com mais de 30 dias (a mais recente de cada obra fica) e os bloqueios
 automáticos vencidos. O histórico fica.
+
+### Conferência do disco
+
+`disco` (a cada 6 horas) confere no disco cada arquivo que o catálogo diz estar na
+biblioteca, de filmes e de séries. O que sumiu (só "arquivo não existe" conta; outro erro de
+leitura deixa o arquivo como está) volta pelo **mesmo torrent**, se ele ainda está no
+cliente: o grab importado que o trouxe volta a "baixando", o registro do arquivo sai do
+catálogo, e o torrent volta à fila do acervo e é verificado de novo — a fila o inicia quando
+couber, e a importação liga o arquivo como da primeira vez. Sem o torrent, o registro só sai
+do catálogo, e a busca dos que faltam o pega.
+
+Num pacote de temporada, só voltam os episódios cujo arquivo sumiu: o grab passa a querer só
+esses, e os outros arquivos do torrent — episódio que está no disco, assistido ou dispensado
+— ficam com prioridade zero.
+
+A conferência nunca apaga torrent nem arquivo. Raiz da biblioteca ausente é disco
+desmontado: nada é feito naquele tipo. Na hora agendada, sumiço em massa (mais da metade dos
+arquivos, e ao menos 5) também não é reparado, com o aviso no resumo; **rodar agora**
+confirma o reparo.
 
 ### Tarefas
 

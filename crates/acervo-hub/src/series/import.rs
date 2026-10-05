@@ -5,7 +5,9 @@
 //! Falha segue a dos filmes: torrent com erro vai para a lista de bloqueio
 //! (com a série) e os episódios são buscados de novo; torrent sumido do
 //! cliente é buscado de novo sem bloqueio; disco cheio devolve o torrent à
-//! fila; problema na importação espera a próxima volta.
+//! fila; problema na importação espera a próxima volta. Arquivo que o
+//! cliente dá por baixado e não está no disco faz o torrent ser verificado de
+//! novo, como nos filmes.
 //!
 //! A volta liga os arquivos no disco primeiro e grava tudo de uma vez no
 //! fim ([`Store::import_series_files`]): arquivos, legendas e o grab.
@@ -30,8 +32,9 @@ use crate::config::Config;
 use crate::decide::now_rfc3339;
 use crate::events::{self, Event, Kind};
 use crate::grab::{
-    Condition, Failure, NO_SEEDS, QUEUE_TAG, QUEUED, UNREGISTERED, absent, client_trouble,
-    ensure_client_listed, install, left, no_seeds, present, progress, qbit, watch,
+    CHECKING, Condition, Failure, NO_SEEDS, QUEUE_TAG, QUEUED, UNREGISTERED, absent, checking,
+    client_trouble, ensure_client_listed, install, left, no_seeds, present, progress, qbit,
+    recheck_once, watch,
 };
 
 /// Quanto se espera pelo título do episódio depois da exibição.
@@ -220,12 +223,20 @@ impl Importer<'_> {
         }
         let trouble = client_trouble(&mut watch(), &torrent, now);
         if let Some(failure) = trouble {
-            // Arquivo sumido: o torrent perdido sai do cliente (se é só deste
-            // grab), senão a nova busca devolveria o mesmo hash, ainda em
-            // `missingFiles`. Sem bloqueio: a culpa não é do release.
-            if matches!(failure, Failure::Lost(..)) {
-                self.drop_torrent(grab, &torrent, "arquivos sumidos")
-                    .await?;
+            // Arquivo sumido: antes de desistir, o mesmo torrent é verificado
+            // de novo e baixa o que falta. Se persistir depois disso, o
+            // torrent perdido sai do cliente (se é só deste grab), senão a
+            // nova busca devolveria o mesmo hash, ainda em `missingFiles`.
+            // Sem bloqueio: a culpa não é do release.
+            match failure {
+                Failure::Lost(..) => {
+                    self.drop_torrent(grab, &torrent, "arquivos sumidos")
+                        .await?;
+                }
+                _ if torrent.state == "missingFiles" => {
+                    recheck_once(&self.client, &torrent).await;
+                }
+                _ => {}
             }
             return Err(failure);
         }
@@ -311,12 +322,17 @@ impl Importer<'_> {
                 }
             });
         }
+        if checking(&torrent) {
+            return Ok(Step::waiting(CHECKING));
+        }
         if selection.changed || torrent.progress < 1.0 || torrent.state == "moving" {
             return Ok(Step::waiting(progress(&torrent)));
         }
 
         let mut step = Step::default();
         let mut waiting = Vec::new();
+        // O que o cliente dá por baixado e não está no disco.
+        let mut vanished = Vec::new();
         let map = self.config.path_map();
         let series = &entry.series;
         for (file, choice) in pending {
@@ -373,6 +389,9 @@ impl Importer<'_> {
                 let source = map
                     .to_host(&client_path(&torrent, file))
                     .map_err(|e| e.to_string())?;
+                if crate::grab::not_found(&source).await {
+                    return Ok(None);
+                }
                 let target = map.to_host(&destination).map_err(|e| e.to_string())?;
                 // O mesmo nome de um arquivo que já está lá: troca no lugar.
                 let same_name = entry.files.iter().any(|f| f.file.relative_path == relative);
@@ -419,7 +438,7 @@ impl Importer<'_> {
                 let beside = self
                     .link_subtitles(&torrent, entry, &record.relative_path, &own)
                     .await;
-                Ok::<_, Failure>(Linked {
+                Ok::<_, Failure>(Some(Linked {
                     shown,
                     quality: quality.quality,
                     record: SeriesImport {
@@ -427,14 +446,29 @@ impl Importer<'_> {
                         episode_ids: linked,
                         subtitles: beside,
                     },
-                })
+                }))
             }
             .await;
             match done {
-                Ok(linked) => step.linked.push(linked),
+                Ok(Some(linked)) => step.linked.push(linked),
+                Ok(None) => vanished.push(map.to_host(&client_path(&torrent, file))),
                 Err(Failure::Import(error)) if !step.linked.is_empty() => {
                     step.failed = Some(error);
                     break;
+                }
+                Err(failure) => return Err(failure),
+            }
+        }
+        // Os que sumiram do disco: o mesmo torrent é verificado e baixa de
+        // novo, sem desfazer os que ligaram.
+        if let Some(Ok(source)) = vanished.into_iter().next() {
+            match crate::grab::source_gone(&self.client, &torrent, &source).await {
+                Ok(Some(why)) => waiting.push(why),
+                Ok(None) => {}
+                Err(failure) if !step.linked.is_empty() => {
+                    if let Failure::Import(error) = failure {
+                        step.failed.get_or_insert(error);
+                    }
                 }
                 Err(failure) => return Err(failure),
             }
