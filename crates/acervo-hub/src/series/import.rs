@@ -5,6 +5,10 @@
 //! Falha segue a dos filmes: torrent com erro ou sumido vai para a lista de
 //! bloqueio (com a série) e os episódios são buscados de novo; disco cheio
 //! devolve o torrent à fila; problema na importação espera a próxima volta.
+//! Arquivo que o cliente dá por baixado e não está no disco faz o torrent ser
+//! verificado de novo, como nos filmes. Num pacote, só se liga o arquivo
+//! escolhido e inteiro: o de prioridade zero (episódio que se tem ou foi
+//! assistido) nunca entra, e o incompleto espera sem segurar os outros.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -12,19 +16,19 @@ use std::path::{Path, PathBuf};
 use acervo_api::Catalog;
 use acervo_clients::{QbitClient, TorrentFile, TorrentInfo, client_path};
 use acervo_core::DownloadHash;
-use acervo_store::{CatalogSeries, EpisodeFile, GrabState, SeriesGrab, Store};
+use acervo_store::{CatalogEpisode, CatalogSeries, EpisodeFile, GrabState, SeriesGrab, Store};
 use anyhow::Result;
 use serde::Serialize;
 use time::{Duration, OffsetDateTime};
 
-use super::grab::{Choice, apply_selection, give_up};
+use super::grab::{Choice, Selection, apply_selection, give_up};
 use super::naming::{TBA, episode_path};
 use crate::config::Config;
 use crate::decide::now_rfc3339;
 use crate::events::{self, Event, Kind};
 use crate::grab::{
-    Condition, Failure, NO_SEEDS, QUEUE_TAG, QUEUED, UNREGISTERED, client_trouble, install, left,
-    no_seeds, progress, qbit, watch,
+    CHECKING, Condition, Failure, NO_SEEDS, QUEUE_TAG, QUEUED, UNREGISTERED, checking,
+    client_trouble, install, left, no_seeds, progress, qbit, recheck_once, watch,
 };
 
 /// Quanto se espera pelo título do episódio depois da exibição.
@@ -84,6 +88,25 @@ pub fn to_link(
                 .any(|e| e.id == *id && e.file_id.is_none() && e.skip.is_none())
         })
         .collect()
+}
+
+/// Um arquivo do torrent e o destino dele.
+pub(crate) type Picked<'a> = (&'a TorrentFile, &'a Choice);
+
+/// Os vídeos do torrent a importar, sem IO: os escolhidos (prioridade acima
+/// de zero) com algum episódio do grab ainda em Quero ([`to_link`]),
+/// separados em inteiros no cliente e ainda incompletos. O arquivo de
+/// prioridade zero de um pacote — episódio que já se tem, assistido ou
+/// dispensado — nunca entra, baixado ou não.
+pub(crate) fn importable<'a>(
+    selection: &'a Selection,
+    episodes: &[CatalogEpisode],
+    wanted: &HashSet<i64>,
+) -> (Vec<Picked<'a>>, Vec<Picked<'a>>) {
+    selection
+        .videos()
+        .filter(|(_, choice)| !to_link(episodes, wanted, &choice.episodes).is_empty())
+        .partition(|(file, _)| file.progress >= 1.0)
 }
 
 /// O que uma volta fez com um grab.
@@ -207,12 +230,20 @@ impl Importer<'_> {
         }
         let trouble = client_trouble(&mut watch(), &torrent, now);
         if let Some(failure) = trouble {
-            // Arquivo sumido: o torrent perdido sai do cliente (se é só deste
-            // grab), senão a nova busca devolveria o mesmo hash, ainda em
-            // `missingFiles`. Sem bloqueio: a culpa não é do release.
-            if matches!(failure, Failure::Lost(_)) {
-                self.drop_torrent(grab, &torrent, "arquivos sumidos")
-                    .await?;
+            // Arquivo sumido: antes de desistir, o mesmo torrent é verificado
+            // de novo e baixa o que falta. Se persistir depois disso, o
+            // torrent perdido sai do cliente (se é só deste grab), senão a
+            // nova busca devolveria o mesmo hash, ainda em `missingFiles`.
+            // Sem bloqueio: a culpa não é do release.
+            match failure {
+                Failure::Lost(_) => {
+                    self.drop_torrent(grab, &torrent, "arquivos sumidos")
+                        .await?;
+                }
+                _ if torrent.state == "missingFiles" => {
+                    recheck_once(&self.client, &torrent).await;
+                }
+                _ => {}
             }
             return Err(failure);
         }
@@ -253,8 +284,8 @@ impl Importer<'_> {
         else {
             return Ok(Step::waiting("aguardando os metadados do torrent"));
         };
-        let chosen: Vec<(&TorrentFile, &Choice)> = selection.videos().collect();
-        let subtitles: Vec<(&TorrentFile, &Choice)> = selection.subtitles().collect();
+        let chosen: Vec<Picked<'_>> = selection.videos().collect();
+        let subtitles: Vec<Picked<'_>> = selection.subtitles().collect();
         if chosen.is_empty() {
             // Nunca baixou nada: não há o que semear. Mas só sai se o torrent
             // é deste grab e de mais ninguém; na dúvida, fica no cliente.
@@ -267,11 +298,8 @@ impl Importer<'_> {
         // Pendente: algum episódio do grab que ele traz ainda sem arquivo e
         // sem `skip` — apagado ou dispensado no meio não é importado.
         let wanted: HashSet<i64> = grab.episode_ids.iter().copied().collect();
-        let pending: Vec<&(&TorrentFile, &Choice)> = chosen
-            .iter()
-            .filter(|(_, choice)| !to_link(&entry.episodes, &wanted, &choice.episodes).is_empty())
-            .collect();
-        if pending.is_empty() {
+        let (pending, incomplete) = importable(&selection, &entry.episodes, &wanted);
+        if pending.is_empty() && incomplete.is_empty() {
             let ours = entry.files.iter().any(|f| {
                 f.file.scene_name.as_deref() == Some(grab.title.as_str())
                     && entry
@@ -294,12 +322,27 @@ impl Importer<'_> {
                 }
             });
         }
+        if checking(&torrent) {
+            return Ok(Step::waiting(CHECKING));
+        }
         if selection.changed || torrent.progress < 1.0 || torrent.state == "moving" {
             return Ok(Step::waiting(progress(&torrent)));
         }
 
         let mut step = Step::default();
         let mut waiting = Vec::new();
+        if !incomplete.is_empty() {
+            waiting.push(format!(
+                "aguardando {} do torrent",
+                if incomplete.len() == 1 {
+                    "1 arquivo".to_owned()
+                } else {
+                    format!("{} arquivos", incomplete.len())
+                }
+            ));
+        }
+        // Os vídeos que o cliente dá por baixados e não estão no disco.
+        let mut vanished: Vec<PathBuf> = Vec::new();
         let map = self.config.path_map();
         let series = &entry.series;
         for (file, choice) in pending {
@@ -353,6 +396,10 @@ impl Importer<'_> {
             let source = map
                 .to_host(&client_path(&torrent, file))
                 .map_err(|e| e.to_string())?;
+            if crate::grab::not_found(&source).await {
+                vanished.push(source);
+                continue;
+            }
             let target = map.to_host(&destination).map_err(|e| e.to_string())?;
             // O mesmo nome de um arquivo que já está lá: troca no lugar.
             let same_name = entry.files.iter().any(|f| f.file.relative_path == relative);
@@ -447,6 +494,19 @@ impl Importer<'_> {
             )
             .await;
             step.linked.push(shown);
+        }
+        // O cliente diz que terminou, mas o vídeo não está no disco: o mesmo
+        // torrent é verificado de novo e baixa o que falta. Já verificado,
+        // sem nada ligado nesta volta, é importação travada.
+        if let Some(first) = vanished.first() {
+            match crate::grab::source_gone(&self.client, &torrent, first).await {
+                Err(failure) if step.linked.is_empty() && waiting.is_empty() => {
+                    return Err(failure);
+                }
+                Ok(Some(why)) | Err(Failure::Import(why)) => waiting.push(why),
+                Ok(None) => {}
+                Err(failure) => return Err(failure),
+            }
         }
         if !waiting.is_empty() {
             step.waiting = Some(waiting.join("; "));
@@ -663,6 +723,74 @@ mod tests {
         let wanted = HashSet::from([1, 2, 3, 4]);
         assert_eq!(to_link(&episodes, &wanted, &[1, 2, 3, 4, 5]), [1, 4]);
         assert!(to_link(&episodes, &wanted, &[2, 3]).is_empty());
+    }
+
+    #[test]
+    fn pacote_com_arquivo_de_prioridade_zero_importa_so_o_inteiro_e_escolhido() {
+        let episode = |id: i64, file_id: Option<i64>, skip: Option<acervo_store::Skip>| {
+            acervo_store::CatalogEpisode {
+                id,
+                episode: acervo_store::Episode {
+                    season: 1,
+                    number: u16::try_from(id).unwrap(),
+                    tmdb_id: None,
+                    title: None,
+                    air_date: None,
+                    overview: None,
+                    runtime: 0,
+                },
+                skip,
+                skipped_at: None,
+                file_id,
+            }
+        };
+        // E1 assistido (o arquivo saiu), E2 no disco, E3 e E4 sumidos e
+        // voltando pelo mesmo pacote.
+        let episodes = [
+            episode(1, None, Some(acervo_store::Skip::Watched)),
+            episode(2, Some(20), None),
+            episode(3, None, None),
+            episode(4, None, None),
+        ];
+        let file = |index: usize, priority: u8, progress: f64| -> TorrentFile {
+            serde_json::from_value(serde_json::json!({
+                "index": index,
+                "name": format!("Show.S01/Show.S01E{:02}.mkv", index + 1),
+                "size": 100,
+                "priority": priority,
+                "progress": progress,
+            }))
+            .unwrap()
+        };
+        let choice = |index: usize, priority: u8| Choice {
+            index,
+            priority,
+            episodes: vec![i64::try_from(index).unwrap() + 1],
+            subtitle: false,
+        };
+        let selection = Selection {
+            // E1 e E2 com prioridade zero, nunca baixados de novo; E3 inteiro;
+            // E4 ainda baixando.
+            files: vec![
+                file(0, 0, 0.0),
+                file(1, 0, 0.0),
+                file(2, 1, 1.0),
+                file(3, 1, 0.4),
+            ],
+            choices: vec![choice(0, 0), choice(1, 0), choice(2, 1), choice(3, 1)],
+            changed: false,
+        };
+        let wanted = HashSet::from([3, 4]);
+        let (ready, incomplete) = importable(&selection, &episodes, &wanted);
+        let ready: Vec<usize> = ready.iter().map(|(f, _)| f.index).collect();
+        let incomplete: Vec<usize> = incomplete.iter().map(|(f, _)| f.index).collect();
+        assert_eq!(ready, [2]);
+        assert_eq!(incomplete, [3]);
+        // Mesmo que o grab ainda quisesse E1 e E2, sem prioridade eles não
+        // entram, baixados ou não.
+        let wanted = HashSet::from([1, 2, 3, 4]);
+        let (ready, _) = importable(&selection, &episodes, &wanted);
+        assert_eq!(ready.len(), 1);
     }
 
     #[test]

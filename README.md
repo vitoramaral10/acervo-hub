@@ -118,9 +118,14 @@ por volta, roda a fila.
 O que o cliente diz uma vez só não derruba o download:
 
 - **Arquivos sumidos** (`missingFiles`) e **erro do cliente com espaço livre** tentam de
-  novo até persistirem 30 minutos observados pelo processo. Depois, o arquivo sumido vira
-  falha sem bloqueio, e o torrent sai do cliente (se nenhum arquivo tem outro link); o erro,
-  falha com bloqueio de 7 dias.
+  novo até persistirem 30 minutos observados pelo processo. Na primeira vez que o cliente
+  diz `missingFiles`, o acervo manda verificar o torrent de novo, e o mesmo torrent baixa o
+  que falta. Só se persistir 30 minutos depois disso o arquivo sumido vira falha sem
+  bloqueio, e o torrent sai do cliente (se nenhum arquivo tem outro link); o erro, falha com
+  bloqueio de 7 dias.
+- **Terminado, mas fora do disco**: o cliente dá o torrent por completo e o vídeo não está
+  lá. O acervo manda verificar o torrent de novo e espera; se o arquivo continuar sumido
+  depois disso, fica "em atenção".
 - **Disco cheio** devolve o torrent à fila, com o que já baixou.
 - **Sem seeds**: além do que o cliente diz, o torrent precisa estar ativo e sem seed há 30
   minutos observados; torrent que sai de parado ou da fila recomeça a contagem.

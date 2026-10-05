@@ -10,7 +10,10 @@
 //! filme é buscado de novo. Problema na importação (arquivo no caminho, disco
 //! diferente) não é culpa do release: o download fica na fila, com o aviso,
 //! até dar certo. O que o cliente diz uma vez só (arquivos sumidos, erro, sem
-//! seeds) precisa persistir 30 min observados antes de virar falha.
+//! seeds) precisa persistir 30 min observados antes de virar falha. Arquivo
+//! sumido do disco, antes de qualquer falha, faz o cliente verificar o
+//! torrent de novo ([`recheck_once`]): o mesmo torrent baixa outra vez o que
+//! falta, sem busca nova.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -88,6 +91,8 @@ pub(crate) struct Watch {
     since: HashMap<(String, Condition), OffsetDateTime>,
     /// Os torrents cujo aviso de importação travada já saiu.
     noticed: HashSet<String>,
+    /// Os torrents que o acervo já mandou verificar de novo.
+    rechecked: HashSet<String>,
 }
 
 impl Watch {
@@ -114,10 +119,22 @@ impl Watch {
         self.noticed.insert(hash.to_owned())
     }
 
+    /// A verificação do torrent já foi pedida, desde o último
+    /// [`Watch::forget`].
+    pub fn rechecked(&self, hash: &str) -> bool {
+        self.rechecked.contains(hash)
+    }
+
+    /// Anota que a verificação do torrent foi pedida.
+    pub fn mark_rechecked(&mut self, hash: &str) {
+        self.rechecked.insert(hash.to_owned());
+    }
+
     /// O grab terminou: tudo o que se acompanhava do torrent sai.
     pub fn forget(&mut self, hash: &str) {
         self.since.retain(|(h, _), _| h != hash);
         self.noticed.remove(hash);
+        self.rechecked.remove(hash);
     }
 }
 
@@ -147,7 +164,9 @@ pub(crate) const CLIENT_ERROR: &str = "o cliente marcou o torrent com `error`";
 /// `error` (o de disco cheio já foi tratado antes) tentam de novo até
 /// persistirem [`PERSIST`] observados. Aí, arquivo sumido é falha sem
 /// bloqueio — o release não tem culpa —, e erro é falha com o bloqueio que
-/// expira, como o de sem seeds.
+/// expira, como o de sem seeds. Arquivo sumido só desiste depois de o
+/// torrent ter sido verificado de novo ([`recheck_once`]): sem isso, tenta
+/// para sempre (e a importação travada avisa).
 pub(crate) fn client_trouble(
     watch: &mut Watch,
     torrent: &acervo_clients::TorrentInfo,
@@ -162,7 +181,9 @@ pub(crate) fn client_trouble(
     );
     let error = watch.observe(&torrent.hash, Condition::ClientError, state == "error", now);
     match state {
-        "missingFiles" if missing >= PERSIST => Some(Failure::Lost(MISSING_FILES.into())),
+        "missingFiles" if missing >= PERSIST && watch.rechecked(&torrent.hash) => {
+            Some(Failure::Lost(MISSING_FILES.into()))
+        }
         "missingFiles" => Some(Failure::Import(format!(
             "{MISSING_FILES}; tenta de novo por 30 min"
         ))),
@@ -172,6 +193,88 @@ pub(crate) fn client_trouble(
         ))),
         _ => None,
     }
+}
+
+/// A mensagem da espera depois de pedir a verificação de um torrent que o
+/// cliente dava por terminado, com o arquivo fora do disco.
+pub(crate) const VANISHED: &str =
+    "o cliente diz que terminou, mas o arquivo sumiu; verificando o torrent de novo";
+
+/// A mensagem da espera enquanto o cliente verifica o torrent.
+pub(crate) const CHECKING: &str = "o cliente está verificando os arquivos do torrent";
+
+/// O cliente está conferindo os arquivos do torrent (`checkingUP`,
+/// `checkingDL`, `checkingResumeData`): o progresso ainda não vale.
+pub(crate) fn checking(torrent: &acervo_clients::TorrentInfo) -> bool {
+    torrent.state.starts_with("checking")
+}
+
+/// Pede ao cliente que verifique o torrent de novo, uma vez por torrent até
+/// [`Watch::forget`]: o que sumiu do disco deixa de contar como baixado e o
+/// mesmo torrent o baixa outra vez. `true` se pediu agora. Falha no pedido
+/// vira aviso e não marca: a próxima volta tenta de novo.
+pub(crate) async fn recheck_once(
+    client: &QbitClient,
+    torrent: &acervo_clients::TorrentInfo,
+) -> bool {
+    let done = watch().rechecked(&torrent.hash);
+    if done {
+        return false;
+    }
+    match client.recheck(&[&torrent.hash]).await {
+        Ok(()) => {
+            watch().mark_rechecked(&torrent.hash);
+            tracing::info!(torrent = %torrent.name, "arquivos sumidos: verificando o torrent de novo");
+            true
+        }
+        Err(error) => {
+            tracing::warn!(torrent = %torrent.name, "verificação do torrent não pedida: {error}");
+            false
+        }
+    }
+}
+
+/// O arquivo que o cliente dá por baixado não está no disco (só `NotFound`
+/// conta; outro erro fica para quem liga o arquivo dizer): na primeira vez,
+/// pede a verificação do torrent e devolve a espera ([`VANISHED`]); com ela
+/// já pedida, é importação travada, com o caminho. No disco: `Ok(None)`.
+pub(crate) async fn source_gone(
+    client: &QbitClient,
+    torrent: &acervo_clients::TorrentInfo,
+    source: &Path,
+) -> Result<Option<String>, Failure> {
+    if !not_found(source).await {
+        return Ok(None);
+    }
+    if recheck_once(client, torrent).await {
+        return Ok(Some(VANISHED.into()));
+    }
+    let done = watch().rechecked(&torrent.hash);
+    Err(Failure::Import(if done {
+        format!(
+            "o arquivo `{}` não está no disco, e o torrent já foi verificado de novo",
+            source.display()
+        )
+    } else {
+        format!(
+            "o arquivo `{}` não está no disco; a verificação do torrent falhou, tenta de novo",
+            source.display()
+        )
+    }))
+}
+
+/// O caminho, no host, não existe. Só `NotFound` conta: outro erro de
+/// leitura é dúvida, e dúvida é `false`.
+pub(crate) async fn not_found(path: &Path) -> bool {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        matches!(
+            std::fs::symlink_metadata(&path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// O aviso da importação travada: `true` uma vez só, quando o torrent passa
@@ -1540,12 +1643,20 @@ impl MovieImport<'_> {
         }
         let trouble = client_trouble(&mut watch(), &torrent, now);
         if let Some(failure) = trouble {
-            // Arquivo sumido: o torrent perdido sai do cliente (se nenhum
-            // arquivo tem outro link), senão a nova busca devolveria o mesmo
-            // hash, ainda em `missingFiles`, e o ciclo nunca acabaria. Sem
-            // bloqueio: a culpa não é do release.
-            if matches!(failure, Failure::Lost(_)) {
-                delete_unlinked(self.config, client, &torrent, "arquivos sumidos").await?;
+            // Arquivo sumido: antes de desistir, o mesmo torrent é verificado
+            // de novo e baixa o que falta. Depois disso, se persistir, o
+            // torrent perdido sai do cliente (se nenhum arquivo tem outro
+            // link), senão a nova busca devolveria o mesmo hash, ainda em
+            // `missingFiles`, e o ciclo nunca acabaria. Sem bloqueio: a culpa
+            // não é do release.
+            match failure {
+                Failure::Lost(_) => {
+                    delete_unlinked(self.config, client, &torrent, "arquivos sumidos").await?;
+                }
+                _ if torrent.state == "missingFiles" => {
+                    recheck_once(client, &torrent).await;
+                }
+                _ => {}
             }
             return Err(failure);
         }
@@ -1572,6 +1683,9 @@ impl MovieImport<'_> {
             // travado, porém, ocuparia vaga e reserva.
             delete_unlinked(self.config, client, &torrent, "torrent sem seeds").await?;
             return Err(Failure::Download(NO_SEEDS.into()));
+        }
+        if checking(&torrent) {
+            return Ok(Step::Waiting(CHECKING.into()));
         }
         if torrent.progress < 1.0 {
             return Ok(Step::Waiting(progress(&torrent)));
@@ -1602,6 +1716,11 @@ impl MovieImport<'_> {
             .to_host(&client_path(&torrent, video))
             .map_err(|e| e.to_string())?;
         let destination_host = map.to_host(&destination).map_err(|e| e.to_string())?;
+        // O cliente diz que terminou, mas o vídeo não está no disco (disco
+        // apagado, arquivo removido à mão): o mesmo torrent baixa de novo.
+        if let Some(waiting) = source_gone(client, &torrent, &source_host).await? {
+            return Ok(Step::Waiting(waiting));
+        }
         let installed = destination_host.clone();
         tokio::task::spawn_blocking(move || install(&source_host, &installed, old_host.as_deref()))
             .await
@@ -2009,6 +2128,8 @@ mod tests {
         let mut watch = Watch::default();
         let start = at("2026-10-03T12:00:00Z");
         let missing = torrent("missingFiles");
+        // A verificação do torrent foi pedida na primeira volta.
+        watch.mark_rechecked(&missing.hash);
         for minutes in [0, 10, 29] {
             assert!(
                 matches!(
@@ -2032,6 +2153,46 @@ mod tests {
             client_trouble(&mut watch, &missing, start + time::Duration::hours(2)),
             Some(Failure::Import(_))
         ));
+    }
+
+    #[test]
+    fn arquivos_sumidos_sem_verificacao_pedida_nunca_desistem() {
+        let mut watch = Watch::default();
+        let start = at("2026-10-03T12:00:00Z");
+        let missing = torrent("missingFiles");
+        for minutes in [0, 30, 600] {
+            assert!(
+                matches!(
+                    client_trouble(
+                        &mut watch,
+                        &missing,
+                        start + time::Duration::minutes(minutes)
+                    ),
+                    Some(Failure::Import(message)) if message.contains("tenta de novo por 30 min")
+                ),
+                "{minutes} min"
+            );
+        }
+        // Pedida a verificação, ainda sumido depois de 30 min: desiste.
+        watch.mark_rechecked(&missing.hash);
+        assert!(matches!(
+            client_trouble(&mut watch, &missing, start + time::Duration::minutes(601)),
+            Some(Failure::Lost(_))
+        ));
+        // O grab acabou: a verificação de um grab novo do mesmo torrent
+        // recomeça.
+        watch.forget(&missing.hash);
+        assert!(!watch.rechecked(&missing.hash));
+    }
+
+    #[test]
+    fn verificando_nao_e_progresso_que_vale() {
+        for state in ["checkingUP", "checkingDL", "checkingResumeData"] {
+            assert!(checking(&torrent(state)), "{state}");
+        }
+        for state in ["stalledUP", "downloading", "missingFiles", "stoppedDL"] {
+            assert!(!checking(&torrent(state)), "{state}");
+        }
     }
 
     #[test]
