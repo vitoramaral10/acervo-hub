@@ -43,6 +43,8 @@ reqwest.workspace = true
 rustix.workspace = true
 
 [dev-dependencies]
+# Relógio pausado nos testes do agendador (`start_paused`).
+tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
 
 [lints]
