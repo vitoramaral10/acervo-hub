@@ -202,6 +202,21 @@ impl QbitClient {
             .await
     }
 
+    /// Manda o cliente verificar de novo os arquivos dos torrents (o "forçar
+    /// verificação"): o que sumiu do disco deixa de contar como baixado, e o
+    /// torrent volta a baixá-lo. Lista vazia não chama o cliente.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status não-2xx.
+    pub async fn recheck(&self, hashes: &[&str]) -> Result<(), QbitError> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        self.post("api/v2/torrents/recheck", &[("hashes", &hashes.join("|"))])
+            .await
+    }
+
     /// Põe uma tag em torrents; a tag é criada se não existir.
     ///
     /// # Errors
