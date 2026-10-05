@@ -13,7 +13,8 @@ use serde::Serialize;
 use tokio_postgres::Row;
 
 use crate::{
-    CatalogSubtitle, GrabState, Result, Store, StoreError, narrow, quality, small, subtitle_from,
+    Blocked, CatalogSubtitle, GrabState, Result, Store, StoreError, Subtitle,
+    insert_episode_subtitle, manage, narrow, quality, small, subtitle_from,
 };
 
 /// Por que um episódio não é buscado.
@@ -673,7 +674,9 @@ impl Store {
             .collect()
     }
 
-    /// Muda o estado de um grab.
+    /// Muda o estado de um grab. Como em [`Store::update_grab`], só mexe em
+    /// grab ainda `downloading`, e devolve se a linha mudou: `false` é
+    /// "outro fluxo já fechou este grab".
     ///
     /// # Errors
     ///
@@ -684,17 +687,106 @@ impl Store {
         state: GrabState,
         message: Option<&str>,
         finished_at: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let client = self.pool.get().await?;
-        client
-            .execute(
-                "UPDATE series_grabs SET state = $2, message = $3, finished_at = $4
-                 WHERE id = $1",
-                &[&id, &state.as_str(), &message, &finished_at],
-            )
-            .await?;
-        Ok(())
+        set_series_grab(&client, id, state, message, finished_at).await
     }
+
+    /// Desiste de um grab de série e, com `block`, bloqueia o release, numa
+    /// transação, como [`Store::fail_grab`]. `false` (e nada gravado) se o
+    /// grab já não estava `downloading`.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn fail_series_grab(
+        &self,
+        id: i64,
+        message: &str,
+        block: Option<&Blocked>,
+        at: &str,
+    ) -> Result<bool> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        if !set_series_grab(&tx, id, GrabState::Failed, Some(message), Some(at)).await? {
+            return Ok(false);
+        }
+        if let Some(block) = block {
+            manage::insert_block(&tx, block).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// O que uma volta da importação de série ligou, numa transação: cada
+    /// arquivo com os episódios e as legendas dele, e o grab no estado novo
+    /// (`Imported`, ou ainda `Downloading` com `message` quando falta algum
+    /// arquivo). Se algo cai no meio, nada fica e a volta seguinte refaz.
+    ///
+    /// Devolve, por arquivo e na ordem de `files`, o id e os que ele tirou
+    /// do catálogo (o disco é com quem chama, depois desta gravação), ou
+    /// `None` — e nada gravado — se o grab já não estava `downloading`.
+    ///
+    /// # Errors
+    ///
+    /// Episódio de outra série ou falha de escrita.
+    pub async fn import_series_files(
+        &self,
+        grab_id: i64,
+        series_id: i64,
+        files: &[SeriesImport],
+        state: GrabState,
+        message: Option<&str>,
+        at: &str,
+    ) -> Result<Option<Vec<(i64, Vec<CatalogEpisodeFile>)>>> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let finished = (state != GrabState::Downloading).then_some(at);
+        if !set_series_grab(&tx, grab_id, state, message, finished).await? {
+            return Ok(None);
+        }
+        let mut linked = Vec::with_capacity(files.len());
+        for import in files {
+            let (file_id, replaced) =
+                link_file(&tx, series_id, &import.file, &import.episode_ids).await?;
+            for subtitle in &import.subtitles {
+                insert_episode_subtitle(&tx, file_id, subtitle).await?;
+            }
+            linked.push((file_id, replaced));
+        }
+        tx.commit().await?;
+        Ok(Some(linked))
+    }
+}
+
+/// Um arquivo de episódio que a importação ligou no disco, a gravar com
+/// [`Store::import_series_files`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesImport {
+    pub file: EpisodeFile,
+    /// Os episódios que ele passa a cobrir (os que estavam em Quero).
+    pub episode_ids: Vec<i64>,
+    /// As legendas ligadas ao lado dele.
+    pub subtitles: Vec<Subtitle>,
+}
+
+/// O corpo de [`Store::update_series_grab`], dentro da transação de quem
+/// chama, se houver.
+async fn set_series_grab(
+    client: &impl GenericClient,
+    id: i64,
+    state: GrabState,
+    message: Option<&str>,
+    finished_at: Option<&str>,
+) -> Result<bool> {
+    Ok(client
+        .execute(
+            "UPDATE series_grabs SET state = $2, message = $3, finished_at = $4
+             WHERE id = $1 AND state = 'downloading'",
+            &[&id, &state.as_str(), &message, &finished_at],
+        )
+        .await?
+        > 0)
 }
 
 /// Um release que a busca de uma série pegou.
@@ -1825,6 +1917,185 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Um cenário só: a falha no meio, o parcial, o fecho e a corrida.
+    async fn importacao_da_serie_e_uma_transacao_e_so_mexe_no_grab_baixando() {
+        let Some(db) = TestDb::new("series_importa").await else {
+            return;
+        };
+        let store = &db.store;
+        let id = store
+            .add_series(&series(10, "Um"), &[episode(1, 1), episode(1, 2)])
+            .await
+            .unwrap();
+        let other = store
+            .add_series(&series(11, "Dois"), &[episode(1, 1)])
+            .await
+            .unwrap();
+        let ids: Vec<i64> = store
+            .series(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .episodes
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        let foreign = store.series(other).await.unwrap().unwrap().episodes[0].id;
+        let grab_id = store
+            .record_series_grab(&grab(id, "aaaa", ids.clone(), "2026-01-01T00:00:00Z"))
+            .await
+            .unwrap();
+        let subtitle = Subtitle {
+            origin: crate::SubtitleOrigin::Import,
+            relative_path: "Season 1/e1.pt-BR.srt".into(),
+            language: Some("pt-BR".into()),
+            forced: false,
+        };
+        let import = |path: &str, episode_ids: Vec<i64>| SeriesImport {
+            file: file(path),
+            episode_ids,
+            subtitles: vec![subtitle.clone()],
+        };
+
+        // O segundo arquivo falha (episódio de outra série): o primeiro, já
+        // gravado na transação, não fica, e o grab segue baixando.
+        let broken = store
+            .import_series_files(
+                grab_id,
+                id,
+                &[
+                    import("Season 1/e1.mkv", ids[..1].to_vec()),
+                    import("Season 1/x.mkv", vec![foreign]),
+                ],
+                GrabState::Imported,
+                None,
+                "2026-01-02T00:00:00Z",
+            )
+            .await;
+        assert!(matches!(broken, Err(StoreError::Corrupt(_))));
+        let entry = store.series(id).await.unwrap().unwrap();
+        assert!(entry.files.is_empty() && entry.subtitles.is_empty());
+        assert!(entry.episodes.iter().all(|e| e.file_id.is_none()));
+        let grabs = store.series_grabs().await.unwrap();
+        assert_eq!(grabs[0].state, GrabState::Downloading);
+
+        // Falta um arquivo: o que ligou fica, e o grab segue baixando, com o
+        // porquê.
+        let written = store
+            .import_series_files(
+                grab_id,
+                id,
+                &[import("Season 1/e1.mkv", ids[..1].to_vec())],
+                GrabState::Downloading,
+                Some("aguardando o título"),
+                "2026-01-02T00:00:00Z",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(written.len(), 1);
+        let entry = store.series(id).await.unwrap().unwrap();
+        assert_eq!(entry.files.len(), 1);
+        assert_eq!(entry.subtitles.len(), 1);
+        assert_eq!(entry.subtitles[0].owner, written[0].0);
+        let grabs = store.series_grabs().await.unwrap();
+        assert_eq!(grabs[0].state, GrabState::Downloading);
+        assert_eq!(grabs[0].message.as_deref(), Some("aguardando o título"));
+        assert_eq!(grabs[0].finished_at, None);
+
+        store
+            .import_series_files(
+                grab_id,
+                id,
+                &[import("Season 1/e2.mkv", ids[1..].to_vec())],
+                GrabState::Imported,
+                None,
+                "2026-01-03T00:00:00Z",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let grabs = store.series_grabs().await.unwrap();
+        assert_eq!(grabs[0].state, GrabState::Imported);
+        assert_eq!(
+            grabs[0].finished_at.as_deref(),
+            Some("2026-01-03T00:00:00Z")
+        );
+
+        // Fechado: quem chega depois perde a corrida e não grava nada — nem
+        // arquivo, nem falha, nem bloqueio, nem anotação.
+        assert_eq!(
+            store
+                .import_series_files(
+                    grab_id,
+                    id,
+                    &[import("Season 1/outro.mkv", ids[..1].to_vec())],
+                    GrabState::Imported,
+                    None,
+                    "2026-01-04T00:00:00Z",
+                )
+                .await
+                .unwrap(),
+            None
+        );
+        let blocked = Blocked {
+            id: 0,
+            movie_id: None,
+            series_id: Some(id),
+            source_title: "Serie.S01.1080p.WEB-DL-GRUPO".into(),
+            indexer: None,
+            quality: None,
+            size: None,
+            hash: None,
+            at: "2026-01-04T00:00:00Z".into(),
+            message: Some("sem seeds".into()),
+            reason: crate::FailReason::NoSeeds,
+        };
+        assert!(
+            !store
+                .fail_series_grab(grab_id, "sem seeds", Some(&blocked), "2026-01-04T00:00:00Z")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .update_series_grab(grab_id, GrabState::Downloading, Some("40%"), None)
+                .await
+                .unwrap()
+        );
+        let entry = store.series(id).await.unwrap().unwrap();
+        assert_eq!(entry.files.len(), 2);
+        assert!(store.blocklist().await.unwrap().is_empty());
+        let grabs = store.series_grabs().await.unwrap();
+        assert_eq!(grabs[0].state, GrabState::Imported);
+        assert_eq!(grabs[0].message, None);
+
+        // Baixando, a falha grava o grab e o bloqueio juntos.
+        let next = store
+            .record_series_grab(&grab(id, "bbbb", ids.clone(), "2026-01-05T00:00:00Z"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .fail_series_grab(next, "sem seeds", Some(&blocked), "2026-01-05T00:00:00Z")
+                .await
+                .unwrap()
+        );
+        let failed = store
+            .series_grabs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|g| g.id == next)
+            .unwrap();
+        assert_eq!(failed.state, GrabState::Failed);
+        assert_eq!(failed.finished_at.as_deref(), Some("2026-01-05T00:00:00Z"));
+        assert_eq!(store.blocklist().await.unwrap().len(), 1);
+
+        db.drop().await;
+    }
+
+    #[tokio::test]
     async fn apagar_a_serie_leva_tudo_e_poupa_o_historico() {
         let Some(db) = TestDb::new("series_apaga").await else {
             return;
@@ -1870,6 +2141,7 @@ mod tests {
             hash: None,
             at: "2026-01-01T00:00:00Z".into(),
             message: None,
+            reason: crate::FailReason::Other,
         };
         store.block(&blocked).await.unwrap();
         assert_eq!(store.blocklist().await.unwrap()[0].series_id, Some(id));

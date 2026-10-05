@@ -67,6 +67,51 @@ pub struct HistoryPage {
     pub events: Vec<HistoryEvent>,
 }
 
+/// Por que um download desistiu, ou um release foi bloqueado. É isto que a
+/// lógica olha (o bloqueio que expira, a poda, a preferência pelo pacote);
+/// a mensagem ao lado é só para a tela, e pode mudar de texto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailReason {
+    /// Baixando sem seed nenhum por tempo demais.
+    NoSeeds,
+    /// O tracker não reconhece mais o torrent.
+    Unregistered,
+    /// O cliente marcou o torrent com erro, com espaço sobrando.
+    ClientError,
+    /// O cliente não acha os arquivos do torrent no disco.
+    MissingFiles,
+    /// O torrent sumiu do cliente.
+    Vanished,
+    /// Qualquer outro: marcado na tela, release sem arquivo útil...
+    Other,
+}
+
+impl FailReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NoSeeds => "no_seeds",
+            Self::Unregistered => "unregistered",
+            Self::ClientError => "client_error",
+            Self::MissingFiles => "missing_files",
+            Self::Vanished => "vanished",
+            Self::Other => "other",
+        }
+    }
+
+    pub(crate) fn parse(text: &str) -> Result<Self> {
+        match text {
+            "no_seeds" => Ok(Self::NoSeeds),
+            "unregistered" => Ok(Self::Unregistered),
+            "client_error" => Ok(Self::ClientError),
+            "missing_files" => Ok(Self::MissingFiles),
+            "vanished" => Ok(Self::Vanished),
+            "other" => Ok(Self::Other),
+            other => Err(StoreError::Corrupt(format!("motivo de falha `{other}`"))),
+        }
+    }
+}
+
 /// Um release que não se pega de novo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Blocked {
@@ -80,7 +125,33 @@ pub struct Blocked {
     pub size: Option<u64>,
     pub hash: Option<String>,
     pub at: String,
+    /// Só para a tela: a lógica olha [`Blocked::reason`].
     pub message: Option<String>,
+    pub reason: FailReason,
+}
+
+/// Grava um bloqueio, dentro da transação de quem chama, se houver.
+pub(crate) async fn insert_block(client: &impl GenericClient, blocked: &Blocked) -> Result<i64> {
+    let row = client
+        .query_one(
+            "INSERT INTO blocklist (movie_id, source_title, indexer, quality, size, hash, at,
+                 message, series_id, reason)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
+            &[
+                &blocked.movie_id,
+                &blocked.source_title,
+                &blocked.indexer,
+                &blocked.quality.map(|q| i16::from(q.id())),
+                &blocked.size.and_then(|s| i64::try_from(s).ok()),
+                &blocked.hash,
+                &blocked.at,
+                &blocked.message,
+                &blocked.series_id,
+                &blocked.reason.as_str(),
+            ],
+        )
+        .await?;
+    Ok(row.try_get(0)?)
 }
 
 fn size(value: Option<i64>) -> Option<u64> {
@@ -216,26 +287,7 @@ impl Store {
     ///
     /// Falha de escrita.
     pub async fn block(&self, blocked: &Blocked) -> Result<i64> {
-        let client = self.pool.get().await?;
-        let row = client
-            .query_one(
-                "INSERT INTO blocklist (movie_id, source_title, indexer, quality, size, hash, at,
-                     message, series_id)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
-                &[
-                    &blocked.movie_id,
-                    &blocked.source_title,
-                    &blocked.indexer,
-                    &blocked.quality.map(|q| i16::from(q.id())),
-                    &blocked.size.and_then(|s| i64::try_from(s).ok()),
-                    &blocked.hash,
-                    &blocked.at,
-                    &blocked.message,
-                    &blocked.series_id,
-                ],
-            )
-            .await?;
-        Ok(row.try_get(0)?)
+        insert_block(&self.pool.get().await?, blocked).await
     }
 
     /// Lista de bloqueio, do mais novo ao mais velho.
@@ -248,7 +300,7 @@ impl Store {
         client
             .query(
                 "SELECT id, movie_id, source_title, indexer, quality, size, hash, at, message,
-                        series_id
+                        series_id, reason
                  FROM blocklist ORDER BY at DESC, id DESC",
                 &[],
             )
@@ -266,6 +318,7 @@ impl Store {
                     at: row.try_get(7)?,
                     message: row.try_get(8)?,
                     series_id: row.try_get(9)?,
+                    reason: FailReason::parse(row.try_get(10)?)?,
                 })
             })
             .collect()
@@ -282,19 +335,19 @@ impl Store {
             > 0)
     }
 
-    /// Apaga os bloqueios automáticos vencidos: os de mensagem em `messages`
+    /// Apaga os bloqueios automáticos vencidos: os de motivo em `reasons`
     /// gravados antes de `before` (RFC 3339, UTC). Devolve quantos saíram.
     ///
     /// # Errors
     ///
     /// Falha de escrita.
-    pub async fn delete_blocks(&self, messages: &[&str], before: &str) -> Result<u64> {
+    pub async fn delete_blocks(&self, reasons: &[FailReason], before: &str) -> Result<u64> {
         let client = self.pool.get().await?;
-        let messages: Vec<&str> = messages.to_vec();
+        let reasons: Vec<&str> = reasons.iter().map(|r| r.as_str()).collect();
         Ok(client
             .execute(
-                "DELETE FROM blocklist WHERE message = ANY($1) AND at < $2",
-                &[&messages, &before],
+                "DELETE FROM blocklist WHERE reason = ANY($1) AND at < $2",
+                &[&reasons, &before],
             )
             .await?)
     }
