@@ -89,10 +89,16 @@ wiremock = "0.6"
 
 [profile.release]
 # O binário vai para uma imagem distroless: símbolo de debug ali só ocupa
-# espaço, e `lto` com uma unidade de codegen paga em tamanho o que custa em
-# tempo de build — que fica no cache mount de qualquer forma.
+# espaço. `lto` thin sem fixar `codegen-units` mantém o build local dentro da
+# memória; o tamanho máximo fica para o perfil `dist`.
 strip = "symbols"
-lto = true
+lto = "thin"
+
+# Só a imagem usa este perfil: `lto` completo com uma unidade de codegen paga
+# em tempo de build o que ganha em tamanho, e isso fica no cache mount de CI.
+[profile.dist]
+inherits = "release"
+lto = "fat"
 codegen-units = 1
 
 # Hash sem otimização leva segundos: o argon2 das senhas e o SCRAM de cada
