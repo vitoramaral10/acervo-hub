@@ -49,6 +49,9 @@ pub const ASSISTIDOS: &str = "assistidos";
 pub const CENA: &str = "cena";
 /// Id da tarefa que baixa as definições do repositório oficial.
 pub const DEFINICOES: &str = "definicoes";
+/// Id da conferência do disco: o que sumiu da biblioteca volta pelo mesmo
+/// torrent.
+pub const DISCO: &str = "disco";
 
 /// Por que uma execução começou.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -594,6 +597,18 @@ pub fn service(
                 registry: Arc::clone(registry),
             }),
         },
+        Task {
+            id: DISCO,
+            name: "Conferência do disco",
+            interval: interval(settings, DISCO),
+            // Não soma a leitura do catálogo inteiro à subida do serviço; e
+            // um disco que demora a montar não pode ser lido como vazio.
+            first: First::AfterInterval,
+            job: Arc::new(DiskHeal {
+                settings: Arc::clone(settings),
+                database: database.clone(),
+            }),
+        },
     ]
 }
 
@@ -1129,6 +1144,36 @@ impl Job for DefinitionsUpdate {
             summary,
             detail: Some(serde_json::to_value(&report)?),
         })
+    }
+}
+
+/// Confere no disco os arquivos que o catálogo diz estar na biblioteca: o
+/// que sumiu volta pelo mesmo torrent, ou sai do catálogo para a busca. Na
+/// hora agendada, sumiço em massa não é reparado (disco desmontado?); "rodar
+/// agora" confirma. O relatório vira o detalhe da execução.
+#[derive(Debug)]
+struct DiskHeal {
+    settings: Arc<Settings>,
+    database: Database,
+}
+
+#[async_trait]
+impl Job for DiskHeal {
+    async fn run(&self, trigger: Trigger) -> Result<Outcome> {
+        let store = store(&self.database)?;
+        let config = self.settings.get();
+        let report = crate::heal::run(&config, store, trigger).await?;
+        let mut outcome = with_series(
+            Ok(report.filmes.summary()),
+            Some(Ok(report.series.summary())),
+        )?;
+        outcome.ok = report.filmes.ok() && report.series.ok();
+        outcome.detail = Some(serde_json::to_value(&report)?);
+        Ok(outcome)
+    }
+
+    fn unavailable(&self) -> Option<String> {
+        without_client(&self.settings)
     }
 }
 

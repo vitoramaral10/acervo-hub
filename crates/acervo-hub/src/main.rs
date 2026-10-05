@@ -23,6 +23,7 @@ mod decide;
 mod definitions;
 mod events;
 mod grab;
+mod heal;
 mod ledger;
 mod library;
 mod manual;
