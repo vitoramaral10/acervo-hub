@@ -52,6 +52,15 @@ const BACKOFF_BASE: Duration = Duration::from_secs(10 * 60);
 /// Teto do recuo calculado.
 const BACKOFF_MAX: Duration = Duration::from_secs(6 * 60 * 60);
 
+/// Falhas seguidas, de qualquer tipo, que abrem o disjuntor: timeout,
+/// Cloudflare e login recusado não dizem "pare" como o 429, mas insistir neles
+/// a cada busca arrisca a conta em tracker privado.
+const BREAKER_AFTER: u32 = 5;
+
+/// Primeira espera do disjuntor; dobra a cada abertura seguida até
+/// `BACKOFF_MAX`.
+const BREAKER_BASE: Duration = Duration::from_secs(5 * 60);
+
 /// Teto do `Retry-After` obedecido: um valor absurdo não pode desligar o
 /// indexador até o próximo reinício.
 const RETRY_AFTER_MAX: Duration = Duration::from_secs(24 * 60 * 60);
@@ -70,8 +79,14 @@ pub struct Health {
     pub last_results: Option<usize>,
     /// Respostas 429 seguidas, sem sucesso no meio: define o tamanho do recuo.
     pub rate_limit_streak: u32,
-    /// Fim da espera, no relógio do tokio (que os testes podem parar).
+    /// Aberturas seguidas do disjuntor, sem sucesso no meio: define o
+    /// tamanho do recuo.
+    pub breaker_trips: u32,
+    /// Fim da espera por 429, no relógio do tokio (que os testes podem parar).
     wait_until: Option<Instant>,
+    /// Fim da espera do disjuntor. À parte do 429 para o teste manual poder
+    /// furá-la: um sucesso dele fecha o disjuntor.
+    breaker_until: Option<Instant>,
 }
 
 impl Health {
@@ -80,7 +95,9 @@ impl Health {
         self.last_results = Some(results);
         self.consecutive_failures = 0;
         self.rate_limit_streak = 0;
+        self.breaker_trips = 0;
         self.wait_until = None;
+        self.breaker_until = None;
     }
 
     fn failure(&mut self, error: String) {
@@ -94,7 +111,7 @@ impl Health {
     /// indexador em espera, não dobra o recuo duas vezes.
     fn rate_limited(&mut self, error: String, retry_after: Option<Duration>) -> Option<Duration> {
         self.failure(error);
-        if self.waiting_until().is_some() {
+        if self.rate_limited_until().is_some() {
             return None;
         }
         self.rate_limit_streak = self.rate_limit_streak.saturating_add(1);
@@ -109,13 +126,41 @@ impl Health {
         Some(wait)
     }
 
-    /// Até quando o indexador está em espera, ou `None` se não está.
-    #[must_use]
-    pub fn waiting_until(&self) -> Option<OffsetDateTime> {
-        let left = self.wait_until?.checked_duration_since(Instant::now())?;
-        if left.is_zero() {
+    /// Abre o disjuntor depois de [`BREAKER_AFTER`] falhas seguidas. Devolve a
+    /// espera, se ela começou agora: falha que chega de uma consulta já em
+    /// voo, com o indexador em espera, não dobra o recuo. A primeira consulta
+    /// depois da espera é a sonda — se falha, a espera dobra.
+    fn trip_breaker(&mut self) -> Option<Duration> {
+        if self.consecutive_failures < BREAKER_AFTER || self.waiting_until().is_some() {
             return None;
         }
+        let doublings = self.breaker_trips.min(16);
+        self.breaker_trips = self.breaker_trips.saturating_add(1);
+        let wait = BREAKER_BASE.saturating_mul(1 << doublings).min(BACKOFF_MAX);
+        self.breaker_until = Instant::now().checked_add(wait);
+        Some(wait)
+    }
+
+    fn left(until: Option<Instant>) -> Option<Duration> {
+        until?
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+    }
+
+    /// Até quando o indexador está em espera por 429, ou `None`.
+    #[must_use]
+    pub fn rate_limited_until(&self) -> Option<OffsetDateTime> {
+        Some(OffsetDateTime::now_utc() + Self::left(self.wait_until)?)
+    }
+
+    /// Até quando o indexador está em espera — por 429 ou pelo disjuntor —,
+    /// ou `None` se não está.
+    #[must_use]
+    pub fn waiting_until(&self) -> Option<OffsetDateTime> {
+        let left = [self.wait_until, self.breaker_until]
+            .into_iter()
+            .filter_map(Self::left)
+            .max()?;
         Some(OffsetDateTime::now_utc() + left)
     }
 }
@@ -278,6 +323,16 @@ impl Catalog {
             .unwrap_or_else(PoisonError::into_inner)
             .get(name)
             .and_then(Health::waiting_until)
+    }
+
+    /// Até quando o indexador está em espera por 429, se está: só o 429 impede
+    /// o teste manual, o disjuntor não.
+    fn rate_limited_until(&self, name: &str) -> Option<OffsetDateTime> {
+        self.health
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+            .and_then(Health::rate_limited_until)
     }
 
     /// Esquece o que foi guardado de um indexador: a sessão ou a credencial
@@ -528,8 +583,10 @@ impl Catalog {
             .get(name)
             .cloned()
             .ok_or_else(|| "indexador desconhecido".to_owned())?;
-        // O teste manual também é requisição ao tracker: em espera, não sai.
-        if let Some(until) = self.waiting_until(name) {
+        // O teste manual também é requisição ao tracker: em espera por 429,
+        // não sai. O disjuntor não o segura: é como o usuário confere que
+        // consertou a credencial, e um sucesso fecha o disjuntor.
+        if let Some(until) = self.rate_limited_until(name) {
             return Err(waiting(name, until).to_string());
         }
         let clock = std::time::Instant::now();
@@ -646,8 +703,8 @@ fn record(
     let entry = health.entry(name.to_owned()).or_default();
     match outcome {
         Ok(results) => entry.success(results),
-        Err(error) => match error.rate_limited() {
-            Some(retry_after) => {
+        Err(error) => {
+            if let Some(retry_after) = error.rate_limited() {
                 if let Some(wait) = entry.rate_limited(error.to_string(), retry_after) {
                     let until = clock(OffsetDateTime::now_utc() + wait);
                     tracing::warn!(
@@ -657,9 +714,19 @@ fn record(
                         "indexador respondeu 429: em espera até {until} UTC"
                     );
                 }
+            } else {
+                entry.failure(error.to_string());
+                if let Some(wait) = entry.trip_breaker() {
+                    let until = clock(OffsetDateTime::now_utc() + wait);
+                    tracing::warn!(
+                        indexer = name,
+                        espera_s = wait.as_secs(),
+                        falhas = entry.consecutive_failures,
+                        "indexador falhou {BREAKER_AFTER} vezes seguidas: em espera até {until} UTC"
+                    );
+                }
             }
-            None => entry.failure(error.to_string()),
-        },
+        }
     }
 }
 

@@ -10,6 +10,7 @@
 //! [`KEEP`] execuções de cada tarefa. Tarefa nova é uma implementação de [`Job`] e uma
 //! entrada em [`service`].
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -21,10 +22,12 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 
 use crate::decide::{Progress, now_rfc3339};
+use crate::events::{Alert, Change, notify_alert};
+use crate::health::{TASK_FAILURES, cleanup_message, task_message, track_streak};
 use crate::serve::Database;
 use crate::settings::Settings;
 
@@ -40,6 +43,58 @@ const SUMMARY_CHARS: usize = 300;
 /// a tarefa segue agendada. Generoso: a busca de todos os que faltam, pelo
 /// botão, leva bem menos.
 const CEILING: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// Maior atraso aleatório da primeira execução das tarefas que começam na
+/// subida: sem ele, todas batem juntas no banco, nos indexadores e no cliente
+/// de download logo depois de um reinício.
+const STAGGER: Duration = Duration::from_secs(90);
+/// De quanto em quanto tempo uma tarefa que espera o cliente de download
+/// responder tenta de novo.
+const READY_RETRY: Duration = Duration::from_secs(15);
+
+/// Aviso de desligamento. Clones veem o mesmo estado.
+#[derive(Debug, Clone)]
+pub struct Cancel(Arc<watch::Sender<bool>>);
+
+impl Default for Cancel {
+    fn default() -> Self {
+        Self(Arc::new(watch::channel(false).0))
+    }
+}
+
+impl Cancel {
+    /// Pede para parar. Vale para sempre.
+    pub fn cancel(&self) {
+        self.0.send_replace(true);
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Espera o pedido; volta já se ele veio.
+    pub async fn cancelled(&self) {
+        let mut receiver = self.0.subscribe();
+        // O remetente vive em `self`: o canal não fecha.
+        let _ = receiver.wait_for(|cancelled| *cancelled).await;
+    }
+}
+
+/// Um atraso aleatório de zero até `max`. Sem gerador de números aleatórios
+/// no projeto, a semente aleatória de cada `RandomState` serve: aqui só
+/// importa espalhar, não imprevisibilidade.
+fn jitter(max: Duration) -> Duration {
+    use std::hash::{BuildHasher, Hasher};
+    let millis = u64::try_from(max.as_millis()).unwrap_or(u64::MAX);
+    if millis == 0 {
+        return Duration::ZERO;
+    }
+    let roll = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    Duration::from_millis(roll % (millis + 1))
+}
 
 /// Id da busca dos que faltam: o botão da tela de filmes dispara esta tarefa.
 pub const BUSCA: &str = "busca";
@@ -97,6 +152,13 @@ pub trait Job: Send + Sync + std::fmt::Debug {
     fn unavailable(&self) -> Option<String> {
         None
     }
+
+    /// Se a primeira execução agendada, na subida, já pode começar. Enquanto
+    /// não, o agendador tenta de novo a cada poucos segundos. "Rodar agora"
+    /// não espera por isto.
+    async fn ready(&self) -> bool {
+        true
+    }
 }
 
 /// Quando a primeira execução agendada acontece.
@@ -152,6 +214,11 @@ struct State {
     running: bool,
     /// "Rodar agora" pediu e o laço ainda não atendeu.
     requested: bool,
+    /// Uma execução em curso, de fato: `running` também vale entre o pedido
+    /// e o início. É o que o desligamento espera.
+    executing: bool,
+    /// Falhas seguidas, para o aviso.
+    failures: u32,
     started: Option<String>,
     next: Option<String>,
     last: Option<LastRun>,
@@ -210,6 +277,11 @@ pub struct Tasks {
     database: Database,
     /// [`CEILING`]; menor nos testes.
     ceiling: Duration,
+    /// [`STAGGER`]; menor nos testes.
+    stagger: Duration,
+    cancel: Cancel,
+    /// Quando o desligamento começou: dali conta a espera das execuções.
+    stopped_at: Mutex<Option<Instant>>,
 }
 
 impl Default for Tasks {
@@ -234,6 +306,43 @@ impl Tasks {
                 .collect(),
             database,
             ceiling: CEILING,
+            stagger: STAGGER,
+            cancel: Cancel::default(),
+            stopped_at: Mutex::new(None),
+        }
+    }
+
+    /// O aviso de desligamento, para quem mais precisa parar com as tarefas.
+    #[must_use]
+    pub fn cancel_token(&self) -> Cancel {
+        self.cancel.clone()
+    }
+
+    /// Começa o desligamento: nenhuma execução nova é agendada nem aceita.
+    /// As que estão rodando seguem; [`Tasks::drain`] espera por elas.
+    pub fn stop(&self) {
+        self.stopped_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert_with(Instant::now);
+        self.cancel.cancel();
+    }
+
+    /// Espera as execuções em curso terminarem, até `grace` depois do
+    /// [`Tasks::stop`]. Devolve quantas ainda rodavam ao desistir.
+    pub async fn drain(&self, grace: Duration) -> usize {
+        let started = (*self
+            .stopped_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner))
+        .unwrap_or_else(Instant::now);
+        let deadline = started + grace;
+        loop {
+            let busy = self.slots.iter().filter(|s| s.lock().executing).count();
+            if busy == 0 || Instant::now() >= deadline {
+                return busy;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -279,6 +388,10 @@ impl Tasks {
     /// dispara outra —, `None` se ela não existe.
     pub fn run_now(&self, id: &str) -> Option<bool> {
         let slot = self.slot(id)?;
+        // Desligando, não começa nada novo.
+        if self.cancel.is_cancelled() {
+            return Some(false);
+        }
         let mut state = slot.lock();
         if state.running {
             return Some(false);
@@ -351,10 +464,16 @@ impl Tasks {
     /// recalcula: o intervalo pode ter mudado.
     async fn schedule(self: Arc<Self>, slot: Arc<Slot>) {
         // De onde se conta o intervalo: a subida, depois o início da última
-        // execução.
+        // execução. As que começam na subida largam espalhadas.
         let mut anchor = Instant::now();
+        if slot.task.first == First::Now {
+            anchor += jitter(self.stagger);
+        }
         let mut ran = false;
         loop {
+            if self.cancel.is_cancelled() {
+                return;
+            }
             let every = slot.every();
             let next = (!every.is_zero()).then(|| {
                 if !ran && slot.task.first == First::Now {
@@ -373,11 +492,32 @@ impl Tasks {
             let woken = tokio::select! {
                 () = timer => false,
                 () = slot.wake.notified() => true,
+                () = self.cancel.cancelled() => return,
             };
+            // A primeira execução da subida espera o que ela precisa
+            // responder (o cliente de download, na importação).
+            if !woken && !ran && slot.task.first == First::Now && !slot.lock().requested {
+                let ready = tokio::select! {
+                    ready = slot.task.job.ready() => ready,
+                    () = self.cancel.cancelled() => return,
+                };
+                if !ready {
+                    tracing::info!(
+                        tarefa = slot.task.id,
+                        "o serviço de que depende não responde; a primeira execução espera"
+                    );
+                    anchor = Instant::now() + READY_RETRY;
+                    continue;
+                }
+            }
+            if self.cancel.is_cancelled() {
+                return;
+            }
             let trigger = {
                 let mut state = slot.lock();
                 if state.requested {
                     state.requested = false;
+                    state.executing = true;
                     Trigger::Manual
                 } else if woken {
                     // Configuração mudou, ou aviso que sobrou de um pedido já
@@ -385,6 +525,7 @@ impl Tasks {
                     continue;
                 } else {
                     state.running = true;
+                    state.executing = true;
                     Trigger::Scheduled
                 }
             };
@@ -439,16 +580,28 @@ impl Tasks {
                 tracing::warn!(tarefa = slot.task.id, "execução fora do histórico: {error}");
             }
         }
-        let mut state = slot.lock();
-        state.running = false;
-        state.started = None;
-        state.last = Some(LastRun {
-            started: started_at,
-            finished: finished_at,
-            duration_ms,
-            ok: outcome.ok,
-            summary,
-        });
+        let (failures, change) = {
+            let mut state = slot.lock();
+            state.running = false;
+            state.executing = false;
+            state.started = None;
+            state.last = Some(LastRun {
+                started: started_at,
+                finished: finished_at,
+                duration_ms,
+                ok: outcome.ok,
+                summary: summary.clone(),
+            });
+            let (failures, change) = track_streak(state.failures, outcome.ok, TASK_FAILURES);
+            state.failures = failures;
+            (failures, change)
+        };
+        if let Some(change) = change
+            && let Ok(store) = self.database.get()
+        {
+            let (title, body) = task_message(change, slot.task.name, failures, &summary);
+            notify_alert(store, Alert::Task, title, body).await;
+        }
     }
 }
 
@@ -557,6 +710,7 @@ pub fn service(
                 settings: Arc::clone(settings),
                 database: database.clone(),
                 pruned: tokio::sync::Mutex::default(),
+                aborted: AtomicBool::new(false),
             }),
         },
         Task {
@@ -911,6 +1065,12 @@ impl Job for Import {
     fn unavailable(&self) -> Option<String> {
         without_client(&self.settings)
     }
+
+    /// Importar logo após o reinício, com o cliente ainda subindo, só gera
+    /// falha na lista: espera ele responder.
+    async fn ready(&self) -> bool {
+        crate::grab::qbit(&self.settings.get()).await.is_ok()
+    }
 }
 
 /// Mantém os metadados em dia: os filmes conferidos há mais de um dia. Sem
@@ -995,6 +1155,8 @@ struct Cleanup {
     database: Database,
     /// Quando foi a última poda. Só em memória: reiniciar poda de novo.
     pruned: tokio::sync::Mutex<Option<Instant>>,
+    /// O último ciclo foi abortado por trava? Só a mudança vira aviso.
+    aborted: AtomicBool,
 }
 
 /// A poda: as buscas com mais de 30 dias (menos a mais recente de cada
@@ -1051,6 +1213,15 @@ impl Job for Cleanup {
         let (ok, mut summary) = report.summary();
         if let Some(pruned) = pruned {
             summary = format!("{summary}; {pruned}");
+        }
+        // Trava de segurança é resultado esperado, mas ciclo atrás de ciclo
+        // sem limpar é algo que alguém precisa ver: avisa na mudança.
+        let aborted = report.abortado.is_some();
+        let was = self.aborted.swap(aborted, Ordering::SeqCst);
+        if let Some(change) = Change::between(was, aborted) {
+            let reason = report.abortado.as_deref().unwrap_or_default();
+            let (title, body) = cleanup_message(change, reason);
+            notify_alert(store, Alert::Cleanup, title, body).await;
         }
         Ok(Outcome {
             ok,
@@ -1214,7 +1385,7 @@ impl Job for Watched {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     use super::*;
 
@@ -1390,6 +1561,91 @@ mod tests {
         gate.release.notify_one();
         until("segunda execução", || !tasks.is_running("teste")).await;
         assert_eq!(tasks.view_one("teste").unwrap()["ultima"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn desligar_para_de_agendar_e_espera_a_execucao_em_curso() {
+        let (tasks, gate) = registry(
+            Database::default(),
+            Duration::from_millis(30),
+            First::AfterInterval,
+        );
+        tasks.start().await;
+        gate.started.notified().await;
+        tasks.stop();
+        // Rodando: o desligamento espera, e desiste ao fim da graça.
+        assert_eq!(tasks.drain(Duration::from_millis(50)).await, 1);
+        // Pedido de "rodar agora" depois do desligamento não começa nada.
+        assert_eq!(tasks.run_now("teste"), Some(false));
+
+        gate.release.notify_one();
+        assert_eq!(tasks.drain(Duration::from_secs(5)).await, 0);
+        // Livre, e o intervalo passa de sobra: nenhuma execução nova.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(gate.runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn subida_espalha_a_primeira_execucao_das_tarefas_que_largam_juntas() {
+        let (tasks, gate) = registry(Database::default(), Duration::from_secs(3600), First::Now);
+        let mut tasks = Arc::try_unwrap(tasks).unwrap();
+        tasks.stagger = Duration::from_millis(400);
+        let tasks = Arc::new(tasks);
+        let slot_jitter = jitter(Duration::from_millis(400));
+        assert!(slot_jitter <= Duration::from_millis(400));
+        tasks.start().await;
+        // Com atraso, a execução acontece, mas dentro da janela.
+        tokio::time::timeout(Duration::from_secs(3), gate.started.notified())
+            .await
+            .expect("a primeira execução vem dentro da janela");
+        gate.release.notify_one();
+        assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
+    }
+
+    /// Só fica pronto quando o teste manda.
+    #[derive(Debug, Default)]
+    struct Late {
+        up: AtomicBool,
+        runs: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Job for Late {
+        async fn run(&self, _: Trigger) -> Result<Outcome> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Ok(Outcome::new(true, "feito"))
+        }
+
+        async fn ready(&self) -> bool {
+            self.up.load(Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn primeira_execucao_espera_o_servico_responder() {
+        let job = Arc::new(Late::default());
+        let tasks = Arc::new(Tasks::new(
+            Database::default(),
+            vec![Task {
+                id: "teste",
+                name: "Teste",
+                interval: Box::new(|| Duration::from_secs(3600)),
+                first: First::Now,
+                job: Arc::clone(&job) as Arc<dyn Job>,
+            }],
+        ));
+        let mut tasks = Arc::try_unwrap(tasks).unwrap();
+        tasks.stagger = Duration::ZERO;
+        let tasks = Arc::new(tasks);
+        tasks.start().await;
+        // Fora do ar: tenta de novo a cada 15 s, sem rodar.
+        tokio::time::sleep(Duration::from_secs(50)).await;
+        assert_eq!(job.runs.load(Ordering::SeqCst), 0);
+
+        job.up.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(16)).await;
+        assert_eq!(job.runs.load(Ordering::SeqCst), 1);
+        tasks.stop();
     }
 
     #[derive(Debug)]

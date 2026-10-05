@@ -171,6 +171,40 @@ uma. Tarefa sem o que precisa — cliente de download, Jellyfin — fica parada,
 Execução que passa de 2 horas é dada como falha e a tarefa segue agendada; cada consulta ao
 banco tem teto de 60 segundos.
 
+Na subida, as tarefas que começam na hora largam espalhadas, com um atraso aleatório de 0 a
+90 segundos cada, e a `importacao` só começa depois de o qBittorrent responder. No SIGTERM o
+serviço para de agendar execuções novas e espera as que estão rodando por até 25 segundos
+antes de sair (o compose dá 30 s de `stop_grace_period`).
+
+### Saúde e avisos
+
+- `GET /health` é a vivacidade: responde `ok` se o processo está de pé.
+- `GET /health/ready`, sem login, é a prontidão: confere o banco, o qBittorrent e o espaço
+  livre contra a folga das regras. Responde 200 com o JSON do que passou, ou 503 com o que
+  falhou, sem endereço nem credencial. Sem cliente de download configurado, essas duas
+  verificações são puladas.
+- `acervo-hub healthcheck` faz esse GET na porta de `ACERVO_BIND` e sai com 0 ou 1: é o
+  `healthcheck` do `deploy/compose.yaml`, já que a imagem não tem curl.
+
+Além dos avisos por filme, o Gotify recebe avisos operacionais, **só na transição** — quando
+o estado vira ruim e quando volta, nunca a cada rodada. Cada um tem a própria chave em
+Configurações → Notificações, ligada por padrão:
+
+| Chave | Avisa quando |
+| --- | --- |
+| `tarefa_falhando` | uma tarefa falha 3 vezes seguidas, e quando volta a passar |
+| `indexador_falhando` | um indexador falha 5 vezes seguidas, e quando volta a responder |
+| `disco_baixo` | o espaço livre da pasta de download cai abaixo de 5% do disco ou da folga das regras (o que for maior), e quando volta |
+| `limpeza_abortada` | uma trava de segurança aborta o ciclo de limpeza, e quando deixa de abortar |
+
+O estado dos avisos fica em memória: reiniciar o serviço o zera.
+
+**Disjuntor de indexador.** Depois de 5 falhas seguidas de qualquer tipo — timeout,
+Cloudflare, login recusado —, o indexador sai das buscas e dos downloads por 5 minutos; se a
+primeira consulta depois disso também falha, a espera dobra, até 6 horas. Um sucesso zera
+tudo. O "testar" da tela fura a espera, para conferir uma credencial consertada. A tela de
+indexadores mostra "em espera até" (também para o 429). Em memória: reiniciar zera.
+
 ## Interface
 
 `serve` responde em `/`:

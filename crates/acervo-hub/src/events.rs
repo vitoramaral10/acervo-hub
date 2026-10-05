@@ -134,6 +134,14 @@ pub struct NotifyOn {
     pub removido: bool,
     /// Download com a importação travada há horas.
     pub travou: bool,
+    /// Tarefa de fundo com falhas seguidas, e quando volta a passar.
+    pub tarefa_falhando: bool,
+    /// Indexador com falhas seguidas, e quando volta.
+    pub indexador_falhando: bool,
+    /// Pouco espaço livre na pasta de download, e quando volta.
+    pub disco_baixo: bool,
+    /// Limpeza abortada por trava de segurança, e quando volta.
+    pub limpeza_abortada: bool,
 }
 
 impl Default for NotifyOn {
@@ -145,6 +153,41 @@ impl Default for NotifyOn {
             falhou: true,
             removido: false,
             travou: true,
+            tarefa_falhando: true,
+            indexador_falhando: true,
+            disco_baixo: true,
+            limpeza_abortada: true,
+        }
+    }
+}
+
+/// Os avisos operacionais: o serviço, não um filme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Alert {
+    Task,
+    Indexer,
+    Disk,
+    Cleanup,
+}
+
+/// Para qual lado o estado de um aviso virou.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    /// Entrou no estado ruim.
+    Entered,
+    /// Voltou ao normal.
+    Recovered,
+}
+
+impl Change {
+    /// A transição entre dois estados, ou `None` se não mudou: aviso só na
+    /// mudança, nunca a cada rodada que repete o mesmo estado.
+    #[must_use]
+    pub const fn between(was_bad: bool, is_bad: bool) -> Option<Self> {
+        match (was_bad, is_bad) {
+            (false, true) => Some(Self::Entered),
+            (true, false) => Some(Self::Recovered),
+            _ => None,
         }
     }
 }
@@ -182,6 +225,16 @@ impl Gotify {
                     self.eventos.removido
                 }
                 Kind::MovieAdded | Kind::SeriesAdded | Kind::Ignored | Kind::Renamed => false,
+            }
+    }
+
+    const fn wants_alert(&self, alert: Alert) -> bool {
+        self.ligado
+            && match alert {
+                Alert::Task => self.eventos.tarefa_falhando,
+                Alert::Indexer => self.eventos.indexador_falhando,
+                Alert::Disk => self.eventos.disco_baixo,
+                Alert::Cleanup => self.eventos.limpeza_abortada,
             }
     }
 
@@ -268,6 +321,23 @@ pub async fn notify_stuck(
             let poster = poster.map(str::to_owned);
             tokio::spawn(async move {
                 if let Err(error) = gotify.send(&title, &body, poster.as_deref()).await {
+                    tracing::warn!("notificação: {error:#}");
+                }
+            });
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!("notificação: {error}"),
+    }
+}
+
+/// Avisa uma mudança de estado operacional (tarefa, indexador, disco,
+/// limpeza). Quem chama decide a transição; aqui só se respeita a chave do
+/// aviso nas notificações. Melhor esforço, como o resto.
+pub async fn notify_alert(store: &Store, alert: Alert, title: String, body: String) {
+    match gotify(store).await {
+        Ok(Some(gotify)) if gotify.wants_alert(alert) => {
+            tokio::spawn(async move {
+                if let Err(error) = gotify.send(&title, &body, None).await {
                     tracing::warn!("notificação: {error:#}");
                 }
             });

@@ -537,6 +537,10 @@ export interface NotifyOn {
   falhou: boolean
   removido: boolean
   travou: boolean
+  tarefa_falhando: boolean
+  indexador_falhando: boolean
+  disco_baixo: boolean
+  limpeza_abortada: boolean
 }
 
 export interface GotifyView {

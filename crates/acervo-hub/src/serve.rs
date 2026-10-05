@@ -83,6 +83,11 @@ pub async fn connect(url: &str) -> Store {
     }
 }
 
+/// Quanto o desligamento espera as tarefas em execução terminarem. Abaixo do
+/// `stop_grace_period` do compose (30 s), para o serviço sair sozinho antes
+/// do SIGKILL.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(25);
+
 /// Como a tela rotula um indexador cadastrado.
 const ORIGIN: &str = "cadastro";
 
@@ -111,6 +116,15 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         crate::tasks::service(&settings, &database, &catalog, &missing, &registry),
     ));
     tasks.start().await;
+    // Indexador falhando e pouco espaço em disco viram aviso na mudança.
+    tokio::spawn(
+        Arc::new(crate::health::Monitor::new(
+            Arc::clone(&settings),
+            database.clone(),
+            catalog.clone(),
+        ))
+        .run(tasks.cancel_token()),
+    );
     // Configuração salva pela tela: o agendador recalcula os intervalos.
     tokio::spawn({
         let mut changes = settings.subscribe();
@@ -135,12 +149,16 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         searches: tokio::sync::Mutex::default(),
         series_searches: tokio::sync::Mutex::default(),
     });
+    let readiness = Arc::new(crate::health::Readiness {
+        settings: Arc::clone(&settings),
+        database: database.clone(),
+    });
     let admin = HubAdmin::new(
         settings,
         catalog.clone(),
         database,
         missing,
-        tasks,
+        Arc::clone(&tasks),
         registry,
     );
     tracing::info!(indexadores = catalog.len(), bind = %bind, "servindo a interface web");
@@ -155,11 +173,27 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
             .merge(crate::agenda::router(Arc::clone(&web)))
             .merge(crate::stats::router(Arc::clone(&web)))
             .merge(crate::manual::router(Arc::clone(&web)))
-            .merge(crate::series::web::router(web)),
+            .merge(crate::series::web::router(web))
+            .merge(crate::health::router(readiness)),
     )
-    .with_graceful_shutdown(shutdown())
+    .with_graceful_shutdown({
+        let tasks = Arc::clone(&tasks);
+        async move {
+            shutdown().await;
+            // Para de agendar já; quem está rodando termina em `drain`.
+            tasks.stop();
+        }
+    })
     .await
     .context("servidor HTTP")?;
+    let running = tasks.drain(SHUTDOWN_GRACE).await;
+    if running > 0 {
+        tracing::warn!(
+            tarefas = running,
+            "tarefas ainda rodando após {} s; saindo assim mesmo",
+            SHUTDOWN_GRACE.as_secs()
+        );
+    }
     Ok(())
 }
 
