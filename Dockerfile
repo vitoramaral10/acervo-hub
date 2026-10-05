@@ -21,8 +21,8 @@ COPY crates ./crates
 # o cache mount some ao fim do RUN, o binário é copiado para fora aqui dentro.
 RUN --mount=type=cache,target=/src/target,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    cargo build --release --locked --target "${TARGET}" --bin acervo-hub \
- && install -D "/src/target/${TARGET}/release/acervo-hub" /out/acervo-hub
+    cargo build --profile dist --locked --target "${TARGET}" --bin acervo-hub \
+ && install -D "/src/target/${TARGET}/dist/acervo-hub" /out/acervo-hub
 
 # `ffprobe` estático: lê as faixas de áudio e legenda do que o acervo importa
 # (o app de legendas depende disso). Binário único, sem bibliotecas.

@@ -17,6 +17,7 @@ import {
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { ConfirmButton } from '@/components/ConfirmButton'
+import { MarkButton, MarkedBadge, useMarkedKeys } from '@/components/DeletionMark'
 import { HistoryList } from '@/components/HistoryList'
 import { RenameDialog, VerifyDialog } from '@/components/MaintenanceDialogs'
 import { PriorityStar } from '@/components/PriorityStar'
@@ -116,7 +117,7 @@ function RemoveSeriesDialog({
   onRemoved: () => void
 }) {
   const queryClient = useQueryClient()
-  const [deleteFiles, setDeleteFiles] = useState(true)
+  const [deleteFiles, setDeleteFiles] = useState(false)
   const remove = useMutation({
     mutationFn: () => seriesApi.remove(series.id, { apagar_arquivos: deleteFiles }),
     onSuccess: () => {
@@ -363,6 +364,9 @@ function EpisodeRow({
 // ---------------------------------------------------------------- temporadas
 
 function SeasonSection({
+  seriesId,
+  marked,
+  wholeMarked,
   season,
   open,
   onToggle,
@@ -374,6 +378,11 @@ function SeasonSection({
   onSkip,
   onSearch,
 }: {
+  seriesId: number
+  /** A temporada está marcada para apagar. */
+  marked: boolean
+  /** A série inteira está marcada: a temporada vai junto. */
+  wholeMarked: boolean
   season: Season
   open: boolean
   onToggle: () => void
@@ -418,6 +427,7 @@ function SeasonSection({
             aria-hidden="true"
           />
           <span className="font-medium">{name}</span>
+          {(marked || (wholeMarked && files > 0)) && <MarkedBadge />}
           <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-content-muted tabular-nums">
             <span className={totais.quero > 0 ? 'text-warning' : undefined}>Quero {totais.quero}</span>
             <span className={totais.tenho > 0 ? 'text-success' : undefined}>Tenho {totais.tenho}</span>
@@ -431,6 +441,16 @@ function SeasonSection({
           </span>
         </button>
         <div className="flex flex-wrap items-center gap-1">
+          {!wholeMarked && (files > 0 || marked) && (
+            <MarkButton
+              size="sm"
+              target={{ serie: seriesId, temporada: season.numero }}
+              marked={marked}
+              label={name}
+            >
+              {marked ? 'Desmarcar temporada' : 'Marcar para apagar'}
+            </MarkButton>
+          )}
           {files > 0 && (
             <ConfirmButton
               size="sm"
@@ -580,6 +600,9 @@ function SeriesBody({ series, onClose }: { series: SeriesDetail; onClose: () => 
   const [showHistory, setShowHistory] = useState(false)
   const [search, setSearch] = useState<{ scope: SeriesSearchScope; label: string } | null>(null)
   const [selection, setSelection] = useState<Set<number>>(new Set())
+  const marks = useMarkedKeys()
+  const wholeMarked = marks.has(`serie-${series.id}`)
+  const markedSeasons = series.temporadas.filter((s) => marks.has(`serie-${series.id}-t${s.numero}`)).length
 
   // Do mais novo ao mais velho, com os especiais por último; a mais recente abre sozinha.
   const seasons = useMemo(
@@ -678,6 +701,17 @@ function SeriesBody({ series, onClose }: { series: SeriesDetail; onClose: () => 
             {series.titulo_original && series.titulo_original !== series.titulo && (
               <p className="text-sm text-content-subtle">{series.titulo_original}</p>
             )}
+            {(wholeMarked || markedSeasons > 0) && (
+              <div>
+                <MarkedBadge
+                  label={
+                    wholeMarked
+                      ? 'Série inteira marcada para apagar'
+                      : `${plural(markedSeasons, 'temporada marcada', 'temporadas marcadas')} para apagar`
+                  }
+                />
+              </div>
+            )}
           </DialogHeader>
           <DialogDescription className="max-w-[65ch] leading-relaxed">
             {series.sinopse || 'Sem sinopse.'}
@@ -753,6 +787,11 @@ function SeriesBody({ series, onClose }: { series: SeriesDetail; onClose: () => 
               <Trash2 aria-hidden="true" />
               Remover
             </Button>
+            {(series.tamanho > 0 || wholeMarked) && (
+              <MarkButton target={{ serie: series.id }} marked={wholeMarked} label={series.titulo}>
+                {wholeMarked ? 'Desmarcar série' : 'Marcar série para apagar'}
+              </MarkButton>
+            )}
             {imdb && (
               <Button asChild variant="ghost">
                 <a href={imdb} target="_blank" rel="noreferrer">
@@ -776,6 +815,9 @@ function SeriesBody({ series, onClose }: { series: SeriesDetail; onClose: () => 
               {seasons.map((season) => (
                 <SeasonSection
                   key={season.numero}
+                  seriesId={series.id}
+                  marked={marks.has(`serie-${series.id}-t${season.numero}`)}
+                  wholeMarked={wholeMarked}
                   season={season}
                   open={openSeasons.has(season.numero)}
                   onToggle={() =>

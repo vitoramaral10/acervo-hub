@@ -15,7 +15,9 @@ const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       retry: (count, error) => !isUnauthorized(error) && count < 1,
-      refetchOnWindowFocus: false,
+      // Voltar à aba ou à rede mostra o dado de agora, não o da última visita.
+      refetchOnWindowFocus: true,
+      refetchOnReconnect: true,
     },
   },
 })

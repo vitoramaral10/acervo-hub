@@ -6,6 +6,7 @@ mod accounts;
 mod config;
 mod definitions;
 mod manage;
+mod marks;
 mod series;
 mod tasks;
 
@@ -19,10 +20,11 @@ use tokio_postgres::{NoTls, Row};
 pub use accounts::SESSION_DAYS;
 pub use config::IndexerRecord;
 pub use definitions::{DefinitionRow, IndexerDayStats, StatsDelta};
-pub use manage::{Blocked, HistoryEvent, HistoryPage, NewHistory};
+pub use manage::{Blocked, FailReason, HistoryEvent, HistoryPage, NewHistory};
+pub use marks::{DeletionMark, MarkTarget};
 pub use series::{
     CatalogEpisode, CatalogEpisodeFile, CatalogSeries, Episode, EpisodeFile, EpisodeSync,
-    SceneMapping, Series, SeriesGrab, SeriesPick, SeriesSearch, Skip, default_skip,
+    SceneMapping, Series, SeriesGrab, SeriesImport, SeriesPick, SeriesSearch, Skip, default_skip,
 };
 pub use tasks::{NewTaskRun, TaskRun};
 
@@ -714,6 +716,49 @@ const MIGRATIONS: &[&str] = &[
     DROP TABLE quality_definitions;
     ALTER TABLE movies DROP COLUMN available;
 ",
+    // O motivo do bloqueio vira coluna: a expiração e a poda olhavam o texto
+    // da mensagem, que é só para a tela. As linhas que já existem ganham o
+    // motivo pelo texto com que foram gravadas; o resto é `other`, que não
+    // expira.
+    r"
+    ALTER TABLE blocklist ADD COLUMN reason TEXT NOT NULL DEFAULT 'other'
+        CHECK (reason IN ('no_seeds', 'unregistered', 'client_error', 'missing_files',
+            'vanished', 'other'));
+    UPDATE blocklist SET reason = CASE message
+        WHEN 'sem seeds há 30 min' THEN 'no_seeds'
+        WHEN 'o tracker não reconhece mais o torrent' THEN 'unregistered'
+        WHEN 'o cliente marcou o torrent com `error`' THEN 'client_error'
+        WHEN 'o cliente não acha os arquivos do torrent' THEN 'missing_files'
+        WHEN 'o torrent sumiu do cliente' THEN 'vanished'
+        ELSE 'other'
+    END;
+    CREATE INDEX blocklist_by_reason ON blocklist(reason, at);
+",
+    // Assistido deixa de sair sozinho: o usuário marca o que quer apagar (um
+    // filme, uma temporada ou a série inteira, `season` nulo) e confirma na
+    // tela "Para apagar". A marca sai com o filme ou a série. Sai também a
+    // tarefa `assistidos`: o intervalo gravado dela (a configuração recusa
+    // tarefa desconhecida e o serviço não subiria) e o histórico, cujas
+    // remoções seguem no histórico de atividade.
+    r"
+    CREATE TABLE deletion_marks (
+        id BIGSERIAL PRIMARY KEY,
+        movie_id BIGINT REFERENCES movies(id) ON DELETE CASCADE,
+        series_id BIGINT REFERENCES series(id) ON DELETE CASCADE,
+        season INTEGER CHECK (season >= 0),
+        marked_at TEXT NOT NULL,
+        CHECK ((movie_id IS NULL) <> (series_id IS NULL)),
+        CHECK (season IS NULL OR series_id IS NOT NULL)
+    );
+    CREATE UNIQUE INDEX deletion_marks_by_movie ON deletion_marks(movie_id)
+        WHERE movie_id IS NOT NULL;
+    CREATE UNIQUE INDEX deletion_marks_by_series ON deletion_marks(series_id, COALESCE(season, -1))
+        WHERE series_id IS NOT NULL;
+    UPDATE config_sections
+        SET value = jsonb_set(value, '{intervalos}', (value -> 'intervalos') - 'assistidos')
+        WHERE name = 'tarefas' AND jsonb_typeof(value -> 'intervalos') = 'object';
+    DELETE FROM task_runs WHERE task = 'assistidos';
+",
 ];
 
 /// Quanto uma consulta pode levar. A maior consulta real (o catálogo de
@@ -1075,25 +1120,7 @@ impl Store {
     ///
     /// Filme inexistente ou falha de escrita.
     pub async fn add_movie_subtitle(&self, movie_id: i64, subtitle: &Subtitle) -> Result<i64> {
-        let client = self.pool.get().await?;
-        Ok(client
-            .query_one(
-                "INSERT INTO subtitle_files (movie_id, relative_path, language, forced, origin)
-                 VALUES ($1, $2, $3, $4, $5)
-                 ON CONFLICT (movie_id, relative_path) DO UPDATE SET
-                     language = EXCLUDED.language, forced = EXCLUDED.forced,
-                     origin = EXCLUDED.origin
-                 RETURNING id",
-                &[
-                    &movie_id,
-                    &subtitle.relative_path,
-                    &subtitle.language,
-                    &subtitle.forced,
-                    &subtitle.origin.as_str(),
-                ],
-            )
-            .await?
-            .try_get(0)?)
+        insert_movie_subtitle(&self.pool.get().await?, movie_id, subtitle).await
     }
 
     /// Registra uma legenda de um arquivo de episódio. Devolve o id.
@@ -1102,26 +1129,7 @@ impl Store {
     ///
     /// Arquivo inexistente ou falha de escrita.
     pub async fn add_episode_subtitle(&self, file_id: i64, subtitle: &Subtitle) -> Result<i64> {
-        let client = self.pool.get().await?;
-        Ok(client
-            .query_one(
-                "INSERT INTO subtitle_files (episode_file_id, relative_path, language, forced,
-                     origin)
-                 VALUES ($1, $2, $3, $4, $5)
-                 ON CONFLICT (episode_file_id, relative_path) DO UPDATE SET
-                     language = EXCLUDED.language, forced = EXCLUDED.forced,
-                     origin = EXCLUDED.origin
-                 RETURNING id",
-                &[
-                    &file_id,
-                    &subtitle.relative_path,
-                    &subtitle.language,
-                    &subtitle.forced,
-                    &subtitle.origin.as_str(),
-                ],
-            )
-            .await?
-            .try_get(0)?)
+        insert_episode_subtitle(&self.pool.get().await?, file_id, subtitle).await
     }
 
     /// Troca o caminho de uma legenda (renomeada no disco).
@@ -1285,6 +1293,12 @@ impl Store {
     /// motivo). `message` sem mudar o estado serve de anotação ("ainda
     /// baixando: 40%").
     ///
+    /// Só mexe em grab ainda `downloading`: dois fluxos (a importação, a
+    /// tela, a troca na fila) podem decidir sobre o mesmo grab ao mesmo
+    /// tempo, e o segundo não pode desfazer o que o primeiro fechou — nem
+    /// ressuscitar um falho com uma anotação. Devolve se a linha mudou;
+    /// `false` é "outro fluxo já fechou este grab".
+    ///
     /// # Errors
     ///
     /// Falha de escrita.
@@ -1295,20 +1309,163 @@ impl Store {
         message: Option<&str>,
         imported_path: Option<&str>,
         at: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let client = self.pool.get().await?;
-        let finished = (state != GrabState::Downloading).then_some(at);
-        client
-            .execute(
-                "UPDATE grabs SET state = $2, message = $3,
-                     imported_path = COALESCE($4, imported_path),
-                     finished_at = COALESCE($5, finished_at)
-                 WHERE id = $1",
-                &[&id, &state.as_str(), &message, &imported_path, &finished],
-            )
-            .await?;
-        Ok(())
+        set_grab(&client, id, state, message, imported_path, at).await
     }
+
+    /// Desiste de um grab e, com `block`, bloqueia o release, numa
+    /// transação: nunca o grab falho sem o bloqueio pedido, nem o bloqueio
+    /// de um grab que outro fluxo já fechou. `false` (e nada gravado) se o
+    /// grab já não estava `downloading`.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn fail_grab(
+        &self,
+        id: i64,
+        message: &str,
+        block: Option<&Blocked>,
+        at: &str,
+    ) -> Result<bool> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        if !set_grab(&tx, id, GrabState::Failed, Some(message), None, at).await? {
+            return Ok(false);
+        }
+        if let Some(block) = block {
+            manage::insert_block(&tx, block).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// A importação de um filme, numa transação: o arquivo novo no lugar do
+    /// antigo, as legendas dele e o grab importado (em `imported_path`). Se
+    /// algo cai no meio, nada fica: a volta seguinte refaz tudo, em vez de
+    /// achar o arquivo novo no catálogo e descartar o grab como se outro
+    /// caminho o tivesse importado. `false` (e nada gravado) se o grab já
+    /// não estava `downloading`.
+    ///
+    /// # Errors
+    ///
+    /// Falha de escrita.
+    pub async fn import_movie(
+        &self,
+        movie_id: i64,
+        grab_id: i64,
+        file: &MovieFile,
+        subtitles: &[Subtitle],
+        imported_path: &str,
+        at: &str,
+    ) -> Result<bool> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        if !set_grab(
+            &tx,
+            grab_id,
+            GrabState::Imported,
+            None,
+            Some(imported_path),
+            at,
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM movie_files WHERE movie_id = $1", &[&movie_id])
+            .await?;
+        tx.execute(
+            "DELETE FROM subtitle_files WHERE movie_id = $1",
+            &[&movie_id],
+        )
+        .await?;
+        insert_file(&tx, movie_id, file).await?;
+        for subtitle in subtitles {
+            insert_movie_subtitle(&tx, movie_id, subtitle).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+}
+
+/// O corpo de [`Store::update_grab`], dentro da transação de quem chama, se
+/// houver.
+async fn set_grab(
+    client: &impl GenericClient,
+    id: i64,
+    state: GrabState,
+    message: Option<&str>,
+    imported_path: Option<&str>,
+    at: &str,
+) -> Result<bool> {
+    let finished = (state != GrabState::Downloading).then_some(at);
+    Ok(client
+        .execute(
+            "UPDATE grabs SET state = $2, message = $3,
+                 imported_path = COALESCE($4, imported_path),
+                 finished_at = COALESCE($5, finished_at)
+             WHERE id = $1 AND state = 'downloading'",
+            &[&id, &state.as_str(), &message, &imported_path, &finished],
+        )
+        .await?
+        > 0)
+}
+
+/// O corpo de [`Store::add_movie_subtitle`], dentro da transação de quem
+/// chama, se houver.
+async fn insert_movie_subtitle(
+    client: &impl GenericClient,
+    movie_id: i64,
+    subtitle: &Subtitle,
+) -> Result<i64> {
+    Ok(client
+        .query_one(
+            "INSERT INTO subtitle_files (movie_id, relative_path, language, forced, origin)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (movie_id, relative_path) DO UPDATE SET
+                 language = EXCLUDED.language, forced = EXCLUDED.forced,
+                 origin = EXCLUDED.origin
+             RETURNING id",
+            &[
+                &movie_id,
+                &subtitle.relative_path,
+                &subtitle.language,
+                &subtitle.forced,
+                &subtitle.origin.as_str(),
+            ],
+        )
+        .await?
+        .try_get(0)?)
+}
+
+/// Uma legenda de arquivo de episódio, dentro da transação de quem chama,
+/// se houver. O corpo de [`Store::add_episode_subtitle`].
+pub(crate) async fn insert_episode_subtitle(
+    client: &impl GenericClient,
+    file_id: i64,
+    subtitle: &Subtitle,
+) -> Result<i64> {
+    Ok(client
+        .query_one(
+            "INSERT INTO subtitle_files (episode_file_id, relative_path, language, forced,
+                 origin)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (episode_file_id, relative_path) DO UPDATE SET
+                 language = EXCLUDED.language, forced = EXCLUDED.forced,
+                 origin = EXCLUDED.origin
+             RETURNING id",
+            &[
+                &file_id,
+                &subtitle.relative_path,
+                &subtitle.language,
+                &subtitle.forced,
+                &subtitle.origin.as_str(),
+            ],
+        )
+        .await?
+        .try_get(0)?)
 }
 
 fn quality(id: i16) -> Result<Quality> {
@@ -1820,6 +1977,278 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grab_fechado_por_outro_fluxo_nao_e_regravado() {
+        let Some(db) = TestDb::new("grab_cas").await else {
+            return;
+        };
+        let store = &db.store;
+        let movie_id = added(store, movie(10, "Um", false)).await;
+        let grab = Grab {
+            id: 0,
+            movie_id,
+            hash: "aa".into(),
+            title: "Um.2020.1080p.WEB-DL-GRUPO".into(),
+            indexer: "tracker".into(),
+            quality: Quality::WebDl1080p,
+            size: 1,
+            grabbed_at: "2026-01-01T00:00:00Z".into(),
+            state: GrabState::Downloading,
+            message: None,
+            imported_path: None,
+            finished_at: None,
+            replaces: None,
+        };
+        let id = store.record_grab(&grab).await.unwrap();
+        let blocked = Blocked {
+            id: 0,
+            movie_id: Some(movie_id),
+            series_id: None,
+            source_title: grab.title.clone(),
+            indexer: None,
+            quality: None,
+            size: None,
+            hash: Some("aa".into()),
+            at: "2026-01-01T01:00:00Z".into(),
+            message: Some("sem seeds".into()),
+            reason: FailReason::NoSeeds,
+        };
+        // Baixando: a anotação grava.
+        assert!(
+            store
+                .update_grab(id, GrabState::Downloading, Some("40%"), None, "t")
+                .await
+                .unwrap()
+        );
+        // A tela desiste primeiro.
+        assert!(
+            store
+                .fail_grab(id, "tirado da fila na tela", None, "2026-01-01T01:00:00Z")
+                .await
+                .unwrap()
+        );
+        // A importação, que leu o grab antes, chega depois: nada grava — nem
+        // a falha com bloqueio, nem a anotação que o ressuscitaria, nem o
+        // arquivo.
+        assert!(
+            !store
+                .fail_grab(id, "sem seeds", Some(&blocked), "2026-01-01T02:00:00Z")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .update_grab(id, GrabState::Downloading, Some("importação: x"), None, "t")
+                .await
+                .unwrap()
+        );
+        let file = movie(10, "Um", true).file.unwrap();
+        assert!(
+            !store
+                .import_movie(movie_id, id, &file, &[], "Um.mkv", "t")
+                .await
+                .unwrap()
+        );
+        let read = &store.grabs().await.unwrap()[0];
+        assert_eq!(read.state, GrabState::Failed);
+        assert_eq!(read.message.as_deref(), Some("tirado da fila na tela"));
+        assert_eq!(read.finished_at.as_deref(), Some("2026-01-01T01:00:00Z"));
+        assert!(store.blocklist().await.unwrap().is_empty());
+        assert_eq!(store.movies().await.unwrap()[0].movie.file, None);
+
+        // Baixando, a falha grava o grab e o bloqueio juntos.
+        let again = store
+            .record_grab(&Grab {
+                hash: "bb".into(),
+                ..grab.clone()
+            })
+            .await
+            .unwrap();
+        assert!(
+            store
+                .fail_grab(again, "sem seeds", Some(&blocked), "2026-01-01T03:00:00Z")
+                .await
+                .unwrap()
+        );
+        let blocks = store.blocklist().await.unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].reason, FailReason::NoSeeds);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Um cenário só: a falha no meio e a importação inteira.
+    async fn importacao_do_filme_e_uma_transacao() {
+        let Some(db) = TestDb::new("importa_filme").await else {
+            return;
+        };
+        let store = &db.store;
+        let movie_id = added(store, movie(10, "Um", true)).await;
+        let old = store.movies().await.unwrap()[0].movie.file.clone().unwrap();
+        let subtitle = |path: &str| Subtitle {
+            origin: SubtitleOrigin::Import,
+            relative_path: path.into(),
+            language: Some("pt-BR".into()),
+            forced: false,
+        };
+        store
+            .add_movie_subtitle(movie_id, &subtitle("Um (2020).pt-BR.srt"))
+            .await
+            .unwrap();
+        let id = store
+            .record_grab(&Grab {
+                id: 0,
+                movie_id,
+                hash: "aa".into(),
+                title: "Um.2020.2160p.WEB-DL-GRUPO".into(),
+                indexer: "tracker".into(),
+                quality: Quality::WebDl2160p,
+                size: 1,
+                grabbed_at: "2026-01-01T00:00:00Z".into(),
+                state: GrabState::Downloading,
+                message: None,
+                imported_path: None,
+                finished_at: None,
+                replaces: Some(old.relative_path.clone()),
+            })
+            .await
+            .unwrap();
+        let new = MovieFile {
+            relative_path: "Um (2020) novo.mkv".into(),
+            quality: QualityModel {
+                quality: Quality::WebDl2160p,
+                revision: Revision::default(),
+            },
+            ..old.clone()
+        };
+        // Uma legenda que o banco recusa no meio: o arquivo novo, já
+        // gravado na transação, não fica, e o grab segue baixando — a volta
+        // seguinte refaz, em vez de achar o arquivo novo e descartar o grab.
+        store
+            .pool
+            .get()
+            .await
+            .unwrap()
+            .batch_execute(
+                "CREATE FUNCTION recusa() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN
+                     IF NEW.relative_path = ''quebra.srt'' THEN
+                         RAISE EXCEPTION ''legenda recusada'';
+                     END IF;
+                     RETURN NEW;
+                 END';
+                 CREATE TRIGGER recusa BEFORE INSERT ON subtitle_files
+                     FOR EACH ROW EXECUTE FUNCTION recusa();",
+            )
+            .await
+            .unwrap();
+        let imported_path = "Um (2020)/Um (2020) novo.mkv";
+        assert!(
+            store
+                .import_movie(
+                    movie_id,
+                    id,
+                    &new,
+                    &[subtitle("Um (2020) novo.pt-BR.srt"), subtitle("quebra.srt")],
+                    imported_path,
+                    "2026-01-01T01:00:00Z",
+                )
+                .await
+                .is_err()
+        );
+        let entry = &store.movies().await.unwrap()[0];
+        assert_eq!(entry.movie.file.as_ref(), Some(&old));
+        assert_eq!(entry.subtitles.len(), 1);
+        assert_eq!(
+            entry.subtitles[0].subtitle.relative_path,
+            "Um (2020).pt-BR.srt"
+        );
+        let grab = &store.grabs().await.unwrap()[0];
+        assert_eq!(grab.state, GrabState::Downloading);
+        assert_eq!(grab.imported_path, None);
+
+        // Inteira: arquivo, legendas e grab de uma vez.
+        assert!(
+            store
+                .import_movie(
+                    movie_id,
+                    id,
+                    &new,
+                    &[subtitle("Um (2020) novo.pt-BR.srt")],
+                    imported_path,
+                    "2026-01-01T02:00:00Z",
+                )
+                .await
+                .unwrap()
+        );
+        let entry = &store.movies().await.unwrap()[0];
+        assert_eq!(entry.movie.file.as_ref(), Some(&new));
+        let paths: Vec<&str> = entry
+            .subtitles
+            .iter()
+            .map(|s| s.subtitle.relative_path.as_str())
+            .collect();
+        assert_eq!(paths, ["Um (2020) novo.pt-BR.srt"]);
+        let grab = &store.grabs().await.unwrap()[0];
+        assert_eq!(grab.state, GrabState::Imported);
+        assert_eq!(grab.imported_path.as_deref(), Some(imported_path));
+        assert_eq!(grab.finished_at.as_deref(), Some("2026-01-01T02:00:00Z"));
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn migracao_do_motivo_preenche_pelo_texto_gravado() {
+        let Some(db) = TestDb::before(
+            "motivo",
+            "ADD COLUMN reason TEXT",
+            "INSERT INTO blocklist (source_title, at, message) VALUES
+                 ('a', '2026-01-01T00:00:00Z', 'sem seeds há 30 min'),
+                 ('b', '2026-01-01T00:00:00Z', 'o tracker não reconhece mais o torrent'),
+                 ('c', '2026-01-01T00:00:00Z', 'o cliente marcou o torrent com `error`'),
+                 ('d', '2026-01-01T00:00:00Z', 'o cliente não acha os arquivos do torrent'),
+                 ('e', '2026-01-01T00:00:00Z', 'o torrent sumiu do cliente'),
+                 ('f', '2026-01-01T00:00:00Z', 'marcado como falho na tela'),
+                 ('g', '2026-01-01T00:00:00Z', NULL);",
+        )
+        .await
+        else {
+            return;
+        };
+        let mut read: Vec<(String, FailReason, Option<String>)> = db
+            .store
+            .blocklist()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|b| (b.source_title, b.reason, b.message))
+            .collect();
+        read.sort_by(|a, b| a.0.cmp(&b.0));
+        let reasons: Vec<(&str, FailReason)> =
+            read.iter().map(|(t, r, _)| (t.as_str(), *r)).collect();
+        assert_eq!(
+            reasons,
+            [
+                ("a", FailReason::NoSeeds),
+                ("b", FailReason::Unregistered),
+                ("c", FailReason::ClientError),
+                ("d", FailReason::MissingFiles),
+                ("e", FailReason::Vanished),
+                ("f", FailReason::Other),
+                ("g", FailReason::Other),
+            ]
+        );
+        // O texto fica, para a tela.
+        assert_eq!(read[0].2.as_deref(), Some("sem seeds há 30 min"));
+        // E a poda já olha o motivo nas linhas antigas.
+        assert_eq!(
+            db.store
+                .delete_blocks(&[FailReason::NoSeeds], "2026-02-01T00:00:00Z")
+                .await
+                .unwrap(),
+            1
+        );
+        db.drop().await;
+    }
+
+    #[tokio::test]
     async fn busca_guarda_a_ultima_de_cada_filme() {
         let Some(db) = TestDb::new("buscas").await else {
             return;
@@ -1855,6 +2284,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // As duas podas da limpeza, lado a lado.
     async fn poda_buscas_velhas_e_bloqueios_vencidos() {
         let Some(db) = TestDb::new("poda").await else {
             return;
@@ -1898,7 +2328,7 @@ mod tests {
             0
         );
 
-        let block = |message: &str, at: &str| Blocked {
+        let block = |reason: FailReason, message: &str, at: &str| Blocked {
             id: 0,
             movie_id: Some(um),
             series_id: None,
@@ -1909,35 +2339,61 @@ mod tests {
             hash: None,
             at: at.into(),
             message: Some(message.into()),
+            reason,
         };
         store
-            .block(&block("sem seeds", "2026-01-01T00:00:00Z"))
+            .block(&block(
+                FailReason::NoSeeds,
+                "sem seeds",
+                "2026-01-01T00:00:00Z",
+            ))
             .await
             .unwrap();
         store
-            .block(&block("sem seeds", "2026-03-01T00:00:00Z"))
+            .block(&block(
+                FailReason::NoSeeds,
+                "sem seeds",
+                "2026-03-01T00:00:00Z",
+            ))
             .await
             .unwrap();
         store
-            .block(&block("marcado como falho na tela", "2026-01-01T00:00:00Z"))
+            .block(&block(
+                FailReason::Other,
+                "marcado como falho na tela",
+                "2026-01-01T00:00:00Z",
+            ))
+            .await
+            .unwrap();
+        // A poda olha o motivo, não o texto: a mensagem mudada não escapa.
+        store
+            .block(&block(
+                FailReason::NoSeeds,
+                "texto de outra versão",
+                "2026-01-01T00:00:00Z",
+            ))
             .await
             .unwrap();
         assert_eq!(
             store
-                .delete_blocks(&["sem seeds", "outro"], "2026-02-01T00:00:00Z")
+                .delete_blocks(
+                    &[FailReason::NoSeeds, FailReason::Unregistered],
+                    "2026-02-01T00:00:00Z"
+                )
                 .await
                 .unwrap(),
-            1
+            2
         );
-        let messages: Vec<_> = store
+        let left: Vec<_> = store
             .blocklist()
             .await
             .unwrap()
             .into_iter()
-            .map(|b| (b.message.unwrap(), b.at))
+            .map(|b| (b.reason, b.at))
             .collect();
-        assert_eq!(messages.len(), 2);
-        assert!(messages.contains(&("sem seeds".into(), "2026-03-01T00:00:00Z".into())));
+        assert_eq!(left.len(), 2);
+        assert!(left.contains(&(FailReason::NoSeeds, "2026-03-01T00:00:00Z".into())));
+        assert!(left.contains(&(FailReason::Other, "2026-01-01T00:00:00Z".into())));
         db.drop().await;
     }
 
@@ -2224,6 +2680,7 @@ mod tests {
                 hash: None,
                 at: "2026-01-01T00:00:00Z".into(),
                 message: Some("falhou".into()),
+                reason: FailReason::Other,
             })
             .await
             .unwrap();

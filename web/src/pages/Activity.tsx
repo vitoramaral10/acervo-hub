@@ -19,6 +19,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { type HistoryEventKind, type QueueItem, library } from '@/lib/api'
 import { formatAgo, formatCount, formatSize } from '@/lib/format'
+import { isStuck, queueStatus, stuckFirst } from '@/lib/queue'
 import { cn } from '@/lib/utils'
 
 function formatEta(seconds: number): string {
@@ -51,7 +52,7 @@ function Empty({ icon: Icon, title, text }: { icon: typeof Inbox; title: string;
 
 function RemoveDialog({ item, onClose }: { item: QueueItem | null; onClose: () => void }) {
   const queryClient = useQueryClient()
-  const [fromClient, setFromClient] = useState(true)
+  const [fromClient, setFromClient] = useState(false)
   const [block, setBlock] = useState(false)
   const [search, setSearch] = useState(false)
   const remove = useMutation({
@@ -125,7 +126,7 @@ function RemoveDialog({ item, onClose }: { item: QueueItem | null; onClose: () =
           <Button variant="ghost" onClick={onClose}>
             Cancelar
           </Button>
-          <Button variant="primary" loading={remove.isPending} onClick={() => remove.mutate()}>
+          <Button variant="danger" loading={remove.isPending} onClick={() => remove.mutate()}>
             Tirar da fila
           </Button>
         </DialogFooter>
@@ -136,7 +137,8 @@ function RemoveDialog({ item, onClose }: { item: QueueItem | null; onClose: () =
 
 function QueueRow({ item, onRemove }: { item: QueueItem; onRemove: () => void }) {
   const progress = item.progresso ?? 0
-  const warning = item.mensagem?.startsWith('importação')
+  const status = queueStatus(item)
+  const stuck = isStuck(item)
   const done = progress >= 1
   return (
     <li className="flex gap-4 py-4">
@@ -148,6 +150,7 @@ function QueueRow({ item, onRemove }: { item: QueueItem; onRemove: () => void })
           <p className="font-medium">{item.filme ?? (item.tipo === 'serie' ? 'Série' : `Filme ${item.filme_id}`)}</p>
           <Badge>{item.qualidade}</Badge>
           {item.upgrade && <Badge tone="accent">Upgrade</Badge>}
+          <Badge tone={status.tone}>{status.label}</Badge>
         </div>
         <p className="mt-0.5 truncate font-mono text-xs text-content-subtle" title={item.release}>
           {item.release}
@@ -175,7 +178,7 @@ function QueueRow({ item, onRemove }: { item: QueueItem; onRemove: () => void })
           {item.seeds != null && !done ? <span>{formatCount(item.seeds)} seeds</span> : null}
           <span>{item.indexador}</span>
           <span>pego {formatAgo(item.pego_em)}</span>
-          {done && !warning && <span className="text-success">baixado — importa na próxima rodada</span>}
+          {done && !item.mensagem && <span className="text-success">baixado — importa na próxima rodada</span>}
         </p>
         {!item.no_cliente && (
           <p className="mt-1.5 flex items-center gap-1.5 text-xs text-warning">
@@ -183,8 +186,8 @@ function QueueRow({ item, onRemove }: { item: QueueItem; onRemove: () => void })
             torrent.
           </p>
         )}
-        {warning && (
-          <p className="mt-1.5 flex items-center gap-1.5 text-xs text-warning">
+        {item.mensagem && (
+          <p className={cn('mt-1.5 flex items-center gap-1.5 text-xs', stuck ? 'text-warning' : 'text-content-muted')}>
             <CircleAlert className="size-3.5 shrink-0" aria-hidden="true" />
             {item.mensagem}
           </p>
@@ -214,7 +217,7 @@ function QueueTab() {
   return (
     <>
       <ul className="divide-y divide-border rounded-lg border border-border bg-surface px-4">
-        {queue.data.fila.map((item) => (
+        {stuckFirst(queue.data.fila).map((item) => (
           <QueueRow key={item.id} item={item} onRemove={() => setRemoving(item)} />
         ))}
       </ul>

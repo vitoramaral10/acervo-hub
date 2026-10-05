@@ -25,6 +25,7 @@ import {
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { AddMovieDialog } from '@/components/AddMovieDialog'
+import { MarkButton, MarkedBadge, useMarkedKeys } from '@/components/DeletionMark'
 import { HistoryList } from '@/components/HistoryList'
 import { InteractiveSearch } from '@/components/InteractiveSearch'
 import { RenameDialog, VerifyAllMoviesDialog, VerifyDialog } from '@/components/MaintenanceDialogs'
@@ -285,12 +286,19 @@ function GrabDialog({
 
 export function MoviesPage() {
   const queryClient = useQueryClient()
-  const movies = useQuery({ queryKey: ['filmes'], queryFn: api.movies })
+  const movies = useQuery({
+    queryKey: ['filmes'],
+    queryFn: api.movies,
+    // Enquanto algum filme baixa, a lista acompanha o que o servidor importa.
+    refetchInterval: (state) =>
+      state.state.data?.filmes.some((movie) => movie.download?.estado === 'downloading') ? 5_000 : false,
+  })
   const [query, setQuery] = useState('')
   const [prefs, setPrefs] = useState<MovieListPrefs>(loadPrefs)
   const [selected, setSelected] = useState<number | null>(null)
   const [adding, setAdding] = useState(false)
   const [verifyingAll, setVerifyingAll] = useState(false)
+  const marked = useMarkedKeys()
 
   // A busca dos que faltam roda no servidor; a tela só acompanha enquanto ela dura.
   const progress = useQuery({
@@ -431,6 +439,7 @@ export function MoviesPage() {
           ) : prefs.view === 'tabela' ? (
             <MovieTable
               movies={visible}
+              marked={marked}
               sort={prefs.sort}
               dir={prefs.dir}
               onSort={(sort) =>
@@ -446,7 +455,7 @@ export function MoviesPage() {
             <ul className={GRID} aria-label="Filmes">
               {visible.map((movie) => (
                 <li key={movie.id}>
-                  <PosterCard movie={movie} onOpen={() => setSelected(movie.id)} />
+                  <PosterCard movie={movie} marked={marked.has(`filme-${movie.id}`)} onOpen={() => setSelected(movie.id)} />
                 </li>
               ))}
             </ul>
@@ -777,12 +786,14 @@ const COLUMNS: { label: string; sort: SortKey | null; align: 'left' | 'right' }[
 
 function MovieTable({
   movies,
+  marked,
   sort,
   dir,
   onSort,
   onOpen,
 }: {
   movies: Movie[]
+  marked: Set<string>
   sort: SortKey
   dir: 'asc' | 'desc'
   onSort: (sort: SortKey) => void
@@ -844,6 +855,9 @@ function MovieTable({
                 >
                   {movie.prioritario && (
                     <Star className="mr-1 inline size-3.5 fill-warning text-warning" aria-label="Prioritário" />
+                  )}
+                  {marked.has(`filme-${movie.id}`) && (
+                    <Trash2 className="mr-1 inline size-3.5 text-danger" aria-label="Marcado para apagar" />
                   )}
                   {movie.titulo}
                 </button>
@@ -940,7 +954,7 @@ function PosterMark({ movie }: { movie: Movie }) {
   )
 }
 
-function PosterCard({ movie, onOpen }: { movie: Movie; onOpen: () => void }) {
+function PosterCard({ movie, marked, onOpen }: { movie: Movie; marked: boolean; onOpen: () => void }) {
   const missing = !movie.arquivo
   return (
     <button
@@ -960,6 +974,7 @@ function PosterCard({ movie, onOpen }: { movie: Movie; onOpen: () => void }) {
           <PosterMark movie={movie} />
         </div>
         {movie.prioritario && <PriorityBadge className="absolute top-2 right-2" />}
+        {marked && <MarkedBadge className="absolute bottom-2 left-2" />}
       </div>
       <p className="mt-2 line-clamp-2 text-sm leading-snug font-medium">{movie.titulo}</p>
       <p className="mt-0.5 text-xs text-content-subtle tabular-nums">
@@ -991,7 +1006,7 @@ function RemoveMovieDialog({
   onRemoved: () => void
 }) {
   const queryClient = useQueryClient()
-  const [deleteFiles, setDeleteFiles] = useState(true)
+  const [deleteFiles, setDeleteFiles] = useState(false)
   const remove = useMutation({
     mutationFn: () => library.remove(movie.id, { apagar_arquivos: deleteFiles }),
     onSuccess: () => {
@@ -1096,6 +1111,7 @@ export function MovieDetails({
   const disk = file ? DISK[file.disco] : null
   const imdb = movie.imdb ? `https://www.imdb.com/title/${movie.imdb}/` : null
   const downloading = movie.download?.estado === 'downloading'
+  const marked = useMarkedKeys().has(`filme-${movie.id}`)
   const deleteFile = useMutation({
     mutationFn: () => library.deleteFile(movie.id),
     onSuccess: () => toast.success('Arquivo apagado'),
@@ -1125,6 +1141,11 @@ export function MovieDetails({
               </DialogTitle>
               {movie.titulo_original && movie.titulo_original !== movie.titulo && (
                 <p className="text-sm text-content-subtle">{movie.titulo_original}</p>
+              )}
+              {marked && (
+                <div>
+                  <MarkedBadge label="Marcado para apagar" />
+                </div>
               )}
             </DialogHeader>
             <DialogDescription className="max-w-[65ch] leading-relaxed">
@@ -1207,6 +1228,7 @@ export function MovieDetails({
               <Trash2 aria-hidden="true" />
               Remover
             </Button>
+            <MarkButton target={{ filme: movie.id }} marked={marked} label={movie.titulo} />
             <PriorityStar
               active={movie.prioritario}
               busy={prioritize.isPending}

@@ -1,23 +1,18 @@
-//! Assistidos de séries, dentro da tarefa `assistidos`: episódio assistido
-//! por algum usuário do Jellyfin há mais que a carência, que não é favorito
-//! e cuja série não é favorita, perde o arquivo e fica `watched`. Arquivo
-//! multi-episódio só sai quando todos os episódios dele foram assistidos. Só
-//! sai o arquivo que chegou antes de assistirem, como nos filmes. O torrent
-//! fica semeando até a limpeza.
+//! Sugestões de assistidos de séries, como as dos filmes: o arquivo de
+//! episódio assistido por algum usuário do Jellyfin há mais que a carência,
+//! que não é favorito e cuja série não é favorita, é o que a regra apagaria.
+//! Arquivo multi-episódio só entra quando todos os episódios dele foram
+//! assistidos, e só o arquivo que chegou antes de assistirem. A sugestão é
+//! por temporada, a unidade que se marca: entra a temporada em que todo
+//! arquivo passa na regra. Nada sai sozinho.
 
-use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use acervo_clients::jellyfin::{JellyfinClient, JellyfinEpisode};
-use acervo_store::{CatalogSeries, Skip, Store};
+use acervo_store::{CatalogSeries, Store};
 use anyhow::{Context, Result};
-use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
-
-use crate::config::Config;
-use crate::decide::now_rfc3339;
-use crate::events::{self, Event, Kind};
 
 /// O que um usuário fez com um episódio (ou com um arquivo multi-episódio:
 /// `number..=last`).
@@ -36,7 +31,7 @@ pub struct EpisodeViewing {
 /// O destino de um arquivo de série com algum episódio assistido.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    /// Sai: `user` foi o último a assistir, em `at`.
+    /// A regra apagaria: `user` foi o último a assistir, em `at`.
     Delete { user: String, at: OffsetDateTime },
     /// Fica: o episódio ou a série é favorito de alguém.
     Favorite { user: String },
@@ -117,38 +112,6 @@ pub fn select(
         .collect()
 }
 
-/// Um arquivo de série apagado.
-#[derive(Debug, Clone, Serialize)]
-pub struct Deleted {
-    /// "Série S01E02".
-    pub episodio: String,
-    pub assistido_por: String,
-    pub assistido_em: String,
-    pub tamanho: u64,
-}
-
-/// Um arquivo assistido que ficou, e por quê.
-#[derive(Debug, Clone, Serialize)]
-pub struct Skipped {
-    pub episodio: String,
-    pub motivo: String,
-}
-
-/// O que a parte de séries fez.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct SeriesWatchedReport {
-    pub apagados: Vec<Deleted>,
-    pub pulados: Vec<Skipped>,
-    pub recusados: usize,
-    pub liberado: u64,
-    pub aviso: Option<String>,
-}
-
-fn human(at: OffsetDateTime) -> String {
-    let format = time::macros::format_description!("[day]/[month]/[year] [hour]:[minute] UTC");
-    at.format(&format).unwrap_or_default()
-}
-
 /// A série do catálogo de um episódio do Jellyfin: pelo TMDB, senão pelo
 /// TVDB.
 fn owner<'a>(episode: &JellyfinEpisode, list: &'a [CatalogSeries]) -> Option<&'a CatalogSeries> {
@@ -160,29 +123,6 @@ fn owner<'a>(episode: &JellyfinEpisode, list: &'a [CatalogSeries]) -> Option<&'a
                 .series_tvdb_id
                 .and_then(|id| list.iter().find(|s| s.series.tvdb_id == Some(id)))
         })
-}
-
-/// Marca os episódios `watched` e só então apaga o arquivo do disco e do
-/// catálogo: falha no meio nunca devolve episódio à busca.
-async fn delete_file(
-    config: &Config,
-    store: &Store,
-    entry: &CatalogSeries,
-    file: &acervo_store::CatalogEpisodeFile,
-    episode_ids: &[i64],
-) -> Result<()> {
-    let map = config.path_map();
-    // O vídeo e as legendas dele.
-    let hosts = std::iter::once(file.file.relative_path.clone())
-        .chain(super::subtitle_paths(entry, file.id))
-        .map(|relative| map.to_host(&PathBuf::from(&entry.series.path).join(relative)))
-        .collect::<Result<Vec<PathBuf>, _>>()?;
-    store
-        .set_skip(episode_ids, Some(Skip::Watched), &now_rfc3339())
-        .await?;
-    tokio::task::spawn_blocking(move || super::remove_files(&hosts)).await??;
-    store.delete_episode_file(file.id).await?;
-    Ok(())
 }
 
 /// Lê o que cada usuário fez com os episódios do catálogo, por série.
@@ -224,140 +164,125 @@ async fn viewings(
     Ok(by_series)
 }
 
-/// Uma execução: lê os episódios de cada usuário, aplica a regra e apaga.
+/// Uma temporada em que todo arquivo passa na regra: marcá-la apaga o que
+/// a regra apagaria.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeasonSuggestion {
+    pub series_id: i64,
+    pub season: u16,
+    /// Quantos arquivos a temporada tem no disco.
+    pub files: usize,
+    /// Bytes desses arquivos.
+    pub size: u64,
+    /// Quem assistiu por último, e quando.
+    pub user: String,
+    pub at: OffsetDateTime,
+}
+
+/// As temporadas de uma série que viram sugestão, a partir dos vereditos de
+/// [`select`], sem rede nem banco. Temporada com algum arquivo fora da regra
+/// (favorito, na carência, sem data, multi-episódio pela metade, nunca
+/// assistido, ou que chegou depois de assistirem) fica de fora inteira:
+/// marcar a temporada apagaria esse arquivo também. Arquivo que cobre duas
+/// temporadas conta nas duas.
+#[must_use]
+pub fn season_suggestions(
+    entry: &CatalogSeries,
+    verdicts: &BTreeMap<i64, Verdict>,
+) -> Vec<SeasonSuggestion> {
+    let mut seasons: BTreeMap<u16, BTreeSet<i64>> = BTreeMap::new();
+    for episode in &entry.episodes {
+        if let Some(file_id) = episode.file_id {
+            seasons
+                .entry(episode.episode.season)
+                .or_default()
+                .insert(file_id);
+        }
+    }
+    seasons
+        .into_iter()
+        .filter_map(|(season, file_ids)| {
+            let mut last: Option<(&String, OffsetDateTime)> = None;
+            let mut size = 0;
+            for file_id in &file_ids {
+                let file = entry.files.iter().find(|f| f.id == *file_id)?;
+                let Verdict::Delete { user, at } = verdicts.get(file_id)? else {
+                    return None;
+                };
+                if !crate::watched::watched_after_added(*at, file.file.date_added.as_deref()) {
+                    return None;
+                }
+                if last.is_none_or(|(_, latest)| *at > latest) {
+                    last = Some((user, *at));
+                }
+                size += file.file.size;
+            }
+            let (user, at) = last?;
+            Some(SeasonSuggestion {
+                series_id: entry.id,
+                season,
+                files: file_ids.len(),
+                size,
+                user: user.clone(),
+                at,
+            })
+        })
+        .collect()
+}
+
+/// Os vereditos de cada arquivo da série.
+fn verdicts(
+    entry: &CatalogSeries,
+    viewings: &[EpisodeViewing],
+    now: OffsetDateTime,
+    grace: Duration,
+) -> BTreeMap<i64, Verdict> {
+    let files: Vec<(i64, Vec<(u16, u16)>)> = entry
+        .files
+        .iter()
+        .map(|f| {
+            let episodes = entry
+                .episodes
+                .iter()
+                .filter(|e| e.file_id == Some(f.id))
+                .map(|e| (e.episode.season, e.episode.number))
+                .collect();
+            (f.id, episodes)
+        })
+        .collect();
+    select(&files, viewings, now, grace)
+}
+
+/// Lê os episódios de cada usuário e devolve as temporadas que a regra
+/// apagaria inteiras. Só lê: apagar é com o usuário, pela tela "Para
+/// apagar".
 ///
 /// # Errors
 ///
-/// Jellyfin inalcançável ou catálogo ilegível, antes de apagar qualquer
-/// coisa. Falha num arquivo fica no relatório; os outros seguem.
-#[allow(clippy::too_many_lines)] // Um braço por veredito, como nos filmes.
-pub async fn run(
-    config: &Config,
+/// Jellyfin inalcançável ou catálogo ilegível.
+pub async fn suggest(
     store: &Store,
     jellyfin: &JellyfinClient,
     grace_minutes: u64,
-) -> Result<SeriesWatchedReport> {
+) -> Result<Vec<SeasonSuggestion>> {
     let list = store.series_list().await?;
-    let mut report = SeriesWatchedReport::default();
     if list.is_empty() {
-        return Ok(report);
+        return Ok(Vec::new());
     }
     let by_series = viewings(jellyfin, &list).await?;
-    let grace =
-        Duration::seconds(i64::try_from(grace_minutes.saturating_mul(60)).unwrap_or(i64::MAX));
+    let grace = crate::watched::grace(grace_minutes);
     let now = OffsetDateTime::now_utc();
-    for entry in &list {
-        let Some(viewings) = by_series.get(&entry.id) else {
-            continue;
-        };
-        let files: Vec<(i64, Vec<(u16, u16)>)> = entry
-            .files
-            .iter()
-            .map(|f| {
-                let episodes = entry
-                    .episodes
-                    .iter()
-                    .filter(|e| e.file_id == Some(f.id))
-                    .map(|e| (e.episode.season, e.episode.number))
-                    .collect();
-                (f.id, episodes)
-            })
-            .collect();
-        for (file_id, verdict) in select(&files, viewings, now, grace) {
-            let Some(file) = entry.files.iter().find(|f| f.id == file_id) else {
-                continue;
-            };
-            let episode_ids: Vec<i64> = entry
-                .episodes
-                .iter()
-                .filter(|e| e.file_id == Some(file_id))
-                .map(|e| e.id)
-                .collect();
-            let label = super::label(entry, &episode_ids);
-            let skip = |motivo: String| Skipped {
-                episodio: label.clone(),
-                motivo,
-            };
-            match verdict {
-                Verdict::Delete { at, .. }
-                    if !crate::watched::watched_after_added(
-                        at,
-                        file.file.date_added.as_deref(),
-                    ) =>
-                {
-                    report
-                        .pulados
-                        .push(skip(crate::watched::before_added_reason(
-                            file.file.date_added.as_deref(),
-                        )));
-                }
-                Verdict::Delete { user, at } => {
-                    let reason = format!("assistido por {user} em {}", human(at));
-                    match delete_file(config, store, entry, file, &episode_ids).await {
-                        Ok(()) => {
-                            events::record(
-                                store,
-                                Event {
-                                    source_title: file.file.scene_name.clone(),
-                                    quality: Some(file.file.quality.quality),
-                                    message: Some(format!(
-                                        "{reason}; arquivo apagado: {}; o download segue \
-                                         semeando até o ciclo de limpeza",
-                                        file.file.relative_path
-                                    )),
-                                    poster: entry.series.poster.clone(),
-                                    ..Event::series(
-                                        Kind::FileDeleted,
-                                        entry.id,
-                                        &label,
-                                        &episode_ids,
-                                    )
-                                },
-                            )
-                            .await;
-                            report.liberado += file.file.size;
-                            report.apagados.push(Deleted {
-                                episodio: label.clone(),
-                                assistido_por: user,
-                                assistido_em: at.format(&Rfc3339).unwrap_or_default(),
-                                tamanho: file.file.size,
-                            });
-                        }
-                        Err(error) => {
-                            tracing::warn!(episodio = label, "assistido não removido: {error:#}");
-                            report.recusados += 1;
-                            report
-                                .pulados
-                                .push(skip(format!("remoção recusada: {error:#}")));
-                        }
-                    }
-                }
-                Verdict::Favorite { user } => {
-                    report.pulados.push(skip(format!("favorito de {user}")));
-                }
-                Verdict::InGrace { until } => report
-                    .pulados
-                    .push(skip(format!("dentro da carência, até {}", human(until)))),
-                Verdict::NoDate { user } => report
-                    .pulados
-                    .push(skip(format!("assistido por {user} sem data conhecida"))),
-                Verdict::Partial => report.pulados.push(skip(
-                    "multi-episódio com episódio ainda não assistido".into(),
-                )),
-            }
-        }
-    }
-    if !report.apagados.is_empty()
-        && let Err(error) = jellyfin.refresh_library().await
-    {
-        tracing::warn!("varredura do Jellyfin: {error}");
-        report.aviso = Some(format!("varredura da biblioteca não pedida: {error}"));
-    }
-    Ok(report)
+    Ok(list
+        .iter()
+        .filter_map(|entry| Some((entry, by_series.get(&entry.id)?)))
+        .flat_map(|(entry, viewings)| {
+            season_suggestions(entry, &verdicts(entry, viewings, now, grace))
+        })
+        .collect())
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn at(text: &str) -> OffsetDateTime {
@@ -474,6 +399,127 @@ mod tests {
         assert_eq!(
             decide(&files, &[view("vitor", 1, old), view("ana", 2, None)])[&1],
             Verdict::NoDate { user: "ana".into() }
+        );
+    }
+
+    /// Uma série de teste: `episodes` são `(id, temporada, número, arquivo)`;
+    /// `files`, `(id, bytes, adicionado em)`.
+    pub(crate) fn sample(
+        id: i64,
+        episodes: &[(i64, u16, u16, Option<i64>)],
+        files: &[(i64, u64, Option<&str>)],
+    ) -> CatalogSeries {
+        use acervo_store::{CatalogEpisode, CatalogEpisodeFile, Episode, EpisodeFile, Series};
+        CatalogSeries {
+            id,
+            series: Series {
+                tmdb_id: u32::try_from(id).unwrap(),
+                tvdb_id: None,
+                imdb_id: None,
+                title: "Show".into(),
+                original_title: None,
+                metadata_title: None,
+                original_language: None,
+                year: Some(2024),
+                status: None,
+                overview: None,
+                network: None,
+                runtime: 0,
+                poster: None,
+                fanart: None,
+                path: "/media/series/Show".into(),
+                season_folder: true,
+                monitor_new: true,
+                added: None,
+                refreshed_at: None,
+                alternate_titles: Vec::new(),
+            },
+            episodes: episodes
+                .iter()
+                .map(|&(id, season, number, file_id)| CatalogEpisode {
+                    id,
+                    episode: Episode {
+                        season,
+                        number,
+                        tmdb_id: None,
+                        title: None,
+                        air_date: None,
+                        overview: None,
+                        runtime: 0,
+                    },
+                    skip: None,
+                    skipped_at: None,
+                    file_id,
+                })
+                .collect(),
+            files: files
+                .iter()
+                .map(|&(id, size, added)| CatalogEpisodeFile {
+                    id,
+                    file: EpisodeFile {
+                        relative_path: format!("e{id}.mkv"),
+                        size,
+                        quality: acervo_parser::parse_quality("x.1080p.WEB-DL"),
+                        languages: Vec::new(),
+                        release_group: None,
+                        scene_name: None,
+                        date_added: added.map(str::to_owned),
+                    },
+                })
+                .collect(),
+            priority: false,
+            scene: Vec::new(),
+            subtitles: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sugere_a_temporada_em_que_todo_arquivo_sairia() {
+        let before = Some("2026-08-01T00:00:00Z");
+        // T1: dois arquivos que saem. T2: um sai, outro é favorito. T3: o
+        // arquivo chegou depois de assistirem. T4: nenhum veredito (ninguém
+        // assistiu). O episódio sem arquivo da T1 não conta.
+        let entry = sample(
+            7,
+            &[
+                (1, 1, 1, Some(10)),
+                (2, 1, 2, Some(11)),
+                (3, 1, 3, None),
+                (4, 2, 1, Some(20)),
+                (5, 2, 2, Some(21)),
+                (6, 3, 1, Some(30)),
+                (7, 4, 1, Some(40)),
+            ],
+            &[
+                (10, 100, before),
+                (11, 50, before),
+                (20, 1, before),
+                (21, 1, before),
+                (30, 1, Some("2026-09-10T00:00:00Z")),
+                (40, 1, before),
+            ],
+        );
+        let delete = |user: &str, when: &str| Verdict::Delete {
+            user: user.into(),
+            at: at(when),
+        };
+        let verdicts = BTreeMap::from([
+            (10, delete("vitor", "2026-09-01T00:00:00Z")),
+            (11, delete("ana", "2026-09-02T00:00:00Z")),
+            (20, delete("vitor", "2026-09-01T00:00:00Z")),
+            (21, Verdict::Favorite { user: "ana".into() }),
+            (30, delete("vitor", "2026-09-01T00:00:00Z")),
+        ]);
+        assert_eq!(
+            season_suggestions(&entry, &verdicts),
+            [SeasonSuggestion {
+                series_id: 7,
+                season: 1,
+                files: 2,
+                size: 150,
+                user: "ana".into(),
+                at: at("2026-09-02T00:00:00Z"),
+            }]
         );
     }
 }

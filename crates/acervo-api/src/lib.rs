@@ -62,7 +62,9 @@ pub enum SearchError {
     AllFailed(usize),
     #[error("o indexador não entregou o arquivo")]
     DownloadFailed,
-    #[error("indexador `{indexer}` em espera até {until} UTC por excesso de requisições")]
+    #[error(
+        "indexador `{indexer}` em espera até {until} UTC por excesso de requisições ou falhas seguidas"
+    )]
     IndexerWaiting { indexer: String, until: String },
     #[error("todos os indexadores em espera até {until} UTC")]
     AllWaiting { until: String },

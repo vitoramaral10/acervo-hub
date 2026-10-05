@@ -2,13 +2,15 @@
 //! de um torrent terminado vira um hardlink na pasta da série, com o nome do
 //! padrão, e o catálogo liga o arquivo aos episódios.
 //!
-//! Falha segue a dos filmes: torrent com erro ou sumido vai para a lista de
-//! bloqueio (com a série) e os episódios são buscados de novo; disco cheio
-//! devolve o torrent à fila; problema na importação espera a próxima volta.
-//! Arquivo que o cliente dá por baixado e não está no disco faz o torrent ser
-//! verificado de novo, como nos filmes. Num pacote, só se liga o arquivo
-//! escolhido e inteiro: o de prioridade zero (episódio que se tem ou foi
-//! assistido) nunca entra, e o incompleto espera sem segurar os outros.
+//! Falha segue a dos filmes: torrent com erro vai para a lista de bloqueio
+//! (com a série) e os episódios são buscados de novo; torrent sumido do
+//! cliente é buscado de novo sem bloqueio; disco cheio devolve o torrent à
+//! fila; problema na importação espera a próxima volta. Arquivo que o
+//! cliente dá por baixado e não está no disco faz o torrent ser verificado de
+//! novo, como nos filmes.
+//!
+//! A volta liga os arquivos no disco primeiro e grava tudo de uma vez no
+//! fim ([`Store::import_series_files`]): arquivos, legendas e o grab.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -16,19 +18,23 @@ use std::path::{Path, PathBuf};
 use acervo_api::Catalog;
 use acervo_clients::{QbitClient, TorrentFile, TorrentInfo, client_path};
 use acervo_core::DownloadHash;
-use acervo_store::{CatalogEpisode, CatalogSeries, EpisodeFile, GrabState, SeriesGrab, Store};
+use acervo_store::{
+    CatalogEpisodeFile, CatalogSeries, EpisodeFile, FailReason, GrabState, SeriesGrab,
+    SeriesImport, Store,
+};
 use anyhow::Result;
 use serde::Serialize;
 use time::{Duration, OffsetDateTime};
 
-use super::grab::{Choice, Selection, apply_selection, give_up};
+use super::grab::{Choice, apply_selection, give_up};
 use super::naming::{TBA, episode_path};
 use crate::config::Config;
 use crate::decide::now_rfc3339;
 use crate::events::{self, Event, Kind};
 use crate::grab::{
-    CHECKING, Condition, Failure, NO_SEEDS, QUEUE_TAG, QUEUED, UNREGISTERED, checking,
-    client_trouble, install, left, no_seeds, progress, qbit, recheck_once, watch,
+    CHECKING, Condition, Failure, NO_SEEDS, QUEUE_TAG, QUEUED, UNREGISTERED, absent, checking,
+    client_trouble, ensure_client_listed, install, left, no_seeds, present, progress, qbit,
+    recheck_once, watch,
 };
 
 /// Quanto se espera pelo título do episódio depois da exibição.
@@ -90,30 +96,22 @@ pub fn to_link(
         .collect()
 }
 
-/// Um arquivo do torrent e o destino dele.
-pub(crate) type Picked<'a> = (&'a TorrentFile, &'a Choice);
-
-/// Os vídeos do torrent a importar, sem IO: os escolhidos (prioridade acima
-/// de zero) com algum episódio do grab ainda em Quero ([`to_link`]),
-/// separados em inteiros no cliente e ainda incompletos. O arquivo de
-/// prioridade zero de um pacote — episódio que já se tem, assistido ou
-/// dispensado — nunca entra, baixado ou não.
-pub(crate) fn importable<'a>(
-    selection: &'a Selection,
-    episodes: &[CatalogEpisode],
-    wanted: &HashSet<i64>,
-) -> (Vec<Picked<'a>>, Vec<Picked<'a>>) {
-    selection
-        .videos()
-        .filter(|(_, choice)| !to_link(episodes, wanted, &choice.episodes).is_empty())
-        .partition(|(file, _)| file.progress >= 1.0)
+/// Um arquivo que a volta ligou no disco, ainda por gravar.
+struct Linked {
+    /// O destino, como o cliente vê.
+    shown: String,
+    quality: acervo_parser::Quality,
+    record: SeriesImport,
 }
 
 /// O que uma volta fez com um grab.
 #[derive(Default)]
 struct Step {
-    /// Destinos ligados nesta volta.
-    linked: Vec<String>,
+    /// Arquivos ligados no disco nesta volta.
+    linked: Vec<Linked>,
+    /// Um arquivo não ligou depois de outros que ligaram: os ligados são
+    /// gravados, e o grab fica em atenção com este erro.
+    failed: Option<String>,
     /// Por que ainda não terminou.
     waiting: Option<String>,
     /// Nada mais a importar dele, e nunca importou nada.
@@ -146,18 +144,18 @@ struct Importer<'a> {
 }
 
 impl Importer<'_> {
-    /// Liga as legendas ao lado do vídeo do arquivo `file_id` e as registra.
-    /// Falha numa legenda vira aviso: ela não segura a importação.
+    /// Liga as legendas ao lado do vídeo e devolve as que ligou, a gravar
+    /// com ele. Falha numa legenda vira aviso: ela não segura a importação.
     async fn link_subtitles(
         &self,
         torrent: &TorrentInfo,
         entry: &CatalogSeries,
-        file_id: i64,
         video: &str,
         files: &[&TorrentFile],
-    ) {
+    ) -> Vec<acervo_store::Subtitle> {
+        let mut subtitles = Vec::new();
         if files.is_empty() {
-            return;
+            return subtitles;
         }
         let map = self.config.path_map();
         let folder = PathBuf::from(&entry.series.path);
@@ -182,16 +180,14 @@ impl Importer<'_> {
                 tracing::warn!(legenda = file.name, "legenda não importada: {error:#}");
                 continue;
             }
-            let subtitle = acervo_store::Subtitle {
+            subtitles.push(acervo_store::Subtitle {
                 relative_path: relative,
                 language: named.language.map(str::to_owned),
                 forced: named.forced,
                 origin: acervo_store::SubtitleOrigin::Import,
-            };
-            if let Err(error) = self.store.add_episode_subtitle(file_id, &subtitle).await {
-                tracing::warn!(legenda = file.name, "legenda fora do catálogo: {error}");
-            }
+            });
         }
+        subtitles
     }
 
     #[allow(clippy::too_many_lines)] // A sequência da importação; dividir só espalharia.
@@ -200,15 +196,12 @@ impl Importer<'_> {
             .client
             .torrent(&grab.hash)
             .await
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| {
-                if crate::grab::fresh_grab(&grab.grabbed_at, OffsetDateTime::now_utc()) {
-                    Failure::Import("o torrent ainda não apareceu no cliente".into())
-                } else {
-                    Failure::Download("o torrent sumiu do cliente".into())
-                }
-            })?;
+            .map_err(|e| e.to_string())?;
         let now = OffsetDateTime::now_utc();
+        let Some(torrent) = torrent else {
+            return Err(absent(&mut watch(), &grab.hash, &grab.grabbed_at, now));
+        };
+        present(&mut watch(), &grab.hash, now);
         if torrent.state == "error" {
             let free = self
                 .free_space
@@ -236,7 +229,7 @@ impl Importer<'_> {
             // nova busca devolveria o mesmo hash, ainda em `missingFiles`.
             // Sem bloqueio: a culpa não é do release.
             match failure {
-                Failure::Lost(_) => {
+                Failure::Lost(..) => {
                     self.drop_torrent(grab, &torrent, "arquivos sumidos")
                         .await?;
                 }
@@ -256,7 +249,10 @@ impl Importer<'_> {
             // Como o sem seeds: só sai do cliente se é só deste grab.
             self.drop_torrent(grab, &torrent, "torrent desregistrado")
                 .await?;
-            return Err(Failure::Download(UNREGISTERED.into()));
+            return Err(Failure::Download(
+                FailReason::Unregistered,
+                UNREGISTERED.into(),
+            ));
         }
         let stuck = no_seeds(&mut watch(), &torrent, now);
         if stuck {
@@ -269,7 +265,7 @@ impl Importer<'_> {
             // travado ocuparia vaga e reserva. Só sai se é só deste grab.
             self.drop_torrent(grab, &torrent, "torrent sem seeds")
                 .await?;
-            return Err(Failure::Download(NO_SEEDS.into()));
+            return Err(Failure::Download(FailReason::NoSeeds, NO_SEEDS.into()));
         }
         let Some(selection) = apply_selection(
             &self.client,
@@ -284,22 +280,26 @@ impl Importer<'_> {
         else {
             return Ok(Step::waiting("aguardando os metadados do torrent"));
         };
-        let chosen: Vec<Picked<'_>> = selection.videos().collect();
-        let subtitles: Vec<Picked<'_>> = selection.subtitles().collect();
+        let chosen: Vec<(&TorrentFile, &Choice)> = selection.videos().collect();
+        let subtitles: Vec<(&TorrentFile, &Choice)> = selection.subtitles().collect();
         if chosen.is_empty() {
             // Nunca baixou nada: não há o que semear. Mas só sai se o torrent
             // é deste grab e de mais ninguém; na dúvida, fica no cliente.
             self.drop_torrent(grab, &torrent, "torrent sem arquivo útil")
                 .await?;
             return Err(Failure::Download(
+                FailReason::Other,
                 "nenhum arquivo do torrent é de episódio que se quer".into(),
             ));
         }
         // Pendente: algum episódio do grab que ele traz ainda sem arquivo e
         // sem `skip` — apagado ou dispensado no meio não é importado.
         let wanted: HashSet<i64> = grab.episode_ids.iter().copied().collect();
-        let (pending, incomplete) = importable(&selection, &entry.episodes, &wanted);
-        if pending.is_empty() && incomplete.is_empty() {
+        let pending: Vec<&(&TorrentFile, &Choice)> = chosen
+            .iter()
+            .filter(|(_, choice)| !to_link(&entry.episodes, &wanted, &choice.episodes).is_empty())
+            .collect();
+        if pending.is_empty() {
             let ours = entry.files.iter().any(|f| {
                 f.file.scene_name.as_deref() == Some(grab.title.as_str())
                     && entry
@@ -331,18 +331,8 @@ impl Importer<'_> {
 
         let mut step = Step::default();
         let mut waiting = Vec::new();
-        if !incomplete.is_empty() {
-            waiting.push(format!(
-                "aguardando {} do torrent",
-                if incomplete.len() == 1 {
-                    "1 arquivo".to_owned()
-                } else {
-                    format!("{} arquivos", incomplete.len())
-                }
-            ));
-        }
-        // Os vídeos que o cliente dá por baixados e não estão no disco.
-        let mut vanished: Vec<PathBuf> = Vec::new();
+        // O que o cliente dá por baixado e não está no disco.
+        let mut vanished = Vec::new();
         let map = self.config.path_map();
         let series = &entry.series;
         for (file, choice) in pending {
@@ -371,140 +361,115 @@ impl Importer<'_> {
                 continue;
             }
             let titles: Vec<String> = titles.into_iter().flatten().collect();
-            let named: Vec<(u16, u16, &str)> = episodes
-                .iter()
-                .zip(&titles)
-                .map(|(e, t)| (e.episode.season, e.episode.number, t.as_str()))
-                .collect();
-            let mut quality = acervo_parser::parse_episode_quality(&grab.title);
-            if quality.quality == acervo_parser::Quality::Unknown {
-                quality = acervo_parser::parse_episode_quality(&file.name);
-            }
-            let extension = Path::new(&file.name)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("mkv");
-            let relative = episode_path(
-                super::folder_title(series),
-                series.season_folder,
-                &named,
-                quality,
-                extension,
-            );
-            let destination = PathBuf::from(&series.path).join(&relative);
-            let shown = destination.display().to_string();
-            let source = map
-                .to_host(&client_path(&torrent, file))
-                .map_err(|e| e.to_string())?;
-            if crate::grab::not_found(&source).await {
-                vanished.push(source);
-                continue;
-            }
-            let target = map.to_host(&destination).map_err(|e| e.to_string())?;
-            // O mesmo nome de um arquivo que já está lá: troca no lugar.
-            let same_name = entry.files.iter().any(|f| f.file.relative_path == relative);
-            let (from, to) = (source, target.clone());
-            tokio::task::spawn_blocking(move || {
-                install(&from, &to, same_name.then_some(to.as_path()))
-            })
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| format!("{e:#}"))?;
-            let probe = crate::mediainfo::probe(&target).await;
-            let languages = probe
-                .map(|p| p.audio_languages)
-                .filter(|l| !l.is_empty())
-                .unwrap_or_else(|| {
-                    acervo_parser::parse_episode_title(&grab.title)
-                        .map(|p| p.languages)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|l| *l != acervo_parser::Language::Unknown)
-                        .collect()
-                });
-            let record = EpisodeFile {
-                relative_path: relative,
-                size: file.size,
-                quality,
-                languages: languages.iter().map(|l| l.name().to_owned()).collect(),
-                release_group: acervo_parser::parse_episode_release_group(&grab.title),
-                scene_name: Some(grab.title.clone()),
-                date_added: Some(now_rfc3339()),
-            };
-            // Só os em Quero ganham o arquivo: o que já tem arquivo ou foi
-            // dispensado não é religado (não há upgrade), e o antigo fica.
-            let linked = to_link(&entry.episodes, &wanted, &choice.episodes);
-            let (file_id, replaced) = self
-                .store
-                .add_episode_file(entry.id, &record, &linked)
+            // Um arquivo que não liga não desfaz os que já ligaram nesta
+            // volta: eles são gravados, e o grab fica em atenção.
+            let done = async {
+                let named: Vec<(u16, u16, &str)> = episodes
+                    .iter()
+                    .zip(&titles)
+                    .map(|(e, t)| (e.episode.season, e.episode.number, t.as_str()))
+                    .collect();
+                let mut quality = acervo_parser::parse_episode_quality(&grab.title);
+                if quality.quality == acervo_parser::Quality::Unknown {
+                    quality = acervo_parser::parse_episode_quality(&file.name);
+                }
+                let extension = Path::new(&file.name)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("mkv");
+                let relative = episode_path(
+                    super::folder_title(series),
+                    series.season_folder,
+                    &named,
+                    quality,
+                    extension,
+                );
+                let destination = PathBuf::from(&series.path).join(&relative);
+                let shown = destination.display().to_string();
+                let source = map
+                    .to_host(&client_path(&torrent, file))
+                    .map_err(|e| e.to_string())?;
+                if crate::grab::not_found(&source).await {
+                    return Ok(None);
+                }
+                let target = map.to_host(&destination).map_err(|e| e.to_string())?;
+                // O mesmo nome de um arquivo que já está lá: troca no lugar.
+                let same_name = entry.files.iter().any(|f| f.file.relative_path == relative);
+                let (from, to) = (source, target.clone());
+                tokio::task::spawn_blocking(move || {
+                    install(&from, &to, same_name.then_some(to.as_path()))
+                })
                 .await
-                .map_err(|e| format!("gravando o arquivo: {e}"))?;
-            for old in replaced {
-                // O antigo sai com as legendas dele que vieram do torrent; a
-                // posta à mão fica no disco.
-                for sub in entry.subtitles.iter().filter(|s| s.owner == old.id) {
-                    let path = PathBuf::from(&series.path).join(&sub.subtitle.relative_path);
-                    if let Ok(host) = map.to_host(&path)
-                        && let Err(error) = crate::subtitles::remove_if_from_torrent(
-                            &host,
-                            Some(sub.subtitle.origin),
-                        )
-                    {
-                        tracing::warn!(arquivo = %host.display(), "legenda antiga não apagada: {error}");
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{e:#}"))?;
+                let probe = crate::mediainfo::probe(&target).await;
+                let languages = probe
+                    .map(|p| p.audio_languages)
+                    .filter(|l| !l.is_empty())
+                    .unwrap_or_else(|| {
+                        acervo_parser::parse_episode_title(&grab.title)
+                            .map(|p| p.languages)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|l| *l != acervo_parser::Language::Unknown)
+                            .collect()
+                    });
+                let record = EpisodeFile {
+                    relative_path: relative,
+                    size: file.size,
+                    quality,
+                    languages: languages.iter().map(|l| l.name().to_owned()).collect(),
+                    release_group: acervo_parser::parse_episode_release_group(&grab.title),
+                    scene_name: Some(grab.title.clone()),
+                    date_added: Some(now_rfc3339()),
+                };
+                // Só os em Quero ganham o arquivo: o que já tem arquivo ou foi
+                // dispensado não é religado (não há upgrade), e o antigo fica.
+                let linked = to_link(&entry.episodes, &wanted, &choice.episodes);
+                // As legendas do torrent que são destes episódios vão ao lado.
+                let own: Vec<&TorrentFile> = subtitles
+                    .iter()
+                    .filter(|(_, sub)| {
+                        !sub.episodes.is_empty()
+                            && sub.episodes.iter().all(|e| choice.episodes.contains(e))
+                    })
+                    .map(|(f, _)| *f)
+                    .collect();
+                let beside = self
+                    .link_subtitles(&torrent, entry, &record.relative_path, &own)
+                    .await;
+                Ok::<_, Failure>(Some(Linked {
+                    shown,
+                    quality: quality.quality,
+                    record: SeriesImport {
+                        file: record,
+                        episode_ids: linked,
+                        subtitles: beside,
+                    },
+                }))
+            }
+            .await;
+            match done {
+                Ok(Some(linked)) => step.linked.push(linked),
+                Ok(None) => vanished.push(map.to_host(&client_path(&torrent, file))),
+                Err(Failure::Import(error)) if !step.linked.is_empty() => {
+                    step.failed = Some(error);
+                    break;
+                }
+                Err(failure) => return Err(failure),
+            }
+        }
+        // Os que sumiram do disco: o mesmo torrent é verificado e baixa de
+        // novo, sem desfazer os que ligaram.
+        if let Some(Ok(source)) = vanished.into_iter().next() {
+            match crate::grab::source_gone(&self.client, &torrent, &source).await {
+                Ok(Some(why)) => waiting.push(why),
+                Ok(None) => {}
+                Err(failure) if !step.linked.is_empty() => {
+                    if let Failure::Import(error) = failure {
+                        step.failed.get_or_insert(error);
                     }
                 }
-                let path = PathBuf::from(&series.path).join(&old.file.relative_path);
-                match map.to_host(&path) {
-                    Ok(host) => match std::fs::remove_file(&host) {
-                        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                            tracing::warn!(arquivo = %host.display(), "antigo não apagado: {error}");
-                        }
-                        _ => {}
-                    },
-                    Err(error) => tracing::warn!("antigo fora do mapa: {error}"),
-                }
-            }
-            // As legendas do torrent que são destes episódios vão ao lado.
-            let own: Vec<&TorrentFile> = subtitles
-                .iter()
-                .filter(|(_, sub)| {
-                    !sub.episodes.is_empty()
-                        && sub.episodes.iter().all(|e| choice.episodes.contains(e))
-                })
-                .map(|(f, _)| *f)
-                .collect();
-            self.link_subtitles(&torrent, entry, file_id, &record.relative_path, &own)
-                .await;
-            events::record(
-                self.store,
-                Event {
-                    source_title: Some(grab.title.clone()),
-                    quality: Some(quality.quality),
-                    indexer: Some(grab.indexer.clone()),
-                    download_id: Some(grab.hash.clone()),
-                    message: Some(shown.clone()),
-                    poster: series.poster.clone(),
-                    ..Event::series(
-                        Kind::Imported,
-                        entry.id,
-                        super::label(entry, &linked),
-                        &linked,
-                    )
-                },
-            )
-            .await;
-            step.linked.push(shown);
-        }
-        // O cliente diz que terminou, mas o vídeo não está no disco: o mesmo
-        // torrent é verificado de novo e baixa o que falta. Já verificado,
-        // sem nada ligado nesta volta, é importação travada.
-        if let Some(first) = vanished.first() {
-            match crate::grab::source_gone(&self.client, &torrent, first).await {
-                Err(failure) if step.linked.is_empty() && waiting.is_empty() => {
-                    return Err(failure);
-                }
-                Ok(Some(why)) | Err(Failure::Import(why)) => waiting.push(why),
-                Ok(None) => {}
                 Err(failure) => return Err(failure),
             }
         }
@@ -539,7 +504,38 @@ impl Importer<'_> {
     }
 }
 
-/// Grava o que a volta deu: o estado do grab, o bloqueio e a nova busca.
+/// Tira do disco os arquivos que a importação trocou, já fora do catálogo,
+/// com as legendas deles que vieram do torrent; a posta à mão fica.
+fn remove_replaced(config: &Config, entry: &CatalogSeries, replaced: &[CatalogEpisodeFile]) {
+    let map = config.path_map();
+    let series = &entry.series;
+    for old in replaced {
+        for sub in entry.subtitles.iter().filter(|s| s.owner == old.id) {
+            let path = PathBuf::from(&series.path).join(&sub.subtitle.relative_path);
+            if let Ok(host) = map.to_host(&path)
+                && let Err(error) =
+                    crate::subtitles::remove_if_from_torrent(&host, Some(sub.subtitle.origin))
+            {
+                tracing::warn!(arquivo = %host.display(), "legenda antiga não apagada: {error}");
+            }
+        }
+        let path = PathBuf::from(&series.path).join(&old.file.relative_path);
+        match map.to_host(&path) {
+            Ok(host) => match std::fs::remove_file(&host) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    tracing::warn!(arquivo = %host.display(), "antigo não apagado: {error}");
+                }
+                _ => {}
+            },
+            Err(error) => tracing::warn!("antigo fora do mapa: {error}"),
+        }
+    }
+}
+
+/// Grava o que a volta deu: os arquivos e o estado do grab (numa
+/// transação), ou o bloqueio e a nova busca. `false`, sem gravar nada, se
+/// outro fluxo já fechou o grab: ele sai desta rodada.
+#[allow(clippy::too_many_lines)] // Um braço por desfecho da volta; dividir só espalharia.
 async fn finish(
     config: &Config,
     store: &Store,
@@ -548,7 +544,7 @@ async fn finish(
     entry: &CatalogSeries,
     step: Result<Step, Failure>,
     line: &mut ImportLine,
-) -> Result<()> {
+) -> Result<bool> {
     let at = now_rfc3339();
     match step {
         Ok(Step {
@@ -557,41 +553,97 @@ async fn finish(
         }) => {
             line.estado = "descartado";
             line.detalhe = Some(reason.clone());
-            give_up(store, grab, entry, &reason, false, Kind::Ignored).await?;
+            give_up(store, grab, entry, &reason, None, Kind::Ignored).await
         }
         Ok(step) => {
-            line.destinos = step.linked;
-            line.detalhe.clone_from(&step.waiting);
-            line.estado = if line.destinos.is_empty() && step.waiting.is_some() {
-                "baixando"
+            let (records, shown): (Vec<SeriesImport>, Vec<(String, acervo_parser::Quality)>) = step
+                .linked
+                .into_iter()
+                .map(|l| (l.record, (l.shown, l.quality)))
+                .unzip();
+            // O arquivo que não ligou põe o grab em atenção, como a falha de
+            // importação; os que ligaram são gravados do mesmo jeito.
+            let message = step
+                .failed
+                .as_ref()
+                .map(|error| format!("importação: {error}"))
+                .or_else(|| step.waiting.clone());
+            let state = if message.is_some() {
+                GrabState::Downloading
             } else {
-                "importado"
+                GrabState::Imported
             };
-            if let Some(waiting) = &step.waiting {
-                store
-                    .update_series_grab(grab.id, GrabState::Downloading, Some(waiting), None)
-                    .await?;
-            } else {
-                store
-                    .update_series_grab(grab.id, GrabState::Imported, None, Some(&at))
-                    .await?;
+            let Some(written) = store
+                .import_series_files(grab.id, entry.id, &records, state, message.as_deref(), &at)
+                .await?
+            else {
+                tracing::warn!(
+                    release = grab.title,
+                    "grab encerrado por outro fluxo no meio da importação: o que foi ligado \
+                     fica para a verificação do disco"
+                );
+                return Ok(false);
+            };
+            if state == GrabState::Imported {
                 watch().forget(&grab.hash);
             }
+            for ((record, (destination, quality)), (_, replaced)) in
+                records.iter().zip(&shown).zip(&written)
+            {
+                remove_replaced(config, entry, replaced);
+                let linked = &record.episode_ids;
+                events::record(
+                    store,
+                    Event {
+                        source_title: Some(grab.title.clone()),
+                        quality: Some(*quality),
+                        indexer: Some(grab.indexer.clone()),
+                        download_id: Some(grab.hash.clone()),
+                        message: Some(destination.clone()),
+                        poster: entry.series.poster.clone(),
+                        ..Event::series(
+                            Kind::Imported,
+                            entry.id,
+                            super::label(entry, linked),
+                            linked,
+                        )
+                    },
+                )
+                .await;
+            }
+            line.destinos = shown
+                .into_iter()
+                .map(|(destination, _)| destination)
+                .collect();
+            line.estado = if step.failed.is_some() {
+                line.detalhe = step.failed;
+                "atencao"
+            } else if line.destinos.is_empty() && step.waiting.is_some() {
+                line.detalhe = step.waiting;
+                "baixando"
+            } else {
+                line.detalhe = step.waiting;
+                "importado"
+            };
+            Ok(true)
         }
-        Err(failure @ (Failure::Download(_) | Failure::Lost(_))) => {
-            // O arquivo sumido do disco não é culpa do release: sem bloqueio.
-            let (error, block) = match failure {
-                Failure::Download(error) => (error, true),
-                Failure::Lost(error) => (error, false),
+        Err(failure @ (Failure::Download(..) | Failure::Lost(..))) => {
+            // O arquivo sumido do disco, ou o torrent do cliente, não é culpa
+            // do release: sem bloqueio.
+            let (cause, error, block) = match failure {
+                Failure::Download(cause, error) => (cause, error, Some(cause)),
+                Failure::Lost(cause, error) => (cause, error, None),
                 Failure::Import(_) => unreachable!("o braço de baixo trata"),
             };
             line.estado = "falhou";
             line.detalhe = Some(error.clone());
-            give_up(store, grab, entry, &error, block, Kind::Failed).await?;
+            if !give_up(store, grab, entry, &error, block, Kind::Failed).await? {
+                return Ok(false);
+            }
             if let Some(catalog) = catalog {
                 let only: HashSet<i64> = grab.episode_ids.iter().copied().collect();
                 // O avulso que o tracker apagou deu lugar ao pacote.
-                let prefer_pack = error == UNREGISTERED;
+                let prefer_pack = cause == FailReason::Unregistered;
                 match super::search::series_now_with(
                     config,
                     store,
@@ -612,17 +664,17 @@ async fn finish(
                     }
                 }
             }
+            Ok(true)
         }
         Err(Failure::Import(error)) => {
             line.estado = "atencao";
             line.detalhe = Some(error.clone());
             let message = format!("importação: {error}");
-            store
+            Ok(store
                 .update_series_grab(grab.id, GrabState::Downloading, Some(&message), None)
-                .await?;
+                .await?)
         }
     }
-    Ok(())
 }
 
 /// Importa os downloads de série do acervo que terminaram.
@@ -646,6 +698,9 @@ pub async fn import_downloads(
         return Ok(Vec::new());
     }
     let client = qbit(config).await?;
+    if !ensure_client_listed(config, &client, pending.len()).await? {
+        return Ok(Vec::new());
+    }
     let importer = Importer {
         config,
         store,
@@ -666,8 +721,22 @@ pub async fn import_downloads(
             destinos: Vec::new(),
         };
         let step = importer.step(&grab, &entry).await;
-        let stuck = matches!(step, Err(Failure::Import(_)));
-        finish(config, store, catalog, &grab, &entry, step, &mut line).await?;
+        let stuck = matches!(
+            step,
+            Err(Failure::Import(_))
+                | Ok(Step {
+                    failed: Some(_),
+                    ..
+                })
+        );
+        if !finish(config, store, catalog, &grab, &entry, step, &mut line).await? {
+            tracing::info!(
+                serie = line.serie,
+                release = grab.title,
+                "grab encerrado por outro fluxo nesta volta: pulado"
+            );
+            continue;
+        }
         crate::grab::notify_attention(
             store,
             &grab.hash,
@@ -723,74 +792,6 @@ mod tests {
         let wanted = HashSet::from([1, 2, 3, 4]);
         assert_eq!(to_link(&episodes, &wanted, &[1, 2, 3, 4, 5]), [1, 4]);
         assert!(to_link(&episodes, &wanted, &[2, 3]).is_empty());
-    }
-
-    #[test]
-    fn pacote_com_arquivo_de_prioridade_zero_importa_so_o_inteiro_e_escolhido() {
-        let episode = |id: i64, file_id: Option<i64>, skip: Option<acervo_store::Skip>| {
-            acervo_store::CatalogEpisode {
-                id,
-                episode: acervo_store::Episode {
-                    season: 1,
-                    number: u16::try_from(id).unwrap(),
-                    tmdb_id: None,
-                    title: None,
-                    air_date: None,
-                    overview: None,
-                    runtime: 0,
-                },
-                skip,
-                skipped_at: None,
-                file_id,
-            }
-        };
-        // E1 assistido (o arquivo saiu), E2 no disco, E3 e E4 sumidos e
-        // voltando pelo mesmo pacote.
-        let episodes = [
-            episode(1, None, Some(acervo_store::Skip::Watched)),
-            episode(2, Some(20), None),
-            episode(3, None, None),
-            episode(4, None, None),
-        ];
-        let file = |index: usize, priority: u8, progress: f64| -> TorrentFile {
-            serde_json::from_value(serde_json::json!({
-                "index": index,
-                "name": format!("Show.S01/Show.S01E{:02}.mkv", index + 1),
-                "size": 100,
-                "priority": priority,
-                "progress": progress,
-            }))
-            .unwrap()
-        };
-        let choice = |index: usize, priority: u8| Choice {
-            index,
-            priority,
-            episodes: vec![i64::try_from(index).unwrap() + 1],
-            subtitle: false,
-        };
-        let selection = Selection {
-            // E1 e E2 com prioridade zero, nunca baixados de novo; E3 inteiro;
-            // E4 ainda baixando.
-            files: vec![
-                file(0, 0, 0.0),
-                file(1, 0, 0.0),
-                file(2, 1, 1.0),
-                file(3, 1, 0.4),
-            ],
-            choices: vec![choice(0, 0), choice(1, 0), choice(2, 1), choice(3, 1)],
-            changed: false,
-        };
-        let wanted = HashSet::from([3, 4]);
-        let (ready, incomplete) = importable(&selection, &episodes, &wanted);
-        let ready: Vec<usize> = ready.iter().map(|(f, _)| f.index).collect();
-        let incomplete: Vec<usize> = incomplete.iter().map(|(f, _)| f.index).collect();
-        assert_eq!(ready, [2]);
-        assert_eq!(incomplete, [3]);
-        // Mesmo que o grab ainda quisesse E1 e E2, sem prioridade eles não
-        // entram, baixados ou não.
-        let wanted = HashSet::from([1, 2, 3, 4]);
-        let (ready, _) = importable(&selection, &episodes, &wanted);
-        assert_eq!(ready.len(), 1);
     }
 
     #[test]

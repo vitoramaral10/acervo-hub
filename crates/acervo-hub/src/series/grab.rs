@@ -12,7 +12,7 @@ use acervo_clients::{NewTorrent, QbitClient, TorrentFile, TorrentInfo, client_pa
 use acervo_core::DownloadHash;
 use acervo_decision::{SceneMapping, scene_to_catalog};
 use acervo_parser::{ParsedEpisode, parse_episode_path, parse_episode_title};
-use acervo_store::{CatalogSeries, GrabState, SeriesGrab, Store};
+use acervo_store::{CatalogSeries, FailReason, GrabState, SeriesGrab, Store};
 use anyhow::{Context, Result, bail};
 
 use super::remove::OnDisk;
@@ -655,8 +655,10 @@ pub async fn send_chosen(
     send(config, store, catalog, series_id, release, quality, &wanted).await
 }
 
-/// Desiste de um download de série: marca como falho, bloqueia o release
-/// (com a série) se pedido e registra o evento.
+/// Desiste de um download de série: marca como falho e, com `block`,
+/// bloqueia o release (com a série) com esse motivo — as duas coisas numa
+/// transação — e registra o evento. `false`, sem gravar nada, se outro fluxo
+/// já fechou o grab.
 ///
 /// # Errors
 ///
@@ -666,30 +668,34 @@ pub async fn give_up(
     grab: &SeriesGrab,
     entry: &CatalogSeries,
     reason: &str,
-    blocklist: bool,
+    block: Option<FailReason>,
     kind: Kind,
-) -> Result<()> {
+) -> Result<bool> {
     let at = now_rfc3339();
-    store
-        .update_series_grab(grab.id, GrabState::Failed, Some(reason), Some(&at))
-        .await?;
-    crate::grab::watch().forget(&grab.hash);
-    if blocklist {
-        store
-            .block(&acervo_store::Blocked {
-                id: 0,
-                movie_id: None,
-                series_id: Some(grab.series_id),
-                source_title: grab.title.clone(),
-                indexer: Some(grab.indexer.clone()),
-                quality: Some(grab.quality),
-                size: Some(grab.size),
-                hash: Some(grab.hash.clone()),
-                at,
-                message: Some(reason.to_owned()),
-            })
-            .await?;
+    let blocked = block.map(|cause| acervo_store::Blocked {
+        id: 0,
+        movie_id: None,
+        series_id: Some(grab.series_id),
+        source_title: grab.title.clone(),
+        indexer: Some(grab.indexer.clone()),
+        quality: Some(grab.quality),
+        size: Some(grab.size),
+        hash: Some(grab.hash.clone()),
+        at: at.clone(),
+        message: Some(reason.to_owned()),
+        reason: cause,
+    });
+    if !store
+        .fail_series_grab(grab.id, reason, blocked.as_ref(), &at)
+        .await?
+    {
+        tracing::info!(
+            release = grab.title,
+            "grab já encerrado por outro fluxo: nada a desistir"
+        );
+        return Ok(false);
     }
+    crate::grab::watch().forget(&grab.hash);
     events::record(
         store,
         Event {
@@ -708,7 +714,7 @@ pub async fn give_up(
         },
     )
     .await;
-    Ok(())
+    Ok(true)
 }
 
 /// Tira um download de série da fila, como o de filme: apaga do cliente
@@ -733,6 +739,9 @@ pub async fn remove_download(
         .into_iter()
         .find(|g| g.id == grab_id)
         .context("download desconhecido")?;
+    if grab.state != GrabState::Downloading {
+        bail!("o download já terminou");
+    }
     let entry = store
         .series(grab.series_id)
         .await?
@@ -754,7 +763,11 @@ pub async fn remove_download(
     } else {
         ("tirado da fila na tela", Kind::Ignored)
     };
-    give_up(store, &grab, &entry, reason, blocklist, kind).await?;
+    let block = blocklist.then_some(FailReason::Other);
+    if !give_up(store, &grab, &entry, reason, block, kind).await? {
+        // A importação fechou o grab no meio: nada mais a fazer por ele.
+        return Ok(());
+    }
     if search {
         let only: HashSet<i64> = grab.episode_ids.iter().copied().collect();
         if let Err(error) =

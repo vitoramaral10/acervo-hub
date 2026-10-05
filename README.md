@@ -2,11 +2,11 @@
 
 Um serviço único, em Rust, que cuida de uma biblioteca de filmes e séries: busca nos
 indexadores, decide o release, manda ao cliente de torrent, importa o que terminou, mantém
-os metadados, apaga o que já foi assistido e limpa o que sobrou no cliente — no lugar dos
+os metadados, sugere apagar o que já foi assistido e limpa o que sobrou no cliente — no lugar dos
 quatro processos separados (gerenciador de séries, gerenciador de filmes, agregador de
 indexadores e faxineiro) que a stack usual roda conversando por HTTP.
 
-> **Estado: em produção — filmes, séries, indexadores, limpeza e assistidos.**
+> **Estado: em produção — filmes, séries, indexadores, limpeza e "Para apagar".**
 
 Dois princípios mandam no produto:
 
@@ -145,13 +145,24 @@ cada volta; 6 horas seguidas assim avisam pelo Gotify, uma vez por grab.
 - `definicoes` baixa as definições Cardigann do repositório oficial uma vez por dia e troca
   a de cada indexador em uso que mudou, sem reiniciar.
 
-### Assistidos
+### Para apagar
 
-Com o Jellyfin configurado, `assistidos` (a cada 15 minutos) apaga o filme ou o episódio que
-algum usuário assistiu há mais que a carência (padrão 60 minutos) e que ninguém marcou como
-favorito. Só sai o arquivo que chegou antes de assistirem: o Jellyfin lembra o assistido de
-um título apagado, e o mesmo título adicionado de novo sairia assim que importado. Assistido
-sem data, ou arquivo sem data de adição, fica.
+Assistido não sai sozinho. Na tela **Para apagar** fica o que o usuário marcou — um filme,
+uma temporada ou a série inteira, pelo botão "Marcar para apagar" no detalhe de cada um —,
+com o espaço que cada item libera e o total. Nada sai antes de confirmar ali: apagar os
+selecionados ou todos pede confirmação com o total. O filme sai como no "Remover" com
+arquivos (catálogo, pasta e download); a temporada e a série, como no "Apagar temporada"
+(os arquivos e os torrents que ficam sem uso; a série continua no catálogo, com os
+episódios apagados fora da busca). Falha num item não segura os outros, e a marca só some
+do que saiu.
+
+Com o Jellyfin configurado, a mesma tela mostra **sugestões**, lidas na hora: o filme que
+algum usuário assistiu há mais que a carência (padrão 60 minutos) e que ninguém marcou
+como favorito, e a temporada em que todos os episódios no disco passam nessa regra. Só
+entra o arquivo que chegou antes de assistirem: o Jellyfin lembra o assistido de um título
+apagado, e o mesmo título adicionado de novo seria sugerido assim que importado. Assistido
+sem data, ou arquivo sem data de adição, fica de fora. Cada sugestão se marca num clique,
+ou todas de uma vez; marcar não apaga.
 
 ### Limpeza
 
@@ -191,9 +202,43 @@ confirma o reparo.
 
 Cada tarefa tem intervalo editável na tela **Tarefas** (vale na hora; zero desliga o
 agendamento), "rodar agora" e o histórico das últimas execuções, com o relatório de cada
-uma. Tarefa sem o que precisa — cliente de download, Jellyfin — fica parada, com o motivo.
+uma. Tarefa sem o que precisa — cliente de download — fica parada, com o motivo.
 Execução que passa de 2 horas é dada como falha e a tarefa segue agendada; cada consulta ao
 banco tem teto de 60 segundos.
+
+Na subida, as tarefas que começam na hora largam espalhadas, com um atraso aleatório de 0 a
+90 segundos cada, e a `importacao` só começa depois de o qBittorrent responder. No SIGTERM o
+serviço para de agendar execuções novas e espera as que estão rodando por até 25 segundos
+antes de sair (o compose dá 30 s de `stop_grace_period`).
+
+### Saúde e avisos
+
+- `GET /health` é a vivacidade: responde `ok` se o processo está de pé.
+- `GET /health/ready`, sem login, é a prontidão: confere o banco, o qBittorrent e o espaço
+  livre contra a folga das regras. Responde 200 com o JSON do que passou, ou 503 com o que
+  falhou, sem endereço nem credencial. Sem cliente de download configurado, essas duas
+  verificações são puladas.
+- `acervo-hub healthcheck` faz esse GET na porta de `ACERVO_BIND` e sai com 0 ou 1: é o
+  `healthcheck` do `deploy/compose.yaml`, já que a imagem não tem curl.
+
+Além dos avisos por filme, o Gotify recebe avisos operacionais, **só na transição** — quando
+o estado vira ruim e quando volta, nunca a cada rodada. Cada um tem a própria chave em
+Configurações → Notificações, ligada por padrão:
+
+| Chave | Avisa quando |
+| --- | --- |
+| `tarefa_falhando` | uma tarefa falha 3 vezes seguidas, e quando volta a passar |
+| `indexador_falhando` | um indexador falha 5 vezes seguidas, e quando volta a responder |
+| `disco_baixo` | o espaço livre da pasta de download cai abaixo de 5% do disco ou da folga das regras (o que for maior), e quando volta |
+| `limpeza_abortada` | uma trava de segurança aborta o ciclo de limpeza, e quando deixa de abortar |
+
+O estado dos avisos fica em memória: reiniciar o serviço o zera.
+
+**Disjuntor de indexador.** Depois de 5 falhas seguidas de qualquer tipo — timeout,
+Cloudflare, login recusado —, o indexador sai das buscas e dos downloads por 5 minutos; se a
+primeira consulta depois disso também falha, a espera dobra, até 6 horas. Um sucesso zera
+tudo. O "testar" da tela fura a espera, para conferir uma credencial consertada. A tela de
+indexadores mostra "em espera até" (também para o 429). Em memória: reiniciar zera.
 
 ## Interface
 
@@ -202,8 +247,9 @@ banco tem teto de 60 segundos.
 - **Filmes** e **Séries** — a biblioteca em pôsteres: adicionar pelo TMDB, monitorar,
   prioridade, busca automática ou interativa, renomear, verificar o disco, apagar arquivo
   ou remover — com a pasta e o download no cliente, na hora.
-- **Faltando**, **Calendário**, **Atividade** (a fila com o progresso do cliente, o
-  histórico e a lista de bloqueio) e **Busca** manual em todos os indexadores.
+- **Faltando**, **Para apagar** (o que foi marcado, com o espaço que libera, e as
+  sugestões de assistidos), **Calendário**, **Atividade** (a fila com o progresso do
+  cliente, o histórico e a lista de bloqueio) e **Busca** manual em todos os indexadores.
 - **Indexadores** — estado e estatística de cada um, teste, ativar e desativar, trocar
   credencial, remover e adicionar a partir do catálogo de definições ou de um endpoint
   Torznab. As definições que o executor ainda não roda aparecem com o motivo.

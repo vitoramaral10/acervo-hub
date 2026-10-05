@@ -2,6 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { LoaderCircle, Plus, SearchX, Star, Tv } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { AddSeriesDialog } from '@/components/AddSeriesDialog'
+import { MarkedBadge, useMarkedKeys } from '@/components/DeletionMark'
 import { PageHeader } from '@/components/PageHeader'
 import { PriorityBadge } from '@/components/PriorityStar'
 import { SeriesDetails } from '@/components/SeriesDetails'
@@ -42,7 +43,7 @@ function PosterMarks({ series }: { series: SeriesSummary }) {
   )
 }
 
-function PosterCard({ series, onOpen }: { series: SeriesSummary; onOpen: () => void }) {
+function PosterCard({ series, marked, onOpen }: { series: SeriesSummary; marked: boolean; onOpen: () => void }) {
   const { tenho } = series.episodios
   return (
     <button
@@ -61,6 +62,7 @@ function PosterCard({ series, onOpen }: { series: SeriesSummary; onOpen: () => v
         />
         <PosterMarks series={series} />
         {series.prioritario && <PriorityBadge className="absolute top-2 right-2" />}
+        {marked && <MarkedBadge className="absolute bottom-2 left-2" />}
       </div>
       <p className="mt-2 line-clamp-2 text-sm leading-snug font-medium">{series.titulo}</p>
       <p className="mt-0.5 text-xs text-content-subtle tabular-nums">
@@ -88,10 +90,26 @@ function LibrarySkeleton() {
 }
 
 export function SeriesPage() {
-  const series = useQuery({ queryKey: ['series'], queryFn: seriesApi.list })
+  const series = useQuery({
+    queryKey: ['series'],
+    queryFn: seriesApi.list,
+    // Enquanto algum episódio baixa, a lista acompanha o que o servidor importa.
+    refetchInterval: (state) =>
+      state.state.data?.series.some((item) => item.episodios.baixando > 0) ? 5_000 : false,
+  })
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<SeriesFilter>('todas')
   const [selected, setSelected] = useState<number | null>(null)
+  // Série com alguma marca (inteira ou de temporada): `serie-<id>` ou `serie-<id>-t<n>`.
+  const marks = useMarkedKeys()
+  const markedSeries = useMemo(() => {
+    const ids = new Set<number>()
+    for (const key of marks) {
+      const match = /^serie-(\d+)/.exec(key)
+      if (match) ids.add(Number(match[1]))
+    }
+    return ids
+  }, [marks])
   const [adding, setAdding] = useState(false)
   const [priority, setPriority] = useState(false)
 
@@ -212,7 +230,7 @@ export function SeriesPage() {
             <ul className={GRID} aria-label="Séries">
               {visible.map((item) => (
                 <li key={item.id}>
-                  <PosterCard series={item} onOpen={() => setSelected(item.id)} />
+                  <PosterCard series={item} marked={markedSeries.has(item.id)} onOpen={() => setSelected(item.id)} />
                 </li>
               ))}
             </ul>

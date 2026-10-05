@@ -16,6 +16,10 @@ const EVENT_FIELDS: { key: keyof NotifyOn; label: string; description: string }[
   { key: 'falhou', label: 'Falhou', description: 'Quando um download falhar' },
   { key: 'removido', label: 'Removido', description: 'Quando um filme for removido' },
   { key: 'travou', label: 'Travou', description: 'Quando a importação de um download passar 6 h em atenção' },
+  { key: 'tarefa_falhando', label: 'Tarefa falhando', description: 'Quando uma tarefa falhar 3 vezes seguidas, e quando voltar' },
+  { key: 'indexador_falhando', label: 'Indexador falhando', description: 'Quando um indexador falhar 5 vezes seguidas, e quando voltar' },
+  { key: 'disco_baixo', label: 'Disco baixo', description: 'Quando o espaço livre do download cair abaixo de 5% do disco, e quando voltar' },
+  { key: 'limpeza_abortada', label: 'Limpeza abortada', description: 'Quando a limpeza parar por uma trava de segurança, e quando voltar' },
 ]
 
 const DEFAULT_EVENTS: NotifyOn = {
@@ -25,6 +29,10 @@ const DEFAULT_EVENTS: NotifyOn = {
   falhou: true,
   removido: false,
   travou: true,
+  tarefa_falhando: true,
+  indexador_falhando: true,
+  disco_baixo: true,
+  limpeza_abortada: true,
 }
 
 export function NotificationsSection() {

@@ -556,6 +556,41 @@ async fn preferencia_de_preallocacao_lida_e_ligada() {
 }
 
 #[tokio::test]
+async fn fila_do_cliente_so_conta_ligada_e_com_limite() {
+    let ligada = |downloads: i64, torrents: i64| {
+        json!({
+            "queueing_enabled": true,
+            "max_active_downloads": downloads,
+            "max_active_torrents": torrents,
+        })
+    };
+    for (prefs, esperado) in [
+        (ligada(5, -1), Some(5)),
+        (ligada(-1, 8), Some(8)),
+        (ligada(5, 3), Some(3)),
+        (ligada(-1, -1), None),
+        (
+            json!({ "queueing_enabled": false, "max_active_downloads": 5 }),
+            None,
+        ),
+        (json!({}), None),
+    ] {
+        let server = MockServer::start().await;
+        let cliente = sessao(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/app/preferences"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&prefs))
+            .mount(&server)
+            .await;
+        assert_eq!(
+            cliente.download_slots().await.expect("lida"),
+            esperado,
+            "{prefs}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn arquivos_trazem_indice_e_prioridade_e_a_prioridade_se_muda() {
     let server = MockServer::start().await;
     let cliente = sessao(&server).await;

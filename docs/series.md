@@ -1,12 +1,13 @@
 # Séries
 
 Como o acervo cuida de séries. O desenho segue o de filmes (busca, decisão, grab, fila
-por espaço, importação por hardlink, remoção, assistidos), com três diferenças que dão o
+por espaço, importação por hardlink, remoção, sugestão de assistidos), com três diferenças que dão o
 motivo de existir:
 
 1. **Apagar um episódio é um clique, e ele não volta.** Cada episódio guarda o motivo de
    não ser buscado (`skip`): `unwanted` (nunca quis), `deleted` (apagado na tela) ou
-   `watched` (assistido no Jellyfin). Só "Quero de novo" o devolve à busca.
+   `watched` (apagado por assistido, do tempo em que assistido saía sozinho). Só "Quero
+   de novo" o devolve à busca.
 2. **Pacote de temporada serve para um episódio só.** No fim da temporada o tracker só tem
    o pacote, e às vezes apaga os avulsos. A decisão aceita o pacote se ele cobre ao menos
    um episódio que falta, e o grab manda prioridade zero ao qBittorrent para os arquivos
@@ -137,12 +138,19 @@ pacote sai) conta como falha de download e leva à busca do pacote. Importação
 
 ## Assistidos
 
-Tarefa `assistidos`, junto com os filmes. Episódio assistido por algum usuário do Jellyfin
-há mais que a carência, que não é favorito e cuja série não é favorita: o arquivo sai e o
-episódio fica `watched`. Arquivo multi-episódio só sai quando todos os episódios dele
-foram assistidos. Só sai o arquivo que chegou antes de assistirem: o Jellyfin lembra o
-assistido de um episódio apagado, e o mesmo episódio baixado de novo ficaria sem chance.
-Arquivo sem data de adição fica. O torrent fica semeando até a limpeza, como nos filmes.
+Assistido não sai sozinho: vira sugestão na tela "Para apagar", por temporada, a unidade
+que se marca. Arquivo de episódio assistido por algum usuário do Jellyfin há mais que a
+carência, que não é favorito e cuja série não é favorita, passa na regra; arquivo
+multi-episódio só passa quando todos os episódios dele foram assistidos, e só o arquivo
+que chegou antes de assistirem (o Jellyfin lembra o assistido de um episódio apagado, e
+o mesmo episódio baixado de novo seria sugerido sem chance). A temporada é sugerida
+quando todo arquivo dela no disco passa; um favorito, um episódio por ver ou um arquivo
+sem data de adição a deixa de fora inteira, porque marcar a temporada apagaria esse
+arquivo também.
+
+Marcada a temporada (ou a série inteira) e confirmada a remoção, sai como no "Apagar
+temporada": os episódios com arquivo no disco perdem o arquivo e ficam `deleted`, e os
+torrents que ficam sem nenhum arquivo em uso saem do qBittorrent.
 
 ## Prioridade
 

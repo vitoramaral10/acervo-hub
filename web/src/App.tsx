@@ -10,6 +10,7 @@ import {
   Eraser,
   Film,
   FolderTree,
+  House,
   Library,
   ListChecks,
   LogOut,
@@ -22,6 +23,7 @@ import {
   ServerCog,
   SlidersHorizontal,
   Sun,
+  Trash2,
   Tv,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
@@ -33,6 +35,7 @@ import { type Theme, saveTheme, storedTheme } from '@/lib/theme'
 import { cn } from '@/lib/utils'
 import { ActivityPage } from '@/pages/Activity'
 import { CalendarPage } from '@/pages/Calendar'
+import { HomePage } from '@/pages/Home'
 import { IndexersPage } from '@/pages/Indexers'
 import { LoginPage } from '@/pages/Login'
 import { MissingPage } from '@/pages/Missing'
@@ -41,8 +44,9 @@ import { SearchPage } from '@/pages/Search'
 import { SeriesPage } from '@/pages/Series'
 import { SettingsPage, type SettingsView } from '@/pages/Settings'
 import { TasksPage } from '@/pages/Tasks'
+import { ToDeletePage } from '@/pages/ToDelete'
 
-type MainView = 'filmes' | 'series' | 'faltando' | 'calendario' | 'atividade' | 'busca'
+type MainView = 'inicio' | 'filmes' | 'series' | 'faltando' | 'apagar' | 'calendario' | 'atividade' | 'busca'
 type ConfigView = 'indexadores' | 'tarefas' | SettingsView
 type View = MainView | ConfigView
 
@@ -50,9 +54,11 @@ type NavItem<V extends View> = { view: V; label: string; icon: typeof Server }
 
 /** Uso do dia a dia: sempre à vista. */
 const MAIN: NavItem<MainView>[] = [
+  { view: 'inicio', label: 'Início', icon: House },
   { view: 'filmes', label: 'Filmes', icon: Film },
   { view: 'series', label: 'Séries', icon: MonitorPlay },
   { view: 'faltando', label: 'Faltando', icon: CircleDashed },
+  { view: 'apagar', label: 'Para apagar', icon: Trash2 },
   { view: 'calendario', label: 'Calendário', icon: CalendarDays },
   { view: 'atividade', label: 'Atividade', icon: Activity },
   { view: 'busca', label: 'Busca', icon: Search },
@@ -80,7 +86,7 @@ function viewFromHash(): View {
   const hash = window.location.hash.slice(1).split('?')[0]
   // Endereço salvo da antiga página única de configurações.
   if (hash === 'configuracoes') return 'servidor'
-  return VIEWS.includes(hash as View) ? (hash as View) : 'filmes'
+  return VIEWS.includes(hash as View) ? (hash as View) : 'inicio'
 }
 
 const GROUP_KEY = 'acervo.menu.configuracoes'
@@ -233,7 +239,7 @@ export function App() {
         Pular para o conteúdo
       </a>
       <aside className="sticky top-0 z-30 flex items-center gap-1 border-b border-border bg-surface px-3 py-2.5 md:h-dvh md:flex-col md:items-stretch md:gap-1 md:border-r md:border-b-0 md:px-3 md:py-5">
-        <a href="#filmes" className="flex shrink-0 items-center gap-2.5 rounded-md p-1 md:mb-6 md:px-2">
+        <a href="#inicio" className="flex shrink-0 items-center gap-2.5 rounded-md p-1 md:mb-6 md:px-2">
           <img src="/ui/icone.svg" alt="" className="size-7" />
           <span className="sr-only leading-tight md:not-sr-only">
             <span className="block text-sm font-semibold tracking-tight">acervo-hub</span>
@@ -284,7 +290,9 @@ export function App() {
       </aside>
       <main id="conteudo" tabIndex={-1} className="min-w-0 px-4 py-6 outline-none sm:px-6 md:px-10 md:py-10">
         <div className="mx-auto max-w-6xl">
-          {view === 'busca' ? (
+          {view === 'inicio' ? (
+            <HomePage />
+          ) : view === 'busca' ? (
             <SearchPage />
           ) : view === 'filmes' ? (
             <MoviesPage />
@@ -292,6 +300,8 @@ export function App() {
             <SeriesPage />
           ) : view === 'faltando' ? (
             <MissingPage />
+          ) : view === 'apagar' ? (
+            <ToDeletePage />
           ) : view === 'calendario' ? (
             <CalendarPage />
           ) : view === 'atividade' ? (

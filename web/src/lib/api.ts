@@ -147,15 +147,6 @@ export interface CycleReport {
   falharam: number | null
 }
 
-/** O detalhe de "Apagar assistidos": o que saiu do acervo e o que ficou, com o motivo. */
-export interface WatchedReport {
-  apagados: { titulo: string; ano: number | null; assistido_por: string; assistido_em: string; tamanho: string }[]
-  pulados: { titulo: string; ano: number | null; motivo: string }[]
-  recusados: number
-  liberado: string
-  aviso: string | null
-}
-
 /** Como uma execução de tarefa terminou. */
 export interface TaskLastRun {
   inicio: string
@@ -186,7 +177,7 @@ export interface MetadataReport {
   falhas: { filme: string; erro: string }[]
 }
 
-/** Uma execução no histórico; `detalhe` é o relatório dela (limpeza: `CycleReport`; assistidos: `WatchedReport`; metadados: `MetadataReport`). */
+/** Uma execução no histórico; `detalhe` é o relatório dela (limpeza: `CycleReport`; metadados: `MetadataReport`). */
 export interface TaskRun extends TaskLastRun {
   id: number
   tarefa: string
@@ -537,6 +528,10 @@ export interface NotifyOn {
   falhou: boolean
   removido: boolean
   travou: boolean
+  tarefa_falhando: boolean
+  indexador_falhando: boolean
+  disco_baixo: boolean
+  limpeza_abortada: boolean
 }
 
 export interface GotifyView {
@@ -931,4 +926,70 @@ export const seriesApi = {
   searchNow: (id: number) => request<{ iniciada: boolean }>('POST', `${LIB}/series/${id}/buscar-agora`),
   history: (id: number) =>
     request<{ total: number; eventos: HistoryEvent[] }>('GET', `${LIB}/series/${id}/historico?tamanho=50`),
+}
+
+// ---------------------------------------------------------------- para apagar
+
+/** O que se marca para apagar: um filme, uma temporada ou a série inteira. */
+export type DeletionTarget = { filme: number } | { serie: number; temporada?: number }
+
+/** Um item marcado (ou sugerido), com o espaço que libera. */
+export interface DeletionItem {
+  /** Estável: `filme-1`, `serie-2`, `serie-2-t1`. */
+  chave: string
+  tipo: 'filme' | 'temporada' | 'serie'
+  filme?: number
+  serie?: number
+  temporada?: number
+  /** "Título (ano)". */
+  titulo: string
+  /** "Temporada 2", "Série inteira"; `null` nos filmes. */
+  detalhe: string | null
+  poster: string | null
+  arquivos: number
+  /** Bytes dos arquivos que saem. */
+  tamanho: number
+}
+
+export interface MarkedItem extends DeletionItem {
+  marcado_em: string
+}
+
+/** O que a regra antiga de assistidos apagaria: alguém assistiu, passada a carência, sem favorito. */
+export interface SuggestedItem extends DeletionItem {
+  assistido_por: string
+  assistido_em: string
+}
+
+export interface DeletionSuggestions {
+  /** Sem Jellyfin configurado, não há o que sugerir. */
+  configurado: boolean
+  filmes: SuggestedItem[]
+  temporadas: SuggestedItem[]
+}
+
+export interface PurgeResult {
+  ok: boolean
+  apagados: { chave: string; titulo: string; tamanho: number }[]
+  falhas: { chave: string; titulo: string; erro: string }[]
+  liberado: number
+  avisos: string[]
+}
+
+/** O alvo de um item da lista, para mandar de volta. */
+export function deletionTarget(item: DeletionItem): DeletionTarget {
+  if (item.tipo === 'filme') return { filme: item.filme as number }
+  if (item.tipo === 'temporada') return { serie: item.serie as number, temporada: item.temporada }
+  return { serie: item.serie as number }
+}
+
+const PURGE = `${LIB}/para-apagar`
+
+export const deletionApi = {
+  list: () => request<{ itens: MarkedItem[]; total: number }>('GET', PURGE),
+  suggestions: () => request<DeletionSuggestions>('GET', `${PURGE}/sugestoes`),
+  mark: (itens: DeletionTarget[]) => request<{ ok: boolean; marcados: number }>('POST', `${PURGE}/marcar`, { itens }),
+  unmark: (itens: DeletionTarget[]) =>
+    request<{ ok: boolean; desmarcados: number }>('POST', `${PURGE}/desmarcar`, { itens }),
+  purge: (itens: DeletionTarget[]) => request<PurgeResult>('POST', `${PURGE}/apagar`, { itens }),
 }

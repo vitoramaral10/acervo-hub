@@ -168,6 +168,27 @@ impl QbitClient {
         Ok(preferences.preallocate_all)
     }
 
+    /// Quantos downloads o próprio cliente deixa ativos, segurando o
+    /// excesso na fila dele (`queuedDL`): o menor dos limites de downloads e
+    /// de torrents ativos. `None` é fila desligada ou sem limite nenhum.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status não-2xx.
+    pub async fn download_slots(&self) -> Result<Option<usize>, QbitError> {
+        let preferences: dto::Preferences = self.get("api/v2/app/preferences", &[]).await?;
+        if !preferences.queueing_enabled {
+            return Ok(None);
+        }
+        Ok([
+            preferences.max_active_downloads,
+            preferences.max_active_torrents,
+        ]
+        .into_iter()
+        .filter_map(|n| usize::try_from(n).ok().filter(|n| *n > 0))
+        .min())
+    }
+
     /// Liga a pré-alocação: torrent iniciado já ocupa o tamanho inteiro.
     ///
     /// # Errors
