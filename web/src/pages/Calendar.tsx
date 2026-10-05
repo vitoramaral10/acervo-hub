@@ -16,7 +16,7 @@ type Span = 'semana' | 'mes'
 
 const pad = (n: number) => String(n).padStart(2, '0')
 /** `AAAA-MM-DD` no fuso local: o dia que o usuário vê, não o do UTC. */
-const iso = (date: Date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+export const iso = (date: Date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
 const fromIso = (day: string) => {
   const [year = 0, month = 1, date = 1] = day.split('-').map(Number)
   return new Date(year, month - 1, date)

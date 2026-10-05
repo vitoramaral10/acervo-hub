@@ -362,6 +362,41 @@ async fn pagina_carrega_com_csp_e_api_exige_sessao() {
 }
 
 #[tokio::test]
+async fn cache_so_nos_estaticos_versionados() {
+    let base = serve().await;
+    let cache = |response: &reqwest::Response| {
+        response.headers()["cache-control"]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    };
+
+    let index = http().get(format!("{base}/")).send().await.unwrap();
+    assert_eq!(cache(&index), "no-store");
+    let html = index.text().await.unwrap();
+    assert!(html.contains("/ui/app.js?v=") && html.contains("/ui/app.css?v="));
+
+    for path in ["/ui/app.js", "/ui/app.css"] {
+        let response = http().get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(
+            cache(&response),
+            "public, max-age=31536000, immutable",
+            "{path}"
+        );
+        // A CSP e o resto dos cabeçalhos seguros continuam nos estáticos.
+        assert!(response.headers().contains_key("content-security-policy"));
+    }
+
+    let api = http()
+        .get(format!("{base}/ui/api/indexadores"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(api.status().as_u16(), 401);
+    assert_eq!(cache(&api), "no-store");
+}
+
+#[tokio::test]
 async fn entrar_exige_usuario_e_senha_certos_e_o_cabecalho_da_interface() {
     let base = serve().await;
     let without_header = http()

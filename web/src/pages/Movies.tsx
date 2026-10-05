@@ -285,7 +285,13 @@ function GrabDialog({
 
 export function MoviesPage() {
   const queryClient = useQueryClient()
-  const movies = useQuery({ queryKey: ['filmes'], queryFn: api.movies })
+  const movies = useQuery({
+    queryKey: ['filmes'],
+    queryFn: api.movies,
+    // Enquanto algum filme baixa, a lista acompanha o que o servidor importa.
+    refetchInterval: (state) =>
+      state.state.data?.filmes.some((movie) => movie.download?.estado === 'downloading') ? 5_000 : false,
+  })
   const [query, setQuery] = useState('')
   const [prefs, setPrefs] = useState<MovieListPrefs>(loadPrefs)
   const [selected, setSelected] = useState<number | null>(null)
@@ -991,7 +997,7 @@ function RemoveMovieDialog({
   onRemoved: () => void
 }) {
   const queryClient = useQueryClient()
-  const [deleteFiles, setDeleteFiles] = useState(true)
+  const [deleteFiles, setDeleteFiles] = useState(false)
   const remove = useMutation({
     mutationFn: () => library.remove(movie.id, { apagar_arquivos: deleteFiles }),
     onSuccess: () => {

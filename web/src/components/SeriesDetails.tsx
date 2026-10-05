@@ -116,7 +116,7 @@ function RemoveSeriesDialog({
   onRemoved: () => void
 }) {
   const queryClient = useQueryClient()
-  const [deleteFiles, setDeleteFiles] = useState(true)
+  const [deleteFiles, setDeleteFiles] = useState(false)
   const remove = useMutation({
     mutationFn: () => seriesApi.remove(series.id, { apagar_arquivos: deleteFiles }),
     onSuccess: () => {

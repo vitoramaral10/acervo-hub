@@ -9,7 +9,7 @@
 //! um formulário de outra origem não consegue mandar.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use acervo_indexers::{Release, SearchQuery};
@@ -32,6 +32,27 @@ const INDEX: &str = include_str!("ui/dist/index.html");
 const STYLE: &str = include_str!("ui/dist/app.css");
 const SCRIPT: &str = include_str!("ui/dist/app.js");
 const ICON: &str = include_str!("ui/dist/icone.svg");
+
+/// Impressão do conteúdo (FNV-1a de 64 bits): o mesmo conteúdo dá sempre a
+/// mesma versão, sem relógio nem dependência. Fora de `const` porque o avaliador
+/// de constantes engasga com 600 KB de JS.
+fn fingerprint(content: &str) -> u64 {
+    content.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// O `index.html` com JS e CSS apontando para `?v=<hash>`: o conteúdo novo
+/// vira URL nova, então o navegador pode guardar os estáticos para sempre.
+static VERSIONED_INDEX: LazyLock<String> = LazyLock::new(|| {
+    let (script, style) = (fingerprint(SCRIPT), fingerprint(STYLE));
+    INDEX
+        .replace("\"/ui/app.js\"", &format!("\"/ui/app.js?v={script:016x}\""))
+        .replace(
+            "\"/ui/app.css\"",
+            &format!("\"/ui/app.css?v={style:016x}\""),
+        )
+});
 
 /// O que a interface administra e só o binário sabe fazer: a configuração,
 /// o catálogo de definições e as tarefas de fundo.
@@ -243,19 +264,19 @@ pub(crate) fn routes() -> Router<Arc<Server>> {
     Router::new()
         .route(
             "/",
-            get(|| async { asset(INDEX, "text/html; charset=utf-8") }),
+            get(|| async { page(VERSIONED_INDEX.clone(), "text/html; charset=utf-8") }),
         )
         .route(
             "/ui/app.css",
-            get(|| async { asset(STYLE, "text/css; charset=utf-8") }),
+            get(|| async { immutable(STYLE, "text/css; charset=utf-8") }),
         )
         .route(
             "/ui/app.js",
-            get(|| async { asset(SCRIPT, "text/javascript; charset=utf-8") }),
+            get(|| async { immutable(SCRIPT, "text/javascript; charset=utf-8") }),
         )
         .route(
             "/ui/icone.svg",
-            get(|| async { asset(ICON, "image/svg+xml") }),
+            get(|| async { page(ICON, "image/svg+xml") }),
         )
         .route("/ui/api/entrar", post(login))
         .route("/ui/api/sair", post(logout))
@@ -300,11 +321,24 @@ pub(crate) fn routes() -> Router<Arc<Server>> {
         .route("/ui/baixar", get(download))
 }
 
-fn asset(body: &'static str, media_type: &'static str) -> Response {
+/// Resposta que o navegador não guarda: o `index.html` (que carrega a versão
+/// vigente dos estáticos) e o ícone, que não tem versão na URL.
+fn page(body: impl IntoResponse, media_type: &'static str) -> Response {
     let mut response = body.into_response();
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(media_type));
     secure_headers(headers);
+    response
+}
+
+/// JS e CSS: a URL leva o hash do conteúdo (`?v=`), então a resposta nunca
+/// muda sob a mesma URL e pode ser guardada por um ano.
+fn immutable(body: &'static str, media_type: &'static str) -> Response {
+    let mut response = page(body, media_type);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
     response
 }
 

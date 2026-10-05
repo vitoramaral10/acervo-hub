@@ -88,7 +88,13 @@ function LibrarySkeleton() {
 }
 
 export function SeriesPage() {
-  const series = useQuery({ queryKey: ['series'], queryFn: seriesApi.list })
+  const series = useQuery({
+    queryKey: ['series'],
+    queryFn: seriesApi.list,
+    // Enquanto algum episódio baixa, a lista acompanha o que o servidor importa.
+    refetchInterval: (state) =>
+      state.state.data?.series.some((item) => item.episodios.baixando > 0) ? 5_000 : false,
+  })
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<SeriesFilter>('todas')
   const [selected, setSelected] = useState<number | null>(null)
