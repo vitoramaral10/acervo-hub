@@ -25,7 +25,8 @@ pub enum Skip {
     Unwanted,
     /// O arquivo foi apagado na tela.
     Deleted,
-    /// Assistido no Jellyfin, e o arquivo saiu por isso.
+    /// Assistido no Jellyfin, e o arquivo saiu por isso — do tempo em que
+    /// assistido saía sozinho; hoje só sobra em episódio antigo.
     Watched,
 }
 

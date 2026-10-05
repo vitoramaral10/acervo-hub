@@ -2,7 +2,8 @@
 //!
 //! `serve` é o modo de vida do serviço: um processo longo que serve a
 //! interface e roda as tarefas de fundo — busca, RSS, importação, metadados,
-//! limpeza, assistidos. `users` cuida das contas da interface.
+//! limpeza, numeração de cena, definições. `users` cuida das contas da
+//! interface.
 //!
 //! A configuração mora no Postgres e se edita pela tela. Fora do banco só
 //! há duas variáveis de ambiente: `ACERVO_DATABASE_URL`, que todo comando
@@ -27,6 +28,7 @@ mod health;
 mod ledger;
 mod library;
 mod manual;
+mod marks;
 mod mediainfo;
 mod metadata;
 mod movies;

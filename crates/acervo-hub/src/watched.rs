@@ -1,26 +1,21 @@
-//! Apagar assistidos: o Jellyfin diz o que cada usuário assistiu, e o filme
-//! que alguém assistiu, passada a carência, sai do acervo — catálogo e
-//! arquivos, sem simulação.
+//! Sugestões de assistidos: o Jellyfin diz o que cada usuário assistiu, e o
+//! filme que a regra apagaria vira sugestão na tela "Para apagar". Nada sai
+//! sozinho: o usuário marca e confirma.
 //!
-//! A regra é por filme, somando os usuários: sai quando qualquer um assistiu,
-//! a última vez que alguém assistiu foi há mais que a carência, e ninguém o
-//! marcou como favorito. Na dúvida, fica: assistido sem data conhecida não
-//! sai. E só sai o arquivo que chegou antes de assistirem: o Jellyfin
-//! lembra o assistido de um filme apagado, e o mesmo filme adicionado de
-//! novo sairia assim que importado.
+//! A regra é por filme, somando os usuários: entra quando qualquer um
+//! assistiu, a última vez que alguém assistiu foi há mais que a carência, e
+//! ninguém o marcou como favorito. Na dúvida, fica de fora: assistido sem
+//! data conhecida não entra. E só entra o arquivo que chegou antes de
+//! assistirem: o Jellyfin lembra o assistido de um filme apagado, e o mesmo
+//! filme adicionado de novo seria sugerido assim que importado.
 
-use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::collections::BTreeMap;
 
 use acervo_clients::jellyfin::JellyfinClient;
-use acervo_core::Allocated;
 use acervo_store::{CatalogMovie, Store};
 use anyhow::{Context, Result};
-use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
-
-use crate::config::Config;
 
 /// O que um usuário fez com um filme do Jellyfin.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,7 +31,7 @@ pub struct Viewing {
 /// O destino de um filme que alguém assistiu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    /// Sai: `user` foi o último a assistir, em `at`.
+    /// A regra apagaria: `user` foi o último a assistir, em `at`.
     Delete { user: String, at: OffsetDateTime },
     /// Fica: alguém o marcou como favorito.
     Favorite { user: String },
@@ -47,7 +42,7 @@ pub enum Verdict {
 }
 
 /// A regra, sem rede nem banco. Só entra quem tem id do TMDB e foi
-/// assistido por alguém; o resto não é assunto da tarefa.
+/// assistido por alguém; o resto não é assunto da regra.
 #[must_use]
 pub fn select(
     viewings: &[Viewing],
@@ -105,61 +100,36 @@ pub fn select(
         .collect()
 }
 
-/// Um filme apagado.
-#[derive(Debug, Clone, Serialize)]
-pub struct Deleted {
-    pub titulo: String,
-    pub ano: Option<u16>,
-    pub assistido_por: String,
-    /// RFC 3339.
-    pub assistido_em: String,
-    pub tamanho: String,
+/// Um filme que a regra apagaria: assistido por `user` em `at`, passada a
+/// carência, sem favorito, e o arquivo de agora chegou antes de assistirem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suggestion {
+    pub movie_id: i64,
+    pub user: String,
+    pub at: OffsetDateTime,
 }
 
-/// Um filme assistido que ficou, e por quê.
-#[derive(Debug, Clone, Serialize)]
-pub struct Skipped {
-    pub titulo: String,
-    pub ano: Option<u16>,
-    pub motivo: String,
-}
-
-/// O detalhe de uma execução.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct WatchedReport {
-    pub apagados: Vec<Deleted>,
-    pub pulados: Vec<Skipped>,
-    /// Quantos dos pulados a remoção recusou.
-    pub recusados: usize,
-    pub liberado: String,
-    /// Falha que não desfaz nada, como a varredura do Jellyfin.
-    pub aviso: Option<String>,
-}
-
-impl WatchedReport {
-    /// Uma linha para a lista de tarefas, e se a execução terminou bem.
-    /// Remoção recusada é erro na tela: alguém precisa olhar.
-    #[must_use]
-    pub fn summary(&self) -> (bool, String) {
-        let deleted = self.apagados.len();
-        if deleted == 0 && self.recusados == 0 {
-            return (true, "nada a apagar".into());
-        }
-        let mut line = if deleted == 1 {
-            format!("1 apagado, {} liberados", self.liberado)
-        } else {
-            format!("{deleted} apagados, {} liberados", self.liberado)
-        };
-        match self.recusados {
-            0 => {}
-            1 => line.push_str(", 1 recusado"),
-            n => {
-                use std::fmt::Write as _;
-                let _ = write!(line, ", {n} recusados");
+/// Os vereditos que viram sugestão, sem rede nem banco. Fica de fora o
+/// filme fora do catálogo e o que não sairia: favorito, na carência, sem
+/// data, ou com arquivo que chegou depois de assistirem (o Jellyfin lembra
+/// o assistido de um filme apagado, e o mesmo filme adicionado de novo
+/// seria sugerido assim que importado). Na ordem do catálogo.
+#[must_use]
+pub fn suggestions(verdicts: &BTreeMap<u32, Verdict>, catalog: &[CatalogMovie]) -> Vec<Suggestion> {
+    catalog
+        .iter()
+        .filter_map(|entry| match verdicts.get(&entry.movie.tmdb_id)? {
+            Verdict::Delete { user, at } => {
+                let added = entry.movie.file.as_ref()?.date_added.as_deref();
+                watched_after_added(*at, added).then(|| Suggestion {
+                    movie_id: entry.id,
+                    user: user.clone(),
+                    at: *at,
+                })
             }
-        }
-        (self.recusados == 0, line)
-    }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Assistido depois de o arquivo de agora chegar à biblioteca? Data de
@@ -170,59 +140,27 @@ pub(crate) fn watched_after_added(at: OffsetDateTime, date_added: Option<&str>) 
         .is_some_and(|added| at > added)
 }
 
-/// Por que um assistido fica: visto antes de o arquivo de agora chegar, ou
-/// arquivo sem data de adição.
-pub(crate) fn before_added_reason(date_added: Option<&str>) -> String {
-    match date_added {
-        Some(added) if OffsetDateTime::parse(added, &Rfc3339).is_ok() => format!(
-            "assistido antes de o arquivo de agora chegar ({})",
-            parse_date(added).map(human).unwrap_or_default()
-        ),
-        _ => "arquivo sem data de adição conhecida".into(),
-    }
-}
-
 /// Data do Jellyfin (ISO 8601 em UTC, com até sete casas de fração).
-fn parse_date(text: &str) -> Option<OffsetDateTime> {
+pub(crate) fn parse_date(text: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(text, &Rfc3339).ok()
 }
 
-/// Para o histórico e para o motivo: legível, em UTC.
-fn human(at: OffsetDateTime) -> String {
-    let format = time::macros::format_description!("[day]/[month]/[year] [hour]:[minute] UTC");
-    at.format(&format).unwrap_or_default()
+/// A carência da configuração, em minutos, como duração.
+pub(crate) fn grace(minutes: u64) -> Duration {
+    Duration::seconds(i64::try_from(minutes.saturating_mul(60)).unwrap_or(i64::MAX))
 }
 
-/// O que a pasta do filme ocupa no disco, antes de apagar. Pasta que não
-/// existe não libera nada.
-async fn folder_size(config: &Config, entry: &CatalogMovie) -> Allocated {
-    let Ok(host) = config.path_map().to_host(Path::new(&entry.movie.path)) else {
-        return Allocated::ZERO;
-    };
-    tokio::task::spawn_blocking(move || {
-        if host.is_dir() {
-            acervo_fs::measure_roots(&[host])
-        } else {
-            Allocated::ZERO
-        }
-    })
-    .await
-    .unwrap_or(Allocated::ZERO)
-}
-
-/// Uma execução: lê o Jellyfin, aplica a regra e remove.
+/// Lê o Jellyfin e devolve os filmes do catálogo que a regra apagaria. Só
+/// lê: apagar é com o usuário, pela tela "Para apagar".
 ///
 /// # Errors
 ///
-/// Jellyfin inalcançável ou catálogo ilegível — antes de apagar qualquer
-/// coisa. Falha num filme fica no relatório; os outros seguem.
-#[allow(clippy::too_many_lines)] // Um braço por veredito, como nas séries.
-pub async fn run(
-    config: &Config,
+/// Jellyfin inalcançável ou catálogo ilegível.
+pub async fn suggest(
     store: &Store,
     jellyfin: &JellyfinClient,
     grace_minutes: u64,
-) -> Result<WatchedReport> {
+) -> Result<Vec<Suggestion>> {
     let users = jellyfin
         .users()
         .await
@@ -241,89 +179,8 @@ pub async fn run(
             favorite: movie.favorite,
         }));
     }
-    let grace =
-        Duration::seconds(i64::try_from(grace_minutes.saturating_mul(60)).unwrap_or(i64::MAX));
-    let verdicts = select(&viewings, OffsetDateTime::now_utc(), grace);
-
-    let catalog: HashMap<u32, CatalogMovie> = store
-        .movies()
-        .await?
-        .into_iter()
-        .map(|entry| (entry.movie.tmdb_id, entry))
-        .collect();
-    let mut report = WatchedReport::default();
-    let mut freed = Allocated::ZERO;
-    for (tmdb_id, verdict) in verdicts {
-        let Some(entry) = catalog.get(&tmdb_id) else {
-            continue;
-        };
-        let skip = |motivo: String| Skipped {
-            titulo: entry.movie.title.clone(),
-            ano: entry.movie.year,
-            motivo,
-        };
-        let added = entry
-            .movie
-            .file
-            .as_ref()
-            .and_then(|f| f.date_added.as_deref());
-        match verdict {
-            Verdict::Delete { at, .. } if !watched_after_added(at, added) => {
-                report.pulados.push(skip(before_added_reason(added)));
-            }
-            Verdict::Delete { user, at } => {
-                // Medido antes: depois de apagar, não há o que medir.
-                let size = folder_size(config, entry).await;
-                let reason = format!("assistido por {user} em {}", human(at));
-                match crate::library::remove_because(
-                    config,
-                    store,
-                    entry.id,
-                    true,
-                    false,
-                    Some(&reason),
-                )
-                .await
-                {
-                    Ok(()) => {
-                        freed = freed + size;
-                        report.apagados.push(Deleted {
-                            titulo: entry.movie.title.clone(),
-                            ano: entry.movie.year,
-                            assistido_por: user,
-                            assistido_em: at.format(&Rfc3339).unwrap_or_default(),
-                            tamanho: size.to_string(),
-                        });
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            filme = entry.movie.title,
-                            "assistido não removido: {error:#}"
-                        );
-                        report.recusados += 1;
-                        report
-                            .pulados
-                            .push(skip(format!("remoção recusada: {error:#}")));
-                    }
-                }
-            }
-            Verdict::Favorite { user } => report.pulados.push(skip(format!("favorito de {user}"))),
-            Verdict::InGrace { until } => report
-                .pulados
-                .push(skip(format!("dentro da carência, até {}", human(until)))),
-            Verdict::NoDate { user } => report
-                .pulados
-                .push(skip(format!("assistido por {user} sem data conhecida"))),
-        }
-    }
-    report.liberado = freed.to_string();
-    if !report.apagados.is_empty()
-        && let Err(error) = jellyfin.refresh_library().await
-    {
-        tracing::warn!("varredura do Jellyfin: {error}");
-        report.aviso = Some(format!("varredura da biblioteca não pedida: {error}"));
-    }
-    Ok(report)
+    let verdicts = select(&viewings, OffsetDateTime::now_utc(), grace(grace_minutes));
+    Ok(suggestions(&verdicts, &store.movies().await?))
 }
 
 #[cfg(test)]
@@ -370,7 +227,6 @@ mod tests {
             Some(time::macros::datetime!(2026-09-30 21:14:08.1234567 UTC))
         );
         assert_eq!(parse_date("ontem"), None);
-        assert_eq!(human(at("2026-09-30T21:14:08Z")), "30/09/2026 21:14 UTC");
     }
 
     #[test]
@@ -487,36 +343,9 @@ mod tests {
         assert!(!watched_after_added(seen, Some("ontem")));
     }
 
-    #[test]
-    fn resumo_conta_apagados_e_recusados() {
-        assert_eq!(
-            WatchedReport::default().summary(),
-            (true, "nada a apagar".into())
-        );
-        let mut report = WatchedReport {
-            liberado: "1.5 GiB".into(),
-            ..WatchedReport::default()
-        };
-        report.apagados.push(Deleted {
-            titulo: "A".into(),
-            ano: None,
-            assistido_por: "vitor".into(),
-            assistido_em: NOW.into(),
-            tamanho: "1.5 GiB".into(),
-        });
-        assert_eq!(
-            report.summary(),
-            (true, "1 apagado, 1.5 GiB liberados".into())
-        );
-        report.recusados = 2;
-        assert_eq!(
-            report.summary(),
-            (false, "1 apagado, 1.5 GiB liberados, 2 recusados".into())
-        );
-    }
-
-    /// Um filme com arquivo adicionado em `added`.
-    fn movie(tmdb_id: u32, title: &str, path: &str, added: Option<&str>) -> Movie {
+    /// Um filme com arquivo adicionado em `added`; sem `added`, sem data de
+    /// adição.
+    fn movie(tmdb_id: u32, title: &str, added: Option<&str>) -> Movie {
         Movie {
             tmdb_id,
             imdb_id: None,
@@ -526,7 +355,7 @@ mod tests {
             year: Some(2024),
             status: None,
             monitored: false,
-            path: path.into(),
+            path: format!("/media/movies/{title} (2024)"),
             added: None,
             file: Some(acervo_store::MovieFile {
                 relative_path: format!("{title}.mkv"),
@@ -549,6 +378,56 @@ mod tests {
         }
     }
 
+    fn entry(id: i64, movie: Movie) -> CatalogMovie {
+        CatalogMovie {
+            id,
+            movie,
+            extras: MovieExtras::default(),
+            priority: false,
+            subtitles: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn so_vira_sugestao_o_que_a_regra_apagaria() {
+        let seen = at("2026-09-01T20:00:00Z");
+        let delete = |user: &str| Verdict::Delete {
+            user: user.into(),
+            at: seen,
+        };
+        let before = Some("2026-08-01T00:00:00Z");
+        let verdicts = BTreeMap::from([
+            (10, delete("vitor")),
+            (20, Verdict::Favorite { user: "ana".into() }),
+            (40, delete("vitor")),
+            (50, delete("vitor")),
+            (60, delete("ana")),
+            // Fora do catálogo: ignorado.
+            (99, delete("vitor")),
+        ]);
+        let mut no_file = movie(60, "Sem Arquivo", before);
+        no_file.file = None;
+        let catalog = [
+            entry(1, movie(10, "Visto", before)),
+            entry(2, movie(20, "Amado", before)),
+            // Arquivo que chegou depois de assistirem.
+            entry(4, movie(40, "De Novo", Some("2026-09-10T00:00:00Z"))),
+            // Sem data de adição: na dúvida, fica de fora.
+            entry(5, movie(50, "Sem Data", None)),
+            entry(6, no_file),
+            // Ninguém assistiu.
+            entry(7, movie(70, "Novo", before)),
+        ];
+        assert_eq!(
+            suggestions(&verdicts, &catalog),
+            [Suggestion {
+                movie_id: 1,
+                user: "vitor".into(),
+                at: seen
+            }]
+        );
+    }
+
     fn item(name: &str, tmdb: u32, data: &serde_json::Value) -> serde_json::Value {
         json!({
             "Name": name, "Id": format!("id{tmdb}"), "Type": "Movie", "ProductionYear": 2024,
@@ -557,63 +436,19 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)] // Montar o Jellyfin e o disco e conferir cada veredito.
-    async fn apaga_o_assistido_e_poupa_o_favorito() {
-        let Some(db) = acervo_store::testing::TestDb::new("assistidos").await else {
+    async fn sugere_o_assistido_sem_apagar_nada() {
+        let Some(db) = acervo_store::testing::TestDb::new("sugestoes").await else {
             return;
         };
-        let root = std::env::temp_dir().join(format!("acervo-assistidos-{}", std::process::id()));
-        let visto = root.join("movies/Visto (2024)");
-        let amado = root.join("movies/Amado (2024)");
-        let de_novo = root.join("movies/De Novo (2024)");
-        std::fs::create_dir_all(&visto).unwrap();
-        std::fs::create_dir_all(&amado).unwrap();
-        std::fs::create_dir_all(&de_novo).unwrap();
-        std::fs::write(visto.join("visto.mkv"), vec![0_u8; 64 * 1024]).unwrap();
-        std::fs::write(amado.join("amado.mkv"), b"fica").unwrap();
-        let mut config = Config::default();
-        config
-            .library
-            .paths
-            .insert("/media".into(), root.display().to_string());
-        config.library.root_folders = vec!["/media/movies".into()];
         let store = &db.store;
         let extras = MovieExtras::default();
         let before = Some("2026-08-01T00:00:00Z");
-        store
-            .add_movie(
-                &movie(10, "Visto", "/media/movies/Visto (2024)", before),
-                &extras,
-            )
+        let visto = store
+            .add_movie(&movie(10, "Visto", before), &extras)
             .await
             .unwrap();
         store
-            .add_movie(
-                &movie(20, "Amado", "/media/movies/Amado (2024)", before),
-                &extras,
-            )
-            .await
-            .unwrap();
-        // Apagado por assistido e adicionado de novo depois: o Jellyfin ainda
-        // lembra o assistido de antes, mas o arquivo de agora é mais novo.
-        store
-            .add_movie(
-                &movie(
-                    40,
-                    "De Novo",
-                    "/media/movies/De Novo (2024)",
-                    Some("2026-09-10T00:00:00Z"),
-                ),
-                &extras,
-            )
-            .await
-            .unwrap();
-        // Sem data de adição: na dúvida, fica.
-        store
-            .add_movie(
-                &movie(50, "Sem Data", "/media/movies/Sem Data (2024)", None),
-                &extras,
-            )
+            .add_movie(&movie(20, "Amado", before), &extras)
             .await
             .unwrap();
 
@@ -630,11 +465,8 @@ mod tests {
             .and(path("/Items"))
             .and(query_param("userId", "u1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "Items": [item("Visto", 10, &played), item("Amado", 20, &played),
-                          // Fora do catálogo: ignorado.
-                          item("Outro", 30, &played),
-                          item("De Novo", 40, &played), item("Sem Data", 50, &played)],
-                "TotalRecordCount": 5
+                "Items": [item("Visto", 10, &played), item("Amado", 20, &played)],
+                "TotalRecordCount": 2
             })))
             .mount(&server)
             .await;
@@ -647,64 +479,22 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        // Sugerir não pede varredura: nada saiu.
         Mock::given(method("POST"))
             .and(path("/Library/Refresh"))
             .respond_with(ResponseTemplate::new(204))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
         let jellyfin =
             JellyfinClient::new(&server.uri(), "chave", StdDuration::from_secs(5)).unwrap();
 
-        let report = run(&config, store, &jellyfin, 60).await.unwrap();
-        assert_eq!(report.apagados.len(), 1, "{report:?}");
-        assert_eq!(report.apagados[0].titulo, "Visto");
-        assert_eq!(report.apagados[0].assistido_por, "vitor");
-        assert_eq!(report.apagados[0].assistido_em, "2026-09-01T20:00:00Z");
-        assert_ne!(report.liberado, "0 B");
-        let skipped: Vec<(&str, &str)> = report
-            .pulados
-            .iter()
-            .map(|p| (p.titulo.as_str(), p.motivo.as_str()))
-            .collect();
-        assert_eq!(
-            skipped,
-            [
-                ("Amado", "favorito de ana"),
-                (
-                    "De Novo",
-                    "assistido antes de o arquivo de agora chegar (10/09/2026 00:00 UTC)"
-                ),
-                ("Sem Data", "arquivo sem data de adição conhecida"),
-            ]
-        );
-        assert!(report.summary().0);
-
-        assert!(!visto.exists());
-        assert!(amado.join("amado.mkv").exists());
-        assert!(de_novo.exists());
-        let left: Vec<_> = store
-            .movies()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|m| m.movie.tmdb_id)
-            .collect();
-        assert_eq!(left, [20, 40, 50]);
-        let history = store
-            .history(None, Some("movie_deleted"), 10, 0)
-            .await
-            .unwrap();
-        let message = history.events[0].data["mensagem"].as_str().unwrap();
-        assert!(
-            message.starts_with("assistido por vitor em 01/09/2026 20:00 UTC; pasta apagada"),
-            "{message}"
-        );
-
-        // De novo: nada mais a apagar, e sem varredura (o `expect(1)` confere).
-        let again = run(&config, store, &jellyfin, 60).await.unwrap();
-        assert_eq!(again.summary(), (true, "nada a apagar".into()));
-        std::fs::remove_dir_all(&root).unwrap();
+        let found = suggest(store, &jellyfin, 60).await.unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].movie_id, visto);
+        assert_eq!(found[0].user, "vitor");
+        assert_eq!(found[0].at, at("2026-09-01T20:00:00Z"));
+        assert_eq!(store.movies().await.unwrap().len(), 2);
         db.drop().await;
     }
 }

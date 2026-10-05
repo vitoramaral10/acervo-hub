@@ -1,6 +1,6 @@
 # Serviço do acervo-hub para um stack Compose existente. Um processo só:
 # serve a interface e agenda as tarefas — busca, RSS, importação, metadados,
-# limpeza, assistidos.
+# limpeza, numeração de cena, definições.
 #
 # A tag `main` acompanha o último build da branch principal. `latest` só nasce
 # em tag semver (`v*`). Para fixar uma versão, troque por `:vX.Y.Z` ou digest.

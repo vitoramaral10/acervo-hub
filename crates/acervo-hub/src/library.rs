@@ -523,7 +523,9 @@ pub async fn delete_file(config: &Config, store: &Store, id: i64) -> Result<()> 
 ///
 /// Filme desconhecido, pasta fora das raízes ou falha de escrita.
 pub async fn remove(config: &Config, store: &Store, id: i64, delete_files: bool) -> Result<()> {
-    remove_because(config, store, id, delete_files, delete_files, None).await
+    remove_because(config, store, id, delete_files, delete_files, None)
+        .await
+        .map(drop)
 }
 
 /// [`remove`], com o motivo à frente da mensagem do evento no histórico —
@@ -541,7 +543,7 @@ pub async fn remove_because(
     delete_files: bool,
     delete_seed: bool,
     reason: Option<&str>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let entry = store
         .movies()
         .await?
@@ -625,7 +627,7 @@ pub async fn remove_because(
         },
     )
     .await;
-    Ok(())
+    Ok(removed.err())
 }
 
 #[cfg(test)]

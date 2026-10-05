@@ -98,8 +98,6 @@ fn jitter(max: Duration) -> Duration {
 
 /// Id da busca dos que faltam: o botão da tela de filmes dispara esta tarefa.
 pub const BUSCA: &str = "busca";
-/// Id da tarefa que apaga os filmes assistidos no Jellyfin.
-pub const ASSISTIDOS: &str = "assistidos";
 /// Id da tarefa que baixa a numeração de cena (XEM).
 pub const CENA: &str = "cena";
 /// Id da tarefa que baixa as definições do repositório oficial.
@@ -714,18 +712,6 @@ pub fn service(
             }),
         },
         Task {
-            id: ASSISTIDOS,
-            name: "Apagar assistidos",
-            interval: interval(settings, ASSISTIDOS),
-            // Apagar não precisa correr na subida do serviço; o primeiro
-            // intervalo pega o que houver.
-            first: First::AfterInterval,
-            job: Arc::new(Watched {
-                settings: Arc::clone(settings),
-                database: database.clone(),
-            }),
-        },
-        Task {
             id: CENA,
             name: "Numeração de cena (XEM)",
             interval: interval(settings, CENA),
@@ -1300,86 +1286,6 @@ impl Job for DefinitionsUpdate {
             summary,
             detail: Some(serde_json::to_value(&report)?),
         })
-    }
-}
-
-/// Apaga do acervo o que já foi assistido no Jellyfin. O relatório, com os
-/// apagados e os pulados, vira o detalhe da execução.
-#[derive(Debug)]
-struct Watched {
-    settings: Arc<Settings>,
-    database: Database,
-}
-
-#[async_trait]
-impl Job for Watched {
-    async fn run(&self, _: Trigger) -> Result<Outcome> {
-        let store = store(&self.database)?;
-        let config = self.settings.get();
-        let jellyfin = config
-            .jellyfin()
-            .context("Jellyfin não configurado (Configurações → Jellyfin)")?;
-        let client = JellyfinClient::new(&jellyfin.url, &jellyfin.api_key, config.http_timeout())?;
-        let report = crate::watched::run(
-            &config,
-            store,
-            &client,
-            jellyfin.delete_watched_after_minutes,
-        )
-        .await?;
-        let (mut ok, mut summary) = report.summary();
-        let mut detail = serde_json::to_value(&report)?;
-        let series = match crate::series::watched::run(
-            &config,
-            store,
-            &client,
-            jellyfin.delete_watched_after_minutes,
-        )
-        .await
-        {
-            Ok(series) => series,
-            // Os filmes já foram: o erro das séries não esconde o que saiu.
-            Err(error) => {
-                detail["series"] = json!({ "erro": format!("{error:#}") });
-                return Ok(Outcome {
-                    ok: false,
-                    summary: format!("{summary}; séries: {error:#}"),
-                    detail: Some(detail),
-                });
-            }
-        };
-        if !series.apagados.is_empty() || series.recusados > 0 {
-            summary = format!(
-                "{summary}; séries: {}, {} liberados",
-                count(
-                    series.apagados.len(),
-                    "arquivo apagado",
-                    "arquivos apagados"
-                ),
-                acervo_core::Allocated::from_bytes(series.liberado),
-            );
-            if series.recusados > 0 {
-                summary = format!(
-                    "{summary}, {}",
-                    count(series.recusados, "recusado", "recusados")
-                );
-            }
-            ok = ok && series.recusados == 0;
-        }
-        detail["series"] = serde_json::to_value(&series)?;
-        Ok(Outcome {
-            ok,
-            summary,
-            detail: Some(detail),
-        })
-    }
-
-    fn unavailable(&self) -> Option<String> {
-        self.settings
-            .get()
-            .jellyfin()
-            .is_none()
-            .then(|| "Jellyfin não configurado".to_owned())
     }
 }
 

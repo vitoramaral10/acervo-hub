@@ -42,8 +42,8 @@ pub struct Config {
     /// Cliente de download. Sem URL, não há cliente: o grab e a limpeza
     /// ficam parados.
     pub qbittorrent: QbitConfig,
-    /// Servidor de mídia que diz o que já foi assistido. Sem URL, a tarefa de
-    /// apagar assistidos fica parada.
+    /// Servidor de mídia que diz o que já foi assistido. Sem URL, a tela
+    /// "Para apagar" não sugere assistidos.
     pub jellyfin: JellyfinConfig,
     pub library: LibraryConfig,
     pub policy: PolicyConfig,
@@ -180,8 +180,10 @@ pub struct JellyfinConfig {
     /// Como o serviço alcança o Jellyfin; em Compose, `http://jellyfin:8096`.
     pub url: String,
     pub api_key: String,
-    /// Carência depois da última vez que alguém assistiu: dá tempo de
-    /// marcar como favorito o que é para ficar.
+    /// Carência depois da última vez que alguém assistiu antes de o título
+    /// virar sugestão de apagar: dá tempo de marcar como favorito o que é
+    /// para ficar. O nome é de quando assistido saía sozinho; mudar quebraria
+    /// a seção gravada.
     pub delete_watched_after_minutes: u64,
 }
 
@@ -332,14 +334,13 @@ impl PolicyConfig {
 
 /// Ids das tarefas de fundo com o intervalo padrão, em minutos. Zero desliga
 /// o agendamento; "rodar agora" continua valendo.
-pub const TASK_DEFAULTS: [(&str, u64); 8] = [
+pub const TASK_DEFAULTS: [(&str, u64); 7] = [
     // Sem intervalo, só pelo botão.
     ("busca", 0),
     ("rss", 30),
     ("importacao", 5),
     ("metadados", 360),
     ("limpeza", 60),
-    ("assistidos", 15),
     // A numeração de cena muda pouco: uma vez por dia.
     ("cena", 24 * 60),
     // As definições do repositório oficial, uma vez por dia.
@@ -611,7 +612,16 @@ mod tests {
         assert_eq!(config.tasks.minutes("busca"), 0);
         assert_eq!(config.tasks.minutes("rss"), 30);
         assert_eq!(config.tasks.minutes("limpeza"), 60);
-        assert_eq!(config.tasks.minutes("assistidos"), 15);
+        // Assistido não sai mais sozinho: a tarefa deixou de existir.
+        assert_eq!(config.tasks.minutes("assistidos"), 0);
+        assert!(
+            valid()
+                .with_section(TAREFAS, json!({ "intervalos": { "assistidos": 15 } }))
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .contains("desconhecida")
+        );
         assert_eq!(config.tasks.minutes("cena"), 1440);
         assert_eq!(config.server.xem_url, "https://thexem.info");
         assert_eq!(config.tasks.search_limit, 5);

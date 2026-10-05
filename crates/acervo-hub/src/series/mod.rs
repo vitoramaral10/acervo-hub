@@ -1,6 +1,6 @@
 //! Séries, com o contrato de `docs/series.md`: o desenho dos filmes (busca,
 //! decisão, grab, fila por espaço, importação por hardlink, remoção,
-//! assistidos), com o episódio guardando o motivo de não ser buscado, o
+//! sugestão de assistidos), com o episódio guardando o motivo de não ser buscado, o
 //! pacote de temporada servindo para um episódio só e nenhum upgrade.
 
 use std::collections::{BTreeMap, HashSet};

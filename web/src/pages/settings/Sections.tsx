@@ -490,7 +490,7 @@ function JellyfinForm({ data, save, saving }: FormProps<'jellyfin'>) {
         save(value)
       }}
     >
-      <Field id="jellyfin-url" label="URL" help="Em branco, a tarefa de apagar assistidos fica parada.">
+      <Field id="jellyfin-url" label="URL" help="Em branco, a tela “Para apagar” não sugere assistidos.">
         <Input
           id="jellyfin-url"
           type="url"
@@ -504,7 +504,7 @@ function JellyfinForm({ data, save, saving }: FormProps<'jellyfin'>) {
       <Field
         id="jellyfin-chave"
         label="Chave de API"
-        help="Painel → Chaves de API. A varredura da biblioteca, pedida depois de apagar, exige chave de administrador."
+        help="Painel → Chaves de API. A varredura da biblioteca, pedida depois de importar ou apagar, exige chave de administrador."
       >
         <SecretInput
           id="jellyfin-chave"
@@ -517,7 +517,7 @@ function JellyfinForm({ data, save, saving }: FormProps<'jellyfin'>) {
       <Field
         id="jellyfin-carencia"
         label="Carência depois de assistido (minutos)"
-        help="Dá tempo de marcar como favorito o que é para ficar. Favorito de qualquer usuário nunca sai."
+        help="Só depois dela o assistido vira sugestão de apagar: dá tempo de marcar como favorito o que é para ficar. Favorito de qualquer usuário nunca é sugerido."
       >
         <Input
           id="jellyfin-carencia"
@@ -539,7 +539,7 @@ export function JellyfinSettings() {
     <SectionCard
       name="jellyfin"
       title="Jellyfin"
-      description="Diz o que já foi assistido. Com ele, a tarefa “Apagar assistidos” remove do acervo — pasta e download — o filme visto há mais que a carência."
+      description="Diz o que já foi assistido. Com ele, a tela “Para apagar” sugere o filme ou a temporada vista há mais que a carência; nada sai sem você marcar e confirmar."
       status={(data: JellyfinSection) => data.url !== ''}
       Form={JellyfinForm}
     />

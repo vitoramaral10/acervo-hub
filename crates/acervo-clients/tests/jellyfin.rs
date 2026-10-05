@@ -1,6 +1,6 @@
 //! Contrato com a API do Jellyfin (12.1).
 //!
-//! Cobre o que a tarefa de assistidos lê: a chave no cabeçalho
+//! Cobre o que as sugestões de assistidos leem: a chave no cabeçalho
 //! `MediaBrowser`, os filmes pela rota `/Items?userId=` com os dados do
 //! usuário, e o `ProviderIds` que casa com o catálogo. Não substitui uma
 //! volta contra o servidor de verdade.

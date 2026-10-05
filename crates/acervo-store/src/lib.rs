@@ -6,6 +6,7 @@ mod accounts;
 mod config;
 mod definitions;
 mod manage;
+mod marks;
 mod series;
 mod tasks;
 
@@ -20,6 +21,7 @@ pub use accounts::SESSION_DAYS;
 pub use config::IndexerRecord;
 pub use definitions::{DefinitionRow, IndexerDayStats, StatsDelta};
 pub use manage::{Blocked, FailReason, HistoryEvent, HistoryPage, NewHistory};
+pub use marks::{DeletionMark, MarkTarget};
 pub use series::{
     CatalogEpisode, CatalogEpisodeFile, CatalogSeries, Episode, EpisodeFile, EpisodeSync,
     SceneMapping, Series, SeriesGrab, SeriesImport, SeriesPick, SeriesSearch, Skip, default_skip,
@@ -731,6 +733,31 @@ const MIGRATIONS: &[&str] = &[
         ELSE 'other'
     END;
     CREATE INDEX blocklist_by_reason ON blocklist(reason, at);
+",
+    // Assistido deixa de sair sozinho: o usuário marca o que quer apagar (um
+    // filme, uma temporada ou a série inteira, `season` nulo) e confirma na
+    // tela "Para apagar". A marca sai com o filme ou a série. Sai também a
+    // tarefa `assistidos`: o intervalo gravado dela (a configuração recusa
+    // tarefa desconhecida e o serviço não subiria) e o histórico, cujas
+    // remoções seguem no histórico de atividade.
+    r"
+    CREATE TABLE deletion_marks (
+        id BIGSERIAL PRIMARY KEY,
+        movie_id BIGINT REFERENCES movies(id) ON DELETE CASCADE,
+        series_id BIGINT REFERENCES series(id) ON DELETE CASCADE,
+        season INTEGER CHECK (season >= 0),
+        marked_at TEXT NOT NULL,
+        CHECK ((movie_id IS NULL) <> (series_id IS NULL)),
+        CHECK (season IS NULL OR series_id IS NOT NULL)
+    );
+    CREATE UNIQUE INDEX deletion_marks_by_movie ON deletion_marks(movie_id)
+        WHERE movie_id IS NOT NULL;
+    CREATE UNIQUE INDEX deletion_marks_by_series ON deletion_marks(series_id, COALESCE(season, -1))
+        WHERE series_id IS NOT NULL;
+    UPDATE config_sections
+        SET value = jsonb_set(value, '{intervalos}', (value -> 'intervalos') - 'assistidos')
+        WHERE name = 'tarefas' AND jsonb_typeof(value -> 'intervalos') = 'object';
+    DELETE FROM task_runs WHERE task = 'assistidos';
 ",
 ];
 

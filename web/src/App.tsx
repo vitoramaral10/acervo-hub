@@ -23,6 +23,7 @@ import {
   ServerCog,
   SlidersHorizontal,
   Sun,
+  Trash2,
   Tv,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
@@ -43,8 +44,9 @@ import { SearchPage } from '@/pages/Search'
 import { SeriesPage } from '@/pages/Series'
 import { SettingsPage, type SettingsView } from '@/pages/Settings'
 import { TasksPage } from '@/pages/Tasks'
+import { ToDeletePage } from '@/pages/ToDelete'
 
-type MainView = 'inicio' | 'filmes' | 'series' | 'faltando' | 'calendario' | 'atividade' | 'busca'
+type MainView = 'inicio' | 'filmes' | 'series' | 'faltando' | 'apagar' | 'calendario' | 'atividade' | 'busca'
 type ConfigView = 'indexadores' | 'tarefas' | SettingsView
 type View = MainView | ConfigView
 
@@ -56,6 +58,7 @@ const MAIN: NavItem<MainView>[] = [
   { view: 'filmes', label: 'Filmes', icon: Film },
   { view: 'series', label: 'Séries', icon: MonitorPlay },
   { view: 'faltando', label: 'Faltando', icon: CircleDashed },
+  { view: 'apagar', label: 'Para apagar', icon: Trash2 },
   { view: 'calendario', label: 'Calendário', icon: CalendarDays },
   { view: 'atividade', label: 'Atividade', icon: Activity },
   { view: 'busca', label: 'Busca', icon: Search },
@@ -297,6 +300,8 @@ export function App() {
             <SeriesPage />
           ) : view === 'faltando' ? (
             <MissingPage />
+          ) : view === 'apagar' ? (
+            <ToDeletePage />
           ) : view === 'calendario' ? (
             <CalendarPage />
           ) : view === 'atividade' ? (

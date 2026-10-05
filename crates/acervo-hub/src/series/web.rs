@@ -701,6 +701,7 @@ mod tests {
         // Rota repetida ou ambígua faz o axum entrar em pânico ao juntar.
         let _ = crate::web::routes()
             .merge(super::routes())
-            .merge(crate::agenda::routes());
+            .merge(crate::agenda::routes())
+            .merge(crate::marks::routes());
     }
 }
