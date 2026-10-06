@@ -22,6 +22,7 @@ mod config;
 mod cycle;
 mod decide;
 mod definitions;
+mod discover;
 mod events;
 mod grab;
 mod heal;

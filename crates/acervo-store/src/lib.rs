@@ -5,6 +5,7 @@
 mod accounts;
 mod config;
 mod definitions;
+mod discover;
 mod manage;
 mod marks;
 mod series;
@@ -20,6 +21,7 @@ use tokio_postgres::{NoTls, Row};
 pub use accounts::SESSION_DAYS;
 pub use config::IndexerRecord;
 pub use definitions::{DefinitionRow, IndexerDayStats, StatsDelta};
+pub use discover::{DiscoverKind, HiddenGenre, HiddenTitle, HiddenWeek};
 pub use manage::{Blocked, FailReason, HistoryEvent, HistoryPage, NewHistory};
 pub use marks::{DeletionMark, MarkTarget};
 pub use series::{
@@ -758,6 +760,27 @@ const MIGRATIONS: &[&str] = &[
         SET value = jsonb_set(value, '{intervalos}', (value -> 'intervalos') - 'assistidos')
         WHERE name = 'tarefas' AND jsonb_typeof(value -> 'intervalos') = 'object';
     DELETE FROM task_runs WHERE task = 'assistidos';
+",
+    // Preferências do Descobrir independem da presença da obra no catálogo.
+    r"
+    CREATE TABLE discover_hidden_titles (
+        kind TEXT NOT NULL CHECK (kind IN ('filme','serie')),
+        tmdb_id INTEGER NOT NULL,
+        title TEXT NOT NULL DEFAULT '',
+        hidden_at TEXT NOT NULL,
+        PRIMARY KEY (kind, tmdb_id)
+    );
+    CREATE TABLE discover_hidden_weeks (
+        year INTEGER NOT NULL,
+        week INTEGER NOT NULL CHECK (week BETWEEN 1 AND 53),
+        hidden_at TEXT NOT NULL,
+        PRIMARY KEY (year, week)
+    );
+    CREATE TABLE discover_hidden_genres (
+        genre_id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL DEFAULT '',
+        hidden_at TEXT NOT NULL
+    );
 ",
 ];
 

@@ -993,3 +993,109 @@ export const deletionApi = {
     request<{ ok: boolean; desmarcados: number }>('POST', `${PURGE}/desmarcar`, { itens }),
   purge: (itens: DeletionTarget[]) => request<PurgeResult>('POST', `${PURGE}/apagar`, { itens }),
 }
+
+// ---------------------------------------------------------------- descobrir
+
+export type DiscoverList = 'em_alta' | 'populares' | 'em_breve' | 'no_ar'
+
+export interface DiscoverItem {
+  tipo: MediaKind
+  tmdb: number
+  titulo: string
+  titulo_original: string
+  data: string | null
+  ano: number | null
+  sinopse: string
+  poster: string | null
+  nota: number
+  popularidade: number
+  generos: string[]
+}
+
+export interface DiscoverSearchItem extends DiscoverItem {
+  no_acervo: boolean
+  oculto: boolean
+}
+
+export interface DiscoverDetails extends DiscoverSearchItem {
+  id_acervo: number | null
+  tagline: string
+  backdrop: string | null
+  duracao: number | null
+  temporadas: number | null
+  episodios: number | null
+  status: string | null
+  diretores: string[]
+  criadores: string[]
+  elenco: { nome: string; personagem: string; foto: string | null }[]
+  trailer: string | null
+  recomendacoes: DiscoverItem[]
+}
+
+export interface DiscoverSearchResponse extends DiscoverPageResponse {
+  itens: DiscoverSearchItem[]
+}
+
+export interface DiscoverWeek {
+  semana: number
+  inicio: string
+  fim: string
+  total: number | null
+}
+
+export interface DiscoverWeeks {
+  ano: number
+  semanas: DiscoverWeek[]
+}
+
+export interface DiscoverReleases {
+  ano: number
+  semana: number
+  inicio: string
+  fim: string
+  itens: DiscoverItem[]
+}
+
+export interface DiscoverPageResponse {
+  itens: DiscoverItem[]
+  pagina: number
+  total_paginas: number
+}
+
+export interface DiscoverGenre {
+  id: number
+  nome: string
+  oculto: boolean
+}
+
+export interface DiscoverHidden {
+  titulos: { tipo: MediaKind; tmdb: number; titulo: string; em: string }[]
+  semanas: { ano: number; semana: number; em: string }[]
+  generos: { id: number; nome: string; em: string }[]
+}
+
+const DISCOVER = '/ui/api/descobrir'
+export const discover = {
+  details: (tipo: MediaKind, tmdb: number) => request<DiscoverDetails>('GET', `${DISCOVER}/titulo/${tipo}/${tmdb}`),
+  search: (q: string, pagina: number) =>
+    request<DiscoverSearchResponse>('GET', `${DISCOVER}/busca?${new URLSearchParams({ q, pagina: String(pagina) })}`),
+  weeks: (ano: number) => request<DiscoverWeeks>('GET', `${DISCOVER}/semanas/${ano}`),
+  releases: (ano: number, semana: number) =>
+    request<DiscoverReleases>('GET', `${DISCOVER}/semanas/${ano}/${semana}`),
+  list: (lista: DiscoverList, tipo: MediaKind, pagina: number) =>
+    request<DiscoverPageResponse>('GET', `${DISCOVER}/listas/${lista}?${new URLSearchParams({ tipo, pagina: String(pagina) })}`),
+  genres: () => request<{ generos: DiscoverGenre[] }>('GET', `${DISCOVER}/generos`),
+  hidden: () => request<DiscoverHidden>('GET', `${DISCOVER}/ocultos`),
+  hideTitle: (title: Pick<DiscoverItem, 'tipo' | 'tmdb' | 'titulo'>) =>
+    request<{ ok: boolean }>('POST', `${DISCOVER}/ocultos/titulos`, title),
+  showTitle: (tipo: MediaKind, tmdb: number) =>
+    request<{ ok: boolean; removido: boolean }>('DELETE', `${DISCOVER}/ocultos/titulos/${tipo}/${tmdb}`),
+  hideWeek: (ano: number, semana: number) =>
+    request<{ ok: boolean }>('POST', `${DISCOVER}/ocultos/semanas`, { ano, semana }),
+  showWeek: (ano: number, semana: number) =>
+    request<{ ok: boolean; removido: boolean }>('DELETE', `${DISCOVER}/ocultos/semanas/${ano}/${semana}`),
+  hideGenre: (id: number, nome: string) =>
+    request<{ ok: boolean }>('POST', `${DISCOVER}/ocultos/generos`, { id, nome }),
+  showGenre: (id: number) =>
+    request<{ ok: boolean; removido: boolean }>('DELETE', `${DISCOVER}/ocultos/generos/${id}`),
+}

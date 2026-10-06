@@ -295,7 +295,10 @@ export function MoviesPage() {
   })
   const [query, setQuery] = useState('')
   const [prefs, setPrefs] = useState<MovieListPrefs>(loadPrefs)
-  const [selected, setSelected] = useState<number | null>(null)
+  const [selected, setSelected] = useState<number | null>(() => {
+    const value = new URLSearchParams(window.location.hash.split('?')[1]).get('id')
+    return value && /^\d+$/.test(value) && Number(value) > 0 ? Number(value) : null
+  })
   const [adding, setAdding] = useState(false)
   const [verifyingAll, setVerifyingAll] = useState(false)
   const marked = useMarkedKeys()
@@ -890,7 +893,7 @@ const STATUS: Record<string, string> = {
   released: 'Lançado',
 }
 
-function Poster({ movie, className }: { movie: Movie; className?: string }) {
+export function Poster({ movie, className }: { movie: Pick<Movie, 'poster' | 'titulo'>; className?: string }) {
   const [failed, setFailed] = useState(false)
   return (
     <div

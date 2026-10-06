@@ -6,6 +6,7 @@ import {
   ChevronDown,
   CircleDashed,
   Clapperboard,
+  Compass,
   Download,
   Eraser,
   Film,
@@ -35,6 +36,7 @@ import { type Theme, saveTheme, storedTheme } from '@/lib/theme'
 import { cn } from '@/lib/utils'
 import { ActivityPage } from '@/pages/Activity'
 import { CalendarPage } from '@/pages/Calendar'
+import { DiscoverPage } from '@/pages/Discover'
 import { HomePage } from '@/pages/Home'
 import { IndexersPage } from '@/pages/Indexers'
 import { LoginPage } from '@/pages/Login'
@@ -46,7 +48,7 @@ import { SettingsPage, type SettingsView } from '@/pages/Settings'
 import { TasksPage } from '@/pages/Tasks'
 import { ToDeletePage } from '@/pages/ToDelete'
 
-type MainView = 'inicio' | 'filmes' | 'series' | 'faltando' | 'apagar' | 'calendario' | 'atividade' | 'busca'
+type MainView = 'inicio' | 'filmes' | 'series' | 'descobrir' | 'faltando' | 'apagar' | 'calendario' | 'atividade' | 'busca'
 type ConfigView = 'indexadores' | 'tarefas' | SettingsView
 type View = MainView | ConfigView
 
@@ -57,6 +59,7 @@ const MAIN: NavItem<MainView>[] = [
   { view: 'inicio', label: 'Início', icon: House },
   { view: 'filmes', label: 'Filmes', icon: Film },
   { view: 'series', label: 'Séries', icon: MonitorPlay },
+  { view: 'descobrir', label: 'Descobrir', icon: Compass },
   { view: 'faltando', label: 'Faltando', icon: CircleDashed },
   { view: 'apagar', label: 'Para apagar', icon: Trash2 },
   { view: 'calendario', label: 'Calendário', icon: CalendarDays },
@@ -298,6 +301,8 @@ export function App() {
             <MoviesPage />
           ) : view === 'series' ? (
             <SeriesPage />
+          ) : view === 'descobrir' ? (
+            <DiscoverPage />
           ) : view === 'faltando' ? (
             <MissingPage />
           ) : view === 'apagar' ? (

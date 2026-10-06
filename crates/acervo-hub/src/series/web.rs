@@ -702,6 +702,7 @@ mod tests {
         let _ = crate::web::routes()
             .merge(super::routes())
             .merge(crate::agenda::routes())
-            .merge(crate::marks::routes());
+            .merge(crate::marks::routes())
+            .merge(crate::discover::routes());
     }
 }

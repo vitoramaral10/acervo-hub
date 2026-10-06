@@ -78,6 +78,16 @@ novo sobe com os padrões, e o resto se preenche em **Configurações**.
 
 ## O que o serviço faz
 
+### Descobrir
+
+Lançamentos de filmes no Brasil por semana ISO, além das listas do TMDB de **Em alta**,
+**Populares**, **Em breve** (filmes) e **No ar** (séries). Obras que já estão no catálogo
+não aparecem nas listas. A busca unificada encontra filmes e séries, incluindo títulos
+ocultos ou já no acervo. Ao abrir um título, aparecem sinopse, elenco, direção ou criação,
+trailer e recomendações, com adição ao acervo ou acesso à obra já cadastrada.
+É possível ocultar títulos, semanas e gêneros, e mostrá-los de novo.
+A chave do TMDB é configurada em **Configurações → TMDB**.
+
 ### Busca e decisão
 
 Filmes e séries entram pela tela, a partir do TMDB. Todo filme e toda série usam o **perfil
@@ -247,6 +257,8 @@ indexadores mostra "em espera até" (também para o 429). Em memória: reiniciar
 - **Filmes** e **Séries** — a biblioteca em pôsteres: adicionar pelo TMDB, monitorar,
   prioridade, busca automática ou interativa, renomear, verificar o disco, apagar arquivo
   ou remover — com a pasta e o download no cliente, na hora.
+- **Descobrir** — lançamentos semanais, listas e busca unificada do TMDB, com detalhes,
+  elenco, trailer, recomendações, adição ao acervo e preferências para ocultar títulos, semanas e gêneros.
 - **Faltando**, **Para apagar** (o que foi marcado, com o espaço que libera, e as
   sugestões de assistidos), **Calendário**, **Atividade** (a fila com o progresso do
   cliente, o histórico e a lista de bloqueio) e **Busca** manual em todos os indexadores.

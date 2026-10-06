@@ -174,6 +174,7 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
             .merge(crate::stats::router(Arc::clone(&web)))
             .merge(crate::manual::router(Arc::clone(&web)))
             .merge(crate::marks::router(Arc::clone(&web)))
+            .merge(crate::discover::router(Arc::clone(&web)))
             .merge(crate::series::web::router(web))
             .merge(crate::health::router(readiness)),
     )

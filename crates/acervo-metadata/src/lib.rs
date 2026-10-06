@@ -10,7 +10,11 @@ use std::time::Duration;
 use serde::Deserialize;
 use url::Url;
 
+mod discover;
 mod tv;
+pub use discover::{
+    DiscoverCast, DiscoverDetails, DiscoverItem, DiscoverKind, DiscoverList, DiscoverPage, Genre,
+};
 
 pub use tv::{EpisodeMetadata, SeriesMetadata, SeriesSummary};
 
@@ -19,6 +23,9 @@ const IMAGES: &str = "https://image.tmdb.org/t/p/original";
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetadataError {
+    #[error("argumento inválido: {0}")]
+    Argument(String),
+
     #[error("chave do TMDB recusada")]
     InvalidKey,
 

@@ -99,7 +99,10 @@ export function SeriesPage() {
   })
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<SeriesFilter>('todas')
-  const [selected, setSelected] = useState<number | null>(null)
+  const [selected, setSelected] = useState<number | null>(() => {
+    const value = new URLSearchParams(window.location.hash.split('?')[1]).get('id')
+    return value && /^\d+$/.test(value) && Number(value) > 0 ? Number(value) : null
+  })
   // Série com alguma marca (inteira ou de temporada): `serie-<id>` ou `serie-<id>-t<n>`.
   const marks = useMarkedKeys()
   const markedSeries = useMemo(() => {
