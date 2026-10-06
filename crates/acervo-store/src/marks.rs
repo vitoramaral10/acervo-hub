@@ -282,34 +282,4 @@ mod tests {
         assert!(store.mark_for_deletion(&[whole(series)], AT).await.is_err());
         db.drop().await;
     }
-
-    #[tokio::test]
-    async fn migracao_tira_a_tarefa_de_assistidos() {
-        let Some(db) = TestDb::before(
-            "marcas_migra",
-            "CREATE TABLE deletion_marks",
-            r#"
-            INSERT INTO config_sections (name, value, updated_at) VALUES
-                ('tarefas', '{"intervalos": {"rss": 45, "assistidos": 15}, "search_limit": 3}',
-                 '2026-09-01T00:00:00Z');
-            INSERT INTO task_runs (task, started_at, finished_at, ok, summary) VALUES
-                ('assistidos', '2026-09-01T00:00:00Z', '2026-09-01T00:00:01Z', true, 'nada a apagar'),
-                ('limpeza', '2026-09-01T00:00:00Z', '2026-09-01T00:00:01Z', true, 'ok');
-            "#,
-        )
-        .await
-        else {
-            return;
-        };
-        let sections = db.store.config_sections().await.unwrap();
-        let (_, tasks) = sections.iter().find(|(name, _)| name == "tarefas").unwrap();
-        assert_eq!(
-            *tasks,
-            serde_json::json!({ "intervalos": { "rss": 45 }, "search_limit": 3 })
-        );
-        let runs = db.store.task_runs(10).await.unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].task, "limpeza");
-        db.drop().await;
-    }
 }

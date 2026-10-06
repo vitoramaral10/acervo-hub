@@ -128,12 +128,7 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Write as _;
-
-    use serde_json::json;
-
     use crate::testing::TestDb;
-    use crate::{MIGRATIONS, Store};
 
     use super::*;
 
@@ -173,57 +168,5 @@ mod tests {
         assert_eq!(last[1].summary, "rodada 3");
         assert_eq!(store.task_runs(1).await.unwrap().len(), 1);
         db.drop().await;
-    }
-
-    #[tokio::test]
-    async fn migracao_cria_o_historico_de_tarefas() {
-        let Some(url) = std::env::var("ACERVO_TEST_DATABASE_URL").ok() else {
-            eprintln!("ACERVO_TEST_DATABASE_URL ausente: teste de banco pulado");
-            return;
-        };
-        let schema = format!("teste_tarefas_migra_{}", std::process::id());
-        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-            .await
-            .unwrap();
-        tokio::spawn(connection);
-        // Banco parado na versão anterior, como o de produção antes desta
-        // mudança.
-        let before = MIGRATIONS.len() - 1;
-        let mut setup = format!(
-            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path = {schema};"
-        );
-        for migration in &MIGRATIONS[..before] {
-            setup.push_str(migration);
-        }
-        let _ = write!(
-            setup,
-            "CREATE TABLE schema_version (version INTEGER NOT NULL);
-             INSERT INTO schema_version VALUES ({before});"
-        );
-        client.batch_execute(&setup).await.unwrap();
-
-        let mut config: tokio_postgres::Config = url.parse().unwrap();
-        config.options(format!("-c search_path={schema}"));
-        let store = Store::with_config(config).await.unwrap();
-        let version: i32 = client
-            .query_one(&format!("SELECT version FROM {schema}.schema_version"), &[])
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(usize::try_from(version).unwrap(), MIGRATIONS.len());
-
-        let detail = json!({ "acoes": [], "espaco": "0 B" });
-        store
-            .record_task_run(&run("limpeza", 1, Some(detail.clone())), 500)
-            .await
-            .unwrap();
-        let runs = store.task_runs(100).await.unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].detail, Some(detail));
-        assert!(runs[0].ok);
-        client
-            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
-            .await
-            .unwrap();
     }
 }

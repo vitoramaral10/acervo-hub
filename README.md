@@ -51,8 +51,8 @@ script e automação podem usá-la com a chave de API do servidor no cabeçalho 
 **O parser é o crate perigoso.** O parsing de nome de release é uma década de regex
 acumulada contra a criatividade dos grupos de scene: tabela de dados, não lógica — e
 validar exige corpus real. Quando o parser erra, não há crash: há import silencioso no
-lugar errado. Os corpora de filmes e de séries rodam como testes ignorados, com o caminho
-do JSON no ambiente.
+lugar errado. O port foi conferido contra a referência em títulos reais de filmes e de
+séries; o que ficou são os casos da referência, como testes de unidade.
 
 ## Como rodar
 

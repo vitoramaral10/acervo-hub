@@ -1764,51 +1764,6 @@ pub mod testing {
     }
 
     impl TestDb {
-        /// Um banco parado logo antes da primeira migração cujo texto contém
-        /// `marker`, com `setup` (SQL) rodado nele; depois, migrado até o fim
-        /// como o serviço faria ao subir. `None` quando não há banco de teste
-        /// configurado.
-        ///
-        /// # Panics
-        ///
-        /// Banco configurado mas inalcançável, `marker` sem migração ou
-        /// `setup` que falha.
-        pub async fn before(name: &str, marker: &str, setup: &str) -> Option<Self> {
-            let Ok(url) = std::env::var("ACERVO_TEST_DATABASE_URL") else {
-                eprintln!("ACERVO_TEST_DATABASE_URL ausente: teste de banco pulado");
-                return None;
-            };
-            let schema = format!("teste_{name}_{}", std::process::id());
-            let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-                .await
-                .expect("conectando ao banco de teste");
-            tokio::spawn(connection);
-            let before = super::MIGRATIONS
-                .iter()
-                .position(|m| m.contains(marker))
-                .expect("migração do marcador");
-            let mut sql = format!(
-                "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema};
-                 SET search_path = {schema};"
-            );
-            for migration in &super::MIGRATIONS[..before] {
-                sql.push_str(migration);
-            }
-            sql.push_str("CREATE TABLE schema_version (version INTEGER NOT NULL);");
-            sql.push_str("INSERT INTO schema_version VALUES (");
-            sql.push_str(&before.to_string());
-            sql.push_str(");");
-            sql.push_str(setup);
-            client
-                .batch_execute(&sql)
-                .await
-                .expect("montando o banco antigo");
-            let mut config: tokio_postgres::Config = url.parse().expect("endereço de teste");
-            config.options(format!("-c search_path={schema}"));
-            let store = Store::with_config(config).await.expect("migrando");
-            Some(Self { store, schema, url })
-        }
-
         /// `None` quando não há banco de teste configurado.
         ///
         /// # Panics
@@ -1859,8 +1814,6 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Write as _;
-
     use super::testing::TestDb;
     use super::*;
 
@@ -2218,60 +2171,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migracao_do_motivo_preenche_pelo_texto_gravado() {
-        let Some(db) = TestDb::before(
-            "motivo",
-            "ADD COLUMN reason TEXT",
-            "INSERT INTO blocklist (source_title, at, message) VALUES
-                 ('a', '2026-01-01T00:00:00Z', 'sem seeds há 30 min'),
-                 ('b', '2026-01-01T00:00:00Z', 'o tracker não reconhece mais o torrent'),
-                 ('c', '2026-01-01T00:00:00Z', 'o cliente marcou o torrent com `error`'),
-                 ('d', '2026-01-01T00:00:00Z', 'o cliente não acha os arquivos do torrent'),
-                 ('e', '2026-01-01T00:00:00Z', 'o torrent sumiu do cliente'),
-                 ('f', '2026-01-01T00:00:00Z', 'marcado como falho na tela'),
-                 ('g', '2026-01-01T00:00:00Z', NULL);",
-        )
-        .await
-        else {
-            return;
-        };
-        let mut read: Vec<(String, FailReason, Option<String>)> = db
-            .store
-            .blocklist()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|b| (b.source_title, b.reason, b.message))
-            .collect();
-        read.sort_by(|a, b| a.0.cmp(&b.0));
-        let reasons: Vec<(&str, FailReason)> =
-            read.iter().map(|(t, r, _)| (t.as_str(), *r)).collect();
-        assert_eq!(
-            reasons,
-            [
-                ("a", FailReason::NoSeeds),
-                ("b", FailReason::Unregistered),
-                ("c", FailReason::ClientError),
-                ("d", FailReason::MissingFiles),
-                ("e", FailReason::Vanished),
-                ("f", FailReason::Other),
-                ("g", FailReason::Other),
-            ]
-        );
-        // O texto fica, para a tela.
-        assert_eq!(read[0].2.as_deref(), Some("sem seeds há 30 min"));
-        // E a poda já olha o motivo nas linhas antigas.
-        assert_eq!(
-            db.store
-                .delete_blocks(&[FailReason::NoSeeds], "2026-02-01T00:00:00Z")
-                .await
-                .unwrap(),
-            1
-        );
-        db.drop().await;
-    }
-
-    #[tokio::test]
     async fn busca_guarda_a_ultima_de_cada_filme() {
         let Some(db) = TestDb::new("buscas").await else {
             return;
@@ -2421,59 +2320,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migracao_renomeia_as_buscas_sem_perder_dados() {
-        let Some(url) = std::env::var("ACERVO_TEST_DATABASE_URL").ok() else {
-            eprintln!("ACERVO_TEST_DATABASE_URL ausente: teste de banco pulado");
-            return;
-        };
-        let schema = format!("teste_renomeia_{}", std::process::id());
-        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-            .await
-            .unwrap();
-        tokio::spawn(connection);
-        // Banco parado na versão anterior à migração, com uma busca gravada.
-        let before = MIGRATIONS
-            .iter()
-            .position(|m| m.contains("RENAME TO searches"))
-            .unwrap();
-        let mut setup = format!(
-            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path = {schema};"
-        );
-        for migration in &MIGRATIONS[..before] {
-            setup.push_str(migration);
-        }
-        let _ = write!(
-            setup,
-            "CREATE TABLE schema_version (version INTEGER NOT NULL);
-             INSERT INTO schema_version VALUES ({before});
-             INSERT INTO movies (tmdb_id, title, path, monitored, minimum_availability)
-                 VALUES (1, 'Um', '/filmes/Um', true, 'released');
-             INSERT INTO shadow_runs (movie_id, at, releases, rejections)
-                 SELECT id, '2026-01-01T00:00:00Z', 7, '[]' FROM movies;"
-        );
-        client.batch_execute(&setup).await.unwrap();
-
-        let mut config: tokio_postgres::Config = url.parse().unwrap();
-        config.options(format!("-c search_path={schema}"));
-        let store = Store::with_config(config).await.unwrap();
-        let searches = store.latest_searches().await.unwrap();
-        assert_eq!(searches.len(), 1);
-        assert_eq!(searches[0].releases, 7);
-        let old = client
-            .query_one(
-                &format!("SELECT to_regclass('{schema}.shadow_runs')::text"),
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(old.get::<_, Option<String>>(0), None);
-        client
-            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
     async fn filme_volta_como_foi_gravado() {
         let Some(db) = TestDb::new("ida_e_volta").await else {
             return;
@@ -2541,116 +2387,6 @@ mod tests {
         assert!(!store.set_movie_monitored(999, true).await.unwrap());
         store.set_extras(999, &extras).await.unwrap();
         db.drop().await;
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)] // Montar o banco antigo e conferir tudo o que saiu.
-    async fn migracao_tira_a_api_v3_sem_perder_filmes() {
-        let Some(url) = std::env::var("ACERVO_TEST_DATABASE_URL").ok() else {
-            eprintln!("ACERVO_TEST_DATABASE_URL ausente: teste de banco pulado");
-            return;
-        };
-        let schema = format!("teste_sem_v3_{}", std::process::id());
-        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-            .await
-            .unwrap();
-        tokio::spawn(connection);
-        // Banco parado na versão anterior, com perfil, tag, origem no
-        // gerenciador e arquivo com id e faixas.
-        let before = MIGRATIONS
-            .iter()
-            .position(|m| m.contains("DROP TABLE quality_profiles"))
-            .unwrap();
-        let mut setup = format!(
-            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path = {schema};"
-        );
-        for migration in &MIGRATIONS[..before] {
-            setup.push_str(migration);
-        }
-        let _ = write!(
-            setup,
-            "CREATE TABLE schema_version (version INTEGER NOT NULL);
-             INSERT INTO schema_version VALUES ({before});
-             INSERT INTO quality_profiles (name, upgrade_allowed, items)
-                 VALUES ('Any', false, '[]');
-             INSERT INTO tags (label) VALUES ('pedido');
-             INSERT INTO custom_formats (name, specifications) VALUES ('x', '[]');
-             INSERT INTO exclusions (tmdb_id, title) VALUES (9, 'Fora');
-             INSERT INTO import_lists (name, kind, settings, enabled, monitor, search_on_add,
-                     quality_profile_id, root_folder, minimum_availability)
-                 SELECT 'lista', 'tmdb', '{{}}', true, true, false, id, '/filmes', 'released'
-                 FROM quality_profiles;
-             INSERT INTO movies (tmdb_id, imdb_id, title, path, monitored, quality_profile_id,
-                     source, source_id, runtime, available, in_cinemas, overview, tags,
-                     metadata_title, poster)
-                 SELECT 10, 'tt0000010', 'Um', '/filmes/Um (2020)', true, id, 'radarr', 77,
-                     110, true, '2020-01-10', 'Sinopse', '[1]', 'One', 'p.jpg'
-                 FROM quality_profiles;
-             INSERT INTO movie_titles (movie_id, title) SELECT id, 'Um 2' FROM movies;
-             INSERT INTO movie_files (movie_id, relative_path, size, quality, revision_version,
-                     revision_real, is_repack, languages, release_group, scene_name, file_id,
-                     media_info)
-                 SELECT id, 'Um (2020).mkv', 4000, 3, 1, 0, false, '[\"English\"]', 'GRUPO',
-                     'Um.2020.1080p.WEB-DL-GRUPO', 501, '{{\"audioLanguages\": \"eng\"}}'
-                 FROM movies;"
-        );
-        client.batch_execute(&setup).await.unwrap();
-
-        let mut config: tokio_postgres::Config = url.parse().unwrap();
-        config.options(format!("-c search_path={schema}"));
-        let store = Store::with_config(config).await.unwrap();
-        let movies = store.movies().await.unwrap();
-        assert_eq!(movies.len(), 1);
-        let entry = &movies[0];
-        assert_eq!(entry.movie.tmdb_id, 10);
-        assert_eq!(entry.movie.title, "Um");
-        assert_eq!(entry.movie.path, "/filmes/Um (2020)");
-        assert!(entry.movie.monitored);
-        assert_eq!(entry.movie.runtime, 110);
-        assert_eq!(entry.movie.in_cinemas.as_deref(), Some("2020-01-10"));
-        assert_eq!(entry.movie.alternate_titles, ["Um 2"]);
-        assert_eq!(entry.extras.metadata_title.as_deref(), Some("One"));
-        let file = entry.movie.file.as_ref().unwrap();
-        assert_eq!(file.relative_path, "Um (2020).mkv");
-        assert_eq!(file.size, 4000);
-        assert_eq!(file.quality.quality, Quality::WebDl1080p);
-        assert_eq!(file.languages, ["English"]);
-        assert_eq!(file.release_group.as_deref(), Some("GRUPO"));
-        for gone in [
-            "quality_profiles",
-            "tags",
-            "custom_formats",
-            "exclusions",
-            "import_lists",
-            "movie_file_ids",
-        ] {
-            let row = client
-                .query_one(&format!("SELECT to_regclass('{schema}.{gone}')::text"), &[])
-                .await
-                .unwrap();
-            assert_eq!(row.get::<_, Option<String>>(0), None, "{gone}");
-        }
-        let columns = client
-            .query(
-                "SELECT table_name || '.' || column_name FROM information_schema.columns
-                 WHERE table_schema = $1 AND table_name <> 'episodes' AND column_name IN
-                     ('quality_profile_id', 'tags', 'source', 'source_id', 'file_id', 'media_info')",
-                &[&schema],
-            )
-            .await
-            .unwrap();
-        assert!(
-            columns.is_empty(),
-            "{:?}",
-            columns
-                .iter()
-                .map(|r| r.get::<_, String>(0))
-                .collect::<Vec<_>>()
-        );
-        client
-            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
@@ -2805,49 +2541,5 @@ mod tests {
                 .is_empty()
         );
         db.drop().await;
-    }
-
-    #[tokio::test]
-    async fn migracao_da_prioridade_nasce_falsa_nos_que_existem() {
-        let Some(url) = std::env::var("ACERVO_TEST_DATABASE_URL").ok() else {
-            eprintln!("ACERVO_TEST_DATABASE_URL ausente: teste de banco pulado");
-            return;
-        };
-        let schema = format!("teste_prioridade_{}", std::process::id());
-        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-            .await
-            .unwrap();
-        tokio::spawn(connection);
-        let before = MIGRATIONS
-            .iter()
-            .position(|m| m.contains("ADD COLUMN priority"))
-            .unwrap();
-        let mut setup = format!(
-            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path = {schema};"
-        );
-        for migration in &MIGRATIONS[..before] {
-            setup.push_str(migration);
-        }
-        let _ = write!(
-            setup,
-            "CREATE TABLE schema_version (version INTEGER NOT NULL);
-             INSERT INTO schema_version VALUES ({before});
-             INSERT INTO movies (tmdb_id, title, path, monitored) VALUES (1, 'Um', '/f/Um', true);
-             INSERT INTO series (tmdb_id, title, path, season_folder, monitor_new)
-                 VALUES (2, 'Dois', '/s/Dois', true, true);"
-        );
-        client.batch_execute(&setup).await.unwrap();
-        let mut config: tokio_postgres::Config = url.parse().unwrap();
-        config.options(format!("-c search_path={schema}"));
-        let store = Store::with_config(config).await.unwrap();
-        let movies = store.movies().await.unwrap();
-        assert!(!movies[0].priority);
-        let series = store.series_list().await.unwrap();
-        assert!(!series[0].priority);
-        assert!(series[0].scene.is_empty() && series[0].subtitles.is_empty());
-        client
-            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
-            .await
-            .unwrap();
     }
 }

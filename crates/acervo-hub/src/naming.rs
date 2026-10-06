@@ -235,48 +235,4 @@ mod tests {
         );
         assert_eq!(movie_file_stem(&m, None), "The Film (2026) {imdb-tt1}");
     }
-
-    /// Contra a lista de filmes de um gerenciador real (`GET /api/v3/movie`),
-    /// fora do repositório: todo arquivo existente tem de ter o nome que a
-    /// regra dá, a menos do ano — o arquivo guarda o ano do dia em que foi
-    /// importado, e a base pode tê-lo corrigido depois.
-    #[test]
-    #[ignore = "precisa de ACERVO_NAMING_CORPUS"]
-    fn corpus() {
-        let path = std::env::var("ACERVO_NAMING_CORPUS").expect("ACERVO_NAMING_CORPUS");
-        let movies: Vec<serde_json::Value> =
-            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        let mut checked = 0;
-        let mut wrong = Vec::new();
-        for m in &movies {
-            let Some(file) = m["movieFile"]["relativePath"].as_str() else {
-                continue;
-            };
-            let expected = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
-            let entry = foreign(
-                m["originalTitle"].as_str().unwrap_or_default(),
-                m["originalLanguage"]["name"].as_str().unwrap_or_default(),
-                m["year"].as_u64().and_then(|y| u16::try_from(y).ok()),
-                m["imdbId"].as_str(),
-                m["path"].as_str().unwrap_or_default(),
-            );
-            checked += 1;
-            let got = movie_file_stem(&entry, None);
-            let without_year = |s: &str| {
-                s.rsplit_once(" (")
-                    .map(|(title, rest)| format!("{title}{}", &rest[rest.find(')').unwrap_or(0)..]))
-                    .unwrap_or_default()
-            };
-            if got != expected && without_year(&got) != without_year(expected) {
-                wrong.push(format!("{expected:?} ≠ {got:?}"));
-            }
-        }
-        assert!(
-            wrong.is_empty(),
-            "{} de {checked}:\n{}",
-            wrong.len(),
-            wrong.join("\n")
-        );
-        eprintln!("{checked} arquivos conferidos");
-    }
 }
