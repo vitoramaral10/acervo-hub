@@ -45,7 +45,6 @@ version = "0.0.0"
 dependencies = [
  "acervo-parser",
  "fancy-regex",
- "serde_json",
 ]
 
 [[package]]
@@ -141,8 +140,6 @@ name = "acervo-parser"
 version = "0.0.0"
 dependencies = [
  "fancy-regex",
- "serde",
- "serde_json",
  "unicode-normalization",
 ]
 
