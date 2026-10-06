@@ -35,7 +35,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return data as T
 }
 
-export interface Health {
+interface Health {
   ultimo_sucesso: string | null
   ultima_falha: string | null
   ultimo_erro: string | null
@@ -148,7 +148,7 @@ export interface CycleReport {
 }
 
 /** Como uma execução de tarefa terminou. */
-export interface TaskLastRun {
+interface TaskLastRun {
   inicio: string
   fim: string
   duracao_ms: number
@@ -185,7 +185,7 @@ export interface TaskRun extends TaskLastRun {
   detalhe: unknown
 }
 
-export interface MovieFile {
+interface MovieFile {
   nome: string
   tamanho: number
   qualidade: string
@@ -256,7 +256,7 @@ export interface LastSearch {
 // ---------------------------------------------------------------- configuração
 
 /** Segredo como a API o devolve: nunca o valor, só se está definido. */
-export interface Secret {
+interface Secret {
   definida: boolean
 }
 
@@ -498,7 +498,7 @@ export interface BlockedRelease {
   message: string | null
 }
 
-export interface IndexerRules {
+interface IndexerRules {
   prioridade: number
   seeders_minimos: number
 }
@@ -555,7 +555,7 @@ const LIB = '/ui/api/biblioteca'
 
 // ---------------------------------------------------------------- renomear e verificar disco
 
-export interface RenameStep {
+interface RenameStep {
   arquivo_id: number
   de: string
   para: string
@@ -571,7 +571,7 @@ export interface RenameReport {
   plano: RenameStep[]
 }
 
-export interface VerifyNew {
+interface VerifyNew {
   arquivo: string
   tamanho: number
   episodios: number[]
@@ -582,7 +582,7 @@ export interface VerifyNew {
   erro: string | null
 }
 
-export interface VerifyGone {
+interface VerifyGone {
   arquivo_id: number
   arquivo: string
   episodios: number[]
@@ -592,7 +592,7 @@ export interface VerifyGone {
   erro: string | null
 }
 
-export interface VerifySubtitle {
+interface VerifySubtitle {
   arquivo: string
   video: string
   idioma: string | null
@@ -748,7 +748,7 @@ export const library = {
 
 // ---------------------------------------------------------------- séries
 
-export interface EpisodeTotals {
+interface EpisodeTotals {
   quero: number
   /** Os em Quero que já foram ao ar: o que de fato falta. */
   quero_exibidos: number
@@ -780,10 +780,10 @@ export interface SeriesSummary {
   tamanho: number
 }
 
-export type EpisodeState = 'quero' | 'tenho' | 'dispensado'
-export type SkipReason = 'unwanted' | 'deleted' | 'watched'
+type EpisodeState = 'quero' | 'tenho' | 'dispensado'
+type SkipReason = 'unwanted' | 'deleted' | 'watched'
 
-export interface EpisodeFile {
+interface EpisodeFile {
   id: number
   nome: string
   tamanho: number
@@ -817,7 +817,7 @@ export interface Season {
   episodios: Episode[]
 }
 
-export interface SeriesDownload {
+interface SeriesDownload {
   id: number
   release: string
   qualidade: string

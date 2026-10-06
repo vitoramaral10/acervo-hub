@@ -13,7 +13,7 @@ export function formatAirDate(day: string | null | undefined): string {
 }
 
 /** "02/10" no ano corrente, "02/10/2025" fora dele. */
-export function formatEventDay(iso: string | null | undefined, now = new Date()): string | null {
+function formatEventDay(iso: string | null | undefined, now = new Date()): string | null {
   if (!iso) return null
   const date = new Date(iso)
   if (Number.isNaN(date.getTime())) return null

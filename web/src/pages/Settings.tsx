@@ -18,7 +18,7 @@ import { Label } from '@/components/ui/label'
 import { Badge, Skeleton } from '@/components/ui/misc'
 import { api } from '@/lib/api'
 
-export function TmdbSettings() {
+function TmdbSettings() {
   const queryClient = useQueryClient()
   const settings = useQuery({ queryKey: ['configuracoes'], queryFn: api.configuration })
   const [key, setKey] = useState('')

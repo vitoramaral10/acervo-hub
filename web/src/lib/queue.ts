@@ -1,6 +1,6 @@
 import type { QueueItem } from '@/lib/api'
 
-export type QueueTone = 'success' | 'neutral' | 'warning' | 'danger'
+type QueueTone = 'success' | 'neutral' | 'warning' | 'danger'
 
 interface ClientState {
   label: string

@@ -1,12 +1,13 @@
 # acervo-hub
 
-Um serviço único, em Rust, que cuida de uma biblioteca de filmes e séries: busca nos
-indexadores, decide o release, manda ao cliente de torrent, importa o que terminou, mantém
-os metadados, sugere apagar o que já foi assistido e limpa o que sobrou no cliente — no lugar dos
-quatro processos separados (gerenciador de séries, gerenciador de filmes, agregador de
-indexadores e faxineiro) que a stack usual roda conversando por HTTP.
+Um serviço único, em Rust, que cuida de uma biblioteca de filmes e séries: mostra o que
+há para descobrir, busca nos indexadores, decide o release, manda ao cliente de torrent,
+importa o que terminou, mantém os metadados, sugere apagar o que já foi assistido e limpa o
+que sobrou no cliente — no lugar dos processos separados (gerenciador de séries, gerenciador
+de filmes, agregador de indexadores, faxineiro e app de pedidos) que a stack usual roda
+conversando por HTTP.
 
-> **Estado: em produção — filmes, séries, indexadores, limpeza e "Para apagar".**
+> **Estado: em produção — Descobrir, filmes, séries, indexadores, limpeza e "Para apagar".**
 
 Dois princípios mandam no produto:
 

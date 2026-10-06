@@ -22,7 +22,7 @@ import {
 } from '@/lib/api'
 import { Field, Toggle } from '@/pages/settings/Rules'
 
-export const sectionKey = (name: SectionName) => ['configuracao', name] as const
+const sectionKey = (name: SectionName) => ['configuracao', name] as const
 
 /** Lê e grava uma seção; a resposta do PUT já é a seção como ficou. */
 export function useSection<N extends SectionName>(name: N) {

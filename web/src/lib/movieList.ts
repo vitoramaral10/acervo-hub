@@ -8,7 +8,7 @@ export type StateFilter = 'todos' | 'com-arquivo' | 'sem-arquivo' | 'baixando' |
 export type QualityFilter = '2160p' | '1080p' | '720p'
 export type AudioFilter = 'dual' | 'original'
 export type MonitoredFilter = 'todos' | 'sim' | 'nao'
-export type ViewMode = 'poster' | 'tabela'
+type ViewMode = 'poster' | 'tabela'
 
 export interface MovieListPrefs {
   sort: SortKey
@@ -81,7 +81,7 @@ export function normalize(text: string) {
 }
 
 /** Ordem de estante: sem artigo inicial. */
-export function titleKey(movie: Movie) {
+function titleKey(movie: Movie) {
   return normalize(movie.titulo).replace(/^(the|a|an|o|os|as|um|uma)\s+/, '')
 }
 
@@ -97,7 +97,7 @@ export const isDownloading = (movie: Movie) => movie.download?.estado === 'downl
 
 export const hasFailed = (movie: Movie) => movie.download?.estado === 'failed' && !movie.arquivo
 
-export function matchesState(movie: Movie, state: StateFilter): boolean {
+function matchesState(movie: Movie, state: StateFilter): boolean {
   switch (state) {
     case 'todos':
       return true
@@ -117,7 +117,7 @@ export function matchesState(movie: Movie, state: StateFilter): boolean {
 }
 
 /** Resolução vertical da qualidade ("WEBDL-1080p" → 1080); BR-DISK não traz número e é 1080p. */
-export function resolutionOf(quality: string | null | undefined): number | null {
+function resolutionOf(quality: string | null | undefined): number | null {
   if (!quality) return null
   const match = /(\d{3,4})p/i.exec(quality)
   if (match) return Number(match[1])
@@ -134,7 +134,7 @@ const SOURCE_RANK: [RegExp, number][] = [
 ]
 
 /** Resolução primeiro, depois a origem (DVD < HDTV < WEBRip < WEBDL < Bluray < Remux). */
-export function qualityRank(quality: string | null | undefined): number | null {
+function qualityRank(quality: string | null | undefined): number | null {
   const resolution = resolutionOf(quality)
   if (resolution === null || !quality) return null
   const source = SOURCE_RANK.find(([pattern]) => pattern.test(quality))?.[1] ?? 0
@@ -150,7 +150,7 @@ function matchesQuality(movie: Movie, qualities: QualityFilter[]): boolean {
 }
 
 /** Nome ("Portuguese", "Portuguese (Brazil)") ou código ("pt", "pt-BR", "por"). */
-export const isPortuguese = (language: string) => /^(portuguese|portugues|pt\b|por\b)/i.test(normalize(language).trim())
+const isPortuguese = (language: string) => /^(portuguese|portugues|pt\b|por\b)/i.test(normalize(language).trim())
 
 /** Sem idiomas conhecidos (ou só português) não cai em nenhum dos dois grupos. */
 function audioGroups(movie: Movie): AudioFilter[] {
@@ -204,7 +204,7 @@ const time = (iso: string | null | undefined): number | null => {
 }
 
 /** Valor numérico do campo de ordenação; `null` = não tem, vai para o fim. */
-export function sortValue(movie: Movie, sort: SortKey): number | null {
+function sortValue(movie: Movie, sort: SortKey): number | null {
   switch (sort) {
     case 'titulo':
       return 0
@@ -223,7 +223,7 @@ export function sortValue(movie: Movie, sort: SortKey): number | null {
   }
 }
 
-export function sortMovies(movies: Movie[], sort: SortKey, dir: SortDir): Movie[] {
+function sortMovies(movies: Movie[], sort: SortKey, dir: SortDir): Movie[] {
   const sign = dir === 'asc' ? 1 : -1
   const keys = new Map(movies.map((movie) => [movie.id, titleKey(movie)]))
   const byTitle = (a: Movie, b: Movie) => (keys.get(a.id) ?? '').localeCompare(keys.get(b.id) ?? '', 'pt-BR')
@@ -264,7 +264,7 @@ const pickMany = <T extends string>(value: string | null | undefined, options: r
 const VIEWS: { value: ViewMode }[] = [{ value: 'poster' }, { value: 'tabela' }]
 const DIRS: { value: SortDir }[] = [{ value: 'asc' }, { value: 'desc' }]
 
-export function prefsFromParams(params: URLSearchParams): MovieListPrefs {
+function prefsFromParams(params: URLSearchParams): MovieListPrefs {
   const sort = pick(params.get('ordem'), SORTS, DEFAULT_PREFS.sort)
   return {
     sort,
@@ -279,7 +279,7 @@ export function prefsFromParams(params: URLSearchParams): MovieListPrefs {
 }
 
 /** Só o que difere do padrão (o padrão da direção depende do campo, ver `defaultDir`). */
-export function prefsToParams(prefs: MovieListPrefs): URLSearchParams {
+function prefsToParams(prefs: MovieListPrefs): URLSearchParams {
   const params = new URLSearchParams()
   if (prefs.sort !== DEFAULT_PREFS.sort) params.set('ordem', prefs.sort)
   if (prefs.dir !== defaultDir(prefs.sort)) params.set('dir', prefs.dir)
@@ -293,7 +293,7 @@ export function prefsToParams(prefs: MovieListPrefs): URLSearchParams {
 }
 
 /** Query do hash atual (`#filmes?ordem=ano`). */
-export function hashParams(hash = window.location.hash): URLSearchParams {
+function hashParams(hash = window.location.hash): URLSearchParams {
   const at = hash.indexOf('?')
   return new URLSearchParams(at === -1 ? '' : hash.slice(at + 1))
 }

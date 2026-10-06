@@ -9,12 +9,6 @@ import { cn } from '@/lib/utils'
 
 export const DELETION_KEY = ['para-apagar'] as const
 
-/** A chave de um alvo, a mesma que o servidor devolve em `chave`. */
-export function targetKey(target: DeletionTarget): string {
-  if ('filme' in target) return `filme-${target.filme}`
-  return target.temporada === undefined ? `serie-${target.serie}` : `serie-${target.serie}-t${target.temporada}`
-}
-
 /** As chaves marcadas para apagar; a lista é pequena e serve às telas de filme, de série e à "Para apagar". */
 export function useMarkedKeys(): Set<string> {
   const marks = useQuery({ queryKey: DELETION_KEY, queryFn: deletionApi.list })
