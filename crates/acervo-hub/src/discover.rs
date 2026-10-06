@@ -266,6 +266,7 @@ async fn details(
     let genres = genres(&tmdb).await.map_err(|e| fail(anyhow_bad(&e)))?;
     let mut value = item_json(&detail.item, &HashMap::new());
     let extra = json!({
+        "generos": detail.genres, "tagline": detail.tagline, "backdrop": detail.backdrop,
         "duracao": detail.runtime, "temporadas": detail.number_of_seasons, "episodios": detail.number_of_episodes,
         "status": detail.status, "diretores": detail.directors, "criadores": detail.creators,
         "elenco": detail.cast.iter().map(|person| json!({"nome": person.name, "personagem": person.character, "foto": person.profile})).collect::<Vec<_>>(),
