@@ -16,6 +16,7 @@ struct Counting {
     name: String,
     calls: AtomicUsize,
     fail: AtomicBool,
+    releases: usize,
 }
 
 impl Default for Counting {
@@ -24,6 +25,7 @@ impl Default for Counting {
             name: "tracker".into(),
             calls: AtomicUsize::new(0),
             fail: AtomicBool::new(false),
+            releases: 1,
         }
     }
 }
@@ -45,7 +47,7 @@ impl Indexer for Counting {
                 kind: "timeout",
             });
         }
-        Ok(vec![Release {
+        let release = Release {
             indexer: "tracker".into(),
             guid: "1".into(),
             title: format!("{} 2025 1080p", query.term.clone().unwrap_or_default()),
@@ -58,7 +60,13 @@ impl Indexer for Counting {
             grabs: None,
             categories: vec![2000],
             tags: Vec::new(),
-        }])
+        };
+        Ok((0..self.releases)
+            .map(|id| Release {
+                guid: id.to_string(),
+                ..release.clone()
+            })
+            .collect())
     }
 }
 
@@ -107,7 +115,7 @@ async fn pedidos_simultaneos_iguais_viram_uma_requisicao() {
 }
 
 #[tokio::test]
-async fn paginacao_diferente_usa_a_mesma_resposta() {
+async fn limites_diferentes_usam_a_mesma_resposta() {
     let indexer = Arc::new(Counting::default());
     let catalog = Catalog::new([entry(Arc::clone(&indexer))]).unwrap();
     catalog
@@ -115,7 +123,7 @@ async fn paginacao_diferente_usa_a_mesma_resposta() {
         .await
         .unwrap();
     catalog
-        .search(ALL, &movie("Filme").with_offset(50))
+        .search(ALL, &movie("Filme").with_limit(50))
         .await
         .unwrap();
     assert_eq!(indexer.calls.load(Ordering::SeqCst), 1);
@@ -159,4 +167,53 @@ async fn busca_termina_mesmo_se_quem_pediu_desistir() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     catalog.search(ALL, &movie("Filme")).await.unwrap();
     assert_eq!(indexer.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn busca_interna_devolve_mais_de_cem_e_limite_so_corta_quando_pedido() {
+    let indexer = Arc::new(Counting {
+        releases: 150,
+        ..Counting::default()
+    });
+    let catalog = Catalog::new([entry(Arc::clone(&indexer))]).unwrap();
+    let query = movie("Filme");
+    let all = catalog.search(ALL, &query).await.unwrap();
+    assert_eq!(all.releases.len(), 150);
+    let limited = catalog
+        .search(ALL, &query.clone().with_limit(100))
+        .await
+        .unwrap();
+    assert_eq!(limited.releases.len(), 100);
+    assert_eq!(limited.releases, all.releases[..100]);
+    assert_eq!(
+        catalog
+            .search(ALL, &query.clone().with_limit(0))
+            .await
+            .unwrap()
+            .releases
+            .len(),
+        0
+    );
+    assert_eq!(
+        catalog.search(ALL, &query).await.unwrap().releases.len(),
+        150
+    );
+    assert_eq!(indexer.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn ui_pode_ser_nome_de_indexador_e_all_continua_reservado() {
+    let indexer = Arc::new(Counting {
+        name: "ui".into(),
+        ..Counting::default()
+    });
+    assert!(Catalog::new([entry(indexer)]).is_ok());
+    let indexer = Arc::new(Counting {
+        name: ALL.into(),
+        ..Counting::default()
+    });
+    assert_eq!(
+        Catalog::new([entry(indexer)]).unwrap_err(),
+        acervo_api::CatalogError::ReservedName
+    );
 }

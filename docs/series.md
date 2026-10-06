@@ -5,9 +5,8 @@ por espaço, importação por hardlink, remoção, sugestão de assistidos), com
 motivo de existir:
 
 1. **Apagar um episódio é um clique, e ele não volta.** Cada episódio guarda o motivo de
-   não ser buscado (`skip`): `unwanted` (nunca quis), `deleted` (apagado na tela) ou
-   `watched` (apagado por assistido, do tempo em que assistido saía sozinho). Só "Quero
-   de novo" o devolve à busca.
+   não ser buscado (`skip`): `unwanted` (nunca quis) ou `deleted` (apagado na tela).
+   Só "Quero de novo" o devolve à busca.
 2. **Pacote de temporada serve para um episódio só.** No fim da temporada o tracker só tem
    o pacote, e às vezes apaga os avulsos. A decisão aceita o pacote se ele cobre ao menos
    um episódio que falta, e o grab manda prioridade zero ao qBittorrent para os arquivos

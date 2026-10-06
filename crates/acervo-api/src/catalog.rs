@@ -1,4 +1,4 @@
-//! Os indexadores servidos e o despacho de uma consulta entre eles.
+//! Os indexadores cadastrados e o despacho de uma consulta entre eles.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
@@ -17,12 +17,6 @@ use crate::SearchError;
 /// Nome reservado para a busca em todos os indexadores de uma vez.
 pub const ALL: &str = "all";
 
-/// Nome reservado para as rotas da interface web.
-pub const UI: &str = "ui";
-
-/// Maior página que uma busca devolve.
-pub(crate) const MAX_RESULTS: u16 = 100;
-
 /// Um indexador e as capacidades que ele anunciou.
 ///
 /// As capacidades vêm de fora porque cada tipo as obtém de um jeito: a
@@ -37,7 +31,7 @@ pub struct Entry {
 pub enum CatalogError {
     #[error("nome de indexador inválido `{0}`: use letras minúsculas, números e hífens")]
     InvalidName(String),
-    #[error("`{ALL}` e `{UI}` são nomes reservados")]
+    #[error("`{ALL}` é nome reservado")]
     ReservedName,
     #[error("indexador `{0}` registrado duas vezes")]
     Duplicate(String),
@@ -284,7 +278,7 @@ impl Catalog {
             {
                 return Err(CatalogError::InvalidName(name));
             }
-            if name == ALL || name == UI {
+            if name == ALL {
                 return Err(CatalogError::ReservedName);
             }
             if catalog.contains_key(&name) {
@@ -465,7 +459,7 @@ impl Catalog {
         {
             return Err(CatalogError::InvalidName(name));
         }
-        if name == ALL || name == UI {
+        if name == ALL {
             return Err(CatalogError::ReservedName);
         }
         let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
@@ -610,13 +604,12 @@ impl Catalog {
         Ok(merge(targets.iter().map(|entry| &entry.capabilities)))
     }
 
-    /// Consulta os indexadores elegíveis em paralelo e corta a página.
+    /// Consulta os indexadores elegíveis em paralelo e ordena os releases por data.
     ///
     /// Cada indexador recebe a consulta reduzida ao que anunciou saber
-    /// responder; o que não sabe responder nem é consultado. Paginação e
-    /// limite são aplicados aqui, sobre a primeira página de cada um: nem todo
-    /// indexador pagina, e pedir a página 2 a quem não pagina devolveria a 1
-    /// de novo — duplicata que o consumidor tomaria por release nova.
+    /// responder; o que não sabe responder nem é consultado. O limite, quando
+    /// pedido, é aplicado aqui sobre os resultados reunidos. Sem limite, a
+    /// busca devolve tudo que os indexadores responderam.
     ///
     /// # Errors
     ///
@@ -680,9 +673,9 @@ impl Catalog {
 
         page.releases
             .sort_by_key(|release| Reverse(release.published));
-        let offset = usize::try_from(query.offset).unwrap_or(usize::MAX);
-        let limit = usize::from(query.limit.unwrap_or(MAX_RESULTS));
-        page.releases = page.releases.into_iter().skip(offset).take(limit).collect();
+        if let Some(limit) = query.limit {
+            page.releases.truncate(usize::from(limit));
+        }
         Ok(page)
     }
 }
@@ -749,7 +742,6 @@ fn adapt(query: &SearchQuery, caps: &Capabilities) -> Option<SearchQuery> {
     let keeps = |param: &str| support.supported_params.contains(param);
 
     let mut adapted = query.clone();
-    adapted.offset = 0;
     adapted.limit = None;
     if !keeps("q") {
         adapted.term = None;
@@ -947,10 +939,10 @@ mod tests {
     }
 
     #[test]
-    fn paginacao_nunca_e_repassada() {
-        let query = SearchQuery::general("x").with_offset(100).with_limit(50);
+    fn limite_nunca_e_repassado() {
+        let query = SearchQuery::general("x").with_limit(50);
         let adapted = adapt(&query, &caps(&["q"])).unwrap();
-        assert_eq!((adapted.offset, adapted.limit), (0, None));
+        assert_eq!(adapted.limit, None);
     }
 
     #[test]

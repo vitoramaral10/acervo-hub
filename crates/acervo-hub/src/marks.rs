@@ -516,7 +516,7 @@ async fn suggestions(State(web): Shared, headers: HeaderMap) -> WebResult {
     };
     let client = JellyfinClient::new(&jellyfin.url, &jellyfin.api_key, config.http_timeout())
         .map_err(|e| fail(bad(e)))?;
-    let grace = jellyfin.delete_watched_after_minutes;
+    let grace = jellyfin.carencia_sugestao_minutos;
     let (movie_found, season_found) = tokio::try_join!(
         crate::watched::suggest(store, &client, grace),
         crate::series::watched::suggest(store, &client, grace)
@@ -692,7 +692,6 @@ mod tests {
                 date_added: Some("2026-08-01T00:00:00Z".into()),
             }),
             runtime: 0,
-            secondary_year: None,
             clean_title: None,
             alternate_titles: Vec::new(),
             in_cinemas: None,
@@ -1036,7 +1035,7 @@ mod tests {
         settings
             .save_section(
                 crate::config::JELLYFIN,
-                json!({ "url": jellyfin.uri(), "api_key": "x", "delete_watched_after_minutes": 60 }),
+                json!({ "url": jellyfin.uri(), "api_key": "x", "carencia_sugestao_minutos": 60 }),
             )
             .await
             .unwrap();

@@ -4,8 +4,8 @@
 //! Porte do motor do gerenciador de filmes que este projeto substitui, na
 //! mesma ordem: ler o nome, casar com o filme, agregar os idiomas, avaliar as
 //! especificações e ordenar. Nada aqui faz IO — a decisão recebe a biblioteca,
-//! os perfis e os releases prontos, e é conferida contra a do gerenciador num
-//! corpus de buscas reais (teste `corpus`, ignorado por padrão).
+//! os perfis e os releases prontos. O porte foi conferido em buscas reais, e
+//! os testes de unidade cobrem os casos da referência.
 //!
 //! Fila, lista de bloqueio e espaço livre chegam prontos no alvo e no motor:
 //! quem chama lê o estado, a decisão só o aplica.
@@ -215,7 +215,6 @@ pub struct Target {
     /// original, os alternativos e as traduções.
     pub clean_titles: Vec<String>,
     pub year: Option<u16>,
-    pub secondary_year: Option<u16>,
     pub tmdb_id: u32,
     pub imdb_id: Option<String>,
     pub original_language: Language,
@@ -648,7 +647,6 @@ mod tests {
             title: title.into(),
             clean_titles: vec![acervo_parser::clean_movie_title(title)],
             year: Some(2025),
-            secondary_year: None,
             tmdb_id: u32::try_from(id).unwrap() * 100,
             imdb_id: Some(imdb.into()),
             original_language: Language::English,

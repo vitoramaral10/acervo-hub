@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use acervo_core::{Allocated, DownloadHash, InstanceName};
+use acervo_core::{Allocated, DownloadHash};
 
 /// Uma ação a executar.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,15 +76,6 @@ pub struct Skipped {
 /// O ciclo inteiro foi abortado. Nenhuma ação do plano vale.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Abort {
-    /// Uma instância não respondeu. Sem a fila dela, downloads que ela conhece
-    /// pareceriam fora de fila — e seriam apagados.
-    InstanceUnreachable {
-        instance: InstanceName,
-        reason: String,
-    },
-    /// Instância respondeu, mas diz não conhecer nenhuma obra. Meio-viva é pior
-    /// que morta: responde rápido e mente.
-    EmptyInventory { instance: InstanceName },
     /// O lote passou do teto absoluto.
     BatchTooLarge {
         reclaim: Allocated,
@@ -103,12 +94,6 @@ pub enum Abort {
 impl fmt::Display for Abort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InstanceUnreachable { instance, reason } => {
-                write!(f, "instância `{instance}` não respondeu: {reason}")
-            }
-            Self::EmptyInventory { instance } => {
-                write!(f, "instância `{instance}` não reportou nenhuma obra")
-            }
             Self::BatchTooLarge { reclaim, limit } => {
                 write!(f, "lote de {reclaim} passa do teto de {limit}")
             }

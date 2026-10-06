@@ -192,7 +192,6 @@ function ServerForm({ data, save, saving }: FormProps<'servidor'>) {
   const [key, setKey] = useState('')
   const [generated, setGenerated] = useState(false)
   const [catalogs, setCatalogs] = useState(data.catalogos.join('\n'))
-  const [reserve, setReserve] = useState(data.catalogos_reserva.join('\n'))
   const [definitionsUrl, setDefinitionsUrl] = useState(data.definicoes_url)
   const [timeout, setTimeoutSeconds] = useState(String(data.http_timeout_seconds))
   const [xemUrl, setXemUrl] = useState(data.xem_url)
@@ -209,7 +208,6 @@ function ServerForm({ data, save, saving }: FormProps<'servidor'>) {
         event.preventDefault()
         const value: SectionInput<'servidor'> = {
           catalogos: lines(catalogs),
-          catalogos_reserva: lines(reserve),
           definicoes_url: definitionsUrl.trim(),
           http_timeout_seconds: whole(timeout),
           xem_url: xemUrl.trim(),
@@ -276,19 +274,6 @@ function ServerForm({ data, save, saving }: FormProps<'servidor'>) {
           onChange={setCatalogs}
           placeholder="/etc/acervo-hub/definicoes"
           describedBy="servidor-catalogos-ajuda"
-        />
-      </Field>
-      <Field
-        id="servidor-reserva"
-        label="Diretórios de reserva (catálogo antigo)"
-        help="Um por linha. Valem abaixo das definições que a tarefa «Atualização das definições» baixa do repositório oficial; servem enquanto ela não rodou."
-      >
-        <LinesInput
-          id="servidor-reserva"
-          value={reserve}
-          onChange={setReserve}
-          placeholder="/etc/acervo-hub/catalogo"
-          describedBy="servidor-reserva-ajuda"
         />
       </Field>
       <Field
@@ -478,14 +463,14 @@ export function DownloadClientSettings() {
 function JellyfinForm({ data, save, saving }: FormProps<'jellyfin'>) {
   const [url, setUrl] = useState(data.url)
   const [key, setKey] = useState('')
-  const [grace, setGrace] = useState(String(data.delete_watched_after_minutes))
+  const [grace, setGrace] = useState(String(data.carencia_sugestao_minutos))
   return (
     <form
       noValidate
       className="mt-6 grid gap-4"
       onSubmit={(event) => {
         event.preventDefault()
-        const value: SectionInput<'jellyfin'> = { url: url.trim(), delete_watched_after_minutes: whole(grace) }
+        const value: SectionInput<'jellyfin'> = { url: url.trim(), carencia_sugestao_minutos: whole(grace) }
         if (key.trim()) value.api_key = key.trim()
         save(value)
       }}
@@ -516,7 +501,7 @@ function JellyfinForm({ data, save, saving }: FormProps<'jellyfin'>) {
       </Field>
       <Field
         id="jellyfin-carencia"
-        label="Carência depois de assistido (minutos)"
+        label="Carência antes de sugerir apagar (minutos)"
         help="Só depois dela o assistido vira sugestão de apagar: dá tempo de marcar como favorito o que é para ficar. Favorito de qualquer usuário nunca é sugerido."
       >
         <Input

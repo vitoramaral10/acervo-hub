@@ -7,8 +7,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use acervo_core::{
-    Allocated, Apparent, Download, DownloadHash, DownloadState, FileFacts, InstanceName,
-    InstanceSnapshot, Inventory, QueueItem, QueueItemId, UnreachableInstance, WorkId,
+    Allocated, Apparent, Download, DownloadHash, DownloadState, FileFacts, Inventory,
 };
 use acervo_janitor::{Abort, Action, Policy, SkipReason, StrikeLedger, reconcile};
 
@@ -44,24 +43,6 @@ fn seed(hash: &str, links: u64, bytes: u64) -> Download {
     }
 }
 
-fn snapshot(nome: &str, fila: Vec<QueueItem>) -> InstanceSnapshot {
-    InstanceSnapshot {
-        instance: InstanceName::new(nome),
-        queue: fila,
-        known_works: 134,
-    }
-}
-
-fn item(id: i64, instancia: &str, hash: Option<&str>, obra: Option<i64>) -> QueueItem {
-    QueueItem {
-        id: QueueItemId(id),
-        instance: InstanceName::new(instancia),
-        title: format!("item {id}"),
-        download: hash.map(DownloadHash::new),
-        work: obra.map(WorkId),
-    }
-}
-
 fn politica_aplicando() -> Policy {
     Policy {
         private_seed_grace: None,
@@ -77,7 +58,6 @@ fn acervo_inteiro_com_hardlink_nao_gera_nenhuma_remocao() {
     // biblioteca, ou seja, liberariam zero byte. Só não aconteceu porque a
     // primeira volta foi em dry run.
     let mut inv = Inventory::new(Allocated::from_bytes(1743 * GIB));
-    inv.snapshots.push(snapshot("filmes", vec![]));
     inv.downloads = (0..129)
         .map(|i| seed(&format!("hash{i}"), 2, 12 * GIB))
         .collect();
@@ -102,50 +82,15 @@ fn acervo_inteiro_com_hardlink_nao_gera_nenhuma_remocao() {
 }
 
 #[test]
-fn instancia_fora_do_ar_aborta_o_ciclo_inteiro() {
-    // O incidente: uma instância travou e o ciclo passou dois dias falhando.
-    // O ponto do teste não é que ele falha — é que ele falha ANTES de decidir
-    // qualquer coisa. Sem a fila dessa instância, o seed abaixo pareceria
-    // órfão e seria apagado.
-    let mut inv = Inventory::new(Allocated::from_bytes(100 * GIB));
-    inv.snapshots.push(snapshot("series", vec![]));
-    inv.unreachable.push(UnreachableInstance {
-        instance: InstanceName::new("filmes"),
-        reason: "timeout".into(),
-    });
-    inv.downloads = vec![seed("orfao", 1, 40 * GIB)];
-
-    let erro = reconcile(
-        &inv,
+fn inventario_vazio_e_um_estado_valido() {
+    let plan = reconcile(
+        &Inventory::new(Allocated::ZERO),
         &politica_aplicando(),
         &mut StrikeLedger::new(),
         agora(),
     )
-    .expect_err("instância fora do ar tem de abortar");
-
-    assert!(matches!(erro, Abort::InstanceUnreachable { .. }));
-}
-
-#[test]
-fn instancia_meio_viva_aborta_o_ciclo() {
-    // Responde rápido e diz não conhecer nenhuma obra. Sem esta trava, todo o
-    // acervo vira órfão de uma vez.
-    let mut inv = Inventory::new(Allocated::from_bytes(100 * GIB));
-    inv.snapshots.push(InstanceSnapshot {
-        instance: InstanceName::new("filmes"),
-        queue: vec![item(1, "filmes", Some("aa"), None)],
-        known_works: 0,
-    });
-
-    let erro = reconcile(
-        &inv,
-        &politica_aplicando(),
-        &mut StrikeLedger::new(),
-        agora(),
-    )
-    .expect_err("inventário vazio tem de abortar");
-
-    assert!(matches!(erro, Abort::EmptyInventory { .. }));
+    .expect("inventário vazio não aborta");
+    assert!(plan.is_empty());
 }
 
 #[test]
@@ -153,10 +98,7 @@ fn item_em_fila_nunca_e_avaliado_como_seed_solto() {
     // Quem está na fila do acervo é download em andamento: sem esta
     // separação, ele entraria na limpeza.
     let mut inv = Inventory::new(Allocated::from_bytes(100 * GIB));
-    inv.snapshots.push(snapshot(
-        "filmes",
-        vec![item(1, "filmes", Some("aa"), Some(42))],
-    ));
+    inv.queued_hashes.insert(DownloadHash::new("aa"));
     inv.downloads = vec![seed("aa", 1, 4 * GIB)];
 
     let plano = reconcile(
@@ -175,7 +117,6 @@ fn item_em_fila_nunca_e_avaliado_como_seed_solto() {
 #[test]
 fn arquivo_mexido_na_ultima_janela_e_intocavel() {
     let mut inv = Inventory::new(Allocated::from_bytes(100 * GIB));
-    inv.snapshots.push(snapshot("filmes", vec![]));
     inv.downloads = vec![Download {
         files: vec![arquivo(1, 4 * GIB, HORA)],
         ..seed("aa", 1, 4 * GIB)
@@ -198,7 +139,6 @@ fn lote_grande_demais_aborta_em_vez_de_apagar_parte() {
     // Trava proporcional: 40 GB sem vínculo numa biblioteca de 100 GB são 40%,
     // acima do teto de 30%. Aborta o ciclo inteiro, não apaga "só um pouco".
     let mut inv = Inventory::new(Allocated::from_bytes(100 * GIB));
-    inv.snapshots.push(snapshot("filmes", vec![]));
     inv.downloads = vec![seed("aa", 1, 40 * GIB)];
 
     let erro = reconcile(
@@ -218,7 +158,6 @@ fn biblioteca_que_mede_zero_aborta_em_vez_de_liberar_a_trava() {
     // parecer 0% do acervo — desligando a trava proporcional exatamente no
     // cenário em que tudo parece órfão.
     let mut inv = Inventory::new(Allocated::ZERO);
-    inv.snapshots.push(snapshot("filmes", vec![]));
     inv.downloads = vec![seed("aa", 1, 4 * GIB)];
 
     let erro = reconcile(
@@ -239,7 +178,6 @@ fn download_manual_sem_hardlink_nunca_e_apagado() {
     let mut manual = seed("manual", 1, 50 * GIB);
     manual.category = "cursos".into();
     let mut inv = Inventory::new(Allocated::from_bytes(1743 * GIB));
-    inv.snapshots.push(snapshot("filmes", vec![]));
     inv.downloads = vec![manual];
 
     let plano = reconcile(
@@ -257,7 +195,6 @@ fn download_manual_sem_hardlink_nunca_e_apagado() {
 #[test]
 fn sem_categorias_gerenciadas_a_regra_de_hardlink_nao_apaga_nada() {
     let mut inv = Inventory::new(Allocated::from_bytes(1743 * GIB));
-    inv.snapshots.push(snapshot("filmes", vec![]));
     inv.downloads = vec![seed("orfao", 1, GIB)];
     let politica = Policy {
         managed_categories: Vec::new(),
@@ -279,9 +216,9 @@ fn sem_dono(hash: &str, bytes: u64) -> Download {
     }
 }
 
-fn inventario_com(downloads: Vec<Download>, fila: Vec<QueueItem>) -> Inventory {
+fn inventario_com(downloads: Vec<Download>, fila: Vec<DownloadHash>) -> Inventory {
     let mut inv = Inventory::new(Allocated::from_bytes(1000 * GIB));
-    inv.snapshots.push(snapshot("acervo", fila));
+    inv.queued_hashes = fila.into_iter().collect();
     inv.downloads = downloads;
     inv
 }
@@ -303,7 +240,7 @@ fn torrent_de_grab_em_andamento_nunca_e_candidato_nem_parado() {
     // tag da fila) lido como "sem dono" e apagado no terceiro ciclo.
     let inv = inventario_com(
         vec![sem_dono("emandamento", 10 * GIB)],
-        vec![item(1, "acervo", Some("emandamento"), Some(7))],
+        vec![DownloadHash::new("emandamento")],
     );
     let mut ledger = StrikeLedger::new();
 
@@ -346,7 +283,7 @@ fn incompleto_que_volta_a_ter_grab_perde_os_strikes() {
     let solto = inventario_com(vec![sem_dono("volta", GIB)], vec![]);
     let dono = inventario_com(
         vec![sem_dono("volta", GIB)],
-        vec![item(1, "acervo", Some("volta"), Some(7))],
+        vec![DownloadHash::new("volta")],
     );
 
     reconcile(&solto, &politica, &mut ledger, agora()).unwrap();
@@ -477,7 +414,6 @@ fn politica_de_seed() -> Policy {
 /// Roda a limpeza e diz se o seed saiu.
 fn sai(download: Download, politica: &Policy) -> bool {
     let mut inv = Inventory::new(Allocated::from_bytes(100 * GIB));
-    inv.snapshots.push(snapshot("filmes", vec![]));
     inv.downloads = vec![download];
     let plano = reconcile(&inv, politica, &mut StrikeLedger::new(), agora()).expect("sem abort");
     if plano.actions.is_empty() {
@@ -543,7 +479,6 @@ fn publico_continua_sem_carencia() {
 #[test]
 fn privado_com_hardlink_nunca_sai() {
     let mut inv = Inventory::new(Allocated::from_bytes(100 * GIB));
-    inv.snapshots.push(snapshot("filmes", vec![]));
     inv.downloads = vec![Download {
         files: vec![arquivo(2, 4 * GIB, 90 * HORA)],
         ..privado(9.0, 500, Some(500))

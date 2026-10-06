@@ -126,7 +126,7 @@ impl Registry {
     }
 }
 
-/// O catálogo de definições: as três fontes e as definições fixadas nos
+/// O catálogo de definições: as duas fontes e as definições fixadas nos
 /// cadastros, mesmo fora delas.
 #[must_use]
 pub fn scan(
@@ -134,11 +134,7 @@ pub fn scan(
     rows: &[DefinitionRow],
     records: &BTreeMap<String, IndexerRecord>,
 ) -> Definitions {
-    let mut definitions = Definitions::assemble(
-        &config.server.catalogs,
-        rows,
-        &config.server.reserve_catalogs,
-    );
+    let mut definitions = Definitions::assemble(&config.server.catalogs, rows);
     for record in records.values() {
         if let Some(path) = &record.definition {
             definitions.include(Path::new(path));
@@ -568,27 +564,27 @@ mod tests {
             return;
         };
         let local = Dir::new("update-local", &[("l.yml", yaml("l", "L local"))]);
-        let reserve = Dir::new(
-            "update-reserva",
-            &[
-                ("a.yml", yaml("a", "A velha")),
-                ("b.yml", yaml("b", "B velha")),
-            ],
-        );
+
         let mut config = Config::default();
         config.server.catalogs = vec![local.0.clone()];
-        config.server.reserve_catalogs = vec![reserve.0.clone()];
         let pinned = |name: &str, path: PathBuf| IndexerRecord {
             definition: Some(path.display().to_string()),
             ..record(name, &[])
         };
         let records = vec![
-            // Fixado na reserva: segue a precedência.
-            pinned("a", reserve.0.join("a.yml")),
+            // Definição do banco: a atualização a alcança.
+            record("a", &[]),
             // Fixado no diretório local: nunca é trocado.
             pinned("l", local.0.join("l.yml")),
         ];
-        let registry = Registry::new(&config, &[], records.clone());
+        let old_yaml = yaml("a", "A velha");
+        let old = DefinitionRow {
+            id: "a".into(),
+            sha: crate::definitions::sha(&old_yaml),
+            yaml: old_yaml,
+            updated_at: "t0".into(),
+        };
+        let registry = Registry::new(&config, &[old], records.clone());
         let catalog = Catalog::new(Vec::new()).unwrap();
         for record in &records {
             catalog

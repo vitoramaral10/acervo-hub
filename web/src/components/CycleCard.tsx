@@ -42,20 +42,6 @@ export function CycleCard({ report }: { report: CycleReport }) {
         <Fact label="Ilegíveis" value={formatCount(report.ilegiveis.length)} />
       </dl>
 
-      <div className="grid gap-2">
-        <h3 className="text-xs font-medium text-content-subtle">Fila lida</h3>
-        <ul className="flex flex-wrap gap-2">
-          {report.instancias.map((instance) => (
-            <li key={instance.nome}>
-              <Badge tone={instance.erro ? 'danger' : 'neutral'} className="py-1">
-                {instance.nome}:{' '}
-                {instance.erro ?? `${formatCount(instance.fila)} na fila, ${formatCount(instance.obras)} obras`}
-              </Badge>
-            </li>
-          ))}
-        </ul>
-      </div>
-
       {report.acoes.length > 0 && (
         <div className="grid gap-2">
           <h3 className="text-xs font-medium text-content-subtle">Ações</h3>

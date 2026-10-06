@@ -28,32 +28,24 @@ pub struct EpisodeViewing {
     pub series_favorite: bool,
 }
 
-/// O destino de um arquivo de série com algum episódio assistido.
+/// Candidato a sugestão: assistido por `user` em `at`, passada a carência.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Verdict {
-    /// A regra apagaria: `user` foi o último a assistir, em `at`.
-    Delete { user: String, at: OffsetDateTime },
-    /// Fica: o episódio ou a série é favorito de alguém.
-    Favorite { user: String },
-    /// Fica até `until`.
-    InGrace { until: OffsetDateTime },
-    /// Fica: `user` assistiu, mas não se sabe quando.
-    NoDate { user: String },
-    /// Fica: multi-episódio com episódio ainda não assistido.
-    Partial,
+pub struct Candidate {
+    pub user: String,
+    pub at: OffsetDateTime,
 }
 
 /// A regra, sem rede nem banco, para uma série: `files` são os arquivos,
 /// cada um com os `(temporada, número)` que cobre; `viewings`, o que os
-/// usuários fizeram com os episódios dela. Só entra arquivo com algum
-/// episódio assistido.
+/// usuários fizeram com os episódios dela. Só entra arquivo com todos
+/// os episódios assistidos, sem favorito e passada a carência.
 #[must_use]
 pub fn select(
     files: &[(i64, Vec<(u16, u16)>)],
     viewings: &[EpisodeViewing],
     now: OffsetDateTime,
     grace: Duration,
-) -> BTreeMap<i64, Verdict> {
+) -> BTreeMap<i64, Candidate> {
     let series_fan = viewings.iter().find(|v| v.series_favorite);
     let of = |season: u16, number: u16| -> Vec<&EpisodeViewing> {
         viewings
@@ -70,44 +62,30 @@ pub fn select(
                 return None;
             }
             // Favorito de qualquer usuário segura, mesmo de quem não assistiu.
-            if let Some(fan) =
-                series_fan.or_else(|| views.iter().flatten().copied().find(|v| v.favorite))
-            {
-                return Some((
-                    *file_id,
-                    Verdict::Favorite {
-                        user: fan.user.clone(),
-                    },
-                ));
+            if series_fan.is_some() || views.iter().flatten().any(|v| v.favorite) {
+                return None;
             }
             if views.iter().any(|v| !v.iter().any(|v| v.played)) {
-                return Some((*file_id, Verdict::Partial));
+                return None;
             }
             let played: Vec<&&EpisodeViewing> =
                 views.iter().flatten().filter(|v| v.played).collect();
-            if let Some(undated) = played.iter().find(|v| v.last_played.is_none()) {
-                return Some((
-                    *file_id,
-                    Verdict::NoDate {
-                        user: undated.user.clone(),
-                    },
-                ));
+            if played.iter().any(|v| v.last_played.is_none()) {
+                return None;
             }
             let (user, at) = played
                 .iter()
                 .filter_map(|v| v.last_played.map(|at| (&v.user, at)))
                 .max_by_key(|(_, at)| *at)?;
-            let verdict = if now - at > grace {
-                Verdict::Delete {
-                    user: user.clone(),
-                    at,
-                }
-            } else {
-                Verdict::InGrace {
-                    until: at.checked_add(grace).unwrap_or(at),
-                }
-            };
-            Some((*file_id, verdict))
+            (now - at > grace).then(|| {
+                (
+                    *file_id,
+                    Candidate {
+                        user: user.clone(),
+                        at,
+                    },
+                )
+            })
         })
         .collect()
 }
@@ -179,7 +157,7 @@ pub struct SeasonSuggestion {
     pub at: OffsetDateTime,
 }
 
-/// As temporadas de uma série que viram sugestão, a partir dos vereditos de
+/// As temporadas de uma série que viram sugestão, a partir dos candidatos de
 /// [`select`], sem rede nem banco. Temporada com algum arquivo fora da regra
 /// (favorito, na carência, sem data, multi-episódio pela metade, nunca
 /// assistido, ou que chegou depois de assistirem) fica de fora inteira:
@@ -188,7 +166,7 @@ pub struct SeasonSuggestion {
 #[must_use]
 pub fn season_suggestions(
     entry: &CatalogSeries,
-    verdicts: &BTreeMap<i64, Verdict>,
+    candidates: &BTreeMap<i64, Candidate>,
 ) -> Vec<SeasonSuggestion> {
     let mut seasons: BTreeMap<u16, BTreeSet<i64>> = BTreeMap::new();
     for episode in &entry.episodes {
@@ -206,9 +184,7 @@ pub fn season_suggestions(
             let mut size = 0;
             for file_id in &file_ids {
                 let file = entry.files.iter().find(|f| f.id == *file_id)?;
-                let Verdict::Delete { user, at } = verdicts.get(file_id)? else {
-                    return None;
-                };
+                let Candidate { user, at } = candidates.get(file_id)?;
                 if !crate::watched::watched_after_added(*at, file.file.date_added.as_deref()) {
                     return None;
                 }
@@ -230,13 +206,13 @@ pub fn season_suggestions(
         .collect()
 }
 
-/// Os vereditos de cada arquivo da série.
-fn verdicts(
+/// Os candidatos de cada arquivo da série.
+fn candidates(
     entry: &CatalogSeries,
     viewings: &[EpisodeViewing],
     now: OffsetDateTime,
     grace: Duration,
-) -> BTreeMap<i64, Verdict> {
+) -> BTreeMap<i64, Candidate> {
     let files: Vec<(i64, Vec<(u16, u16)>)> = entry
         .files
         .iter()
@@ -276,7 +252,7 @@ pub async fn suggest(
         .iter()
         .filter_map(|entry| Some((entry, by_series.get(&entry.id)?)))
         .flat_map(|(entry, viewings)| {
-            season_suggestions(entry, &verdicts(entry, viewings, now, grace))
+            season_suggestions(entry, &candidates(entry, viewings, now, grace))
         })
         .collect())
 }
@@ -307,14 +283,14 @@ pub(crate) mod tests {
     fn decide(
         files: &[(i64, Vec<(u16, u16)>)],
         viewings: &[EpisodeViewing],
-    ) -> BTreeMap<i64, Verdict> {
+    ) -> BTreeMap<i64, Candidate> {
         select(files, viewings, at(NOW), Duration::minutes(60))
     }
 
     #[test]
     fn assistido_passada_a_carencia_sai_e_dentro_dela_fica() {
         let files = [(1, vec![(1, 1)]), (2, vec![(1, 2)]), (3, vec![(1, 3)])];
-        let verdicts = decide(
+        let candidates = decide(
             &files,
             &[
                 view("vitor", 1, Some("2026-10-02T10:00:00Z")),
@@ -326,20 +302,15 @@ pub(crate) mod tests {
             ],
         );
         assert_eq!(
-            verdicts[&1],
-            Verdict::Delete {
+            candidates[&1],
+            Candidate {
                 user: "vitor".into(),
                 at: at("2026-10-02T10:00:00Z")
             }
         );
-        assert_eq!(
-            verdicts[&2],
-            Verdict::InGrace {
-                until: at("2026-10-02T12:30:00Z")
-            }
-        );
+        assert!(!candidates.contains_key(&2));
         // Ninguém assistiu: nem entra.
-        assert!(!verdicts.contains_key(&3));
+        assert!(!candidates.contains_key(&3));
     }
 
     #[test]
@@ -348,20 +319,20 @@ pub(crate) mod tests {
         let mut fan = view("ana", 1, None);
         fan.played = false;
         fan.favorite = true;
-        let verdicts = decide(
+        let candidates = decide(
             &files,
             &[view("vitor", 1, Some("2026-09-01T00:00:00Z")), fan],
         );
-        assert_eq!(verdicts[&1], Verdict::Favorite { user: "ana".into() });
+        assert!(candidates.is_empty());
         // Série favorita em qualquer episódio vale para todos.
         let mut series_fan = view("ana", 9, None);
         series_fan.played = false;
         series_fan.series_favorite = true;
-        let verdicts = decide(
+        let candidates = decide(
             &files,
             &[view("vitor", 1, Some("2026-09-01T00:00:00Z")), series_fan],
         );
-        assert_eq!(verdicts[&1], Verdict::Favorite { user: "ana".into() });
+        assert!(candidates.is_empty());
     }
 
     #[test]
@@ -369,12 +340,9 @@ pub(crate) mod tests {
         let files = [(1, vec![(1, 1), (1, 2)])];
         let old = Some("2026-09-01T00:00:00Z");
         // Só o primeiro assistido: fica.
-        assert_eq!(
-            decide(&files, &[view("vitor", 1, old)])[&1],
-            Verdict::Partial
-        );
+        assert!(decide(&files, &[view("vitor", 1, old)]).is_empty());
         // Os dois, por usuários diferentes: sai, com a data mais recente.
-        let verdicts = decide(
+        let candidates = decide(
             &files,
             &[
                 view("vitor", 1, old),
@@ -382,8 +350,8 @@ pub(crate) mod tests {
             ],
         );
         assert_eq!(
-            verdicts[&1],
-            Verdict::Delete {
+            candidates[&1],
+            Candidate {
                 user: "ana".into(),
                 at: at("2026-09-02T00:00:00Z")
             }
@@ -391,15 +359,9 @@ pub(crate) mod tests {
         // O Jellyfin vê o arquivo como um item só, de 1 a 2.
         let mut whole = view("vitor", 1, old);
         whole.last = 2;
-        assert!(matches!(
-            decide(&files, &[whole])[&1],
-            Verdict::Delete { .. }
-        ));
+        assert!(matches!(decide(&files, &[whole])[&1], Candidate { .. }));
         // Assistido sem data: fica.
-        assert_eq!(
-            decide(&files, &[view("vitor", 1, old), view("ana", 2, None)])[&1],
-            Verdict::NoDate { user: "ana".into() }
-        );
+        assert!(decide(&files, &[view("vitor", 1, old), view("ana", 2, None)]).is_empty());
     }
 
     /// Uma série de teste: `episodes` são `(id, temporada, número, arquivo)`;
@@ -499,19 +461,18 @@ pub(crate) mod tests {
                 (40, 1, before),
             ],
         );
-        let delete = |user: &str, when: &str| Verdict::Delete {
+        let delete = |user: &str, when: &str| Candidate {
             user: user.into(),
             at: at(when),
         };
-        let verdicts = BTreeMap::from([
+        let candidates = BTreeMap::from([
             (10, delete("vitor", "2026-09-01T00:00:00Z")),
             (11, delete("ana", "2026-09-02T00:00:00Z")),
             (20, delete("vitor", "2026-09-01T00:00:00Z")),
-            (21, Verdict::Favorite { user: "ana".into() }),
             (30, delete("vitor", "2026-09-01T00:00:00Z")),
         ]);
         assert_eq!(
-            season_suggestions(&entry, &verdicts),
+            season_suggestions(&entry, &candidates),
             [SeasonSuggestion {
                 series_id: 7,
                 season: 1,

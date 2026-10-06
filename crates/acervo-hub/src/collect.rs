@@ -1,11 +1,11 @@
 //! Coleta o inventário de um ciclo: a fila do acervo, o cliente de download
 //! e o disco.
 
+use std::collections::HashSet;
+
 use acervo_clients::{QbitClient, TorrentInfo, client_path, state_from_qbit};
-use acervo_core::{
-    Allocated, Download, DownloadHash, FileFacts, InstanceName, InstanceSnapshot, Inventory,
-    QueueItem, QueueItemId, UnreachableInstance, UnreadableDownload, WorkId,
-};
+
+use acervo_core::{Allocated, Download, DownloadHash, FileFacts, Inventory, UnreadableDownload};
 use acervo_fs::PathMap;
 use acervo_store::{Grab, GrabState, SeriesGrab, Store};
 use anyhow::{Context, Result};
@@ -19,20 +19,13 @@ pub struct Session {
     pub qbit: QbitClient,
 }
 
-/// Nome da instância interna: a fila do próprio acervo.
-const INTERNAL: &str = "acervo";
-
-/// Lê o mundo.
-///
-/// A fila do acervo entra como uma instância. Se o catálogo não puder ser
-/// lido, ela é registrada como inalcançável e o planejador aborta depois, com
-/// o motivo em mãos: sem os grabs, todo download em andamento pareceria sem
-/// dono. Já o cliente de download fora do ar é falha dura — sem ele não há o
-/// que reconciliar.
+/// Lê a fila do acervo, o cliente de download e os fatos do disco. Sem os
+/// grabs, um download em andamento pareceria sem dono: falha de leitura
+/// impede o ciclo antes de planejar qualquer remoção.
 ///
 /// # Errors
 ///
-/// Falha ao autenticar ou consultar o cliente de download.
+/// Falha ao ler os grabs, autenticar ou consultar o cliente de download.
 pub async fn collect(config: &Config, store: &Store) -> Result<Session> {
     let qbit_config = config.janitor()?;
     let qbit = QbitClient::login(
@@ -46,23 +39,10 @@ pub async fn collect(config: &Config, store: &Store) -> Result<Session> {
 
     let mut inventory = Inventory::new(Allocated::ZERO);
 
-    match internal_snapshot_from(store).await {
-        Ok(snapshot) => {
-            tracing::info!(
-                fila = snapshot.queue.len(),
-                obras = snapshot.known_works,
-                "fila interna lida"
-            );
-            inventory.snapshots.push(snapshot);
-        }
-        Err(reason) => {
-            tracing::warn!(erro = %reason, "catálogo não respondeu");
-            inventory.unreachable.push(UnreachableInstance {
-                instance: InstanceName::new(INTERNAL),
-                reason,
-            });
-        }
-    }
+    inventory.queued_hashes = internal_hashes_from(store)
+        .await
+        .context("lendo os grabs em andamento")?;
+    tracing::info!(fila = inventory.queued_hashes.len(), "fila interna lida");
 
     let torrents = qbit.torrents().await.context("listando torrents")?;
     tracing::info!(total = torrents.len(), "torrents no cliente");
@@ -89,54 +69,24 @@ pub async fn collect(config: &Config, store: &Store) -> Result<Session> {
     Ok(Session { inventory, qbit })
 }
 
-async fn internal_snapshot_from(store: &Store) -> Result<InstanceSnapshot, String> {
-    let grabs = store.grabs().await.map_err(|e| e.to_string())?;
-    let series_grabs = store.series_grabs().await.map_err(|e| e.to_string())?;
-    let movies = store.movies().await.map_err(|e| e.to_string())?;
-    let series = store.series_list().await.map_err(|e| e.to_string())?;
-    Ok(internal_snapshot(
-        &grabs,
-        &series_grabs,
-        movies.len() + series.len(),
-    ))
+async fn internal_hashes_from(store: &Store) -> Result<HashSet<DownloadHash>> {
+    let grabs = store.grabs().await?;
+    let series_grabs = store.series_grabs().await?;
+    Ok(internal_hashes(&grabs, &series_grabs))
 }
 
-/// A fila interna: um item por grab em andamento, de filme e de série.
-///
-/// Nenhum item é órfão — o grab sempre aponta para uma obra do catálogo. O id
-/// do item é o do grab; o de série vai negativo para não colidir com o de
-/// filme, que vivem em tabelas separadas.
-fn internal_snapshot(
-    grabs: &[Grab],
-    series_grabs: &[SeriesGrab],
-    known_works: usize,
-) -> InstanceSnapshot {
-    let instance = InstanceName::new(INTERNAL);
+/// Os hashes dos grabs em andamento, de filme e de série. O mesmo torrent
+/// pode aparecer mais de uma vez: para a limpeza basta saber que está na fila.
+fn internal_hashes(grabs: &[Grab], series_grabs: &[SeriesGrab]) -> HashSet<DownloadHash> {
     let movies = grabs
         .iter()
         .filter(|g| g.state == GrabState::Downloading)
-        .map(|g| (g.id, &g.hash, &g.title, g.movie_id));
+        .map(|g| DownloadHash::new(&g.hash));
     let episodes = series_grabs
         .iter()
         .filter(|g| g.state == GrabState::Downloading)
-        .map(|g| (-g.id, &g.hash, &g.title, g.series_id));
-
-    let queue = movies
-        .chain(episodes)
-        .map(|(id, hash, title, work)| QueueItem {
-            id: QueueItemId(id),
-            instance: instance.clone(),
-            title: title.clone(),
-            download: Some(DownloadHash::new(hash)),
-            work: Some(WorkId(work)),
-        })
-        .collect();
-
-    InstanceSnapshot {
-        instance,
-        queue,
-        known_works,
-    }
+        .map(|g| DownloadHash::new(&g.hash));
+    movies.chain(episodes).collect()
 }
 
 /// Monta um [`Download`] com os fatos de disco de cada arquivo.
@@ -242,7 +192,7 @@ mod tests {
 
     #[test]
     fn fila_interna_so_leva_grab_em_andamento() {
-        let snap = internal_snapshot(
+        let snap = internal_hashes(
             &[
                 grab(1, "AA", GrabState::Downloading),
                 grab(2, "bb", GrabState::Imported),
@@ -252,31 +202,20 @@ mod tests {
                 series_grab(1, "dd", GrabState::Downloading),
                 series_grab(2, "ee", GrabState::Failed),
             ],
-            7,
         );
 
-        assert_eq!(snap.instance, InstanceName::new("acervo"));
-        assert_eq!(snap.known_works, 7);
-        let hashes: Vec<_> = snap
-            .queue
-            .iter()
-            .map(|i| i.download.as_ref().unwrap().as_str())
-            .collect();
-        assert_eq!(hashes, ["aa", "dd"]);
+        assert_eq!(
+            snap,
+            HashSet::from([DownloadHash::new("aa"), DownloadHash::new("dd")])
+        );
     }
 
     #[test]
-    fn ids_de_filme_e_serie_nao_colidem_e_todo_item_tem_dono() {
-        let snap = internal_snapshot(
-            &[grab(1, "aa", GrabState::Downloading)],
-            &[series_grab(1, "bb", GrabState::Downloading)],
-            2,
+    fn hashes_duplicados_contam_uma_vez() {
+        let hashes = internal_hashes(
+            &[grab(1, "AA", GrabState::Downloading)],
+            &[series_grab(1, "aa", GrabState::Downloading)],
         );
-
-        assert_eq!(snap.queue[0].id, QueueItemId(1));
-        assert_eq!(snap.queue[1].id, QueueItemId(-1));
-        assert_eq!(snap.queue[0].work, Some(WorkId(11)));
-        assert_eq!(snap.queue[1].work, Some(WorkId(21)));
-        assert!(snap.queue.iter().all(|i| i.work.is_some()));
+        assert_eq!(hashes, HashSet::from([DownloadHash::new("aa")]));
     }
 }

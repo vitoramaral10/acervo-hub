@@ -200,9 +200,6 @@ fn query_params(query: &SearchQuery) -> Vec<(String, String)> {
     if let Some(limit) = query.limit {
         params.push(("limit".into(), limit.to_string()));
     }
-    if query.offset > 0 {
-        params.push(("offset".into(), query.offset.to_string()));
-    }
 
     match &query.mode {
         SearchMode::General => {}

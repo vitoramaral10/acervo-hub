@@ -1,29 +1,6 @@
-//! Identificadores. Newtypes para que o compilador recuse trocar um pelo outro.
+//! Hash do torrent: a chave que cruza os grabs com o cliente de download.
 
 use std::fmt;
-
-macro_rules! numeric_id {
-    ($(#[$meta:meta])* $name:ident) => {
-        $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub struct $name(pub i64);
-
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "{}", self.0)
-            }
-        }
-    };
-}
-
-numeric_id!(
-    /// Uma obra: série ou filme.
-    WorkId
-);
-numeric_id!(
-    /// Item de fila: o id do grab (negativo, num grab de série).
-    QueueItemId
-);
 
 /// Hash do torrent no cliente de download — a chave que cruza fila e cliente.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -43,28 +20,6 @@ impl DownloadHash {
 }
 
 impl fmt::Display for DownloadHash {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// De onde veio uma fila lida num ciclo.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct InstanceName(String);
-
-impl InstanceName {
-    #[must_use]
-    pub fn new(raw: impl Into<String>) -> Self {
-        Self(raw.into())
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for InstanceName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }

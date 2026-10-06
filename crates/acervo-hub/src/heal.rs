@@ -1149,7 +1149,7 @@ mod tests {
                 alternate_titles: Vec::new(),
             },
             episodes: vec![
-                episode(11, 1, None, Some(Skip::Watched)),
+                episode(11, 1, None, Some(Skip::Deleted)),
                 episode(12, 2, Some(102), None),
                 episode(13, 3, Some(103), None),
                 episode(14, 4, Some(104), None),

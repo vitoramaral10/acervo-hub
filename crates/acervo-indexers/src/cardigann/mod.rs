@@ -452,9 +452,6 @@ impl CardigannClient {
     }
 
     fn validate_query(&self, query: &SearchQuery) -> Result<(), IndexerError> {
-        if query.offset != 0 {
-            return Err(unsupported("paginação por offset não é suportada"));
-        }
         let support = match &query.mode {
             SearchMode::General => &self.definition.capabilities.general,
             SearchMode::Tv { .. } => &self.definition.capabilities.tv,

@@ -479,7 +479,6 @@ mod tests {
                     date_added: None,
                 }),
                 runtime: 0,
-                secondary_year: None,
                 clean_title: None,
                 alternate_titles: Vec::new(),
                 in_cinemas: Some("2026-06-01".into()),

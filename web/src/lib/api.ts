@@ -135,7 +135,6 @@ export interface Definition {
 
 export interface CycleReport {
   quando: string
-  instancias: { nome: string; fila: number | null; obras: number | null; erro: string | null }[]
   torrents: number
   ilegiveis: { nome: string; motivo: string }[]
   biblioteca: string
@@ -263,8 +262,6 @@ interface Secret {
 export interface ServerSection {
   api_key: Secret
   catalogos: string[]
-  /** O catálogo antigo: vale abaixo das definições baixadas do repositório. */
-  catalogos_reserva: string[]
   /** O `.tar.gz` do repositório de definições. */
   definicoes_url: string
   http_timeout_seconds: number
@@ -286,7 +283,7 @@ export interface DownloadClientSection {
 export interface JellyfinSection {
   url: string
   api_key: Secret
-  delete_watched_after_minutes: number
+  carencia_sugestao_minutos: number
 }
 
 export interface LibrarySection {
@@ -781,7 +778,7 @@ export interface SeriesSummary {
 }
 
 type EpisodeState = 'quero' | 'tenho' | 'dispensado'
-type SkipReason = 'unwanted' | 'deleted' | 'watched'
+type SkipReason = 'unwanted' | 'deleted'
 
 interface EpisodeFile {
   id: number

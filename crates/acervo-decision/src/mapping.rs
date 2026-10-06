@@ -11,9 +11,7 @@ use crate::{Release, Target};
 
 fn year_fits(parsed: &ParsedMovie, movie: &Target) -> bool {
     match parsed.year {
-        Some(year) if year >= 1800 => {
-            movie.year == Some(year) || movie.secondary_year == Some(year)
-        }
+        Some(year) if year >= 1800 => movie.year == Some(year),
         _ => true,
     }
 }

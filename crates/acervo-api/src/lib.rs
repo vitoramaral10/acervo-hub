@@ -1,4 +1,4 @@
-//! Superfície HTTP do `acervo-hub`: o catálogo de indexadores servidos e a
+//! Superfície HTTP do `acervo-hub`: o catálogo de indexadores cadastrados e a
 //! interface web por cima dele. Nada daqui é API para terceiros: quem fala
 //! com ela é a própria tela, ou um script com a chave em `X-Api-Key`.
 
@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 
 pub use catalog::{
-    ALL, Catalog, CatalogError, Entry, Health, IndexerView, Page, QueryObserver, QueryRecord, UI,
+    ALL, Catalog, CatalogError, Entry, Health, IndexerView, Page, QueryObserver, QueryRecord,
 };
 pub use ui::{Accounts, Admin, DefinitionView, SettingView, authorize_ui, ui_json};
 

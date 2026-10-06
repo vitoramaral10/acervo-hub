@@ -28,27 +28,21 @@ pub struct Viewing {
     pub favorite: bool,
 }
 
-/// O destino de um filme que alguém assistiu.
+/// Candidato a sugestão: assistido por `user` em `at`, passada a carência.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Verdict {
-    /// A regra apagaria: `user` foi o último a assistir, em `at`.
-    Delete { user: String, at: OffsetDateTime },
-    /// Fica: alguém o marcou como favorito.
-    Favorite { user: String },
-    /// Fica até `until`.
-    InGrace { until: OffsetDateTime },
-    /// Fica: `user` assistiu, mas não se sabe quando.
-    NoDate { user: String },
+pub struct Candidate {
+    pub user: String,
+    pub at: OffsetDateTime,
 }
 
 /// A regra, sem rede nem banco. Só entra quem tem id do TMDB e foi
-/// assistido por alguém; o resto não é assunto da regra.
+/// assistido por alguém, sem favorito e passada a carência.
 #[must_use]
 pub fn select(
     viewings: &[Viewing],
     now: OffsetDateTime,
     grace: Duration,
-) -> BTreeMap<u32, Verdict> {
+) -> BTreeMap<u32, Candidate> {
     let mut by_movie: BTreeMap<u32, Vec<&Viewing>> = BTreeMap::new();
     for viewing in viewings {
         if let Some(tmdb_id) = viewing.tmdb_id {
@@ -63,39 +57,26 @@ pub fn select(
                 return None;
             }
             // Favorito de qualquer usuário segura, mesmo de quem não assistiu.
-            if let Some(fan) = views.iter().find(|v| v.favorite) {
-                return Some((
-                    tmdb_id,
-                    Verdict::Favorite {
-                        user: fan.user.clone(),
-                    },
-                ));
+            if views.iter().any(|v| v.favorite) {
+                return None;
             }
-            // Uma visualização sem data pode ser a mais recente: não dá
-            // para saber se a carência passou.
-            if let Some(undated) = played.iter().find(|v| v.last_played.is_none()) {
-                return Some((
-                    tmdb_id,
-                    Verdict::NoDate {
-                        user: undated.user.clone(),
-                    },
-                ));
+            // Uma visualização sem data pode ser a mais recente.
+            if played.iter().any(|v| v.last_played.is_none()) {
+                return None;
             }
             let (user, at) = played
                 .iter()
                 .filter_map(|v| v.last_played.map(|at| (&v.user, at)))
                 .max_by_key(|(_, at)| *at)?;
-            let verdict = if now - at > grace {
-                Verdict::Delete {
-                    user: user.clone(),
-                    at,
-                }
-            } else {
-                Verdict::InGrace {
-                    until: at.checked_add(grace).unwrap_or(at),
-                }
-            };
-            Some((tmdb_id, verdict))
+            (now - at > grace).then(|| {
+                (
+                    tmdb_id,
+                    Candidate {
+                        user: user.clone(),
+                        at,
+                    },
+                )
+            })
         })
         .collect()
 }
@@ -109,25 +90,26 @@ pub struct Suggestion {
     pub at: OffsetDateTime,
 }
 
-/// Os vereditos que viram sugestão, sem rede nem banco. Fica de fora o
+/// Os candidatos que viram sugestão, sem rede nem banco. Fica de fora o
 /// filme fora do catálogo e o que não sairia: favorito, na carência, sem
 /// data, ou com arquivo que chegou depois de assistirem (o Jellyfin lembra
 /// o assistido de um filme apagado, e o mesmo filme adicionado de novo
 /// seria sugerido assim que importado). Na ordem do catálogo.
 #[must_use]
-pub fn suggestions(verdicts: &BTreeMap<u32, Verdict>, catalog: &[CatalogMovie]) -> Vec<Suggestion> {
+pub fn suggestions(
+    candidates: &BTreeMap<u32, Candidate>,
+    catalog: &[CatalogMovie],
+) -> Vec<Suggestion> {
     catalog
         .iter()
-        .filter_map(|entry| match verdicts.get(&entry.movie.tmdb_id)? {
-            Verdict::Delete { user, at } => {
-                let added = entry.movie.file.as_ref()?.date_added.as_deref();
-                watched_after_added(*at, added).then(|| Suggestion {
-                    movie_id: entry.id,
-                    user: user.clone(),
-                    at: *at,
-                })
-            }
-            _ => None,
+        .filter_map(|entry| {
+            let Candidate { user, at } = candidates.get(&entry.movie.tmdb_id)?;
+            let added = entry.movie.file.as_ref()?.date_added.as_deref();
+            watched_after_added(*at, added).then(|| Suggestion {
+                movie_id: entry.id,
+                user: user.clone(),
+                at: *at,
+            })
         })
         .collect()
 }
@@ -179,8 +161,8 @@ pub async fn suggest(
             favorite: movie.favorite,
         }));
     }
-    let verdicts = select(&viewings, OffsetDateTime::now_utc(), grace(grace_minutes));
-    Ok(suggestions(&verdicts, &store.movies().await?))
+    let candidates = select(&viewings, OffsetDateTime::now_utc(), grace(grace_minutes));
+    Ok(suggestions(&candidates, &store.movies().await?))
 }
 
 #[cfg(test)]
@@ -216,7 +198,7 @@ mod tests {
 
     const NOW: &str = "2026-10-02T12:00:00Z";
 
-    fn decide(viewings: &[Viewing], grace_minutes: i64) -> BTreeMap<u32, Verdict> {
+    fn decide(viewings: &[Viewing], grace_minutes: i64) -> BTreeMap<u32, Candidate> {
         select(viewings, at(NOW), Duration::minutes(grace_minutes))
     }
 
@@ -231,7 +213,7 @@ mod tests {
 
     #[test]
     fn so_o_assistido_entra_e_sem_tmdb_fica_de_fora() {
-        let verdicts = decide(
+        let candidates = decide(
             &[
                 view("vitor", Some(1), false, None, false),
                 view("vitor", None, true, Some("2026-09-01T00:00:00Z"), false),
@@ -240,10 +222,10 @@ mod tests {
             60,
         );
         assert_eq!(
-            verdicts.into_iter().collect::<Vec<_>>(),
+            candidates.into_iter().collect::<Vec<_>>(),
             [(
                 2,
-                Verdict::Delete {
+                Candidate {
                     user: "vitor".into(),
                     at: at("2026-09-01T00:00:00Z")
                 }
@@ -261,12 +243,7 @@ mod tests {
             Some("2026-10-02T11:30:00Z"),
             false,
         )];
-        assert_eq!(
-            decide(&recente, 60)[&1],
-            Verdict::InGrace {
-                until: at("2026-10-02T12:30:00Z")
-            }
-        );
+        assert!(decide(&recente, 60).is_empty());
         // Há 90 minutos, sai.
         let velho = [view(
             "vitor",
@@ -275,7 +252,7 @@ mod tests {
             Some("2026-10-02T10:30:00Z"),
             false,
         )];
-        assert!(matches!(decide(&velho, 60)[&1], Verdict::Delete { .. }));
+        assert!(matches!(decide(&velho, 60)[&1], Candidate { .. }));
         // Exatamente na carência ainda fica: é "há mais de".
         let limite = [view(
             "vitor",
@@ -284,31 +261,31 @@ mod tests {
             Some("2026-10-02T11:00:00Z"),
             false,
         )];
-        assert!(matches!(decide(&limite, 60)[&1], Verdict::InGrace { .. }));
+        assert!(decide(&limite, 60).is_empty());
     }
 
     #[test]
     fn favorito_de_outro_usuario_segura() {
-        let verdicts = decide(
+        let candidates = decide(
             &[
                 view("vitor", Some(1), true, Some("2026-09-01T00:00:00Z"), false),
                 view("ana", Some(1), false, None, true),
             ],
             60,
         );
-        assert_eq!(verdicts[&1], Verdict::Favorite { user: "ana".into() });
+        assert!(candidates.is_empty());
     }
 
     #[test]
     fn assistido_sem_data_fica() {
-        let verdicts = decide(
+        let candidates = decide(
             &[
                 view("vitor", Some(1), true, Some("2026-09-01T00:00:00Z"), false),
                 view("ana", Some(1), true, None, false),
             ],
             60,
         );
-        assert_eq!(verdicts[&1], Verdict::NoDate { user: "ana".into() });
+        assert!(candidates.is_empty());
     }
 
     #[test]
@@ -318,15 +295,10 @@ mod tests {
             view("ana", Some(1), true, Some("2026-10-02T11:30:00Z"), false),
         ];
         // A de 9h passou da carência; a de 11h30, não.
-        assert_eq!(
-            decide(&viewings, 60)[&1],
-            Verdict::InGrace {
-                until: at("2026-10-02T12:30:00Z")
-            }
-        );
+        assert!(decide(&viewings, 60).is_empty());
         assert_eq!(
             decide(&viewings, 10)[&1],
-            Verdict::Delete {
+            Candidate {
                 user: "ana".into(),
                 at: at("2026-10-02T11:30:00Z")
             }
@@ -368,7 +340,6 @@ mod tests {
                 date_added: added.map(str::to_owned),
             }),
             runtime: 0,
-            secondary_year: None,
             clean_title: None,
             alternate_titles: Vec::new(),
             in_cinemas: None,
@@ -391,14 +362,13 @@ mod tests {
     #[test]
     fn so_vira_sugestao_o_que_a_regra_apagaria() {
         let seen = at("2026-09-01T20:00:00Z");
-        let delete = |user: &str| Verdict::Delete {
+        let delete = |user: &str| Candidate {
             user: user.into(),
             at: seen,
         };
         let before = Some("2026-08-01T00:00:00Z");
-        let verdicts = BTreeMap::from([
+        let candidates = BTreeMap::from([
             (10, delete("vitor")),
-            (20, Verdict::Favorite { user: "ana".into() }),
             (40, delete("vitor")),
             (50, delete("vitor")),
             (60, delete("ana")),
@@ -419,7 +389,7 @@ mod tests {
             entry(7, movie(70, "Novo", before)),
         ];
         assert_eq!(
-            suggestions(&verdicts, &catalog),
+            suggestions(&candidates, &catalog),
             [Suggestion {
                 movie_id: 1,
                 user: "vitor".into(),

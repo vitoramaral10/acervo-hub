@@ -69,10 +69,6 @@ pub struct ServerConfig {
     /// que tiver um id vence.
     #[serde(rename = "catalogos")]
     pub catalogs: Vec<PathBuf>,
-    /// Diretórios de reserva — o catálogo antigo, copiado do agregador de
-    /// referência. Valem abaixo das definições baixadas para o banco.
-    #[serde(rename = "catalogos_reserva")]
-    pub reserve_catalogs: Vec<PathBuf>,
     /// De onde a tarefa `definicoes` baixa o arquivo `.tar.gz` do repositório
     /// de definições; dentro dele, as de `definitions/v11`.
     #[serde(rename = "definicoes_url")]
@@ -99,7 +95,6 @@ impl std::fmt::Debug for ServerConfig {
         formatter
             .debug_struct("ServerConfig")
             .field("catalogs", &self.catalogs)
-            .field("reserve_catalogs", &self.reserve_catalogs)
             .field("definitions_url", &self.definitions_url)
             .field("http_timeout_seconds", &self.http_timeout_seconds)
             .field("xem_url", &self.xem_url)
@@ -143,7 +138,6 @@ impl Default for ServerConfig {
         Self {
             api_key: String::new(),
             catalogs: Vec::new(),
-            reserve_catalogs: Vec::new(),
             definitions_url: DEFINITIONS_URL.into(),
             http_timeout_seconds: 30,
             xem_url: XEM_URL.into(),
@@ -182,9 +176,8 @@ pub struct JellyfinConfig {
     pub api_key: String,
     /// Carência depois da última vez que alguém assistiu antes de o título
     /// virar sugestão de apagar: dá tempo de marcar como favorito o que é
-    /// para ficar. O nome é de quando assistido saía sozinho; mudar quebraria
-    /// a seção gravada.
-    pub delete_watched_after_minutes: u64,
+    /// para ficar. Em minutos.
+    pub carencia_sugestao_minutos: u64,
 }
 
 impl Default for JellyfinConfig {
@@ -192,7 +185,7 @@ impl Default for JellyfinConfig {
         Self {
             url: String::new(),
             api_key: String::new(),
-            delete_watched_after_minutes: 60,
+            carencia_sugestao_minutos: 60,
         }
     }
 }
@@ -203,10 +196,7 @@ impl std::fmt::Debug for JellyfinConfig {
         formatter
             .debug_struct("JellyfinConfig")
             .field("url", &self.url)
-            .field(
-                "delete_watched_after_minutes",
-                &self.delete_watched_after_minutes,
-            )
+            .field("carencia_sugestao_minutos", &self.carencia_sugestao_minutos)
             .finish_non_exhaustive()
     }
 }

@@ -81,8 +81,6 @@ pub struct Movie {
     pub file: Option<MovieFile>,
     /// Minutos; zero é desconhecido.
     pub runtime: u32,
-    /// Ano alternativo (estreia em outro país), aceito no casamento.
-    pub secondary_year: Option<u16>,
     /// Título limpo da base de metadados, a forma com que o release é
     /// comparado.
     pub clean_title: Option<String>,
@@ -782,6 +780,38 @@ const MIGRATIONS: &[&str] = &[
         hidden_at TEXT NOT NULL
     );
 ",
+    // Episódio apagado por assistido fica fora da busca como qualquer apagado.
+    r"
+    UPDATE episodes SET skip = 'deleted' WHERE skip = 'watched';
+    ALTER TABLE episodes DROP CONSTRAINT episodes_skip_check;
+    ALTER TABLE episodes ADD CONSTRAINT episodes_skip_check
+        CHECK (skip IN ('unwanted', 'deleted'));
+",
+    // O casamento de filmes passa a usar só o ano do catálogo.
+    r"
+    ALTER TABLE movies DROP COLUMN secondary_year;
+",
+    // As regras em settings guardam JSON em texto: saem os nomes antigos.
+    r#"
+    UPDATE settings
+        SET value = ((CASE
+            WHEN value::jsonb ->> 'propers' IN ('preferir_e_atualizar', 'nao_atualizar')
+                THEN jsonb_set(value::jsonb, '{propers}', '"preferir"'::jsonb)
+            ELSE value::jsonb
+        END) - 'pular_checagem_de_espaco')::text
+        WHERE key = 'decisao.regras';
+"#,
+    // Definições vêm dos diretórios locais e do banco, sem catálogo de reserva.
+    r"
+    UPDATE config_sections SET value = value - 'catalogos_reserva' WHERE name = 'servidor';
+",
+    // A carência do Jellyfin só controla quando o assistido vira sugestão.
+    r"
+    UPDATE config_sections
+        SET value = (value - 'delete_watched_after_minutes') ||
+            jsonb_build_object('carencia_sugestao_minutos', value -> 'delete_watched_after_minutes')
+        WHERE name = 'jellyfin' AND value ? 'delete_watched_after_minutes';
+",
 ];
 
 /// Quanto uma consulta pode levar. A maior consulta real (o catálogo de
@@ -1007,13 +1037,12 @@ impl Store {
         let tx = client.transaction().await?;
         let year = movie.year.map(i32::from);
         let runtime = i32::try_from(movie.runtime).unwrap_or(i32::MAX);
-        let secondary_year = movie.secondary_year.map(i32::from);
         let updated = tx
             .execute(
                 "UPDATE movies SET imdb_id = $2, title = $3, original_title = $4,
                      original_language = $5, year = $6, status = $7, runtime = $8,
-                     secondary_year = $9, clean_title = $10, in_cinemas = $11,
-                     digital_release = $12, physical_release = $13, overview = $14
+                     clean_title = $9, in_cinemas = $10,
+                     digital_release = $11, physical_release = $12, overview = $13
                  WHERE id = $1",
                 &[
                     &id,
@@ -1024,7 +1053,6 @@ impl Store {
                     &year,
                     &movie.status,
                     &runtime,
-                    &secondary_year,
                     &movie.clean_title,
                     &movie.in_cinemas,
                     &movie.digital_release,
@@ -1510,14 +1538,12 @@ async fn insert_movie(client: &impl GenericClient, movie: &Movie) -> Result<i64>
     let tmdb_id = i64::from(movie.tmdb_id);
     let year = movie.year.map(i32::from);
     let runtime = i32::try_from(movie.runtime).unwrap_or(i32::MAX);
-    let secondary_year = movie.secondary_year.map(i32::from);
     let id: i64 = client
         .query_one(
             "INSERT INTO movies (tmdb_id, imdb_id, title, original_title, original_language,
-                 year, status, monitored, path, added, runtime, secondary_year,
+                 year, status, monitored, path, added, runtime,
                  clean_title, in_cinemas, digital_release, physical_release, overview)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                 $17)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
              RETURNING id",
             &[
                 &tmdb_id,
@@ -1531,7 +1557,6 @@ async fn insert_movie(client: &impl GenericClient, movie: &Movie) -> Result<i64>
                 &movie.path,
                 &movie.added,
                 &runtime,
-                &secondary_year,
                 &movie.clean_title,
                 &movie.in_cinemas,
                 &movie.digital_release,
@@ -1647,7 +1672,7 @@ async fn read_movies(client: &impl GenericClient) -> Result<Vec<CatalogMovie>> {
         .query(
             "SELECT m.id, m.tmdb_id, m.imdb_id, m.title, m.original_title, m.original_language,
                     m.year, m.status, m.monitored, m.path, m.added,
-                    m.runtime, m.secondary_year, m.clean_title,
+                    m.runtime, m.clean_title,
                     m.in_cinemas, m.digital_release, m.physical_release, m.overview,
                     m.metadata_title, m.poster, m.fanart, m.metadata_refreshed_at, m.priority,
                     f.relative_path AS f_relative_path, f.size AS f_size,
@@ -1684,10 +1709,6 @@ async fn read_movies(client: &impl GenericClient) -> Result<Vec<CatalogMovie>> {
                 added: row.try_get("added")?,
                 file: read_file(row)?,
                 runtime: narrow(row.try_get("runtime")?, "duração")?,
-                secondary_year: row
-                    .try_get::<_, Option<i32>>("secondary_year")?
-                    .map(|y| narrow(y, "ano"))
-                    .transpose()?,
                 clean_title: row.try_get("clean_title")?,
                 alternate_titles: Vec::new(),
                 in_cinemas: row.try_get("in_cinemas")?,
@@ -1817,6 +1838,178 @@ mod tests {
     use super::testing::TestDb;
     use super::*;
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Um cenário de migração: dados antigos e configuração juntos.
+    async fn migra_os_dados_e_as_configuracoes_aposentadas() {
+        let Some(db) = TestDb::new("remocoes_legadas").await else {
+            return;
+        };
+        let store = &db.store;
+        let original = movie(10, "Um", false);
+        let movie_id = store
+            .add_movie(&original, &MovieExtras::default())
+            .await
+            .unwrap();
+        let mut client = store.pool.get().await.unwrap();
+        let tx = client.transaction().await.unwrap();
+        tx.batch_execute(
+            "ALTER TABLE episodes DROP CONSTRAINT episodes_skip_check;
+             ALTER TABLE episodes ADD CONSTRAINT episodes_skip_check
+                 CHECK (skip IN ('unwanted', 'deleted', 'watched'));
+             ALTER TABLE movies ADD COLUMN secondary_year INTEGER;
+             INSERT INTO series (tmdb_id, title, path, season_folder, monitor_new)
+                 VALUES (10, 'Um', '/series/Um', TRUE, TRUE);
+             INSERT INTO episodes (series_id, season, number, skip, skipped_at)
+                 SELECT id, 1, n, 'watched', '2026-01-01T00:00:00Z'
+                 FROM series CROSS JOIN generate_series(1, 101) AS n;
+             INSERT INTO episodes (series_id, season, number, skip)
+                 SELECT id, 2, n, CASE n WHEN 1 THEN 'unwanted' WHEN 2 THEN 'deleted' END
+                 FROM series CROSS JOIN generate_series(1, 3) AS n;",
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "UPDATE movies SET secondary_year = 2021 WHERE id = $1",
+            &[&movie_id],
+        )
+        .await
+        .unwrap();
+        let rules = serde_json::json!({
+            "propers": "preferir_e_atualizar", "pular_checagem_de_espaco": true,
+            "folga_minima_mb": 2048
+        })
+        .to_string();
+        tx.execute(
+            "INSERT INTO settings (key, value, updated_at) VALUES ('decisao.regras', $1, 't0')",
+            &[&rules],
+        )
+        .await
+        .unwrap();
+        let server =
+            serde_json::json!({"catalogos_reserva": ["/catalogo"], "catalogos": ["/definicoes"]});
+        let jellyfin = serde_json::json!({"delete_watched_after_minutes": 0, "url": ""});
+        let janitor = serde_json::json!({"managed_categories": ["filmes", "series"]});
+        for (name, value) in [
+            ("servidor", server),
+            ("jellyfin", jellyfin),
+            ("limpeza", janitor.clone()),
+        ] {
+            tx.execute(
+                "INSERT INTO config_sections (name, value, updated_at) VALUES ($1, $2, 't0')",
+                &[&name, &value],
+            )
+            .await
+            .unwrap();
+        }
+        let first = MIGRATIONS
+            .iter()
+            .position(|sql| sql.contains("UPDATE episodes SET skip = 'deleted'"))
+            .unwrap();
+        for migration in &MIGRATIONS[first..first + 5] {
+            tx.batch_execute(migration).await.unwrap();
+        }
+        let deleted: i64 = tx
+            .query_one("SELECT count(*) FROM episodes WHERE skip = 'deleted'", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(deleted, 102);
+        let dated: i64 = tx
+            .query_one(
+                "SELECT count(*) FROM episodes WHERE skipped_at = '2026-01-01T00:00:00Z'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(dated, 101);
+        let unchanged: i64 = tx
+            .query_one(
+                "SELECT count(*) FROM episodes WHERE skip = 'unwanted' OR skip IS NULL",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(unchanged, 2);
+        let text: String = tx
+            .query_one(
+                "SELECT value FROM settings WHERE key = 'decisao.regras'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let rules: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            rules,
+            serde_json::json!({"propers": "preferir", "folga_minima_mb": 2048})
+        );
+        // Os dois aliases antigos tinham exatamente o mesmo destino.
+        for propers in ["nao_atualizar", "nao_preferir", "preferir"] {
+            let value = serde_json::json!({"propers": propers}).to_string();
+            tx.execute(
+                "UPDATE settings SET value = $1 WHERE key = 'decisao.regras'",
+                &[&value],
+            )
+            .await
+            .unwrap();
+            tx.batch_execute(MIGRATIONS[first + 2]).await.unwrap();
+            let text: String = tx
+                .query_one(
+                    "SELECT value FROM settings WHERE key = 'decisao.regras'",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            let rules: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                rules["propers"],
+                if propers == "nao_atualizar" {
+                    "preferir"
+                } else {
+                    propers
+                }
+            );
+        }
+        for (name, expected) in [
+            (
+                "servidor",
+                serde_json::json!({"catalogos": ["/definicoes"]}),
+            ),
+            (
+                "jellyfin",
+                serde_json::json!({"carencia_sugestao_minutos": 0, "url": ""}),
+            ),
+            ("limpeza", janitor),
+        ] {
+            let value: serde_json::Value = tx
+                .query_one(
+                    "SELECT value FROM config_sections WHERE name = $1",
+                    &[&name],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(value, expected);
+        }
+        tx.commit().await.unwrap();
+        drop(client);
+        assert_eq!(
+            store
+                .movies()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.id == movie_id)
+                .unwrap()
+                .movie,
+            original
+        );
+        db.drop().await;
+    }
+
     fn movie(tmdb_id: u32, title: &str, with_file: bool) -> Movie {
         Movie {
             tmdb_id,
@@ -1843,7 +2036,6 @@ mod tests {
                 date_added: Some("2026-01-02T00:00:00Z".into()),
             }),
             runtime: 110,
-            secondary_year: None,
             clean_title: Some(title.to_lowercase()),
             alternate_titles: vec![format!("{title} alternativo"), format!("{title} 2")],
             in_cinemas: Some("2020-01-10".into()),

@@ -121,7 +121,6 @@ fn skip_name(skip: Skip) -> &'static str {
     match skip {
         Skip::Unwanted => "unwanted",
         Skip::Deleted => "deleted",
-        Skip::Watched => "watched",
     }
 }
 

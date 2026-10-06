@@ -86,7 +86,6 @@ fn target(entry: &CatalogMovie, remote: &Remote, now: time::OffsetDateTime) -> T
         title: metadata_title(movie),
         clean_titles,
         year: movie.year,
-        secondary_year: movie.secondary_year,
         tmdb_id: movie.tmdb_id,
         imdb_id: movie.imdb_id.clone(),
         original_language,
@@ -105,7 +104,7 @@ fn target(entry: &CatalogMovie, remote: &Remote, now: time::OffsetDateTime) -> T
     }
 }
 
-/// Os indexadores servidos, com a prioridade e os seeders mínimos das
+/// Os indexadores cadastrados, com a prioridade e os seeders mínimos das
 /// regras.
 pub(crate) fn indexers(served: &[String], rules: &DecisionRules) -> Vec<Indexer> {
     served
@@ -152,7 +151,7 @@ pub(crate) fn summarize(decisions: &[Decision], movie: i64) -> Vec<(String, usiz
 }
 
 /// Tudo o que a decisão precisa, lido uma vez: a biblioteca como alvos, os
-/// indexadores servidos e as regras.
+/// indexadores cadastrados e as regras.
 pub(crate) struct Decider {
     pub library: Vec<Target>,
     /// Os filmes prioritários: buscados antes dos outros.
@@ -409,7 +408,7 @@ impl Progress {
 
 /// Busca até `limit` filmes que faltam (todos, sem `limit`), começando pelos
 /// que estão há mais tempo sem busca, e pega o escolhido de cada um.
-/// `catalog` é o dos indexadores servidos: a busca divide sessão e consultas
+/// `catalog` é o dos indexadores cadastrados: a busca divide sessão e consultas
 /// guardadas com o RSS e a tela. Filme com download em
 /// andamento não entra: já tem o que esperar.
 ///

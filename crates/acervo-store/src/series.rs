@@ -2,7 +2,7 @@
 //!
 //! O episódio não tem "monitorado". Ele tem [`Skip`], o motivo de não ser
 //! buscado. Sem arquivo e sem `skip`, é procurado assim que vai ao ar. Assim,
-//! apagar ou assistir um episódio nunca o devolve à busca por engano: o
+//! apagar um episódio nunca o devolve à busca por engano: o
 //! motivo fica gravado, e só [`Store::set_skip`] com `None` o traz de volta.
 
 use std::collections::{HashMap, HashSet};
@@ -25,9 +25,6 @@ pub enum Skip {
     Unwanted,
     /// O arquivo foi apagado na tela.
     Deleted,
-    /// Assistido no Jellyfin, e o arquivo saiu por isso — do tempo em que
-    /// assistido saía sozinho; hoje só sobra em episódio antigo.
-    Watched,
 }
 
 impl Skip {
@@ -35,7 +32,6 @@ impl Skip {
         match self {
             Self::Unwanted => "unwanted",
             Self::Deleted => "deleted",
-            Self::Watched => "watched",
         }
     }
 
@@ -43,7 +39,6 @@ impl Skip {
         match text {
             "unwanted" => Ok(Self::Unwanted),
             "deleted" => Ok(Self::Deleted),
-            "watched" => Ok(Self::Watched),
             other => Err(StoreError::Corrupt(format!("skip `{other}`"))),
         }
     }
@@ -1550,6 +1545,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skip_watched_nao_e_mais_aceito_no_banco() {
+        let Some(db) = TestDb::new("series_skip_watched").await else {
+            return;
+        };
+        let id = db.store.add_series(&series(10, "Um"), &[]).await.unwrap();
+        let client = db.store.pool.get().await.unwrap();
+        let error = client.execute(
+            "INSERT INTO episodes (series_id, season, number, skip) VALUES ($1, 1, 1, 'watched')",
+            &[&id],
+        ).await.unwrap_err();
+        let db_error = error.as_db_error().expect("erro do Postgres");
+        assert_eq!(
+            db_error.code(),
+            &tokio_postgres::error::SqlState::CHECK_VIOLATION
+        );
+        assert_eq!(db_error.constraint(), Some("episodes_skip_check"));
+        drop(client);
+        db.drop().await;
+    }
+
+    #[tokio::test]
     async fn sincroniza_episodios() {
         let Some(db) = TestDb::new("series_sync").await else {
             return;
@@ -1565,7 +1581,7 @@ mod tests {
         let read = store.series(id).await.unwrap().unwrap();
         let ids: Vec<i64> = read.episodes.iter().map(|e| e.id).collect();
         store
-            .set_skip(&ids[0..1], Some(Skip::Watched), "2026-03-01T00:00:00Z")
+            .set_skip(&ids[0..1], Some(Skip::Deleted), "2026-03-01T00:00:00Z")
             .await
             .unwrap();
         // O 3 tem arquivo; o 4 não.
@@ -1590,7 +1606,7 @@ mod tests {
         let numbers: Vec<_> = read.episodes.iter().map(|e| e.episode.number).collect();
         assert_eq!(numbers, [1, 3, 5]);
         assert_eq!(read.episodes[0].episode, changed);
-        assert_eq!(read.episodes[0].skip, Some(Skip::Watched));
+        assert_eq!(read.episodes[0].skip, Some(Skip::Deleted));
         assert_eq!(
             read.episodes[0].skipped_at.as_deref(),
             Some("2026-03-01T00:00:00Z")

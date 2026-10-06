@@ -253,7 +253,7 @@ mod tests {
     fn mascara_cada_segredo() {
         let view = mask(
             "jellyfin",
-            json!({ "url": "http://j", "api_key": "x", "delete_watched_after_minutes": 1 }),
+            json!({ "url": "http://j", "api_key": "x", "carencia_sugestao_minutos": 1 }),
         );
         assert_eq!(view["api_key"], json!({ "definida": true }));
         assert_eq!(view["url"], "http://j");

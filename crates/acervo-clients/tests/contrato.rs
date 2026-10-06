@@ -4,8 +4,8 @@
 
 //! Contrato com a `WebUI` API v2 do qBittorrent.
 //!
-//! Vale o mesmo aviso do adaptador das `*arr`: isto não substitui um ciclo
-//! contra o cliente de verdade. Cobre o que dá para cobrir sem ele — o login
+//! Isto não substitui um ciclo contra o cliente de verdade. Cobre o que dá
+//! para cobrir sem ele — o login
 //! que responde 200 mesmo quando recusa, o campo `private` que só existe a
 //! partir da 5.0, e a remoção, que é a única chamada aqui capaz de apagar
 //! arquivo.

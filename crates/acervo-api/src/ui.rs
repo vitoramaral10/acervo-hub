@@ -973,7 +973,7 @@ async fn search(
         .map_err(|_| UiError(StatusCode::BAD_REQUEST, "categoria inválida".into()))?;
     let query = SearchQuery::general(params.q.trim())
         .with_categories(categories)
-        .with_limit(crate::catalog::MAX_RESULTS);
+        .with_limit(100);
     let target = params
         .indexador
         .filter(|name| !name.is_empty())

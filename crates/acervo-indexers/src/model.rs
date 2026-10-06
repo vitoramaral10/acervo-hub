@@ -38,7 +38,6 @@ pub struct SearchQuery {
     pub term: Option<String>,
     pub categories: Vec<u32>,
     pub limit: Option<u16>,
-    pub offset: u32,
 }
 
 impl SearchQuery {
@@ -49,7 +48,6 @@ impl SearchQuery {
             term: nonempty(term),
             categories: Vec::new(),
             limit: None,
-            offset: 0,
         }
     }
 
@@ -65,7 +63,6 @@ impl SearchQuery {
             term: nonempty(term),
             categories: Vec::new(),
             limit: None,
-            offset: 0,
         }
     }
 
@@ -80,7 +77,6 @@ impl SearchQuery {
             term: nonempty(term),
             categories: Vec::new(),
             limit: None,
-            offset: 0,
         }
     }
 
@@ -95,12 +91,6 @@ impl SearchQuery {
     #[must_use]
     pub const fn with_limit(mut self, limit: u16) -> Self {
         self.limit = Some(limit);
-        self
-    }
-
-    #[must_use]
-    pub const fn with_offset(mut self, offset: u32) -> Self {
-        self.offset = offset;
         self
     }
 

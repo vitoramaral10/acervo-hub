@@ -2,12 +2,12 @@
 //!
 //! Porte do parser do gerenciador de filmes que este projeto substitui
 //! (GPL-3.0, a mesma licença): mesmos padrões, mesma ordem de decisão. A
-//! fidelidade se mede contra a leitura dele num corpus de títulos reais — o
-//! teste `corpus`, ignorado por padrão. Onde este porte diverge de propósito,
-//! o código diz por quê.
+//! fidelidade foi conferida contra a leitura dele em títulos reais; os casos
+//! da referência ficam nos testes de unidade. Onde este porte diverge de
+//! propósito, o código diz por quê.
 //!
 //! O parser de episódio (`episode.rs`) é o porte do equivalente do gerenciador
-//! de séries, conferido pelo teste `corpus_series`; qualidade, idioma e grupo
+//! de séries, conferido em títulos reais; qualidade, idioma e grupo
 //! de episódio são variantes à parte, porque ele não lê igual ao de filmes.
 //!
 //! Erro de parser não derruba nada: importa o arquivo errado em silêncio. Por

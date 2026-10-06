@@ -11,22 +11,18 @@ use crate::strike::{StrikeKey, StrikeLedger};
 
 /// Planeja um ciclo de reconciliação.
 ///
-/// Devolve [`Abort`] quando a leitura do mundo não é confiável — e aí nenhuma
-/// ação é devolvida, nem as que pareciam seguras. Esta é a diferença entre
-/// "não apagou o que devia" e "apagou o que não devia".
+/// Devolve [`Abort`] quando o lote passa das travas de tamanho; nenhuma ação
+/// é devolvida, nem as que pareciam seguras.
 ///
 /// # Errors
 ///
-/// Ver [`Abort`]: instância fora do ar, inventário vazio, ou lote acima das
-/// travas de tamanho.
+/// Ver [`Abort`]: biblioteca sem tamanho medido ou lote acima das travas.
 pub fn reconcile(
     inv: &Inventory,
     policy: &Policy,
     ledger: &mut StrikeLedger,
     now: SystemTime,
 ) -> Result<Plan, Abort> {
-    check_inventory_is_trustworthy(inv)?;
-
     let mut actions = Vec::new();
     let mut skipped = Vec::new();
     let mut reclaim = Allocated::ZERO;
@@ -52,26 +48,6 @@ pub fn reconcile(
         skipped,
         reclaim,
     })
-}
-
-/// Travas de leitura: rodam antes de qualquer decisão.
-fn check_inventory_is_trustworthy(inv: &Inventory) -> Result<(), Abort> {
-    if let Some(down) = inv.unreachable.first() {
-        return Err(Abort::InstanceUnreachable {
-            instance: down.instance.clone(),
-            reason: down.reason.clone(),
-        });
-    }
-
-    for snapshot in &inv.snapshots {
-        if snapshot.known_works == 0 {
-            return Err(Abort::EmptyInventory {
-                instance: snapshot.instance.clone(),
-            });
-        }
-    }
-
-    Ok(())
 }
 
 /// Travas de tamanho: rodam depois, sobre o lote já montado.
@@ -116,10 +92,10 @@ fn plan_unlinked_downloads(
     skipped: &mut Vec<Skipped>,
     reclaim: &mut Allocated,
 ) {
-    let queued: HashSet<_> = inv.hashes_in_any_queue().into_iter().collect();
+    let queued = &inv.queued_hashes;
 
     for download in &inv.downloads {
-        let skip = evaluate_download(download, &queued, policy, now);
+        let skip = evaluate_download(download, queued, policy, now);
 
         if let Some(reason) = skip {
             skipped.push(Skipped {
@@ -141,7 +117,7 @@ fn plan_unlinked_downloads(
 /// Passo 2: download fora de fila, sem seed e sem hardlink: ninguém o quer.
 ///
 /// Cobre o que sobra quando o dono sai de cena (grab desistido, obra apagada):
-/// incompleto, parado ou com erro. O seed é do passo 2. Um strike por ciclo,
+/// incompleto, parado ou com erro. O seed é do passo 1. Um strike por ciclo,
 /// com chave pelo hash; só no limite vira remoção. Devolve as chaves vistas.
 ///
 /// Os motivos de pulo que o passo 1 já registra (fila, categoria, estado) não
@@ -155,7 +131,7 @@ fn plan_unowned_downloads(
     skipped: &mut Vec<Skipped>,
     reclaim: &mut Allocated,
 ) -> Vec<StrikeKey> {
-    let queued: HashSet<_> = inv.hashes_in_any_queue().into_iter().collect();
+    let queued = &inv.queued_hashes;
     let mut seen = Vec::new();
 
     for download in &inv.downloads {
@@ -218,7 +194,7 @@ fn plan_unowned_downloads(
 /// `None` significa "pode apagar".
 fn evaluate_download(
     download: &Download,
-    queued: &HashSet<&acervo_core::DownloadHash>,
+    queued: &HashSet<acervo_core::DownloadHash>,
     policy: &Policy,
     now: SystemTime,
 ) -> Option<SkipReason> {

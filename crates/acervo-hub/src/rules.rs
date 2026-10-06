@@ -108,14 +108,8 @@ fn quality_definitions() -> Vec<QualityDefinition> {
 /// prefere, ou não, a revisão nova entre os releases da mesma busca.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Propers {
-    /// `preferir_e_atualizar` e `nao_atualizar` são os valores de antes,
-    /// quando havia a troca do arquivo pela revisão nova.
     #[default]
-    #[serde(
-        rename = "preferir",
-        alias = "preferir_e_atualizar",
-        alias = "nao_atualizar"
-    )]
+    #[serde(rename = "preferir")]
     Prefer,
     #[serde(rename = "nao_preferir")]
     DoNotPrefer,
@@ -130,7 +124,7 @@ pub struct DelayRules {
 
 /// As regras, no formato do banco e da tela.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DecisionRules {
     /// Teto de tamanho, em megabytes; zero é sem teto.
     pub tamanho_maximo_mb: u64,
@@ -246,24 +240,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn regras_gravadas_com_campo_aposentado_ainda_leem() {
-        // `pular_checagem_de_espaco` existia nas regras antigas.
-        let rules =
-            DecisionRules::parse(r#"{"folga_minima_mb": 2048, "pular_checagem_de_espaco": true}"#)
-                .expect("lê");
-        assert_eq!(rules.folga_minima_mb, 2048);
+    fn regras_gravadas_depois_da_migracao_carregam() {
+        // O formato gravado em produção, já com o `propers` normalizado.
+        let rules = DecisionRules::parse(
+            r#"{"tamanho_maximo_mb": 30000, "aceitar_legenda_embutida": true,
+                "legendas_embutidas_liberadas": "", "propers": "preferir",
+                "preferir_flags_do_indexador": true, "folga_minima_mb": 2048,
+                "carencia_dias": 0,
+                "indexadores": {"um": {"prioridade": 25, "seeders_minimos": 1}},
+                "atraso": {"minutos": 1440, "pular_se_melhor_qualidade": true}}"#,
+        );
+        assert!(rules.is_ok(), "{rules:?}");
     }
 
     #[test]
-    fn propers_antigos_viram_preferir() {
-        for old in ["preferir_e_atualizar", "nao_atualizar", "preferir"] {
-            let rules = DecisionRules::parse(&format!(r#"{{"propers": "{old}"}}"#)).expect("lê");
-            assert_eq!(rules.propers, Propers::Prefer, "{old}");
-            assert_eq!(
-                rules.settings().propers,
-                acervo_decision::Propers::DoNotUpgrade
-            );
+    fn regras_recusam_campo_aposentado() {
+        assert!(
+            DecisionRules::parse(r#"{"folga_minima_mb": 2048, "pular_checagem_de_espaco": true}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn propers_so_aceitam_os_valores_atuais() {
+        for old in ["preferir_e_atualizar", "nao_atualizar"] {
+            assert!(DecisionRules::parse(&format!(r#"{{"propers": "{old}"}}"#)).is_err());
         }
+        let rules = DecisionRules::parse(r#"{"propers": "preferir"}"#).expect("lê");
+        assert_eq!(rules.propers, Propers::Prefer);
+        assert_eq!(
+            rules.settings().propers,
+            acervo_decision::Propers::DoNotUpgrade
+        );
         let rules = DecisionRules::parse(r#"{"propers": "nao_preferir"}"#).expect("lê");
         assert_eq!(rules.propers, Propers::DoNotPrefer);
         assert_eq!(

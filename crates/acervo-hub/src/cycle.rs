@@ -16,7 +16,6 @@ use crate::{apply, collect, ledger};
 #[derive(Debug, Clone, Serialize)]
 pub struct CycleReport {
     pub quando: String,
-    pub instancias: Vec<InstanceLine>,
     pub torrents: usize,
     pub ilegiveis: Vec<Unreadable>,
     pub biblioteca: String,
@@ -27,14 +26,6 @@ pub struct CycleReport {
     pub pulados: Vec<SkippedLine>,
     pub executadas: Option<usize>,
     pub falharam: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct InstanceLine {
-    pub nome: String,
-    pub fila: Option<usize>,
-    pub obras: Option<usize>,
-    pub erro: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,8 +49,8 @@ pub struct SkippedLine {
 
 impl CycleReport {
     /// Uma linha para a lista de tarefas, e se o ciclo terminou bem. Ciclo
-    /// abortado conta como erro na tela: nada falhou, mas a leitura do mundo
-    /// não era confiável e alguém precisa olhar.
+    /// abortado conta como erro na tela: o lote passou de uma trava de
+    /// tamanho e alguém precisa olhar.
     #[must_use]
     pub fn summary(&self) -> (bool, String) {
         if let Some(reason) = &self.abortado {
@@ -85,32 +76,10 @@ impl CycleReport {
 impl CycleReport {
     /// O que foi lido, antes de qualquer decisão.
     fn header(inventory: &acervo_core::Inventory) -> Self {
-        let mut instancias: Vec<InstanceLine> = inventory
-            .snapshots
-            .iter()
-            .map(|snapshot| InstanceLine {
-                nome: snapshot.instance.to_string(),
-                fila: Some(snapshot.queue.len()),
-                obras: Some(snapshot.known_works),
-                erro: None,
-            })
-            .collect();
-        instancias.extend(
-            inventory
-                .unreachable
-                .iter()
-                .map(|unreachable| InstanceLine {
-                    nome: unreachable.instance.to_string(),
-                    fila: None,
-                    obras: None,
-                    erro: Some(unreachable.reason.clone()),
-                }),
-        );
         Self {
             quando: OffsetDateTime::now_utc()
                 .format(&Rfc3339)
                 .unwrap_or_default(),
-            instancias,
             torrents: inventory.downloads.len(),
             ilegiveis: inventory
                 .unreadable
@@ -185,8 +154,7 @@ pub async fn run(config: &Config, store: &acervo_store::Store) -> Result<CycleRe
     ) {
         Ok(plan) => plan,
         Err(abort) => {
-            // Abortar é resultado esperado, não defeito: a leitura do mundo não
-            // estava confiável.
+            // O lote passou de uma trava de tamanho: nenhuma ação se aplica.
             tracing::warn!("ciclo abortado: {abort}");
             result.abortado = Some(abort.to_string());
             return Ok(result);

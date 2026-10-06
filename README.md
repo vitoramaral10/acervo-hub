@@ -37,7 +37,7 @@ Workspace Cargo, binário único `acervo-hub`:
 | `acervo-parser` | Nome de release: título, ano, temporada e episódio, qualidade, idiomas, grupo |
 | `acervo-decision` | Casamento com o filme ou a série, rejeições e ordem de preferência |
 | `acervo-indexers` | Busca em indexadores (Cardigann e Torznab), rate limit, proxy e `FlareSolverr` |
-| `acervo-api` | O catálogo de indexadores servido, com cache de consultas, e a interface web |
+| `acervo-api` | O catálogo de indexadores cadastrados, com cache de consultas, e a interface web |
 | `acervo-metadata` | Metadados do TMDB |
 | `acervo-clients` | qBittorrent e Jellyfin |
 | `acervo-fs` | Tradução de caminho container→host e `stat(2)` |
@@ -168,7 +168,8 @@ episódios apagados fora da busca). Falha num item não segura os outros, e a ma
 do que saiu.
 
 Com o Jellyfin configurado, a mesma tela mostra **sugestões**, lidas na hora: o filme que
-algum usuário assistiu há mais que a carência (padrão 60 minutos) e que ninguém marcou
+algum usuário assistiu há mais que a carência antes de sugerir apagar
+(`carencia_sugestao_minutos`, padrão 60 minutos) e que ninguém marcou
 como favorito, e a temporada em que todos os episódios no disco passam nessa regra. Só
 entra o arquivo que chegou antes de assistirem: o Jellyfin lembra o assistido de um título
 apagado, e o mesmo título adicionado de novo seria sugerido assim que importado. Assistido
@@ -184,9 +185,10 @@ ou todas de uma vez; marcar não apaga.
 - o **download sem dono** — sem grab em andamento, sem seed e sem hardlink — depois de
   aparecer assim em ciclos seguidos.
 
-Só nas categorias gerenciadas. As travas abortam o ciclo inteiro quando a leitura não é
-confiável: fila do acervo ilegível, catálogo vazio, lote maior que o teto absoluto ou que a
-fração da biblioteca, biblioteca que mede zero. Uma vez por dia, a limpeza também poda o
+Só nas categorias gerenciadas. Fila do acervo ilegível falha a tarefa antes de planejar
+qualquer remoção; catálogo vazio é um estado válido. As travas abortam o ciclo inteiro
+quando o lote passa do teto absoluto ou da fração da biblioteca, ou quando há espaço a
+liberar e a biblioteca mede zero. Uma vez por dia, a limpeza também poda o
 banco: as buscas com mais de 30 dias (a mais recente de cada obra fica) e os bloqueios
 automáticos vencidos. O histórico fica.
 

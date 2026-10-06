@@ -1,12 +1,11 @@
 //! Catálogo de definições Cardigann: o que a interface oferece para
 //! adicionar e de onde cada indexador cadastrado tira a sua.
 //!
-//! Três fontes, da mais forte para a mais fraca:
+//! Duas fontes, da mais forte para a mais fraca:
 //!
 //! 1. os diretórios locais (`catalogos`), com as definições customizadas —
 //!    nunca trocadas pelas do repositório;
-//! 2. o banco, com as que a tarefa `definicoes` baixa do repositório oficial;
-//! 3. os diretórios de reserva (`catalogos_reserva`), o catálogo antigo.
+//! 2. o banco, com as que a tarefa `definicoes` baixa do repositório oficial.
 //!
 //! Montado na subida e refeito quando os diretórios mudam ou a tarefa traz
 //! definição nova: são centenas de YAML, e o resultado — quais rodam e por
@@ -29,8 +28,6 @@ pub enum Source {
     Local(PathBuf),
     /// Baixada do repositório para o banco.
     Database(Arc<str>),
-    /// Arquivo do catálogo de reserva.
-    Reserve(PathBuf),
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +46,7 @@ impl Known {
     /// Arquivo que sumiu ou ficou ilegível desde a varredura.
     pub fn yaml(&self) -> Result<String> {
         match &self.source {
-            Source::Local(path) | Source::Reserve(path) => read(path),
+            Source::Local(path) => read(path),
             Source::Database(yaml) => Ok(yaml.to_string()),
         }
     }
@@ -58,7 +55,7 @@ impl Known {
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         match &self.source {
-            Source::Local(path) | Source::Reserve(path) => Some(path),
+            Source::Local(path) => Some(path),
             Source::Database(_) => None,
         }
     }
@@ -74,7 +71,7 @@ impl Known {
 pub struct Resolved {
     pub yaml: String,
     pub sha: String,
-    /// Vem de diretório local (ou de arquivo fixado fora da reserva): o
+    /// Vem de diretório local (ou de arquivo fixado num cadastro): o
     /// repositório nunca a troca.
     pub local: bool,
 }
@@ -82,7 +79,6 @@ pub struct Resolved {
 #[derive(Debug, Clone, Default)]
 pub struct Definitions {
     by_id: BTreeMap<String, Known>,
-    reserve: Vec<PathBuf>,
 }
 
 /// SHA-256 em hexadecimal.
@@ -102,7 +98,7 @@ fn read(path: &Path) -> Result<String> {
 }
 
 /// Os YAML de um diretório, em ordem de nome. Ilegível é pulado com aviso:
-/// catálogo incompleto não impede servir os indexadores já configurados.
+/// catálogo incompleto não impede consultar os indexadores já configurados.
 fn files(dir: &Path) -> Vec<(PathBuf, String)> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -127,13 +123,12 @@ fn files(dir: &Path) -> Vec<(PathBuf, String)> {
 }
 
 impl Definitions {
-    /// Junta as três fontes na ordem de precedência; o primeiro que tiver um
+    /// Junta as duas fontes na ordem de precedência; o primeiro que tiver um
     /// id vence.
     #[must_use]
-    pub fn assemble(local: &[PathBuf], database: &[DefinitionRow], reserve: &[PathBuf]) -> Self {
+    pub fn assemble(local: &[PathBuf], database: &[DefinitionRow]) -> Self {
         let mut definitions = Self {
             by_id: BTreeMap::new(),
-            reserve: reserve.to_vec(),
         };
         for dir in local {
             for (path, yaml) in files(dir) {
@@ -142,11 +137,6 @@ impl Definitions {
         }
         for row in database {
             definitions.offer(Source::Database(Arc::from(row.yaml.as_str())), &row.yaml);
-        }
-        for dir in reserve {
-            for (path, yaml) in files(dir) {
-                definitions.offer(Source::Reserve(path), &yaml);
-            }
         }
         tracing::info!(
             definicoes = definitions.by_id.len(),
@@ -187,34 +177,23 @@ impl Definitions {
         self.by_id.values()
     }
 
-    /// O arquivo está num diretório de reserva? Cadastro fixado num arquivo
-    /// de lá segue a precedência, como se não estivesse fixado.
-    #[must_use]
-    pub fn in_reserve(&self, path: &Path) -> bool {
-        self.reserve.iter().any(|dir| path.starts_with(dir))
-    }
-
     /// Registra a definição fixada num cadastro, para que ela também
     /// apareça no catálogo mesmo fora dos diretórios.
     pub fn include(&mut self, path: &Path) {
-        if self.in_reserve(path) {
-            return;
-        }
         if let Ok(yaml) = read(path) {
             self.offer(Source::Local(path.to_owned()), &yaml);
         }
     }
 
-    /// A definição de um cadastro Cardigann. Arquivo fixado fora da reserva
-    /// é customizado e vale como está; senão vale a precedência pelo id, e
-    /// o arquivo fixado só se ninguém tiver o id.
+    /// A definição de um cadastro Cardigann. Arquivo fixado é customizado e
+    /// vale como está; senão vale a precedência pelo id.
     ///
     /// # Errors
     ///
     /// Arquivo ilegível ou id que nenhuma fonte tem.
     pub fn resolve(&self, id: &str, pinned: Option<&str>) -> Result<Resolved> {
         let pinned = pinned.map(Path::new);
-        if let Some(path) = pinned.filter(|path| !self.in_reserve(path)) {
+        if let Some(path) = pinned {
             let yaml = read(path)?;
             return Ok(Resolved {
                 sha: sha(&yaml),
@@ -230,14 +209,7 @@ impl Definitions {
                 local: known.is_local(),
             });
         }
-        let path =
-            pinned.with_context(|| format!("a definição `{id}` não está em nenhum catálogo"))?;
-        let yaml = read(path)?;
-        Ok(Resolved {
-            sha: sha(&yaml),
-            yaml,
-            local: false,
-        })
+        anyhow::bail!("a definição `{id}` não está em nenhum catálogo")
     }
 }
 
@@ -411,66 +383,34 @@ search:
     }
 
     #[test]
-    fn local_vence_o_banco_que_vence_a_reserva() {
+    fn local_vence_o_banco_e_primeiro_diretorio_vence() {
         let local = Dir::new("precedencia-local", &[("a.yml", yaml("a", "A local"))]);
-        let reserve = Dir::new(
-            "precedencia-reserva",
-            &[
-                ("a.yml", yaml("a", "A reserva")),
-                ("b.yml", yaml("b", "B reserva")),
-                ("c.yml", yaml("c", "C reserva")),
-            ],
-        );
+        let other = Dir::new("precedencia-outro", &[("a.yml", yaml("a", "A outro"))]);
         let definitions = Definitions::assemble(
-            std::slice::from_ref(&local.0),
+            &[local.0.clone(), other.0.clone()],
             &[row("a", "A banco"), row("b", "B banco")],
-            std::slice::from_ref(&reserve.0),
         );
-        let name = |id: &str| definitions.get(id).unwrap().header.name.clone();
-        assert_eq!(name("a"), "A local");
-        assert_eq!(name("b"), "B banco");
-        assert_eq!(name("c"), "C reserva");
+        assert_eq!(definitions.get("a").unwrap().header.name, "A local");
+        assert_eq!(definitions.get("b").unwrap().header.name, "B banco");
         assert!(definitions.get("a").unwrap().is_local());
         assert!(matches!(
             definitions.get("b").unwrap().source,
             Source::Database(_)
         ));
-        assert!(matches!(
-            definitions.get("c").unwrap().source,
-            Source::Reserve(_)
-        ));
         assert!(definitions.iter().all(|known| known.refusal.is_none()));
     }
 
     #[test]
-    fn cadastro_fixado_na_reserva_segue_a_precedencia_e_o_local_fica() {
-        let local = Dir::new("fixado-local", &[("x.yml", yaml("x", "X local"))]);
-        let reserve = Dir::new("fixado-reserva", &[("b.yml", yaml("b", "B reserva"))]);
-        let definitions = Definitions::assemble(
-            &[],
-            &[row("b", "B banco")],
-            std::slice::from_ref(&reserve.0),
-        );
-
-        // Fixado num arquivo da reserva: vale o banco, que é mais forte.
-        let pinned = reserve.0.join("b.yml");
+    fn arquivo_fixado_vence_e_sem_fixar_vale_o_id() {
+        let local = Dir::new("fixado-local", &[("b.yml", yaml("b", "B local"))]);
+        let mut definitions = Definitions::assemble(&[], &[row("b", "B banco")]);
+        let pinned = local.0.join("b.yml");
+        definitions.include(&pinned);
         let resolved = definitions.resolve("b", pinned.to_str()).unwrap();
+        assert!(resolved.yaml.contains("B local") && resolved.local);
+        assert_eq!(resolved.sha, sha(&yaml("b", "B local")));
+        let resolved = definitions.resolve("b", None).unwrap();
         assert!(resolved.yaml.contains("B banco") && !resolved.local);
-        assert_eq!(resolved.sha, sha(&yaml("b", "B banco")));
-
-        // Fixado fora da reserva: customizado, vale como está.
-        let custom = local.0.join("x.yml");
-        let resolved = definitions.resolve("x", custom.to_str()).unwrap();
-        assert!(resolved.yaml.contains("X local") && resolved.local);
-
-        // Sem fixar: pelo id.
-        assert!(
-            definitions
-                .resolve("b", None)
-                .unwrap()
-                .yaml
-                .contains("B banco")
-        );
         assert!(definitions.resolve("zzz", None).is_err());
     }
 

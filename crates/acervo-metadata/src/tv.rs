@@ -1,5 +1,5 @@
 //! Séries pela API v3 do TMDB: o detalhe, os episódios por temporada, a busca
-//! e a ponte do id do TVDB, que é o único que o Sonarr conhece.
+//! e o id do TVDB, guardado para cruzar referências.
 
 use serde::Deserialize;
 

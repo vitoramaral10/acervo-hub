@@ -10,8 +10,8 @@ use crate::size::{Allocated, Apparent};
 /// Estado do torrent no cliente.
 ///
 /// `Paused` é um estado próprio, e **não** é sinônimo de órfão: a maior parte
-/// dos pausados é download desejado esperando liberar espaço. Órfão é o item
-/// cuja obra não existe mais.
+/// dos pausados é download desejado esperando liberar espaço. Sem grab em
+/// andamento e sem hardlink, o item pode entrar na regra de download sem dono.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DownloadState {
     Downloading,
@@ -59,8 +59,8 @@ pub struct Download {
     pub state: DownloadState,
     /// Tracker privado. Muda a política: hit&run custa acesso ao tracker.
     pub private: bool,
-    /// Categoria no cliente. É o que separa o que os *arr baixaram do que
-    /// alguém baixou à mão — e só o primeiro é da conta da limpeza.
+    /// Categoria no cliente. Só as categorias gerenciadas entram na limpeza;
+    /// as outras são downloads manuais, fora da conta do acervo.
     pub category: String,
     pub ratio: f64,
     pub seeded_for: Duration,

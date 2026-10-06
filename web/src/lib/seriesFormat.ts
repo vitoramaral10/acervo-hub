@@ -20,10 +20,10 @@ function formatEventDay(iso: string | null | undefined, now = new Date()): strin
   return (date.getFullYear() === now.getFullYear() ? shortDate : fullDate).format(date)
 }
 
-/** O chip de um episódio dispensado: "assistido 02/10", "apagado 02/10", "não quero". */
+/** O chip de um episódio dispensado: "apagado 02/10", "não quero". */
 export function skipLabel(episode: Episode): string {
   const day = formatEventDay(episode.motivo_em)
-  const text = episode.motivo === 'watched' ? 'assistido' : episode.motivo === 'deleted' ? 'apagado' : 'não quero'
+  const text = episode.motivo === 'deleted' ? 'apagado' : 'não quero'
   return day ? `${text} ${day}` : text
 }
 

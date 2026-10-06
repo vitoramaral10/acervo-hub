@@ -2,8 +2,8 @@
 //! (PROPER, REPACK, REAL).
 //!
 //! Porte do parser de qualidade do gerenciador de filmes que este projeto
-//! substitui, com a mesma tabela e a mesma ordem de decisão: é ela que o
-//! corpus confere.
+//! substitui, com a mesma tabela e a mesma ordem de decisão, cobertas pelos
+//! testes de unidade.
 
 use std::sync::LazyLock;
 

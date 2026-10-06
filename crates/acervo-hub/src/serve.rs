@@ -199,7 +199,7 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
     Ok(())
 }
 
-/// Os indexadores servidos: os cadastros ativos que sobem.
+/// Os indexadores cadastrados: os cadastros ativos que sobem.
 ///
 /// Cadastro que não sobe — definição ilegível, endpoint que não responde
 /// `caps` — fica de fora, com o motivo no log, sem derrubar os outros nem a
@@ -342,7 +342,7 @@ impl HubAdmin {
         Ok(())
     }
 
-    /// Remonta todos os indexadores servidos — o timeout HTTP, o proxy ou
+    /// Remonta todos os indexadores cadastrados — o timeout HTTP, o proxy ou
     /// o `FlareSolverr` mudaram, e eles moram dentro de cada cliente.
     async fn reload_catalog(&self) {
         let records: Vec<_> = self
@@ -670,8 +670,8 @@ impl Admin for HubAdmin {
                 settings.insert(name, value);
             }
         }
-        // Só a definição local fica fixada no arquivo; a do banco e a da
-        // reserva seguem a precedência, e a atualização as alcança.
+        // Só a definição local fica fixada no arquivo; a do banco segue a
+        // precedência, e a atualização a alcança.
         let record = IndexerRecord {
             name: definition.to_owned(),
             kind: CARDIGANN.into(),
@@ -822,8 +822,7 @@ impl Admin for HubAdmin {
         let saved = self.settings.save_section(section, value).await?;
         if section == SERVIDOR {
             let after = self.settings.get();
-            let catalogs = after.server.catalogs != before.server.catalogs
-                || after.server.reserve_catalogs != before.server.reserve_catalogs;
+            let catalogs = after.server.catalogs != before.server.catalogs;
             if catalogs {
                 let rows = self
                     .store()?

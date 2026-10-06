@@ -216,10 +216,7 @@ async fn consulta_filme_com_overrides_ids_e_limite_local() {
 async fn consulta_incompativel_nao_faz_http() {
     let server = MockServer::start().await;
     let client = client(&yaml_at(&server));
-    for query in [
-        SearchQuery::general("q").with_offset(1),
-        SearchQuery::general("q").with_categories([123_456]),
-    ] {
+    for query in [SearchQuery::general("q").with_categories([123_456])] {
         assert!(matches!(
             client.search(&query).await,
             Err(IndexerError::UnsupportedQuery { .. })
