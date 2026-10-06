@@ -257,7 +257,6 @@ indexadores mostra "em espera até" (também para o 429). Em memória: reiniciar
 - **Descobrir** — a tela de entrada: lançamentos semanais, listas e busca unificada do
   TMDB, com detalhes, elenco, trailer, recomendações, adição ao acervo e preferências para
   ocultar títulos, semanas e gêneros.
-- **Painel** — o que está baixando, o que travou e quanto disco sobra.
 - **Filmes** e **Séries** — a biblioteca em pôsteres: adicionar pelo TMDB, monitorar,
   prioridade, busca automática ou interativa, renomear, verificar o disco, apagar arquivo
   ou remover — com a pasta e o download no cliente, na hora.

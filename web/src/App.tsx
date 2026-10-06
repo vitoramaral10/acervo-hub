@@ -11,7 +11,6 @@ import {
   Eraser,
   Film,
   FolderTree,
-  House,
   Library,
   ListChecks,
   LogOut,
@@ -37,7 +36,6 @@ import { cn } from '@/lib/utils'
 import { ActivityPage } from '@/pages/Activity'
 import { CalendarPage } from '@/pages/Calendar'
 import { DiscoverPage } from '@/pages/Discover'
-import { HomePage } from '@/pages/Home'
 import { IndexersPage } from '@/pages/Indexers'
 import { LoginPage } from '@/pages/Login'
 import { MissingPage } from '@/pages/Missing'
@@ -48,7 +46,7 @@ import { SettingsPage, type SettingsView } from '@/pages/Settings'
 import { TasksPage } from '@/pages/Tasks'
 import { ToDeletePage } from '@/pages/ToDelete'
 
-type MainView = 'inicio' | 'filmes' | 'series' | 'descobrir' | 'faltando' | 'apagar' | 'calendario' | 'atividade' | 'busca'
+type MainView = 'filmes' | 'series' | 'descobrir' | 'faltando' | 'apagar' | 'calendario' | 'atividade' | 'busca'
 type ConfigView = 'indexadores' | 'tarefas' | SettingsView
 type View = MainView | ConfigView
 
@@ -57,7 +55,6 @@ type NavItem<V extends View> = { view: V; label: string; icon: typeof Server }
 /** Uso do dia a dia: sempre à vista. */
 const MAIN: NavItem<MainView>[] = [
   { view: 'descobrir', label: 'Descobrir', icon: Compass },
-  { view: 'inicio', label: 'Painel', icon: House },
   { view: 'filmes', label: 'Filmes', icon: Film },
   { view: 'series', label: 'Séries', icon: MonitorPlay },
   { view: 'faltando', label: 'Faltando', icon: CircleDashed },
@@ -293,9 +290,7 @@ export function App() {
       </aside>
       <main id="conteudo" tabIndex={-1} className="min-w-0 px-4 py-6 outline-none sm:px-6 md:px-10 md:py-10">
         <div className="mx-auto max-w-6xl">
-          {view === 'inicio' ? (
-            <HomePage />
-          ) : view === 'busca' ? (
+          {view === 'busca' ? (
             <SearchPage />
           ) : view === 'filmes' ? (
             <MoviesPage />
