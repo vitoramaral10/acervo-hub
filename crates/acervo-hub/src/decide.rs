@@ -64,7 +64,7 @@ struct Remote {
     rules: DecisionRules,
 }
 
-fn target(entry: &CatalogMovie, remote: &Remote, now: time::OffsetDateTime) -> Target {
+fn target(entry: &CatalogMovie, now: time::OffsetDateTime) -> Target {
     let movie = &entry.movie;
     let profile = automatic_profile();
     let mut clean_titles: Vec<String> = movie.clean_title.iter().cloned().collect();
@@ -92,7 +92,7 @@ fn target(entry: &CatalogMovie, remote: &Remote, now: time::OffsetDateTime) -> T
         runtime: movie.runtime,
         monitored: movie.monitored,
         // Calculada das datas, como a referência faz, com a carência dela.
-        available: crate::library::is_available(movie, now.date(), remote.rules.carencia_dias),
+        available: crate::library::is_available(movie, now.date()),
         file: movie.file.as_ref().map(|file| ExistingFile {
             quality: file.quality,
             release_group: file.release_group.clone(),
@@ -104,19 +104,15 @@ fn target(entry: &CatalogMovie, remote: &Remote, now: time::OffsetDateTime) -> T
     }
 }
 
-/// Os indexadores cadastrados, com a prioridade e os seeders mínimos das
-/// regras.
-pub(crate) fn indexers(served: &[String], rules: &DecisionRules) -> Vec<Indexer> {
+/// Os indexadores cadastrados, com prioridade 25 e mínimo de um seeder.
+pub(crate) fn indexers(served: &[String]) -> Vec<Indexer> {
     served
         .iter()
-        .map(|name| {
-            let rules = rules.indexer(name);
-            Indexer {
-                name: name.clone(),
-                priority: rules.prioridade,
-                minimum_seeders: rules.seeders_minimos,
-                multi_languages: Vec::new(),
-            }
+        .map(|name| Indexer {
+            name: name.clone(),
+            priority: 25,
+            minimum_seeders: 1,
+            multi_languages: Vec::new(),
         })
         .collect()
 }
@@ -193,10 +189,7 @@ impl Decider {
         }
         let remote = Remote { rules };
         let now = time::OffsetDateTime::now_utc();
-        let mut library: Vec<Target> = movies
-            .iter()
-            .map(|entry| target(entry, &remote, now))
-            .collect();
+        let mut library: Vec<Target> = movies.iter().map(|entry| target(entry, now)).collect();
         // O que o acervo mesmo mandou ao cliente conta como fila: sem isso,
         // pegaria o mesmo filme de novo enquanto o primeiro baixa.
         for grab in grabs
@@ -217,7 +210,7 @@ impl Decider {
             bail!("nenhum indexador ativo para buscar");
         }
         Ok(Self {
-            indexers: indexers(&served, &remote.rules),
+            indexers: indexers(&served),
             settings: remote.rules.settings(),
             delay: remote.rules.delay(),
             // Bloqueio por falta de seeds expira; a linha fica na tela.

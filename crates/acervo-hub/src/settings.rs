@@ -3,8 +3,7 @@
 //!
 //! Quem usa pega o instantâneo na hora em que roda ([`Settings::get`]), e
 //! não guarda: mudança feita na tela vale para a próxima tarefa e a próxima
-//! requisição, sem reiniciar. Quem precisa reagir à mudança — o agendador,
-//! que recalcula os intervalos — assina ([`Settings::subscribe`]).
+//! requisição, sem reiniciar. Os intervalos das tarefas são fixos.
 
 use std::sync::Arc;
 
@@ -13,7 +12,7 @@ use anyhow::Result;
 use serde_json::{Map, Value};
 use tokio::sync::watch;
 
-use crate::config::{self, Config, SERVIDOR, TAREFAS};
+use crate::config::{self, Config, SERVIDOR};
 
 pub struct Settings {
     store: Store,
@@ -74,16 +73,6 @@ fn merge(section: &str, current: Value, incoming: Value) -> Result<Value, String
     };
     for (field, value) in incoming {
         if secrets.contains(&field.as_str()) && blank(&value) {
-            continue;
-        }
-        // Intervalos vão por tarefa: mandar só o da busca não pode
-        // devolver as outras ao padrão.
-        if section == TAREFAS
-            && field == "intervalos"
-            && let (Some(Value::Object(saved)), Value::Object(sent)) =
-                (merged.get_mut(&field), &value)
-        {
-            saved.extend(sent.clone());
             continue;
         }
         merged.insert(field, value);
@@ -217,32 +206,6 @@ mod tests {
 
         // Inválido: nada muda, nem no banco.
         changes.mark_unchanged();
-        let error = settings
-            .save_section("limpeza", json!({ "max_batch_fraction": 2.0 }))
-            .await
-            .unwrap_err();
-        assert!(error.contains("fração"), "{error}");
-        assert!(!changes.has_changed().unwrap());
-        assert!((settings.get().policy.max_batch_fraction - 0.30).abs() < f64::EPSILON);
-        assert!(
-            settings
-                .save_section("limpeza", json!({ "orphan_strikez": 1 }))
-                .await
-                .is_err()
-        );
-
-        // Intervalo de uma tarefa só: as outras ficam como estavam.
-        settings
-            .save_section("tarefas", json!({ "intervalos": { "rss": 45 } }))
-            .await
-            .unwrap();
-        settings
-            .save_section("tarefas", json!({ "intervalos": { "busca": 120 } }))
-            .await
-            .unwrap();
-        assert_eq!(settings.get().tasks.minutes("rss"), 45);
-        assert_eq!(settings.get().tasks.minutes("busca"), 120);
-
         // O banco guarda o mesmo que a memória.
         let reloaded = Settings::load(db.store.clone()).await.unwrap();
         assert_eq!(*reloaded.get(), *settings.get());
@@ -251,10 +214,7 @@ mod tests {
 
     #[test]
     fn mascara_cada_segredo() {
-        let view = mask(
-            "jellyfin",
-            json!({ "url": "http://j", "api_key": "x", "carencia_sugestao_minutos": 1 }),
-        );
+        let view = mask("jellyfin", json!({ "url": "http://j", "api_key": "x" }));
         assert_eq!(view["api_key"], json!({ "definida": true }));
         assert_eq!(view["url"], "http://j");
         let view = mask("servidor", json!({ "api_key": "" }));

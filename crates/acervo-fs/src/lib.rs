@@ -1,9 +1,4 @@
-//! Filesystem: tradução de caminho container→host e leitura de `stat(2)`.
-//!
-//! O cliente de download reporta caminhos como **ele** os vê, de dentro do
-//! container. Quem roda a reconciliação vê outra árvore. Comparar por
-//! `basename` para contornar isso dá falso negativo — nome de arquivo se repete
-//! entre temporadas e entre obras. A tradução é por caminho completo.
+//! Leitura do disco: stat(2), espaço livre e tamanho das raízes.
 
 use std::collections::HashSet;
 use std::fs;
@@ -14,9 +9,6 @@ use acervo_core::{Allocated, Apparent, FileFacts};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FsError {
-    #[error("caminho `{path}` não casa com nenhum mapeamento configurado")]
-    Unmapped { path: PathBuf },
-
     #[error("não foi possível ler `{path}`: {source}")]
     Stat {
         path: PathBuf,
@@ -25,62 +17,14 @@ pub enum FsError {
     },
 }
 
-/// Tradução de prefixo de caminho, do que o cliente vê para o que o host vê.
-#[derive(Debug, Clone, Default)]
-pub struct PathMap {
-    /// Ordenado por prefixo mais longo primeiro, para que o mapeamento mais
-    /// específico vença quando dois se sobrepõem.
-    rules: Vec<(PathBuf, PathBuf)>,
-}
-
-impl PathMap {
-    #[must_use]
-    pub fn new(rules: impl IntoIterator<Item = (PathBuf, PathBuf)>) -> Self {
-        let mut rules: Vec<_> = rules.into_iter().collect();
-        rules.sort_by_key(|(from, _)| std::cmp::Reverse(from.as_os_str().len()));
-        Self { rules }
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
-    }
-
-    /// Traduz um caminho do cliente para o host.
-    ///
-    /// Sem mapeamento nenhum configurado, o caminho passa inalterado — é o caso
-    /// de quem roda tudo no mesmo namespace de filesystem.
-    ///
-    /// # Errors
-    ///
-    /// [`FsError::Unmapped`] quando há mapeamentos, mas nenhum casa. Não casar
-    /// é erro, não passagem direta: um caminho não traduzido apontaria para o
-    /// lugar errado do host, e `stat` ali responderia sobre outro arquivo.
-    pub fn to_host(&self, client_path: &Path) -> Result<PathBuf, FsError> {
-        if self.rules.is_empty() {
-            return Ok(client_path.to_path_buf());
-        }
-
-        for (from, to) in &self.rules {
-            if let Ok(rest) = client_path.strip_prefix(from) {
-                return Ok(to.join(rest));
-            }
-        }
-
-        Err(FsError::Unmapped {
-            path: client_path.to_path_buf(),
-        })
-    }
-}
-
-/// Lê os fatos de `stat(2)` de um arquivo, já traduzido para o host.
+/// Lê os fatos de `stat(2)` de um arquivo.
 ///
 /// # Errors
 ///
-/// [`FsError::Unmapped`] ou [`FsError::Stat`]. Falha nunca vira "sem link":
+/// [`FsError::Stat`]. Falha nunca vira "sem link":
 /// não saber se a biblioteca aponta para o inode é motivo para não decidir.
-pub fn facts_for(client_path: &Path, map: &PathMap) -> Result<FileFacts, FsError> {
-    let host = map.to_host(client_path)?;
+pub fn facts_for(host: &Path) -> Result<FileFacts, FsError> {
+    let host = host.to_path_buf();
     let meta = fs::metadata(&host).map_err(|source| FsError::Stat {
         path: host.clone(),
         source,
@@ -150,48 +94,9 @@ pub fn measure_roots(roots: &[PathBuf]) -> Allocated {
 mod tests {
     use super::*;
 
-    fn map() -> PathMap {
-        PathMap::new([
-            (PathBuf::from("/media"), PathBuf::from("/mnt/acervo")),
-            (
-                PathBuf::from("/media/downloads"),
-                PathBuf::from("/mnt/rapido/downloads"),
-            ),
-        ])
-    }
-
-    #[test]
-    fn prefixo_mais_especifico_vence() {
-        let m = map();
-        assert_eq!(
-            m.to_host(Path::new("/media/downloads/a.mkv")).unwrap(),
-            PathBuf::from("/mnt/rapido/downloads/a.mkv")
-        );
-        assert_eq!(
-            m.to_host(Path::new("/media/series/b.mkv")).unwrap(),
-            PathBuf::from("/mnt/acervo/series/b.mkv")
-        );
-    }
-
-    #[test]
-    fn caminho_fora_do_mapa_e_erro_e_nao_passagem_direta() {
-        let erro = map().to_host(Path::new("/outro/lugar/c.mkv")).unwrap_err();
-        assert!(matches!(erro, FsError::Unmapped { .. }));
-    }
-
-    #[test]
-    fn sem_mapeamento_o_caminho_passa_inalterado() {
-        let m = PathMap::default();
-        assert_eq!(
-            m.to_host(Path::new("/media/x.mkv")).unwrap(),
-            PathBuf::from("/media/x.mkv")
-        );
-    }
-
     #[test]
     fn arquivo_inexistente_vira_erro_de_stat() {
-        let m = PathMap::default();
-        let erro = facts_for(Path::new("/nao/existe/mesmo.mkv"), &m).unwrap_err();
+        let erro = facts_for(Path::new("/nao/existe/mesmo.mkv")).unwrap_err();
         assert!(matches!(erro, FsError::Stat { .. }));
     }
 

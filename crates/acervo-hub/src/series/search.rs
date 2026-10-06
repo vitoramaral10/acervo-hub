@@ -130,7 +130,7 @@ impl Parts {
             bail!("nenhum indexador ativo para buscar");
         }
         Ok(Self {
-            indexers: crate::decide::indexers(&served, &rules),
+            indexers: crate::decide::indexers(&served),
             settings: rules.settings(),
             // Bloqueio de filme não diz nada a série.
             blocklist: blocked

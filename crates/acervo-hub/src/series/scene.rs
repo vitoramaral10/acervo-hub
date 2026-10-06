@@ -15,8 +15,6 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::config::Config;
-
 /// Os tvdb ids da lista `havemap`. O XEM manda os ids como texto; número
 /// também vale.
 ///
@@ -148,12 +146,12 @@ pub struct SceneReport {
 ///
 /// Banco ilegível ou lista do XEM inalcançável. Falha numa série fica no
 /// relato; as outras seguem.
-pub async fn refresh(config: &Config, store: &Store) -> Result<SceneReport> {
+pub async fn refresh(store: &Store) -> Result<SceneReport> {
     let http = reqwest::Client::builder()
-        .timeout(config.http_timeout())
+        .timeout(crate::config::HTTP_TIMEOUT)
         .user_agent("acervo-hub")
         .build()?;
-    let base = &config.server.xem_url;
+    let base = crate::config::XEM_URL;
     let list = store.series_list().await?;
     let mut report = SceneReport::default();
     if list.is_empty() {

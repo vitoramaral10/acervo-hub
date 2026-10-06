@@ -148,7 +148,7 @@ pub async fn run(config: &Config, store: &acervo_store::Store) -> Result<CycleRe
     let mut strikes = ledger::load(store).await?;
     let plan = match reconcile(
         inventory,
-        &config.policy.to_policy(),
+        &config.cleanup_policy(),
         &mut strikes,
         SystemTime::now(),
     ) {

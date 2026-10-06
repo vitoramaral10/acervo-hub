@@ -269,9 +269,6 @@ pub enum IndexerError {
         source: url::ParseError,
     },
 
-    #[error("o endpoint de `{indexer}` precisa usar HTTP ou HTTPS")]
-    BadEndpointScheme { indexer: String },
-
     #[error("não foi possível construir o cliente http: {0}")]
     Build(#[source] reqwest::Error),
 
@@ -290,20 +287,6 @@ pub enum IndexerError {
     RateLimited {
         indexer: String,
         retry_after: Option<Duration>,
-    },
-
-    #[error("indexador `{indexer}` recusou a consulta ({code}): {description}")]
-    Api {
-        indexer: String,
-        code: String,
-        description: String,
-    },
-
-    #[error("xml inválido devolvido por `{indexer}`: {source}")]
-    Xml {
-        indexer: String,
-        #[source]
-        source: quick_xml::Error,
     },
 
     #[error("`{indexer}` devolveu um documento que não é {expected}")]

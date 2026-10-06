@@ -4,8 +4,6 @@ use acervo_metadata::Tmdb;
 use acervo_store::Store;
 use anyhow::{Context, Result};
 
-use crate::config::Config;
-
 /// Onde a chave do TMDB fica na tabela de configurações.
 pub const TMDB_KEY: &str = "tmdb.api_key";
 
@@ -17,11 +15,15 @@ pub const LANGUAGE: &str = "pt-BR";
 /// # Errors
 ///
 /// Banco inalcançável.
-pub async fn tmdb(config: &Config, store: &Store) -> Result<Option<Tmdb>> {
+pub async fn tmdb(store: &Store) -> Result<Option<Tmdb>> {
     let Some(key) = store.setting(TMDB_KEY).await? else {
         return Ok(None);
     };
-    Ok(Some(Tmdb::new(&key, LANGUAGE, config.http_timeout())?))
+    Ok(Some(Tmdb::new(
+        &key,
+        LANGUAGE,
+        crate::config::HTTP_TIMEOUT,
+    )?))
 }
 
 /// Como [`tmdb`], mas sem chave é erro.
@@ -29,8 +31,8 @@ pub async fn tmdb(config: &Config, store: &Store) -> Result<Option<Tmdb>> {
 /// # Errors
 ///
 /// Sem chave configurada ou banco inalcançável.
-pub async fn require_tmdb(config: &Config, store: &Store) -> Result<Tmdb> {
-    tmdb(config, store)
+pub async fn require_tmdb(store: &Store) -> Result<Tmdb> {
+    tmdb(store)
         .await?
         .context("chave do TMDB não configurada: defina em Configurações, na interface")
 }

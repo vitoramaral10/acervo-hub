@@ -292,9 +292,6 @@ async fn missing(
         store.grabs()
     )
     .map_err(|e| fail(bad(e)))?;
-    let rules = crate::rules::stored(store)
-        .await
-        .map_err(|e| fail(crate::web::anyhow_bad(&e)))?;
     let today = crate::series::today();
     let items = missing_items(
         &series,
@@ -302,7 +299,7 @@ async fn missing(
         &movies,
         &grabs,
         today,
-        |m| crate::library::is_available(&m.movie, today, rules.carencia_dias),
+        |m| crate::library::is_available(&m.movie, today),
         only,
     );
     ok(&json!({ "total": items.len(), "itens": items }))

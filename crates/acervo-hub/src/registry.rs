@@ -1,27 +1,21 @@
-//! Os indexadores cadastrados e o catálogo de definições, divididos entre a
-//! administração pela tela e a tarefa que atualiza as definições: os dois
-//! leem os mesmos cadastros e gravam um de cada vez.
-//!
-//! Aqui também mora a montagem de um indexador a partir do cadastro — a
-//! definição pela precedência, os settings e a rede (proxy e `FlareSolverr`).
+//! Catálogo local e em uso, cache remoto sob demanda e montagem dos indexadores.
+//! A rede de cada cadastro preserva proxy e `FlareSolverr`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
-use acervo_api::{Catalog, Entry};
+use acervo_api::Entry;
 use acervo_indexers::{
-    CardigannClient, CardigannDefinition, Challenge, FlareSolverr, Network, Proxy, TorznabClient,
+    CardigannClient, CardigannDefinition, Challenge, FlareSolverr, Network, Proxy,
 };
-use acervo_store::{DefinitionRow, IndexerRecord, Store};
+use acervo_store::{DefinitionRow, IndexerRecord};
 use anyhow::{Context, Result};
-use serde::Serialize;
 
 use crate::config::Config;
 use crate::definitions::{self, Definitions};
 
-pub const TORZNAB: &str = "torznab";
 pub const CARDIGANN: &str = "cardigann";
 
 /// Setting do cadastro, fora da definição: o indexador sai pelo proxy do
@@ -56,7 +50,14 @@ pub fn check_reserved(name: &str, value: &str) -> Result<(), String> {
     }
 }
 
-/// O que a tela administra, em memória, e o que a tarefa `definicoes` lê.
+/// Catálogo disponível, com aviso quando a atualização remota falhou.
+#[derive(Debug)]
+pub struct Available {
+    pub definitions: Definitions,
+    pub warning: Option<String>,
+}
+
+/// Os cadastros em memória e os dois catálogos de definições.
 #[derive(Debug, Default)]
 pub struct Registry {
     pub definitions: RwLock<Definitions>,
@@ -65,6 +66,8 @@ pub struct Registry {
     pub records: RwLock<BTreeMap<String, IndexerRecord>>,
     /// Serializa as gravações: duas mudanças simultâneas não podem se apagar.
     pub write: tokio::sync::Mutex<()>,
+    pub remote: RwLock<Option<(std::time::Instant, Definitions)>>,
+    fetch: tokio::sync::Mutex<()>,
 }
 
 impl Registry {
@@ -79,6 +82,8 @@ impl Registry {
             definitions: RwLock::new(scan(config, rows, &records)),
             records: RwLock::new(records),
             write: tokio::sync::Mutex::new(()),
+            remote: RwLock::new(None),
+            fetch: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -110,6 +115,79 @@ impl Registry {
             .definitions
             .write()
             .unwrap_or_else(PoisonError::into_inner) = definitions;
+    }
+
+    /// Catálogo para adicionar: locais e definições em uso têm precedência.
+    /// O download e a interpretação são compartilhados por quinze minutos.
+    pub async fn available(&self) -> Result<Available> {
+        self.available_with(async {
+            let downloaded =
+                definitions::download(crate::config::DEFINITIONS_URL, crate::config::HTTP_TIMEOUT)
+                    .await?;
+            tokio::task::spawn_blocking(move || {
+                let mut remote = Definitions::default();
+                for (_, yaml) in downloaded {
+                    remote.offer(
+                        definitions::Source::Database(Arc::from(yaml.as_str())),
+                        &yaml,
+                    );
+                }
+                remote
+            })
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await
+    }
+
+    /// O carregador é injetável para exercitar falhas sem acessar a rede.
+    async fn available_with(
+        &self,
+        refresh: impl std::future::Future<Output = Result<Definitions>>,
+    ) -> Result<Available> {
+        let _fetch = self.fetch.lock().await;
+        let fresh = self
+            .remote
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(15 * 60));
+        let mut warning = None;
+        if !fresh {
+            match refresh.await {
+                Ok(remote) => {
+                    *self.remote.write().unwrap_or_else(PoisonError::into_inner) =
+                        Some((std::time::Instant::now(), remote));
+                }
+                Err(error) => {
+                    let cached = self.available_cached();
+                    if cached.iter().next().is_none() {
+                        return Err(error);
+                    }
+                    tracing::warn!(%error, "catálogo remoto indisponível; usando definições locais e em cache");
+                    warning = Some(format!(
+                        "Não foi possível atualizar o catálogo remoto. As definições locais e em cache continuam disponíveis: {error:#}"
+                    ));
+                }
+            }
+        }
+        Ok(Available {
+            definitions: self.available_cached(),
+            warning,
+        })
+    }
+
+    pub fn available_cached(&self) -> Definitions {
+        let mut all = self.definitions().clone();
+        if let Some((_, remote)) = self
+            .remote
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            all.extend(remote);
+        }
+        all
     }
 
     /// A definição de um cadastro Cardigann, pela precedência.
@@ -186,11 +264,10 @@ pub fn network(config: &Config, record: &IndexerRecord) -> Result<Network> {
 /// # Errors
 ///
 /// Definição ilegível ou recusada, settings inválidos, rede que não monta ou
-/// endpoint Torznab que não responde `caps`.
+/// configuração de rede inválida.
 pub async fn build(record: &IndexerRecord, config: &Config, registry: &Registry) -> Result<Entry> {
     match record.kind.as_str() {
         CARDIGANN => cardigann(record, registry.definition(record)?, config),
-        TORZNAB => torznab(record, config).await,
         other => anyhow::bail!("tipo de indexador desconhecido: {other}"),
     }
 }
@@ -206,7 +283,7 @@ pub fn cardigann(
     definition: CardigannDefinition,
     config: &Config,
 ) -> Result<Entry> {
-    let client = cardigann_client(record, definition, config.http_timeout())?
+    let client = cardigann_client(record, definition, crate::config::HTTP_TIMEOUT)?
         .with_network(network(config, record)?)
         .with_context(|| format!("configurando a rede de `{}`", record.name))?;
     let capabilities = client.capabilities().clone();
@@ -216,8 +293,7 @@ pub fn cardigann(
     })
 }
 
-/// O cliente sem a rede: o que a atualização de definições confere antes de
-/// trocar a de um indexador em uso.
+/// O cliente com os settings do cadastro, antes de configurar sua rede.
 fn cardigann_client(
     record: &IndexerRecord,
     definition: CardigannDefinition,
@@ -250,265 +326,8 @@ fn cardigann_client(
         .with_context(|| format!("configurando a definição de `{}`", record.name))
 }
 
-/// Intervalo mínimo entre duas requisições ao mesmo endpoint Torznab.
-fn request_interval(record: &IndexerRecord) -> Result<Duration> {
-    let seconds = match record.settings.get("request_interval_seconds") {
-        Some(text) => text
-            .parse::<f64>()
-            .context("`request_interval_seconds` não é um número")?,
-        None => 2.0,
-    };
-    anyhow::ensure!(
-        seconds.is_finite() && (0.0..=3600.0).contains(&seconds),
-        "`request_interval_seconds` precisa ficar entre 0 e 3600"
-    );
-    Ok(Duration::from_secs_f64(seconds))
-}
-
-/// O cliente de um endpoint Torznab, já com as capacidades lidas.
-///
-/// # Errors
-///
-/// Endpoint inválido, proxy que não monta ou `caps` que falha.
-pub async fn torznab(record: &IndexerRecord, config: &Config) -> Result<Entry> {
-    let client = TorznabClient::new(
-        record.name.clone(),
-        record.url.as_deref().unwrap_or_default(),
-        record.settings.get("api_key").cloned(),
-        config.http_timeout(),
-        request_interval(record)?,
-    )?
-    .with_proxy(network(config, record)?.proxy.as_ref())?;
-    let capabilities = client
-        .capabilities()
-        .await
-        .context("lendo as capacidades")?;
-    Ok(Entry {
-        indexer: Arc::new(client),
-        capabilities,
-    })
-}
-
-// --- Atualização das definições ---------------------------------------------
-
-/// Uma definição que não entrou, ou não carregou.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Failed {
-    pub definicao: String,
-    pub motivo: String,
-    /// Em uso: a versão anterior continua valendo.
-    pub em_uso: bool,
-}
-
-/// Um indexador cadastrado cuja definição mudou.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Changed {
-    pub indexador: String,
-    /// Remontado no catálogo servido, sem reiniciar. Falso em desativado (a
-    /// definição nova vale quando ele for ativado) ou em falha.
-    pub recarregado: bool,
-    pub motivo: Option<String>,
-}
-
-/// O relatório da tarefa `definicoes`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct UpdateReport {
-    pub baixadas: usize,
-    pub novas: Vec<String>,
-    pub atualizadas: Vec<String>,
-    pub falharam: Vec<Failed>,
-    pub em_uso_mudaram: Vec<Changed>,
-}
-
-impl UpdateReport {
-    /// Ok, e a linha da tela.
-    #[must_use]
-    pub fn summary(&self) -> (bool, String) {
-        let in_use_failed = self.falharam.iter().filter(|f| f.em_uso).count();
-        let reload_failed = self
-            .em_uso_mudaram
-            .iter()
-            .filter(|c| c.motivo.is_some())
-            .count();
-        let mut summary = format!(
-            "{} baixadas: {} novas, {} atualizadas, {} não carregam",
-            self.baixadas,
-            self.novas.len(),
-            self.atualizadas.len(),
-            self.falharam.len()
-        );
-        if !self.em_uso_mudaram.is_empty() {
-            let reloaded = self.em_uso_mudaram.iter().filter(|c| c.recarregado).count();
-            summary = format!("{summary}; em uso: {reloaded} recarregadas");
-        }
-        if in_use_failed > 0 {
-            summary = format!("{summary}; {in_use_failed} em uso mantidas na versão anterior");
-        }
-        (in_use_failed == 0 && reload_failed == 0, summary)
-    }
-}
-
-/// Aplica as definições baixadas: grava no banco as novas e as que mudaram,
-/// refaz o catálogo e remonta os indexadores em uso cuja definição mudou.
-///
-/// Definição em uso que a versão nova quebraria — não carrega, ou não monta
-/// com os settings do cadastro — não é gravada: a anterior segue valendo,
-/// inclusive depois de reiniciar. Definição local nunca é trocada.
-///
-/// # Errors
-///
-/// Banco inalcançável.
-pub async fn apply_update(
-    config: &Config,
-    store: &Store,
-    catalog: &Catalog,
-    registry: &Registry,
-    downloaded: Vec<(String, String)>,
-    at: &str,
-) -> Result<UpdateReport> {
-    let _guard = registry.write.lock().await;
-    let mut report = UpdateReport {
-        baixadas: downloaded.len(),
-        ..UpdateReport::default()
-    };
-    let stored: BTreeMap<String, String> = store.definition_shas().await?.into_iter().collect();
-    let records = registry.records();
-    let before = registry.definitions().clone();
-    // A definição efetiva de cada cadastro Cardigann, antes.
-    let effective = |definitions: &Definitions, record: &IndexerRecord| {
-        definitions
-            .resolve(&record.name, record.definition.as_deref())
-            .ok()
-    };
-    let in_use: BTreeMap<&str, &IndexerRecord> = records
-        .iter()
-        .filter(|record| record.kind == CARDIGANN)
-        .filter(|record| effective(&before, record).is_none_or(|resolved| !resolved.local))
-        .map(|record| (record.name.as_str(), record))
-        .collect();
-
-    let mut rows = Vec::new();
-    for (file, yaml) in downloaded {
-        let Some(header) = acervo_indexers::DefinitionHeader::peek(&yaml) else {
-            report.falharam.push(Failed {
-                definicao: file,
-                motivo: "YAML sem id e nome".into(),
-                em_uso: false,
-            });
-            continue;
-        };
-        let id = header.id;
-        let sha = definitions::sha(&yaml);
-        if stored.get(&id) == Some(&sha) {
-            continue;
-        }
-        let loaded = CardigannDefinition::from_yaml_v11(&yaml).map_err(anyhow::Error::from);
-        if let Some(record) = in_use.get(id.as_str()) {
-            let checked = loaded
-                .and_then(|definition| cardigann_client(record, definition, config.http_timeout()));
-            if let Err(error) = checked {
-                report.falharam.push(Failed {
-                    definicao: id,
-                    motivo: format!("{error:#}"),
-                    em_uso: true,
-                });
-                continue;
-            }
-        } else if let Err(error) = loaded {
-            // Fora de uso, entra assim mesmo: o catálogo a mostra recusada,
-            // com o motivo.
-            report.falharam.push(Failed {
-                definicao: id.clone(),
-                motivo: format!("{error:#}"),
-                em_uso: false,
-            });
-        }
-        if stored.contains_key(&id) {
-            report.atualizadas.push(id.clone());
-        } else {
-            report.novas.push(id.clone());
-        }
-        rows.push(DefinitionRow {
-            id,
-            yaml,
-            sha,
-            updated_at: at.to_owned(),
-        });
-    }
-    if rows.is_empty() {
-        return Ok(report);
-    }
-    store
-        .save_definitions(&rows)
-        .await
-        .context("gravando as definições")?;
-    let all = store.definitions().await?;
-    let mirror = registry
-        .records
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone();
-    let after = scan(config, &all, &mirror);
-    drop(all);
-
-    let mut reload = Vec::new();
-    for record in in_use.values() {
-        let old = effective(&before, record).map(|resolved| resolved.sha);
-        let new = effective(&after, record).map(|resolved| resolved.sha);
-        if old != new {
-            reload.push(*record);
-        }
-    }
-    registry.set_definitions(after);
-    for record in reload {
-        report
-            .em_uso_mudaram
-            .push(reload_one(record, config, catalog, registry).await);
-    }
-    Ok(report)
-}
-
-/// Remonta no catálogo servido o indexador cuja definição mudou. Desativado
-/// fica como está: a definição nova vale quando ele for ativado.
-async fn reload_one(
-    record: &IndexerRecord,
-    config: &Config,
-    catalog: &Catalog,
-    registry: &Registry,
-) -> Changed {
-    let mut changed = Changed {
-        indexador: record.name.clone(),
-        recarregado: false,
-        motivo: None,
-    };
-    if record.enabled {
-        match build(record, config, registry).await {
-            Ok(entry) => {
-                let swapped = if catalog.replace(&record.name, entry.clone()).is_ok() {
-                    Ok(())
-                } else {
-                    // Fora do catálogo (não tinha subido): entra agora.
-                    catalog.insert(entry).map_err(|error| error.to_string())
-                };
-                match swapped {
-                    Ok(()) => changed.recarregado = true,
-                    Err(error) => changed.motivo = Some(error),
-                }
-            }
-            Err(error) => changed.motivo = Some(format!("{error:#}")),
-        }
-    }
-    tracing::info!(
-        indexer = record.name,
-        recarregado = changed.recarregado,
-        "definição em uso atualizada"
-    );
-    changed
-}
-
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use super::*;
 
@@ -549,141 +368,116 @@ mod tests {
         assert!(check_reserved(USE_FLARESOLVERR, "talvez").is_err());
         assert!(check_reserved(USE_PROXY, "true").is_ok());
     }
+    #[tokio::test]
+    async fn catalogo_remoto_em_cache_nao_carrega_indexadores_e_local_vence() {
+        use crate::definitions::tests::{Dir, yaml};
+        let local = Dir::new("catalogo-demanda", &[("um.yml", yaml("um", "Um local"))]);
+        let mut config = Config::default();
+        config.server.catalogs = vec![local.0.clone()];
+        let registry = Registry::new(&config, &[], Vec::new());
+        let mut remote = Definitions::default();
+        for (id, name) in [("um", "Um remoto"), ("dois", "Dois remoto")] {
+            let yaml = yaml(id, name);
+            remote.offer(
+                definitions::Source::Database(Arc::from(yaml.as_str())),
+                &yaml,
+            );
+        }
+        *registry.remote.write().unwrap() = Some((std::time::Instant::now(), remote));
+        let available = registry.available().await.unwrap();
+        assert_eq!(
+            available.definitions.get("um").unwrap().header.name,
+            "Um local"
+        );
+        assert_eq!(
+            available.definitions.get("dois").unwrap().header.name,
+            "Dois remoto"
+        );
+        assert!(registry.definitions().get("dois").is_none());
+        assert!(registry.records().is_empty());
+    }
+    #[tokio::test]
+    async fn falha_remota_preserva_locais_em_uso_e_cache_antigo() {
+        use crate::definitions::tests::{Dir, yaml};
+        let local = Dir::new("catalogo-fallback", &[("um.yml", yaml("um", "Um local"))]);
+        let mut config = Config::default();
+        config.server.catalogs = vec![local.0.clone()];
+        let yaml_in_use = yaml("em-uso", "Em uso");
+        let registry = Registry::new(
+            &config,
+            &[DefinitionRow {
+                id: "em-uso".into(),
+                yaml: yaml_in_use.clone(),
+                sha: definitions::sha(&yaml_in_use),
+                updated_at: String::new(),
+            }],
+            Vec::new(),
+        );
+        let mut remote = Definitions::default();
+        for (id, name) in [("um", "Um remoto"), ("dois", "Dois remoto")] {
+            let text = yaml(id, name);
+            remote.offer(
+                definitions::Source::Database(Arc::from(text.as_str())),
+                &text,
+            );
+        }
+        let expired = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(16 * 60))
+            .unwrap();
+        *registry.remote.write().unwrap() = Some((expired, remote));
+        let available = registry
+            .available_with(async { anyhow::bail!("falha simulada") })
+            .await
+            .unwrap();
+        assert!(available.warning.unwrap().contains("falha simulada"));
+        assert_eq!(
+            available.definitions.get("um").unwrap().header.name,
+            "Um local"
+        );
+        assert!(available.definitions.get("em-uso").is_some());
+        assert!(available.definitions.get("dois").is_some());
+        assert_eq!(registry.remote.read().unwrap().as_ref().unwrap().0, expired);
 
-    fn with_tv(yaml: &str) -> String {
-        yaml.replace(
-            "    - {id: 1, cat: Movies, desc: Filmes}",
-            "    - {id: 1, cat: Movies, desc: Filmes}\n    - {id: 2, cat: TV, desc: Séries}",
-        )
+        // Sem cache remoto, os locais e em uso ainda permitem cadastrar.
+        *registry.remote.write().unwrap() = None;
+        let available = registry
+            .available_with(async { anyhow::bail!("falha simulada") })
+            .await
+            .unwrap();
+        assert!(available.warning.is_some());
+        assert_eq!(available.definitions.iter().count(), 2);
     }
 
     #[tokio::test]
-    async fn atualizacao_grava_recarrega_em_uso_e_poupa_local_e_quebrada() {
-        use crate::definitions::tests::{Dir, yaml};
-        let Some(db) = acervo_store::testing::TestDb::new("definicoes_update").await else {
-            return;
-        };
-        let local = Dir::new("update-local", &[("l.yml", yaml("l", "L local"))]);
-
-        let mut config = Config::default();
-        config.server.catalogs = vec![local.0.clone()];
-        let pinned = |name: &str, path: PathBuf| IndexerRecord {
-            definition: Some(path.display().to_string()),
-            ..record(name, &[])
-        };
-        let records = vec![
-            // Definição do banco: a atualização a alcança.
-            record("a", &[]),
-            // Fixado no diretório local: nunca é trocado.
-            pinned("l", local.0.join("l.yml")),
-        ];
-        let old_yaml = yaml("a", "A velha");
-        let old = DefinitionRow {
-            id: "a".into(),
-            sha: crate::definitions::sha(&old_yaml),
-            yaml: old_yaml,
-            updated_at: "t0".into(),
-        };
-        let registry = Registry::new(&config, &[old], records.clone());
-        let catalog = Catalog::new(Vec::new()).unwrap();
-        for record in &records {
-            catalog
-                .insert(build(record, &config, &registry).await.unwrap())
-                .unwrap();
-        }
-        assert_eq!(catalog.capabilities("a").unwrap().categories.len(), 1);
-
-        let downloaded = vec![
-            ("a".to_owned(), with_tv(&yaml("a", "A nova"))),
-            ("b".to_owned(), yaml("b", "B nova")),
-            ("c".to_owned(), "id: c\nname: C\nlinks: [nada]\n".to_owned()),
-            ("l".to_owned(), with_tv(&yaml("l", "L do repositório"))),
-        ];
-        let report = apply_update(
-            &config,
-            &db.store,
-            &catalog,
-            &registry,
-            downloaded.clone(),
-            "t1",
-        )
-        .await
-        .unwrap();
-        assert_eq!(report.baixadas, 4);
-        assert_eq!(report.novas, ["a", "b", "c", "l"]);
-        assert!(report.atualizadas.is_empty());
-        assert_eq!(report.falharam.len(), 1);
-        assert_eq!(report.falharam[0].definicao, "c");
-        assert!(!report.falharam[0].em_uso);
-        // Só o "a" mudou de verdade para quem o usa; o local ficou.
-        assert_eq!(
-            report.em_uso_mudaram,
-            [Changed {
-                indexador: "a".into(),
-                recarregado: true,
-                motivo: None,
-            }]
+    async fn falha_remota_sem_locais_usa_cache_antigo() {
+        use crate::definitions::tests::yaml;
+        let registry = Registry::default();
+        let mut remote = Definitions::default();
+        let text = yaml("um", "Um remoto");
+        remote.offer(
+            definitions::Source::Database(Arc::from(text.as_str())),
+            &text,
         );
-        assert_eq!(catalog.capabilities("a").unwrap().categories.len(), 2);
-        assert_eq!(catalog.capabilities("l").unwrap().categories.len(), 1);
-        assert_eq!(
-            registry.definitions().get("b").unwrap().header.name,
-            "B nova"
-        );
-        assert_eq!(
-            registry.definitions().get("l").unwrap().header.name,
-            "L local"
-        );
-        assert_eq!(db.store.definitions().await.unwrap().len(), 4);
-
-        // A mesma coisa de novo: nada muda.
-        let again = apply_update(&config, &db.store, &catalog, &registry, downloaded, "t2")
+        *registry.remote.write().unwrap() = Some((
+            std::time::Instant::now()
+                .checked_sub(Duration::from_secs(16 * 60))
+                .unwrap(),
+            remote,
+        ));
+        let available = registry
+            .available_with(async { anyhow::bail!("falha simulada") })
             .await
             .unwrap();
-        assert!(again.novas.is_empty() && again.atualizadas.is_empty());
-        assert!(again.em_uso_mudaram.is_empty());
-
-        // Versão nova do "a" que não carrega: mantém a anterior, no banco
-        // e no catálogo servido.
-        let broken = vec![("a".to_owned(), "id: a\nname: A\nlinks: [nada]\n".to_owned())];
-        let kept = apply_update(&config, &db.store, &catalog, &registry, broken, "t3")
-            .await
-            .unwrap();
-        assert!(kept.atualizadas.is_empty());
-        assert_eq!(kept.falharam.len(), 1);
-        assert!(kept.falharam[0].em_uso);
-        assert!(!kept.summary().0);
-        assert_eq!(catalog.capabilities("a").unwrap().categories.len(), 2);
-        let stored = db.store.definitions().await.unwrap();
-        let a = stored.iter().find(|row| row.id == "a").unwrap();
-        assert!(a.yaml.contains("A nova"));
-        db.drop().await;
+        assert!(available.warning.is_some());
+        assert!(available.definitions.get("um").is_some());
     }
 
-    #[test]
-    fn resumo_conta_e_so_falha_com_definicao_em_uso() {
-        let mut report = UpdateReport {
-            baixadas: 3,
-            novas: vec!["a".into()],
-            atualizadas: vec!["b".into()],
-            falharam: vec![Failed {
-                definicao: "c".into(),
-                motivo: "x".into(),
-                em_uso: false,
-            }],
-            em_uso_mudaram: vec![Changed {
-                indexador: "b".into(),
-                recarregado: true,
-                motivo: None,
-            }],
-        };
-        let (ok, summary) = report.summary();
-        assert!(ok, "{summary}");
-        assert_eq!(
-            summary,
-            "3 baixadas: 1 novas, 1 atualizadas, 1 não carregam; em uso: 1 recarregadas"
-        );
-        report.falharam[0].em_uso = true;
-        assert!(!report.summary().0);
+    #[tokio::test]
+    async fn falha_remota_so_e_erro_sem_nenhuma_definicao() {
+        let error = Registry::default()
+            .available_with(async { anyhow::bail!("falha simulada") })
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "falha simulada");
     }
 }

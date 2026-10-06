@@ -36,11 +36,11 @@ Workspace Cargo, binário único `acervo-hub`:
 | `acervo-core` | Domínio puro, sem IO: downloads, fila, inventário, tamanhos |
 | `acervo-parser` | Nome de release: título, ano, temporada e episódio, qualidade, idiomas, grupo |
 | `acervo-decision` | Casamento com o filme ou a série, rejeições e ordem de preferência |
-| `acervo-indexers` | Busca em indexadores (Cardigann e Torznab), rate limit, proxy e `FlareSolverr` |
+| `acervo-indexers` | Busca em indexadores (Cardigann), rate limit, proxy e `FlareSolverr` |
 | `acervo-api` | O catálogo de indexadores cadastrados, com cache de consultas, e a interface web |
 | `acervo-metadata` | Metadados do TMDB |
 | `acervo-clients` | qBittorrent e Jellyfin |
-| `acervo-fs` | Tradução de caminho container→host e `stat(2)` |
+| `acervo-fs` | `stat(2)`, espaço livre e tamanho das raízes |
 | `acervo-janitor` | A limpeza: decide o que apagar do cliente, sem executar nada |
 | `acervo-store` | Catálogo, fila, histórico, configuração e contas no Postgres |
 | `acervo-hub` | Binário: tarefas de fundo, importação, decisão aplicada, interface |
@@ -77,27 +77,47 @@ A linha de comando tem só isso: `serve` e as contas da interface. A senha vem d
 padrão, nunca de argumento. As tabelas são criadas e migradas na primeira conexão; banco
 novo sobe com os padrões, e o resto se preenche em **Configurações**.
 
+## Configuração editável
+
+| Seção no banco | Campos editáveis |
+|---|---|
+| `servidor` | `api_key`, `catalogos`, `proxy_url`, `proxy_username`, `proxy_password`, `flaresolverr_url`, `flaresolverr_timeout_s` |
+| `biblioteca` | `roots`, `root_folders`, `series_root`, `category` |
+| `qbittorrent` | `url`, `username`, `password` |
+| `jellyfin` | `url`, `api_key` |
+| `settings['tmdb.api_key']` | chave do TMDB |
+| `settings['decisao.regras']` | `atraso`, `tamanho_maximo_mb`, `folga_minima_mb`, `downloads_simultaneos`, `aceitar_legenda_embutida` |
+| Notificações | Gotify e os eventos que disparam avisos |
+
+Não há seções `limpeza` ou `tarefas`. Os timeouts HTTP são 60 segundos, o XEM usa
+`https://thexem.info`, e a carência para sugerir apagar assistidos é 60 minutos.
+Todos os indexadores têm prioridade 25 e mínimo de 1 seeder; PROPER/REPACK e flags do
+indexador são preferidos, sem lista de termos que libere legendas embutidas e sem carência
+extra após a disponibilidade. Os caminhos do serviço e do qBittorrent devem ser iguais;
+não há tradução de caminhos.
+
 ## O que o serviço faz
 
 ### Descobrir
 
 Lançamentos de filmes no Brasil por semana ISO, além das listas do TMDB de **Em alta**,
 **Populares**, **Em breve** (filmes) e **No ar** (séries). Obras que já estão no catálogo
-não aparecem nas listas. A busca unificada encontra filmes e séries, incluindo títulos
+não aparecem nas listas. A busca global, acessível de qualquer tela pelo menu, por `/`
+ou Ctrl/Cmd+K, encontra filmes e séries, incluindo títulos
 ocultos ou já no acervo. Ao abrir um título, aparecem sinopse, elenco, direção ou criação,
 trailer e recomendações, com adição ao acervo ou acesso à obra já cadastrada.
-É possível ocultar títulos, semanas e gêneros, e mostrá-los de novo.
+É possível ocultar títulos individuais e mostrá-los de novo. Semanas e gêneros permanecem visíveis.
 A chave do TMDB é configurada em **Configurações → TMDB**.
 
 ### Busca e decisão
 
-Filmes e séries entram pela tela, a partir do TMDB. Todo filme e toda série usam o **perfil
+Filmes e séries entram pela busca global, a partir do TMDB. Todo filme e toda série usam o **perfil
 automático**: da melhor qualidade de arquivo para a pior (Remux 2160p … SD), sem upgrade.
 Os seeders pesam antes — um release com 5 ou mais vence qualquer um mais fraco, e a
 qualidade decide dentro da faixa. O tamanho por minuto de cada qualidade é uma tabela fixa.
 
 - **Busca dos que faltam** (`busca`): os prioritários primeiro, depois os há mais tempo sem
-  busca. Agendada, pega um lote; pelo botão, todos.
+  busca. A cada 120 minutos, procura até 10 filmes e 10 séries; pelo botão, todos.
 - **RSS** (`rss`): os releases recentes de todos os indexadores, casados com a biblioteca
   inteira.
 - **Busca interativa**: cada release com qualidade, idiomas e o motivo de cada recusa; o
@@ -153,8 +173,11 @@ cada volta; 6 horas seguidas assim avisam pelo Gotify, uma vez por grab.
 - `metadados` atualiza filmes (a cada dia) e séries (a cada 12 h) pelo TMDB, gravando só o
   que vem da base: monitorado, pasta, prioridade e as escolhas da tela ficam como estão.
 - `cena` baixa a numeração de cena (XEM) uma vez por dia.
-- `definicoes` baixa as definições Cardigann do repositório oficial uma vez por dia e troca
-  a de cada indexador em uso que mudou, sem reiniciar.
+
+O diálogo **Adicionar indexador** baixa o arquivo do repositório oficial sob demanda,
+interpreta as definições e mantém o catálogo em memória por 15 minutos. Ao cadastrar,
+somente o YAML escolhido vai para o banco. Diretórios locais (`servidor.catalogos`) têm
+precedência. Não há tarefa diária de atualização das definições.
 
 ### Para apagar
 
@@ -169,7 +192,7 @@ do que saiu.
 
 Com o Jellyfin configurado, a mesma tela mostra **sugestões**, lidas na hora: o filme que
 algum usuário assistiu há mais que a carência antes de sugerir apagar
-(`carencia_sugestao_minutos`, padrão 60 minutos) e que ninguém marcou
+(60 minutos, fixos) e que ninguém marcou
 como favorito, e a temporada em que todos os episódios no disco passam nessa regra. Só
 entra o arquivo que chegou antes de assistirem: o Jellyfin lembra o assistido de um título
 apagado, e o mesmo título adicionado de novo seria sugerido assim que importado. Assistido
@@ -185,7 +208,10 @@ ou todas de uma vez; marcar não apaga.
 - o **download sem dono** — sem grab em andamento, sem seed e sem hardlink — depois de
   aparecer assim em ciclos seguidos.
 
-Só nas categorias gerenciadas. Fila do acervo ilegível falha a tarefa antes de planejar
+Só na categoria de `biblioteca.category`. A política é fixa: 3 strikes; privados têm
+teto de 120 horas de seed, ratio alvo 1,0 ou 24 horas ociosos; arquivos alterados nas últimas
+24 horas são protegidos. O lote tem teto de 300 GiB e de 30% da biblioteca, e os órfãos
+privados elegíveis saem com seus dados. Fila do acervo ilegível falha a tarefa antes de planejar
 qualquer remoção; catálogo vazio é um estado válido. As travas abortam o ciclo inteiro
 quando o lote passa do teto absoluto ou da fração da biblioteca, ou quando há espaço a
 liberar e a biblioteca mede zero. Uma vez por dia, a limpeza também poda o
@@ -213,9 +239,9 @@ confirma o reparo.
 
 ### Tarefas
 
-Cada tarefa tem intervalo editável na tela **Tarefas** (vale na hora; zero desliga o
-agendamento), "rodar agora" e o histórico das últimas execuções, com o relatório de cada
-uma. Tarefa sem o que precisa — cliente de download — fica parada, com o motivo.
+A tela **Tarefas** mostra intervalos fixos, "rodar agora" e o histórico das últimas
+execuções, com o relatório de cada uma. Importação: 5 minutos; RSS: 30; limpeza: 60;
+busca: 120; metadados: 360; cena: 1440; disco: 360. Tarefa sem o que precisa — cliente de download — fica parada, com o motivo.
 Execução que passa de 2 horas é dada como falha e a tarefa segue agendada; cada consulta ao
 banco tem teto de 60 segundos.
 
@@ -257,21 +283,23 @@ indexadores mostra "em espera até" (também para o 429). Em memória: reiniciar
 
 `serve` responde em `/`:
 
-- **Descobrir** — a tela de entrada: lançamentos semanais, listas e busca unificada do
-  TMDB, com detalhes, elenco, trailer, recomendações, adição ao acervo e preferências para
-  ocultar títulos, semanas e gêneros.
-- **Filmes** e **Séries** — a biblioteca em pôsteres: adicionar pelo TMDB, monitorar,
+- **Busca global** — pelo menu, `/` ou Ctrl/Cmd+K: filmes e séries misturados, indicação
+  de títulos no acervo, paginação, detalhes, adição ou link para a obra cadastrada.
+- **Descobrir** — lançamentos semanais e listas do TMDB, com detalhes, elenco, trailer,
+  recomendações, adição ao acervo e títulos ocultos.
+- **Filmes** e **Séries** — a biblioteca em pôsteres: monitorar,
   prioridade, busca automática ou interativa, renomear, verificar o disco, apagar arquivo
   ou remover — com a pasta e o download no cliente, na hora.
 - **Faltando**, **Para apagar** (o que foi marcado, com o espaço que libera, e as
   sugestões de assistidos), **Calendário**, **Atividade** (a fila com o progresso do
-  cliente, o histórico e a lista de bloqueio) e **Busca** manual em todos os indexadores.
-- **Indexadores** — estado e estatística de cada um, teste, ativar e desativar, trocar
-  credencial, remover e adicionar a partir do catálogo de definições ou de um endpoint
-  Torznab. As definições que o executor ainda não roda aparecem com o motivo.
-- **Configurações** — cliente de download, Jellyfin, biblioteca, limpeza, regras de
-  decisão, notificações (Gotify), TMDB e servidor (chave de API, rede dos indexadores,
-  catálogo de definições).
+  cliente, o histórico e a lista de bloqueio).
+- **Indexadores** — estado, espera do disjuntor, teste, ativar e desativar, trocar
+  credencial, remover e adicionar pelo catálogo Cardigann sob demanda. As definições
+  que o executor ainda não roda aparecem com o motivo.
+- **Tarefas** — intervalos fixos, rodar agora e histórico.
+- **Configurações** — uma única tela com qBittorrent, Jellyfin, biblioteca, regras de
+  decisão, notificações (Gotify), TMDB e servidor (chave de API, proxy, FlareSolverr e
+  diretórios de definições). As contas continuam administradas pela linha de comando.
 
 Segurança:
 

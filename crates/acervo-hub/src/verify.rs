@@ -15,7 +15,6 @@ use acervo_store::{CatalogMovie, CatalogSeries, EpisodeFile, MovieFile, Store, S
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use crate::config::Config;
 use crate::decide::now_rfc3339;
 use crate::grab::VIDEO;
 use crate::series::grab::is_sample_or_extra;
@@ -478,19 +477,13 @@ async fn languages(host: &Path, from_name: Vec<Language>) -> Vec<String> {
 ///
 /// # Errors
 ///
-/// Série desconhecida, pasta fora do mapa, ausente ou ilegível.
-pub async fn series(
-    config: &Config,
-    store: &Store,
-    series_id: i64,
-    apply: bool,
-    mode: Mode,
-) -> Result<Check> {
+/// Série desconhecida, pasta ausente ou ilegível.
+pub async fn series(store: &Store, series_id: i64, apply: bool, mode: Mode) -> Result<Check> {
     let entry = store
         .series(series_id)
         .await?
         .context("série fora do catálogo")?;
-    let root = config.path_map().to_host(Path::new(&entry.series.path))?;
+    let root = (Path::new(&entry.series.path)).to_path_buf();
     let known: Vec<String> = entry
         .files
         .iter()
@@ -576,14 +569,9 @@ pub async fn series(
 ///
 /// # Errors
 ///
-/// Pasta fora do mapa, ausente ou ilegível.
-pub async fn movie(
-    config: &Config,
-    store: &Store,
-    entry: &CatalogMovie,
-    apply: bool,
-) -> Result<Check> {
-    let root = config.path_map().to_host(Path::new(&entry.movie.path))?;
+/// Pasta ausente ou ilegível.
+pub async fn movie(store: &Store, entry: &CatalogMovie, apply: bool) -> Result<Check> {
+    let root = (Path::new(&entry.movie.path)).to_path_buf();
     let known: Vec<String> = entry
         .movie
         .file
@@ -658,7 +646,7 @@ pub struct MovieCheck {
     pub filme: String,
     #[serde(flatten)]
     pub check: Check,
-    /// Por que não se conferiu (pasta ausente, fora do mapa).
+    /// Por que não se conferiu (pasta ausente ou ilegível).
     pub aviso: Option<String>,
 }
 
@@ -669,11 +657,11 @@ pub struct MovieCheck {
 /// # Errors
 ///
 /// Catálogo ilegível.
-pub async fn all_movies(config: &Config, store: &Store, apply: bool) -> Result<Vec<MovieCheck>> {
+pub async fn all_movies(store: &Store, apply: bool) -> Result<Vec<MovieCheck>> {
     let mut out = Vec::new();
     for entry in store.movies().await? {
         let filme = crate::events::label(&entry.movie.title, entry.movie.year);
-        match movie(config, store, &entry, apply).await {
+        match movie(store, &entry, apply).await {
             Ok(check) if check.any() || !check.nao_reconhecidos.is_empty() => {
                 out.push(MovieCheck {
                     filme_id: entry.id,
@@ -719,17 +707,10 @@ pub fn folder_stamp(root: &Path) -> Option<SystemTime> {
 /// # Errors
 ///
 /// Catálogo ilegível. Falha numa série fica no log; as outras seguem.
-pub async fn new_files(
-    config: &Config,
-    store: &Store,
-    stamps: &mut HashMap<i64, SystemTime>,
-) -> Result<usize> {
-    let map = config.path_map();
+pub async fn new_files(store: &Store, stamps: &mut HashMap<i64, SystemTime>) -> Result<usize> {
     let mut linked = 0;
     for entry in store.series_list().await? {
-        let Ok(root) = map.to_host(Path::new(&entry.series.path)) else {
-            continue;
-        };
+        let root = (Path::new(&entry.series.path)).to_path_buf();
         let stamp = tokio::task::spawn_blocking(move || folder_stamp(&root)).await?;
         let Some(stamp) = stamp else {
             continue;
@@ -737,7 +718,7 @@ pub async fn new_files(
         if stamps.get(&entry.id) == Some(&stamp) {
             continue;
         }
-        match series(config, store, entry.id, true, Mode::AUTOMATIC).await {
+        match series(store, entry.id, true, Mode::AUTOMATIC).await {
             Ok(check) => {
                 stamps.insert(entry.id, stamp);
                 for new in check.novos.iter().filter(|n| n.feito) {

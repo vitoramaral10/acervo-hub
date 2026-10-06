@@ -445,7 +445,6 @@ pub async fn send(
         })
         .await
         .context("registrando o grab")?;
-    crate::stats::grabbed(store, &release.indexer).await;
     if let Err(error) = start_queued(config, store, &client).await {
         tracing::warn!("fila de downloads: {error:#}");
     }
@@ -497,14 +496,12 @@ pub(crate) enum Owner {
 /// [`deletable`] para um grab de série, lendo o catálogo, o cliente e o
 /// disco. Qualquer erro no caminho é dúvida: `false`.
 pub(crate) async fn owns(
-    config: &Config,
     store: &Store,
     client: &QbitClient,
     grab: &SeriesGrab,
     torrent: &TorrentInfo,
 ) -> bool {
     owns_torrent(
-        config,
         store,
         client,
         Owner::Series(grab.id),
@@ -518,7 +515,6 @@ pub(crate) async fn owns(
 /// `grabbed_at` com o torrent `torrent`. Qualquer erro no caminho é dúvida:
 /// `false`.
 pub(crate) async fn owns_torrent(
-    config: &Config,
     store: &Store,
     client: &QbitClient,
     owner: Owner,
@@ -540,14 +536,11 @@ pub(crate) async fn owns_torrent(
     let Ok(files) = client.files(&DownloadHash::new(hash.clone())).await else {
         return false;
     };
-    let map = config.path_map();
-    let Some(paths) = files
+
+    let paths: Vec<PathBuf> = files
         .iter()
-        .map(|file| map.to_host(&client_path(torrent, file)).ok())
-        .collect::<Option<Vec<PathBuf>>>()
-    else {
-        return false;
-    };
+        .map(|file| client_path(torrent, file))
+        .collect();
     let files = tokio::task::spawn_blocking(move || super::remove::stat_all(&paths))
         .await
         .ok()
@@ -558,12 +551,7 @@ pub(crate) async fn owns_torrent(
 /// Apaga do cliente o torrent de um grab que sai ainda na fila, sem nada
 /// baixado: sem grab em andamento, ele ficaria no cliente sem dono. Só se
 /// for dele ([`owns`]); erro vira aviso.
-pub(crate) async fn drop_queued(
-    config: &Config,
-    store: &Store,
-    client: &QbitClient,
-    grab: &SeriesGrab,
-) {
+pub(crate) async fn drop_queued(store: &Store, client: &QbitClient, grab: &SeriesGrab) {
     let torrent = match client.torrent(&grab.hash).await {
         Ok(Some(torrent)) if torrent.has_tag(QUEUE_TAG) && torrent.progress <= 0.0 => torrent,
         Ok(_) => return,
@@ -575,7 +563,7 @@ pub(crate) async fn drop_queued(
             return;
         }
     };
-    if !owns(config, store, client, grab, &torrent).await {
+    if !owns(store, client, grab, &torrent).await {
         tracing::warn!(
             release = grab.title,
             "torrent na fila sem grab, mas não é só deste: fica no cliente"

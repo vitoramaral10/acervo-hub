@@ -20,8 +20,8 @@ use tokio_postgres::{NoTls, Row};
 
 pub use accounts::SESSION_DAYS;
 pub use config::IndexerRecord;
-pub use definitions::{DefinitionRow, IndexerDayStats, StatsDelta};
-pub use discover::{DiscoverKind, HiddenGenre, HiddenTitle, HiddenWeek};
+pub use definitions::DefinitionRow;
+pub use discover::{DiscoverKind, HiddenTitle};
 pub use manage::{Blocked, FailReason, HistoryEvent, HistoryPage, NewHistory};
 pub use marks::{DeletionMark, MarkTarget};
 pub use series::{
@@ -811,6 +811,42 @@ const MIGRATIONS: &[&str] = &[
         SET value = (value - 'delete_watched_after_minutes') ||
             jsonb_build_object('carencia_sugestao_minutos', value -> 'delete_watched_after_minutes')
         WHERE name = 'jellyfin' AND value ? 'delete_watched_after_minutes';
+",
+    // Definições só ficam no banco enquanto um cadastro referencia seu id.
+    r"
+    DELETE FROM definitions d WHERE NOT EXISTS (
+        SELECT 1 FROM indexers i WHERE i.name = d.id
+    );
+    DELETE FROM task_runs WHERE task = 'definicoes';
+",
+    // Todos os indexadores usam definições Cardigann.
+    r"
+    DELETE FROM indexers WHERE kind = 'torznab';
+    ALTER TABLE indexers DROP CONSTRAINT indexers_kind_check;
+    ALTER TABLE indexers ADD CONSTRAINT indexers_kind_check CHECK (kind = 'cardigann');
+",
+    // Limpeza e tarefas passam a usar valores fixos, sem seções editáveis.
+    r"
+    DELETE FROM config_sections WHERE name = 'limpeza';
+    DELETE FROM config_sections WHERE name = 'tarefas';
+    UPDATE config_sections SET value = value - 'carencia_sugestao_minutos' WHERE name = 'jellyfin';
+    UPDATE config_sections SET value = value - 'paths' - 'categoria_manual' - 'manual_category' WHERE name = 'biblioteca';
+    UPDATE config_sections SET value = value - 'definicoes_url' - 'http_timeout_seconds' - 'xem_url' WHERE name = 'servidor';
+",
+    // Regras simplificadas: os campos retirados agora são constantes do serviço.
+    r"
+    UPDATE settings SET value = (value::jsonb - 'indexadores' - 'carencia_dias' - 'propers'
+        - 'preferir_flags_do_indexador' - 'legendas_embutidas_liberadas')::text
+        WHERE key = 'decisao.regras';
+",
+    // Estatísticas diárias não são mais mantidas; o circuito fica em memória.
+    r"
+    DROP TABLE indexer_stats;
+",
+    // Descobrir só permite ocultar títulos individuais.
+    r"
+    DROP TABLE discover_hidden_weeks;
+    DROP TABLE discover_hidden_genres;
 ",
 ];
 
@@ -2051,6 +2087,132 @@ mod tests {
             .add_movie(&movie, &MovieExtras::default())
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Um snapshot antigo atravessa as seis migrações novas.
+    async fn simplificacao_migra_snapshot_antigo_sem_perder_configuracao() {
+        let Some(db) = TestDb::new("simplificacao").await else {
+            return;
+        };
+        let store = &db.store;
+        let client = store.pool.get().await.unwrap();
+        client.batch_execute("CREATE TABLE indexer_stats (indexer TEXT);
+            CREATE TABLE discover_hidden_weeks (year INTEGER);
+            CREATE TABLE discover_hidden_genres (genre_id INTEGER);
+            ALTER TABLE indexers DROP CONSTRAINT indexers_kind_check;
+            ALTER TABLE indexers ADD CONSTRAINT indexers_kind_check CHECK (kind IN ('torznab', 'cardigann'));
+            INSERT INTO indexers (name, kind, definition, settings, enabled) VALUES
+                ('local', 'cardigann', '/catalogo/local.yml', '{}'::jsonb, true),
+                ('remoto', 'cardigann', NULL, '{}'::jsonb, true),
+                ('legado', 'torznab', NULL, '{}'::jsonb, true);
+            INSERT INTO definitions (id, yaml, sha, updated_at) VALUES
+                ('local', 'id: local', 's1', 't0'), ('remoto', 'id: remoto', 's2', 't0'),
+                ('sem-uso', 'id: sem-uso', 's3', 't0');
+            INSERT INTO task_runs (task, started_at, finished_at, ok, summary) VALUES
+                ('definicoes', 't0', 't0', true, 'feito'), ('rss', 't0', 't0', true, 'feito');
+            UPDATE schema_version SET version = 29;").await.unwrap();
+        let sections = [
+            (
+                "servidor",
+                serde_json::json!({"api_key": "chave-de-teste", "catalogos": ["/catalogo"],
+                "proxy_url": "http://proxy.invalid", "flaresolverr_url": "http://solver.invalid",
+                "definicoes_url": "http://repositorio.invalid", "http_timeout_seconds": 60, "xem_url": "http://xem.invalid"}),
+                serde_json::json!({"api_key": "chave-de-teste", "catalogos": ["/catalogo"],
+                "proxy_url": "http://proxy.invalid", "flaresolverr_url": "http://solver.invalid"}),
+            ),
+            (
+                "biblioteca",
+                serde_json::json!({"roots": ["/media"], "root_folders": ["/media/movies"],
+                "category": "acervo", "paths": {"/media": "/media"}, "categoria_manual": "manual", "manual_category": "manual"}),
+                serde_json::json!({"roots": ["/media"], "root_folders": ["/media/movies"], "category": "acervo"}),
+            ),
+            (
+                "jellyfin",
+                serde_json::json!({"url": "http://media.invalid", "api_key": "chave", "carencia_sugestao_minutos": 60}),
+                serde_json::json!({"url": "http://media.invalid", "api_key": "chave"}),
+            ),
+        ];
+        for (name, old, _) in &sections {
+            store.save_config_section(name, old, "t0").await.unwrap();
+        }
+        for name in ["limpeza", "tarefas"] {
+            store
+                .save_config_section(name, &serde_json::json!({}), "t0")
+                .await
+                .unwrap();
+        }
+        let expected = serde_json::json!({"atraso": {"minutos": 1440, "pular_se_melhor_qualidade": true},
+            "tamanho_maximo_mb": 30000, "folga_minima_mb": 2048, "downloads_simultaneos": 3, "aceitar_legenda_embutida": true});
+        let mut old = expected.clone();
+        for (key, value) in serde_json::json!({"indexadores": {"remoto": {"prioridade": 25, "seeders_minimos": 1}},
+            "carencia_dias": 0, "propers": "preferir", "preferir_flags_do_indexador": true, "legendas_embutidas_liberadas": ""}).as_object().unwrap() {
+            old[key] = value.clone();
+        }
+        store
+            .set_setting("decisao.regras", Some(&old.to_string()), "t0")
+            .await
+            .unwrap();
+        drop(client);
+        store.migrate().await.unwrap();
+        let stored = store.config_sections().await.unwrap();
+        assert_eq!(stored.len(), 3);
+        for (name, _, expected) in sections {
+            assert_eq!(
+                &stored.iter().find(|(n, _)| n == name).unwrap().1,
+                &expected
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &store.setting("decisao.regras").await.unwrap().unwrap()
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!(
+            store
+                .definitions()
+                .await
+                .unwrap()
+                .iter()
+                .map(|d| d.id.as_str())
+                .collect::<Vec<_>>(),
+            ["local", "remoto"]
+        );
+        assert_eq!(store.indexers().await.unwrap().len(), 2);
+        assert_eq!(
+            store
+                .task_runs(10)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.task.as_str())
+                .collect::<Vec<_>>(),
+            ["rss"]
+        );
+        let client = store.pool.get().await.unwrap();
+        for table in [
+            "indexer_stats",
+            "discover_hidden_weeks",
+            "discover_hidden_genres",
+        ] {
+            let exists: bool = client
+                .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
+                .await
+                .unwrap()
+                .get(0);
+            assert!(!exists, "{table}");
+        }
+        assert!(client.execute("INSERT INTO indexers (name, kind, settings, enabled) VALUES ('invalido', 'torznab', '{}', true)", &[]).await.is_err());
+        let version: i32 = client
+            .query_one("SELECT version FROM schema_version", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(version, 35);
+        drop(client);
+        db.drop().await;
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 [package]
 name = "acervo-indexers"
 version = "0.0.0"
-description = "Busca agregada em indexadores Torznab com rate limit compartilhado."
+description = "Busca agregada em indexadores Cardigann com rate limit compartilhado."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -12,7 +12,6 @@ async-trait.workspace = true
 fancy-regex.workspace = true
 futures.workspace = true
 http.workspace = true
-quick-xml.workspace = true
 reqwest.workspace = true
 regex.workspace = true
 scraper.workspace = true

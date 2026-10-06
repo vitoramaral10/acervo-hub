@@ -167,14 +167,11 @@ pub(crate) fn routes() -> Router<Arc<Web>> {
 
 async fn options(State(web): Shared, headers: HeaderMap) -> WebResult {
     enter(&web, &headers, &Method::GET).await?;
-    let map = web.config().path_map();
     let roots = web.config().library.root_folders.clone();
     let series_root = web.config().library.series_root.clone();
     let (folders, series_folder) = tokio::task::spawn_blocking(move || {
         let folder = |root: String| {
-            let free = map
-                .to_host(std::path::Path::new(&root))
-                .ok()
+            let free = Some((std::path::Path::new(&root)).to_path_buf())
                 .and_then(|host| acervo_fs::free_space(&host).ok());
             json!({ "caminho": root, "livre": free })
         };
@@ -207,7 +204,7 @@ async fn tmdb_search(
     Query(q): Query<TmdbQuery>,
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::GET).await?;
-    let tmdb = crate::metadata::require_tmdb(&web.config(), store)
+    let tmdb = crate::metadata::require_tmdb(store)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     let term = q.termo.trim();
@@ -319,7 +316,7 @@ async fn add_movie(
             body.pasta
         ))));
     }
-    let tmdb = crate::metadata::require_tmdb(&web.config(), store)
+    let tmdb = crate::metadata::require_tmdb(store)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     let request = crate::library::AddRequest {
@@ -378,7 +375,7 @@ async fn remove_movie(
 
 async fn delete_file(State(web): Shared, Path(id): Path<i64>, headers: HeaderMap) -> WebResult {
     let store = enter(&web, &headers, &Method::DELETE).await?;
-    crate::library::delete_file(&web.config(), store, id)
+    crate::library::delete_file(store, id)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     ok(&json!({ "ok": true }))
@@ -402,10 +399,10 @@ async fn rename_movie(
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::POST).await?;
     let entry = movie_entry(store, id).await?;
-    let disk = crate::rename::disk_subtitles(&web.config(), &entry.movie.path).await;
+    let disk = crate::rename::disk_subtitles(&entry.movie.path).await;
     let plan = crate::rename::movie_plan(&entry, &disk);
     let plan = if q.aplicar {
-        crate::rename::apply_movie(&web.config(), store, &entry, plan)
+        crate::rename::apply_movie(store, &entry, plan)
             .await
             .map_err(|e| fail(anyhow_bad(&e)))?
     } else {
@@ -427,7 +424,7 @@ async fn verify_movie(
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::POST).await?;
     let entry = movie_entry(store, id).await?;
-    let check = crate::verify::movie(&web.config(), store, &entry, q.aplicar)
+    let check = crate::verify::movie(store, &entry, q.aplicar)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     ok(&serde_json::to_value(&check).map_err(|e| fail(bad(e)))?)
@@ -439,7 +436,7 @@ async fn verify_movies(
     Query(q): Query<crate::series::web::ApplyQuery>,
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::POST).await?;
-    let list = crate::verify::all_movies(&web.config(), store, q.aplicar)
+    let list = crate::verify::all_movies(store, q.aplicar)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     ok(&json!({ "aplicado": q.aplicar, "total": list.len(), "filmes": list }))

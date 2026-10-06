@@ -77,10 +77,10 @@ async fn rename(
         .await
         .map_err(|e| fail(bad(e)))?
         .ok_or_else(|| fail(bad("série fora do catálogo")))?;
-    let disk = crate::rename::disk_subtitles(&web.config(), &entry.series.path).await;
+    let disk = crate::rename::disk_subtitles(&entry.series.path).await;
     let plan = crate::rename::series_plan(&entry, &disk);
     let plan = if q.aplicar {
-        crate::rename::apply_series(&web.config(), store, &entry, plan)
+        crate::rename::apply_series(store, &entry, plan)
             .await
             .map_err(|e| fail(anyhow_bad(&e)))?
     } else {
@@ -101,15 +101,9 @@ async fn verify(
     Query(q): Query<ApplyQuery>,
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::POST).await?;
-    let check = crate::verify::series(
-        &web.config(),
-        store,
-        id,
-        q.aplicar,
-        crate::verify::Mode::MANUAL,
-    )
-    .await
-    .map_err(|e| fail(anyhow_bad(&e)))?;
+    let check = crate::verify::series(store, id, q.aplicar, crate::verify::Mode::MANUAL)
+        .await
+        .map_err(|e| fail(anyhow_bad(&e)))?;
     ok(&serde_json::to_value(&check).map_err(|e| fail(bad(e)))?)
 }
 
@@ -321,7 +315,7 @@ async fn tmdb_search(
     Query(query): Query<TmdbQuery>,
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::GET).await?;
-    let tmdb = crate::metadata::require_tmdb(&web.config(), store)
+    let tmdb = crate::metadata::require_tmdb(store)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     let term = query.q.trim();
@@ -400,7 +394,7 @@ async fn add(
     axum::Json(body): axum::Json<AddBody>,
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::POST).await?;
-    let tmdb = crate::metadata::require_tmdb(&web.config(), store)
+    let tmdb = crate::metadata::require_tmdb(store)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     let request = AddRequest {

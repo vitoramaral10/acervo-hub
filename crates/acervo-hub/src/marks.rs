@@ -355,11 +355,14 @@ pub async fn purge(config: &Config, store: &Store, targets: &[MarkTarget]) -> Re
     if !report.apagados.is_empty()
         && let Some(jellyfin) = config.jellyfin()
     {
-        let refreshed =
-            match JellyfinClient::new(&jellyfin.url, &jellyfin.api_key, config.http_timeout()) {
-                Ok(client) => client.refresh_library().await.map_err(|e| e.to_string()),
-                Err(error) => Err(error.to_string()),
-            };
+        let refreshed = match JellyfinClient::new(
+            &jellyfin.url,
+            &jellyfin.api_key,
+            crate::config::HTTP_TIMEOUT,
+        ) {
+            Ok(client) => client.refresh_library().await.map_err(|e| e.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
         if let Err(error) = refreshed {
             tracing::warn!("varredura do Jellyfin: {error}");
             report
@@ -514,9 +517,13 @@ async fn suggestions(State(web): Shared, headers: HeaderMap) -> WebResult {
     let Some(jellyfin) = config.jellyfin() else {
         return ok(&json!({ "configurado": false, "filmes": [], "temporadas": [] }));
     };
-    let client = JellyfinClient::new(&jellyfin.url, &jellyfin.api_key, config.http_timeout())
-        .map_err(|e| fail(bad(e)))?;
-    let grace = jellyfin.carencia_sugestao_minutos;
+    let client = JellyfinClient::new(
+        &jellyfin.url,
+        &jellyfin.api_key,
+        crate::config::HTTP_TIMEOUT,
+    )
+    .map_err(|e| fail(bad(e)))?;
+    let grace = crate::config::SUGGESTION_GRACE_MINUTES;
     let (movie_found, season_found) = tokio::try_join!(
         crate::watched::suggest(store, &client, grace),
         crate::series::watched::suggest(store, &client, grace)
@@ -773,22 +780,24 @@ mod tests {
             .save_section(
                 crate::config::BIBLIOTECA,
                 json!({
-                    "paths": { "/media": root.display().to_string() },
-                    "root_folders": ["/media/movies"],
-                    "series_root": "/media/series",
+                    "root_folders": [root.join("movies")],
+                    "series_root": root.join("series"),
                 }),
             )
             .await
             .unwrap();
         let config = settings.get();
+        let mut title = movie("Visto", 4000);
+        title.path = root.join("movies/Visto (2024)").display().to_string();
         let visto = store
-            .add_movie(&movie("Visto", 4000), &MovieExtras::default())
+            .add_movie(&title, &MovieExtras::default())
             .await
             .unwrap();
         let fica = store
             .add_movie(
                 &Movie {
                     tmdb_id: 11,
+                    path: root.join("movies/Fica (2024)").display().to_string(),
                     ..movie("Fica", 4000)
                 },
                 &MovieExtras::default(),
@@ -840,20 +849,23 @@ mod tests {
             .save_section(
                 crate::config::BIBLIOTECA,
                 json!({
-                    "paths": { "/media": root.display().to_string() },
-                    "root_folders": ["/media/movies"],
-                    "series_root": "/media/series",
+                    "root_folders": [root.join("movies")],
+                    "series_root": root.join("series"),
                 }),
             )
             .await
             .unwrap();
 
+        let mut title = movie("Visto", 4000);
+        title.path = root.join("movies/Visto (2024)").display().to_string();
         let movie_id = store
-            .add_movie(&movie("Visto", 4000), &MovieExtras::default())
+            .add_movie(&title, &MovieExtras::default())
             .await
             .unwrap();
+        let mut title = show();
+        title.path = root.join("series/Show").display().to_string();
         let series_id = store
-            .add_series(&show(), &[episode(1, 1), episode(1, 2), episode(2, 1)])
+            .add_series(&title, &[episode(1, 1), episode(1, 2), episode(2, 1)])
             .await
             .unwrap();
         let entry = store.series(series_id).await.unwrap().unwrap();
@@ -1035,16 +1047,18 @@ mod tests {
         settings
             .save_section(
                 crate::config::JELLYFIN,
-                json!({ "url": jellyfin.uri(), "api_key": "x", "carencia_sugestao_minutos": 60 }),
+                json!({ "url": jellyfin.uri(), "api_key": "x" }),
             )
             .await
             .unwrap();
+        let title = movie("Visto", 4000);
         let movie_id = store
-            .add_movie(&movie("Visto", 4000), &MovieExtras::default())
+            .add_movie(&title, &MovieExtras::default())
             .await
             .unwrap();
+        let title = show();
         let series_id = store
-            .add_series(&show(), &[episode(1, 1), episode(1, 2), episode(2, 1)])
+            .add_series(&title, &[episode(1, 1), episode(1, 2), episode(2, 1)])
             .await
             .unwrap();
         let entry = store.series(series_id).await.unwrap().unwrap();

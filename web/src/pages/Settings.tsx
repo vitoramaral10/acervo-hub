@@ -1,12 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { CircleCheck, CircleDashed, ExternalLink, KeyRound } from 'lucide-react'
-import { type ReactNode, useState } from 'react'
+import { type ReactNode, useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { PageHeader } from '@/components/PageHeader'
 import { NotificationsSection } from '@/pages/settings/Notifications'
 import { RulesSection, RulesSkeleton, useRules } from '@/pages/settings/Rules'
 import {
-  CleanupSettings,
   DownloadClientSettings,
   JellyfinSettings,
   LibrarySettings,
@@ -46,8 +45,8 @@ function TmdbSettings() {
               The Movie Database
             </h2>
             <p className="mt-1 max-w-[60ch] text-sm text-content-muted">
-              Fonte dos metadados de filmes: título, ano, datas de lançamento e títulos alternativos. Sem ela, o
-              acervo-hub não adiciona filmes nem sabe quando um filme fica disponível.
+              Fonte dos metadados de filmes e séries: títulos, sinopses, lançamentos e episódios. Necessária
+              para a busca global e para adicionar títulos ao acervo.
             </p>
           </div>
           {settings.isPending ? (
@@ -139,10 +138,10 @@ function TmdbSettings() {
   )
 }
 
-/** As telas de configuração, uma por item do menu. */
-export type SettingsView = 'servidor' | 'cliente-download' | 'jellyfin' | 'biblioteca' | 'limpeza' | 'regras' | 'notificacoes' | 'tmdb'
+/** Seções editáveis reunidas na mesma tela. */
+type Section = 'servidor' | 'cliente-download' | 'jellyfin' | 'biblioteca' | 'regras' | 'notificacoes' | 'tmdb'
 
-const PAGES: Record<SettingsView, { title: string; description: string; body: () => ReactNode }> = {
+const PAGES: Record<Section, { title: string; description: string; body: () => ReactNode }> = {
   servidor: {
     title: 'Servidor',
     description: 'A chave de API, a rede dos indexadores e o catálogo de definições. Vale na hora, sem reiniciar.',
@@ -163,11 +162,6 @@ const PAGES: Record<SettingsView, { title: string; description: string; body: ()
     description: 'Pastas, caminhos e a categoria dos downloads do acervo.',
     body: () => <LibrarySettings />,
   },
-  limpeza: {
-    title: 'Limpeza',
-    description: 'As regras e as travas do ciclo que limpa fila e seed.',
-    body: () => <CleanupSettings />,
-  },
   regras: {
     title: 'Regras de decisão',
     description: 'O que vale para todo release na hora de escolher.',
@@ -180,7 +174,7 @@ const PAGES: Record<SettingsView, { title: string; description: string; body: ()
   },
   tmdb: {
     title: 'TMDB',
-    description: 'A fonte dos metadados dos filmes.',
+    description: 'A fonte dos metadados de filmes e séries.',
     body: () => <TmdbSettings />,
   },
 }
@@ -199,12 +193,36 @@ function RulesBody() {
   )
 }
 
-export function SettingsPage({ view }: { view: SettingsView }) {
-  const page = PAGES[view]
+function sectionFromHash(): Section {
+  const [view, query] = window.location.hash.slice(1).split('?')
+  const name = view === 'configuracoes' ? new URLSearchParams(query).get('secao') : view
+  return name && name in PAGES ? name as Section : 'servidor'
+}
+
+export function SettingsPage() {
+  const [section, setSection] = useState<Section>(sectionFromHash)
+  useEffect(() => {
+    const change = () => setSection(sectionFromHash())
+    window.addEventListener('hashchange', change)
+    return () => window.removeEventListener('hashchange', change)
+  }, [])
   return (
     <>
-      <PageHeader title={page.title} description={page.description} />
-      {page.body()}
+      <PageHeader title="Configurações" description="Conexões, biblioteca e regras do serviço." />
+      <div className="mb-6 flex flex-wrap gap-2" role="group" aria-label="Seções de configuração">
+        {(Object.keys(PAGES) as Section[]).map((name) => (
+          <Button
+            key={name}
+            size="sm"
+            variant={section === name ? 'primary' : 'secondary'}
+            aria-pressed={section === name}
+            onClick={() => { window.location.hash = `configuracoes?secao=${name}` }}
+          >
+            {PAGES[name].title}
+          </Button>
+        ))}
+      </div>
+      {PAGES[section].body()}
     </>
   )
 }

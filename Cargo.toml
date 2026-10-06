@@ -48,7 +48,6 @@ unicode-normalization = "0.1"
 futures = "0.3"
 # Para remontar a resposta do 403 já lido, quando ele não é o desafio.
 http = "1"
-quick-xml = "0.38"
 # Postgres em Rust puro, sem libpq: o build estático musl continua. Sem TLS
 # porque o banco fica na rede interna do Docker.
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }

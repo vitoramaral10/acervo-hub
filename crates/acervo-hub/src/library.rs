@@ -46,13 +46,13 @@ pub fn status(movie: &Movie, today: Date) -> &'static str {
     }
 }
 
-/// Já passou do lançamento, mais `delay_days` de carência. Todo filme segue
-/// a regra de "lançado": o primeiro lançamento digital ou físico, ou 90 dias
+/// Já passou do lançamento. Todo filme segue a regra de "lançado": o
+/// primeiro lançamento digital ou físico, ou 90 dias
 /// depois da estreia se não houver nenhum; sem data nenhuma, indisponível.
 /// Não há mais disponibilidade mínima por filme, para não buscar o que ainda
 /// não saiu.
 #[must_use]
-pub fn is_available(movie: &Movie, today: Date, delay_days: i64) -> bool {
+pub fn is_available(movie: &Movie, today: Date) -> bool {
     let cinema = date(movie.in_cinemas.as_deref());
     let digital = date(movie.digital_release.as_deref());
     let physical = date(movie.physical_release.as_deref());
@@ -62,7 +62,7 @@ pub fn is_available(movie: &Movie, today: Date, delay_days: i64) -> bool {
         (None, Some(p)) => Some(p),
         (None, None) => cinema.map(|c| c + Duration::days(90)),
     };
-    when.is_some_and(|when| when + Duration::days(delay_days) <= today)
+    when.is_some_and(|when| when <= today)
 }
 
 fn today() -> Date {
@@ -295,7 +295,7 @@ pub async fn edit(store: &Store, id: i64, change: &MovieEdit) -> Result<CatalogM
 ///
 /// Pasta fora das raízes ou falha ao apagar.
 pub async fn delete_folder(config: &Config, movie_path: &str) -> Result<()> {
-    delete_folder_within(config, movie_path, &config.library.root_folders).await
+    delete_folder_within(movie_path, &config.library.root_folders).await
 }
 
 /// A raiz, entre `roots`, de que `folder` é filha direta — só pelo texto:
@@ -335,18 +335,14 @@ fn still_inside(host: &Path, root: &Path) -> std::io::Result<bool> {
 /// # Errors
 ///
 /// Pasta fora das raízes ou falha ao apagar.
-pub(crate) async fn delete_folder_within(
-    config: &Config,
-    movie_path: &str,
-    roots: &[String],
-) -> Result<()> {
+pub(crate) async fn delete_folder_within(movie_path: &str, roots: &[String]) -> Result<()> {
     let folder = Path::new(movie_path);
     let Some(root) = root_of(folder, roots) else {
         bail!("a pasta `{movie_path}` não está direto numa pasta raiz; nada apagado");
     };
-    let map = config.path_map();
-    let host = map.to_host(folder)?;
-    let root_host = map.to_host(Path::new(root))?;
+
+    let host = (folder).to_path_buf();
+    let root_host = (Path::new(root)).to_path_buf();
     let shown = movie_path.to_owned();
     tokio::task::spawn_blocking(move || {
         if !still_inside(&host, &root_host)? {
@@ -386,8 +382,7 @@ pub(crate) async fn downloads_of(
     config: &Config,
     movie_path: &str,
 ) -> Result<Vec<(DownloadHash, String)>> {
-    let map = config.path_map();
-    let folder = map.to_host(Path::new(movie_path))?;
+    let folder = (Path::new(movie_path)).to_path_buf();
     let inodes = tokio::task::spawn_blocking(move || linked_inodes(&folder)).await??;
     if inodes.is_empty() {
         return Ok(Vec::new());
@@ -400,13 +395,9 @@ pub(crate) async fn downloads_of(
             .files(&hash)
             .await
             .context("listando os arquivos de um torrent")?;
-        // Caminho fora do mapa não é deste acervo: não pode ser o filme.
         let paths = files
             .iter()
-            .filter_map(|file| {
-                map.to_host(&acervo_clients::client_path(&torrent, file))
-                    .ok()
-            })
+            .map(|file| acervo_clients::client_path(&torrent, file))
             .collect();
         candidates.push((hash, torrent.name, paths));
     }
@@ -468,7 +459,7 @@ pub(crate) async fn delete_downloads(
 /// # Errors
 ///
 /// Filme sem arquivo ou falha ao apagar.
-pub async fn delete_file(config: &Config, store: &Store, id: i64) -> Result<()> {
+pub async fn delete_file(store: &Store, id: i64) -> Result<()> {
     let entry = store
         .movies()
         .await?
@@ -480,7 +471,7 @@ pub async fn delete_file(config: &Config, store: &Store, id: i64) -> Result<()> 
         .file
         .clone()
         .context("o filme não tem arquivo")?;
-    let map = config.path_map();
+
     // O vídeo e as legendas dele.
     let hosts = std::iter::once(file.relative_path.clone())
         .chain(
@@ -489,8 +480,8 @@ pub async fn delete_file(config: &Config, store: &Store, id: i64) -> Result<()> 
                 .iter()
                 .map(|s| s.subtitle.relative_path.clone()),
         )
-        .map(|relative| map.to_host(&Path::new(&entry.movie.path).join(relative)))
-        .collect::<Result<Vec<PathBuf>, _>>()?;
+        .map(|relative| Path::new(&entry.movie.path).join(relative))
+        .collect::<Vec<PathBuf>>();
     tokio::task::spawn_blocking(move || crate::series::remove_files(&hosts)).await??;
     store.set_movie_file(id, None).await?;
     events::record(
@@ -572,7 +563,7 @@ pub async fn remove_because(
         match crate::grab::qbit(config).await {
             Ok(client) => {
                 for grab in &queued {
-                    crate::grab::drop_queued(config, store, &client, grab).await;
+                    crate::grab::drop_queued(store, &client, grab).await;
                 }
             }
             Err(error) => tracing::warn!("torrents da fila não conferidos: {error:#}"),
@@ -792,56 +783,26 @@ mod tests {
     fn disponibilidade_so_pela_regra_de_lancado() {
         let today = day("2026-09-25");
         // Só anunciado, sem data nenhuma: indisponível.
-        assert!(!is_available(&movie(None, None, None), today, 0));
+        assert!(!is_available(&movie(None, None, None), today));
         // Cinema recente, sem digital nem físico: ainda não.
-        assert!(!is_available(
-            &movie(Some("2026-08-26"), None, None),
-            today,
-            0
-        ));
-        assert!(!is_available(
-            &movie(Some("2026-09-20"), None, None),
-            today,
-            0
-        ));
+        assert!(!is_available(&movie(Some("2026-08-26"), None, None), today));
+        assert!(!is_available(&movie(Some("2026-09-20"), None, None), today));
         // Cinema há mais de 90 dias: lançado.
-        assert!(is_available(
-            &movie(Some("2026-06-17"), None, None),
-            today,
-            0
-        ));
+        assert!(is_available(&movie(Some("2026-06-17"), None, None), today));
         // Digital passada vale; a menor entre digital e física manda.
-        assert!(is_available(
-            &movie(None, Some("2026-09-24"), None),
-            today,
-            0
-        ));
+        assert!(is_available(&movie(None, Some("2026-09-24"), None), today));
         assert!(is_available(
             &movie(Some("2026-01-01"), None, Some("2026-09-24")),
-            today,
-            0
+            today
         ));
         assert!(is_available(
             &movie(None, Some("2026-09-24"), Some("2026-12-01")),
-            today,
-            0
+            today
         ));
         // Digital futura não vale, mesmo com cinema antigo.
         assert!(!is_available(
             &movie(Some("2026-01-01"), Some("2026-10-30"), None),
-            today,
-            0
-        ));
-        // A carência empurra a data.
-        assert!(!is_available(
-            &movie(None, Some("2026-09-24"), None),
-            today,
-            2
-        ));
-        assert!(is_available(
-            &movie(None, Some("2026-09-23"), None),
-            today,
-            2
+            today
         ));
     }
 }

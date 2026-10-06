@@ -73,55 +73,6 @@ export interface Setting {
   value: string | null
 }
 
-export interface Release {
-  titulo: string
-  indexador: string
-  tamanho: number
-  seeders: number | null
-  leechers: number | null
-  downloads: number | null
-  categorias: number[]
-  publicado: string | null
-  detalhes: string | null
-  download: string
-  /** O link do indexador, para mandar ao cliente pela busca. */
-  link: string
-}
-
-/** Um dia da série de um indexador. */
-export interface IndexerStatsDay {
-  dia: string
-  consultas: number
-  falhas: number
-  grabs: number
-}
-
-/** Os números de um indexador na janela pedida. */
-export interface IndexerStats {
-  nome: string
-  consultas: number
-  falhas: number
-  /** Respostas 429. */
-  limitadas: number
-  grabs: number
-  /** De 0 a 1. */
-  taxa_falha: number
-  tempo_medio_ms: number | null
-  serie: IndexerStatsDay[]
-}
-
-export interface SentToClient {
-  ok: boolean
-  hash: string
-  categoria: string
-  magnet: boolean
-}
-
-export interface SearchResponse {
-  resultados: Release[]
-  falhas: { indexador: string; erro: string }[]
-}
-
 export interface Definition {
   id: string
   name: string
@@ -131,6 +82,7 @@ export interface Definition {
   supported: boolean
   reason: string | null
   added: boolean
+  settings: Setting[]
 }
 
 export interface CycleReport {
@@ -262,11 +214,6 @@ interface Secret {
 export interface ServerSection {
   api_key: Secret
   catalogos: string[]
-  /** O `.tar.gz` do repositório de definições. */
-  definicoes_url: string
-  http_timeout_seconds: number
-  /** Base do XEM, de onde vem a numeração de cena. */
-  xem_url: string
   flaresolverr_url: string | null
   flaresolverr_timeout_s: number
   proxy_url: string | null
@@ -283,33 +230,13 @@ export interface DownloadClientSection {
 export interface JellyfinSection {
   url: string
   api_key: Secret
-  carencia_sugestao_minutos: number
 }
 
 export interface LibrarySection {
   roots: string[]
   root_folders: string[]
   category: string
-  /** Categoria do que a busca manual manda ao cliente; fora da limpeza. */
-  categoria_manual: string
-  paths: Record<string, string>
-}
-
-export interface CleanupSection {
-  orphan_strikes: number
-  delete_private_orphans: boolean
-  private_seed_grace_hours: number
-  seed_ratio_alvo: number
-  seed_ocioso_horas: number
-  recent_change_grace_hours: number
-  max_batch_gib: number
-  max_batch_fraction: number
-  managed_categories: string[]
-}
-
-export interface TasksSection {
-  intervalos: Record<string, number>
-  search_limit: number
+  series_root: string
 }
 
 /** As seções e o formato de cada uma, como o GET devolve. */
@@ -318,8 +245,6 @@ export interface Sections {
   qbittorrent: DownloadClientSection
   jellyfin: JellyfinSection
   biblioteca: LibrarySection
-  limpeza: CleanupSection
-  tarefas: TasksSection
 }
 
 export type SectionName = keyof Sections
@@ -345,7 +270,7 @@ export const api = {
       `/ui/api/indexadores/${encodeURIComponent(name)}/settings`,
       values,
     ),
-  catalog: () => request<{ definicoes: Definition[] }>('GET', '/ui/api/catalogo'),
+  catalog: () => request<{ definicoes: Definition[]; aviso: string | null }>('GET', '/ui/api/catalogo'),
   definitionSettings: (id: string) =>
     request<{ settings: Setting[] }>('GET', `/ui/api/catalogo/${encodeURIComponent(id)}/settings`),
   addIndexer: (definicao: string, settings: Record<string, string>) =>
@@ -372,17 +297,7 @@ export const api = {
   section: <N extends SectionName>(name: N) => request<Sections[N]>('GET', `/ui/api/configuracoes/${name}`),
   saveSection: <N extends SectionName>(name: N, value: SectionInput<N>) =>
     request<Sections[N]>('PUT', `/ui/api/configuracoes/${name}`, value),
-  indexerStats: (dias: number) =>
-    request<{ dias: number; indexadores: IndexerStats[] }>('GET', `/ui/api/indexadores/estatisticas?dias=${dias}`),
-  sendToClient: (indexador: string, link: string) =>
-    request<SentToClient>('POST', '/ui/api/busca/enviar', { indexador, link }),
-  search: (params: { q: string; indexador: string; cat: string }) => {
-    const query = new URLSearchParams()
-    query.set('q', params.q)
-    if (params.indexador) query.set('indexador', params.indexador)
-    if (params.cat) query.set('cat', params.cat)
-    return request<SearchResponse>('GET', `/ui/api/busca?${query}`)
-  },
+
 }
 
 // ---------------------------------------------------------------- biblioteca
@@ -495,21 +410,11 @@ export interface BlockedRelease {
   message: string | null
 }
 
-interface IndexerRules {
-  prioridade: number
-  seeders_minimos: number
-}
-
 export interface DecisionRules {
   tamanho_maximo_mb: number
   aceitar_legenda_embutida: boolean
-  legendas_embutidas_liberadas: string
-  propers: 'preferir' | 'nao_preferir'
-  preferir_flags_do_indexador: boolean
   folga_minima_mb: number
   downloads_simultaneos: number
-  carencia_dias: number
-  indexadores: Record<string, IndexerRules>
   atraso: { minutos: number; pular_se_melhor_qualidade: boolean }
 }
 
@@ -1059,16 +964,8 @@ export interface DiscoverPageResponse {
   total_paginas: number
 }
 
-export interface DiscoverGenre {
-  id: number
-  nome: string
-  oculto: boolean
-}
-
 export interface DiscoverHidden {
   titulos: { tipo: MediaKind; tmdb: number; titulo: string; em: string }[]
-  semanas: { ano: number; semana: number; em: string }[]
-  generos: { id: number; nome: string; em: string }[]
 }
 
 const DISCOVER = '/ui/api/descobrir'
@@ -1081,18 +978,9 @@ export const discover = {
     request<DiscoverReleases>('GET', `${DISCOVER}/semanas/${ano}/${semana}`),
   list: (lista: DiscoverList, tipo: MediaKind, pagina: number) =>
     request<DiscoverPageResponse>('GET', `${DISCOVER}/listas/${lista}?${new URLSearchParams({ tipo, pagina: String(pagina) })}`),
-  genres: () => request<{ generos: DiscoverGenre[] }>('GET', `${DISCOVER}/generos`),
   hidden: () => request<DiscoverHidden>('GET', `${DISCOVER}/ocultos`),
   hideTitle: (title: Pick<DiscoverItem, 'tipo' | 'tmdb' | 'titulo'>) =>
     request<{ ok: boolean }>('POST', `${DISCOVER}/ocultos/titulos`, title),
   showTitle: (tipo: MediaKind, tmdb: number) =>
     request<{ ok: boolean; removido: boolean }>('DELETE', `${DISCOVER}/ocultos/titulos/${tipo}/${tmdb}`),
-  hideWeek: (ano: number, semana: number) =>
-    request<{ ok: boolean }>('POST', `${DISCOVER}/ocultos/semanas`, { ano, semana }),
-  showWeek: (ano: number, semana: number) =>
-    request<{ ok: boolean; removido: boolean }>('DELETE', `${DISCOVER}/ocultos/semanas/${ano}/${semana}`),
-  hideGenre: (id: number, nome: string) =>
-    request<{ ok: boolean }>('POST', `${DISCOVER}/ocultos/generos`, { id, nome }),
-  showGenre: (id: number) =>
-    request<{ ok: boolean; removido: boolean }>('DELETE', `${DISCOVER}/ocultos/generos/${id}`),
 }

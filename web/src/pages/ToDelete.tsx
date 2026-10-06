@@ -325,7 +325,7 @@ function SuggestionsSection({ onOpen }: { onOpen: (item: ItemRef) => void }) {
       ) : !suggestions.data.configurado ? (
         <div className="rounded-lg border border-dashed border-border-strong px-6 py-10 text-center text-sm text-content-muted">
           Sem Jellyfin configurado, não há sugestões. Configure em{' '}
-          <a href="#jellyfin" className="font-medium text-accent hover:underline">
+          <a href="#configuracoes?secao=jellyfin" className="font-medium text-accent hover:underline">
             Configurações → Jellyfin
           </a>
           .

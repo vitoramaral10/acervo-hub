@@ -15,15 +15,13 @@ use crate::{Result, Store, StoreError};
 pub struct IndexerRecord {
     /// O nome servido em `/<nome>/api`; num Cardigann, o id da definição.
     pub name: String,
-    /// `torznab` ou `cardigann`.
+    /// Sempre `cardigann`.
     pub kind: String,
     /// Arquivo YAML da definição, num Cardigann.
     pub definition: Option<String>,
-    /// Endpoint, num Torznab; num Cardigann, o link da definição escolhido
-    /// (ausente é o primeiro).
+    /// Link da definição escolhido (ausente é o primeiro).
     pub url: Option<String>,
-    /// Settings da definição, ou `api_key` e `request_interval_seconds` de um
-    /// Torznab. Guarda segredo.
+    /// Settings da definição e da rede. Guarda segredo.
     pub settings: BTreeMap<String, String>,
     pub enabled: bool,
     pub added_at: Option<String>,
@@ -163,6 +161,43 @@ impl Store {
         Ok(inserted == 1)
     }
 
+    /// Cadastra com a única definição escolhida, numa transação.
+    ///
+    /// # Errors
+    /// Falha de escrita.
+    pub async fn insert_indexer_with_definition(
+        &self,
+        record: &IndexerRecord,
+        definition: Option<&crate::DefinitionRow>,
+    ) -> Result<bool> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let inserted = tx
+            .execute(
+                INSERT_INDEXER,
+                &[
+                    &record.name,
+                    &record.kind,
+                    &record.definition,
+                    &record.url,
+                    &settings_value(&record.settings),
+                    &record.enabled,
+                    &record.added_at,
+                ],
+            )
+            .await?;
+        if inserted == 0 {
+            return Ok(false);
+        }
+        if let Some(row) = definition {
+            tx.execute("INSERT INTO definitions (id, yaml, sha, updated_at) VALUES ($1, $2, $3, $4)
+                ON CONFLICT (id) DO UPDATE SET yaml = excluded.yaml, sha = excluded.sha, updated_at = excluded.updated_at",
+                &[&row.id, &row.yaml, &row.sha, &row.updated_at]).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Regrava um indexador existente. `false` se ele não existe.
     ///
     /// # Errors
@@ -254,7 +289,7 @@ mod tests {
     fn record(name: &str) -> IndexerRecord {
         IndexerRecord {
             name: name.into(),
-            kind: "torznab".into(),
+            kind: "cardigann".into(),
             definition: None,
             url: Some("http://x/api".into()),
             settings: [("api_key".to_owned(), "segredo".to_owned())].into(),

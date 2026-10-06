@@ -16,7 +16,6 @@ use acervo_store::{CatalogMovie, CatalogSeries, Store};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use crate::config::Config;
 use crate::events::{self, Event, Kind};
 use crate::naming::movie_file_stem;
 use crate::series::naming::{TBA, episode_path};
@@ -419,10 +418,8 @@ async fn record_subtitle(
 
 /// As legendas da pasta (no host), relativas a ela. Pasta ilegível: nenhuma
 /// (o renomear em si é que vai dizer o porquê).
-pub async fn disk_subtitles(config: &Config, folder: &str) -> Vec<String> {
-    let Ok(root) = config.path_map().to_host(Path::new(folder)) else {
-        return Vec::new();
-    };
+pub async fn disk_subtitles(folder: &str) -> Vec<String> {
+    let root = (Path::new(folder)).to_path_buf();
     tokio::task::spawn_blocking(move || crate::verify::scan(&root, &[]))
         .await
         .ok()
@@ -436,14 +433,13 @@ pub async fn disk_subtitles(config: &Config, folder: &str) -> Vec<String> {
 ///
 /// # Errors
 ///
-/// Pasta da série fora do mapa de caminhos.
+/// Banco inalcançável ou falha ao renomear.
 pub async fn apply_series(
-    config: &Config,
     store: &Store,
     entry: &CatalogSeries,
     mut plan: Vec<Rename>,
 ) -> Result<Vec<Rename>> {
-    let root = config.path_map().to_host(Path::new(&entry.series.path))?;
+    let root = (Path::new(&entry.series.path)).to_path_buf();
     for step in &mut plan {
         let file_id = step.arquivo_id;
         run_step(
@@ -484,14 +480,13 @@ pub async fn apply_series(
 ///
 /// # Errors
 ///
-/// Pasta do filme fora do mapa de caminhos.
+/// Banco inalcançável ou falha ao renomear.
 pub async fn apply_movie(
-    config: &Config,
     store: &Store,
     entry: &CatalogMovie,
     mut plan: Vec<Rename>,
 ) -> Result<Vec<Rename>> {
-    let root = config.path_map().to_host(Path::new(&entry.movie.path))?;
+    let root = (Path::new(&entry.movie.path)).to_path_buf();
     for step in &mut plan {
         run_step(
             store,
@@ -526,15 +521,15 @@ pub async fn apply_movie(
 /// # Errors
 ///
 /// Catálogo ilegível. Falha num arquivo fica no log; os outros seguem.
-pub async fn titled_files(config: &Config, store: &Store) -> Result<usize> {
+pub async fn titled_files(store: &Store) -> Result<usize> {
     let mut done = 0;
     for entry in store.series_list().await? {
         if titled_since(series_plan(&entry, &[])).is_empty() {
             continue;
         }
-        let disk = disk_subtitles(config, &entry.series.path).await;
+        let disk = disk_subtitles(&entry.series.path).await;
         let plan = titled_since(series_plan(&entry, &disk));
-        let result = match apply_series(config, store, &entry, plan).await {
+        let result = match apply_series(store, &entry, plan).await {
             Ok(result) => result,
             Err(error) => {
                 tracing::warn!(serie = entry.series.title, "renomear: {error:#}");

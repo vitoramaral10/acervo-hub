@@ -49,7 +49,7 @@ pub enum Presence {
     Present,
     /// `NotFound`: sumiu.
     Missing,
-    /// Outro erro de leitura, ou caminho fora do mapa: dúvida, fica.
+    /// Outro erro de leitura: dúvida, fica.
     Unknown,
 }
 
@@ -167,7 +167,7 @@ fn presence(path: &Path) -> Presence {
     }
 }
 
-/// Lê, no host, as raízes e os arquivos. `None` é caminho fora do mapa, que
+/// Lê as raízes e os arquivos. `None` é registro sem caminho, que
 /// vira [`Presence::Unknown`]. Devolve se todas as raízes existem (como
 /// pasta) e a presença de cada arquivo, na ordem.
 ///
@@ -356,17 +356,15 @@ async fn requeue(client: &QbitClient, hash: &str) -> Result<()> {
 
 /// As legendas do filme que ainda estão no disco, para voltarem ao catálogo
 /// depois de o arquivo sair (sair leva as legendas junto).
-async fn surviving_subtitles(
-    map: &acervo_fs::PathMap,
-    entry: &CatalogMovie,
-) -> Vec<acervo_store::Subtitle> {
+async fn surviving_subtitles(entry: &CatalogMovie) -> Vec<acervo_store::Subtitle> {
     let candidates: Vec<(acervo_store::Subtitle, PathBuf)> = entry
         .subtitles
         .iter()
-        .filter_map(|s| {
-            map.to_host(&PathBuf::from(&entry.movie.path).join(&s.subtitle.relative_path))
-                .ok()
-                .map(|host| (s.subtitle.clone(), host))
+        .map(|s| {
+            (
+                s.subtitle.clone(),
+                PathBuf::from(&entry.movie.path).join(&s.subtitle.relative_path),
+            )
         })
         .collect();
     tokio::task::spawn_blocking(move || {
@@ -382,12 +380,8 @@ async fn surviving_subtitles(
 
 /// Tira o arquivo do filme do catálogo, ficando as legendas que ainda estão
 /// no disco.
-async fn forget_movie_file(
-    store: &Store,
-    map: &acervo_fs::PathMap,
-    entry: &CatalogMovie,
-) -> Result<()> {
-    let kept = surviving_subtitles(map, entry).await;
+async fn forget_movie_file(store: &Store, entry: &CatalogMovie) -> Result<()> {
+    let kept = surviving_subtitles(entry).await;
     store.set_movie_file(entry.id, None).await?;
     for subtitle in &kept {
         if let Err(error) = store.add_movie_subtitle(entry.id, subtitle).await {
@@ -409,7 +403,6 @@ async fn movies(
     hashes: &HashSet<String>,
     trigger: Trigger,
 ) -> Result<Report> {
-    let map = config.path_map();
     let grabs = store.grabs().await?;
     let busy: HashSet<i64> = grabs
         .iter()
@@ -430,21 +423,16 @@ async fn movies(
         .collect();
     let mut roots: Vec<PathBuf> = Vec::new();
     for entry in &entries {
-        match map.to_host(&root_of(&entry.movie.path, &configured)) {
-            Ok(root) if !roots.contains(&root) => roots.push(root),
-            Ok(_) => {}
-            Err(error) => tracing::warn!(filme = entry.movie.title, "raiz fora do mapa: {error}"),
+        let root = root_of(&entry.movie.path, &configured);
+        if !roots.contains(&root) {
+            roots.push(root);
         }
     }
     let files: Vec<Option<PathBuf>> = entries
         .iter()
         .map(|entry| {
             let file = entry.movie.file.as_ref()?;
-            map.to_host(&PathBuf::from(&entry.movie.path).join(&file.relative_path))
-                .inspect_err(|error| {
-                    tracing::warn!(filme = entry.movie.title, "arquivo fora do mapa: {error}");
-                })
-                .ok()
+            Some(PathBuf::from(&entry.movie.path).join(&file.relative_path))
         })
         .collect();
     let (roots_present, seen) = read_disk(roots, files).await?;
@@ -472,7 +460,7 @@ async fn movies(
             Action::Redownload(hash) => candidates[index].iter().find(|g| &g.hash == hash).copied(),
             Action::Forget => None,
         };
-        let line = movie_line(store, client, &map, &entries[index], grab).await;
+        let line = movie_line(store, client, &entries[index], grab).await;
         report.sumidos.push(line);
     }
     Ok(report)
@@ -483,7 +471,6 @@ async fn movies(
 async fn movie_line(
     store: &Store,
     client: &QbitClient,
-    map: &acervo_fs::PathMap,
     entry: &CatalogMovie,
     grab: Option<&Grab>,
 ) -> Line {
@@ -504,8 +491,8 @@ async fn movie_line(
         erro: None,
     };
     let done = match grab {
-        Some(grab) => heal_movie(store, client, map, entry, grab).await,
-        None => forget_movie(store, map, entry).await,
+        Some(grab) => heal_movie(store, client, entry, grab).await,
+        None => forget_movie(store, entry).await,
     };
     if let Err(error) = done {
         tracing::warn!(filme = line.item, "conferência do disco: {error:#}");
@@ -532,11 +519,10 @@ async fn movie_line(
 async fn heal_movie(
     store: &Store,
     client: &QbitClient,
-    map: &acervo_fs::PathMap,
     entry: &CatalogMovie,
     grab: &Grab,
 ) -> Result<()> {
-    forget_movie_file(store, map, entry).await?;
+    forget_movie_file(store, entry).await?;
     store
         .record_grab(&Grab {
             state: GrabState::Downloading,
@@ -570,8 +556,8 @@ async fn heal_movie(
 }
 
 /// Sem torrent: o arquivo só sai do catálogo, e a busca o pega.
-async fn forget_movie(store: &Store, map: &acervo_fs::PathMap, entry: &CatalogMovie) -> Result<()> {
-    forget_movie_file(store, map, entry).await?;
+async fn forget_movie(store: &Store, entry: &CatalogMovie) -> Result<()> {
+    forget_movie_file(store, entry).await?;
     events::record(
         store,
         Event {
@@ -701,7 +687,6 @@ async fn series(
     hashes: &HashSet<String>,
     trigger: Trigger,
 ) -> Result<Report> {
-    let map = config.path_map();
     let grabs = store.series_grabs().await?;
     let entries = store.series_list().await?;
     let files = series_files(&entries);
@@ -711,24 +696,14 @@ async fn series(
         if !files.iter().any(|f| f.entry.id == entry.id) {
             continue;
         }
-        match map.to_host(&root_of(&entry.series.path, &configured)) {
-            Ok(root) if !roots.contains(&root) => roots.push(root),
-            Ok(_) => {}
-            Err(error) => tracing::warn!(serie = entry.series.title, "raiz fora do mapa: {error}"),
+        let root = root_of(&entry.series.path, &configured);
+        if !roots.contains(&root) {
+            roots.push(root);
         }
     }
     let paths: Vec<Option<PathBuf>> = files
         .iter()
-        .map(|f| {
-            map.to_host(&PathBuf::from(&f.entry.series.path).join(&f.file.file.relative_path))
-                .inspect_err(|error| {
-                    tracing::warn!(
-                        serie = f.entry.series.title,
-                        "arquivo fora do mapa: {error}"
-                    );
-                })
-                .ok()
-        })
+        .map(|f| Some(PathBuf::from(&f.entry.series.path).join(&f.file.file.relative_path)))
         .collect();
     let (roots_present, seen) = read_disk(roots, paths).await?;
     let records: Vec<Record> = files

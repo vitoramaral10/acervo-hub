@@ -1,32 +1,24 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Activity,
-  Bell,
   CalendarDays,
   ChevronDown,
   CircleDashed,
-  Clapperboard,
   Compass,
-  Download,
-  Eraser,
   Film,
-  FolderTree,
   Library,
   ListChecks,
   LogOut,
   Monitor,
   MonitorPlay,
   Moon,
-  Scale,
-  Search,
   Server,
-  ServerCog,
   SlidersHorizontal,
   Sun,
   Trash2,
-  Tv,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
+import { GlobalSearch } from '@/components/GlobalSearch'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Tooltip } from '@/components/ui/misc'
@@ -40,14 +32,13 @@ import { IndexersPage } from '@/pages/Indexers'
 import { LoginPage } from '@/pages/Login'
 import { MissingPage } from '@/pages/Missing'
 import { MoviesPage } from '@/pages/Movies'
-import { SearchPage } from '@/pages/Search'
 import { SeriesPage } from '@/pages/Series'
-import { SettingsPage, type SettingsView } from '@/pages/Settings'
+import { SettingsPage } from '@/pages/Settings'
 import { TasksPage } from '@/pages/Tasks'
 import { ToDeletePage } from '@/pages/ToDelete'
 
-type MainView = 'filmes' | 'series' | 'descobrir' | 'faltando' | 'apagar' | 'calendario' | 'atividade' | 'busca'
-type ConfigView = 'indexadores' | 'tarefas' | SettingsView
+type MainView = 'filmes' | 'series' | 'descobrir' | 'faltando' | 'apagar' | 'calendario' | 'atividade'
+type ConfigView = 'indexadores' | 'tarefas' | 'configuracoes'
 type View = MainView | ConfigView
 
 type NavItem<V extends View> = { view: V; label: string; icon: typeof Server }
@@ -61,21 +52,13 @@ const MAIN: NavItem<MainView>[] = [
   { view: 'apagar', label: 'Para apagar', icon: Trash2 },
   { view: 'calendario', label: 'Calendário', icon: CalendarDays },
   { view: 'atividade', label: 'Atividade', icon: Activity },
-  { view: 'busca', label: 'Busca', icon: Search },
 ]
 
 /** Configuração do serviço: num grupo que se recolhe. */
 const CONFIG: NavItem<ConfigView>[] = [
   { view: 'indexadores', label: 'Indexadores', icon: Server },
   { view: 'tarefas', label: 'Tarefas', icon: ListChecks },
-  { view: 'cliente-download', label: 'Cliente de download', icon: Download },
-  { view: 'jellyfin', label: 'Jellyfin', icon: Tv },
-  { view: 'biblioteca', label: 'Biblioteca', icon: FolderTree },
-  { view: 'limpeza', label: 'Limpeza', icon: Eraser },
-  { view: 'regras', label: 'Regras de decisão', icon: Scale },
-  { view: 'notificacoes', label: 'Notificações', icon: Bell },
-  { view: 'tmdb', label: 'TMDB', icon: Clapperboard },
-  { view: 'servidor', label: 'Servidor', icon: ServerCog },
+  { view: 'configuracoes', label: 'Configurações', icon: SlidersHorizontal },
 ]
 
 const VIEWS: View[] = [...MAIN, ...CONFIG].map((item) => item.view)
@@ -83,9 +66,9 @@ const inConfig = (view: View) => CONFIG.some((item) => item.view === view)
 
 function viewFromHash(): View {
   // A query depois de `?` é da tela (ex.: `#filmes?ordem=ano`), não faz parte do nome.
-  const hash = window.location.hash.slice(1).split('?')[0]
+  const hash = window.location.hash.slice(1).split('?')[0] ?? ''
   // Endereço salvo da antiga página única de configurações.
-  if (hash === 'configuracoes') return 'servidor'
+  if (['servidor', 'cliente-download', 'jellyfin', 'biblioteca', 'regras', 'notificacoes', 'tmdb'].includes(hash)) return 'configuracoes'
   return VIEWS.includes(hash as View) ? (hash as View) : 'descobrir'
 }
 
@@ -246,6 +229,7 @@ export function App() {
             <span className="block text-xs text-content-subtle">mídia</span>
           </span>
         </a>
+        <GlobalSearch />
         {/* Celular: barra horizontal, com o grupo de configurações numa folha. */}
         <nav aria-label="Seções" className="flex min-w-0 flex-1 gap-1 overflow-x-auto md:hidden">
           {MAIN.map(({ view: target, label, icon: Icon }) => (
@@ -290,9 +274,7 @@ export function App() {
       </aside>
       <main id="conteudo" tabIndex={-1} className="min-w-0 px-4 py-6 outline-none sm:px-6 md:px-10 md:py-10">
         <div className="mx-auto max-w-6xl">
-          {view === 'busca' ? (
-            <SearchPage />
-          ) : view === 'filmes' ? (
+          {view === 'filmes' ? (
             <MoviesPage />
           ) : view === 'series' ? (
             <SeriesPage />
@@ -311,7 +293,7 @@ export function App() {
           ) : view === 'indexadores' ? (
             <IndexersPage />
           ) : (
-            <SettingsPage view={view} />
+            <SettingsPage />
           )}
         </div>
       </main>

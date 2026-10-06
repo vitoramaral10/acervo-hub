@@ -14,7 +14,6 @@ import {
   Film,
   ListFilter,
   LoaderCircle,
-  Plus,
   Radar,
   ScanSearch,
   SearchX,
@@ -24,7 +23,6 @@ import {
 } from 'lucide-react'
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
-import { AddMovieDialog } from '@/components/AddMovieDialog'
 import { MarkButton, MarkedBadge, useMarkedKeys } from '@/components/DeletionMark'
 import { HistoryList } from '@/components/HistoryList'
 import { InteractiveSearch } from '@/components/InteractiveSearch'
@@ -299,7 +297,6 @@ export function MoviesPage() {
     const value = new URLSearchParams(window.location.hash.split('?')[1]).get('id')
     return value && /^\d+$/.test(value) && Number(value) > 0 ? Number(value) : null
   })
-  const [adding, setAdding] = useState(false)
   const [verifyingAll, setVerifyingAll] = useState(false)
   const marked = useMarkedKeys()
 
@@ -375,22 +372,10 @@ export function MoviesPage() {
               <ScanSearch aria-hidden="true" />
               Verificar todos os filmes
             </Button>
-            <Button variant="primary" onClick={() => setAdding(true)}>
-              <Plus aria-hidden="true" />
-              Adicionar filme
-            </Button>
           </div>
         }
       />
       {verifyingAll && <VerifyAllMoviesDialog onClose={() => setVerifyingAll(false)} />}
-      <AddMovieDialog
-        open={adding}
-        onOpenChange={setAdding}
-        onOpenMovie={(id) => {
-          setAdding(false)
-          setSelected(id)
-        }}
-      />
 
       {movies.isPending ? (
         <LibrarySkeleton />
@@ -405,14 +390,8 @@ export function MoviesPage() {
           <Film className="size-8 text-content-subtle" aria-hidden="true" />
           <p className="font-medium">A biblioteca está vazia</p>
           <p className="max-w-md text-sm text-content-muted">
-            Adicione filmes buscando no TMDB.
+            Use “Buscar títulos” no menu, / ou Ctrl/Cmd+K para adicionar filmes.
           </p>
-          <div className="flex flex-wrap justify-center gap-2">
-            <Button variant="primary" onClick={() => setAdding(true)}>
-              <Plus aria-hidden="true" />
-              Adicionar filme
-            </Button>
-          </div>
         </div>
       ) : (
         <>

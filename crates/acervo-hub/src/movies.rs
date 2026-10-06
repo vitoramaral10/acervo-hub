@@ -8,8 +8,6 @@ use acervo_store::{CatalogMovie, Store};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::config::Config;
-
 /// Estado do arquivo no disco, visto daqui.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -19,7 +17,7 @@ pub enum Disk {
     Missing,
     /// Existe, com outro tamanho: foi trocado ou está incompleto.
     SizeDiffers,
-    /// Não deu para olhar: caminho fora do mapa ou erro de leitura.
+    /// Não deu para olhar: erro de leitura.
     Unreadable,
 }
 
@@ -79,8 +77,8 @@ pub struct DownloadView {
     pub pego_em: String,
 }
 
-fn disk(path: &Path, expected: u64, map: &acervo_fs::PathMap) -> (Disk, Option<String>) {
-    match acervo_fs::facts_for(path, map) {
+fn disk(path: &Path, expected: u64) -> (Disk, Option<String>) {
+    match acervo_fs::facts_for(path) {
         Ok(facts) if facts.apparent.as_u64() == expected => (Disk::Ok, None),
         Ok(facts) => (
             Disk::SizeDiffers,
@@ -100,14 +98,13 @@ fn disk(path: &Path, expected: u64, map: &acervo_fs::PathMap) -> (Disk, Option<S
 
 fn view(
     entry: CatalogMovie,
-    map: &acervo_fs::PathMap,
     search: Option<acervo_store::SearchRun>,
     download: Option<DownloadView>,
 ) -> MovieView {
     let movie = entry.movie;
     let arquivo = movie.file.map(|file| {
         let full = Path::new(&movie.path).join(&file.relative_path);
-        let (disco, disco_detalhe) = disk(&full, file.size, map);
+        let (disco, disco_detalhe) = disk(&full, file.size);
         FileView {
             nome: file.relative_path,
             tamanho: file.size,
@@ -156,8 +153,7 @@ fn view(
 /// # Errors
 ///
 /// Catálogo ilegível.
-pub async fn list(config: &Config, store: &Store) -> Result<Vec<MovieView>> {
-    let map = config.path_map();
+pub async fn list(store: &Store) -> Result<Vec<MovieView>> {
     let mut searches: HashMap<i64, acervo_store::SearchRun> = store
         .latest_searches()
         .await?
@@ -182,7 +178,7 @@ pub async fn list(config: &Config, store: &Store) -> Result<Vec<MovieView>> {
             .map(|entry| {
                 let search = searches.remove(&entry.id);
                 let download = downloads.remove(&entry.id);
-                view(entry, &map, search, download)
+                view(entry, search, download)
             })
             .collect())
     })
@@ -200,12 +196,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("filme.mkv");
         std::fs::write(&file, b"12345").unwrap();
-        let map = acervo_fs::PathMap::new([]);
-        assert_eq!(disk(&file, 5, &map).0, Disk::Ok);
-        assert_eq!(disk(&file, 6, &map).0, Disk::SizeDiffers);
-        assert_eq!(disk(&dir.join("outro.mkv"), 5, &map).0, Disk::Missing);
-        let elsewhere = acervo_fs::PathMap::new([("/nada".into(), "/nada".into())]);
-        assert_eq!(disk(&file, 5, &elsewhere).0, Disk::Unreadable);
+        assert_eq!(disk(&file, 5).0, Disk::Ok);
+        assert_eq!(disk(&file, 6).0, Disk::SizeDiffers);
+        assert_eq!(disk(&dir.join("outro.mkv"), 5).0, Disk::Missing);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

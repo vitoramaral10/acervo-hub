@@ -111,7 +111,6 @@ fn week_key(year: i32, week: u8) -> String {
 #[derive(Debug)]
 struct Filters {
     titles: HashSet<(StoredKind, u32)>,
-    genres: HashSet<u32>,
     movies: HashSet<u32>,
     series: HashSet<u32>,
 }
@@ -124,16 +123,9 @@ impl Filters {
             .into_iter()
             .map(|t| (t.kind, t.tmdb_id))
             .collect();
-        let genres = store
-            .hidden_genres()
-            .await?
-            .into_iter()
-            .map(|g| g.genre_id)
-            .collect();
         let (movies, series) = store.catalog_tmdb_ids().await?;
         Ok(Self {
             titles,
-            genres,
             movies,
             series,
         })
@@ -148,7 +140,6 @@ impl Filters {
                 DiscoverKind::Series => &self.series,
             })
             .contains(&item.tmdb_id)
-            && !item.genre_ids.iter().any(|id| self.genres.contains(id))
     }
 
     fn items(&self, items: &[DiscoverItem], genres: &[Genre]) -> Vec<Value> {
@@ -203,7 +194,7 @@ async fn search(
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::GET).await?;
     let q = search_args(&query).map_err(|e| fail(anyhow_bad(&e)))?;
-    let tmdb = crate::metadata::require_tmdb(&web.config(), store)
+    let tmdb = crate::metadata::require_tmdb(store)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     let key = format!("{}:{q}", query.pagina);
@@ -251,7 +242,7 @@ async fn details(
         StoredKind::Filme => DiscoverKind::Movie,
         StoredKind::Serie => DiscoverKind::Series,
     };
-    let tmdb = crate::metadata::require_tmdb(&web.config(), store)
+    let tmdb = crate::metadata::require_tmdb(store)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     let key = format!("{}:{id}", stored.as_str());
@@ -275,7 +266,6 @@ async fn details(
     let genres = genres(&tmdb).await.map_err(|e| fail(anyhow_bad(&e)))?;
     let mut value = item_json(&detail.item, &HashMap::new());
     let extra = json!({
-        "generos": detail.genres, "tagline": detail.tagline, "backdrop": detail.backdrop,
         "duracao": detail.runtime, "temporadas": detail.number_of_seasons, "episodios": detail.number_of_episodes,
         "status": detail.status, "diretores": detail.directors, "criadores": detail.creators,
         "elenco": detail.cast.iter().map(|person| json!({"nome": person.name, "personagem": person.character, "foto": person.profile})).collect::<Vec<_>>(),
@@ -308,40 +298,19 @@ pub(crate) fn routes() -> Router<Arc<Web>> {
             "/ui/api/descobrir/ocultos/titulos/{tipo}/{tmdb}",
             delete(unhide_title),
         )
-        .route("/ui/api/descobrir/ocultos/semanas", post(hide_week))
-        .route(
-            "/ui/api/descobrir/ocultos/semanas/{ano}/{semana}",
-            delete(unhide_week),
-        )
-        .route("/ui/api/descobrir/ocultos/generos", post(hide_genre))
-        .route(
-            "/ui/api/descobrir/ocultos/generos/{id}",
-            delete(unhide_genre),
-        )
 }
 
 async fn weeks(State(web): Shared, headers: HeaderMap, Path(year): Path<i32>) -> WebResult {
     let store = enter(&web, &headers, &Method::GET).await?;
     valid_year(year).map_err(|e| fail(anyhow_bad(&e)))?;
-    crate::metadata::require_tmdb(&web.config(), store)
+    crate::metadata::require_tmdb(store)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     let filters = Filters::load(store)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
-    let hidden: HashSet<_> = store
-        .hidden_weeks()
-        .await
-        .map_err(|e| fail(bad(e)))?
-        .into_iter()
-        .filter(|w| w.year == year)
-        .map(|w| w.week)
-        .collect();
     let mut weeks = Vec::new();
     for week in 1..=time::util::weeks_in_year(year) {
-        if hidden.contains(&week) {
-            continue;
-        }
         let (start, end) = week_dates(year, week).map_err(|e| fail(anyhow_bad(&e)))?;
         let total = cached(&WEEKS, &week_key(year, week), WEEK_TTL)
             .map(|items| items.iter().filter(|i| filters.visible(i)).count());
@@ -357,7 +326,7 @@ async fn week(
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::GET).await?;
     let (start, end) = week_dates(year, week).map_err(|e| fail(anyhow_bad(&e)))?;
-    let tmdb = crate::metadata::require_tmdb(&web.config(), store)
+    let tmdb = crate::metadata::require_tmdb(store)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     let key = week_key(year, week);
@@ -416,7 +385,7 @@ async fn list(
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::GET).await?;
     let (list, kind) = list_args(&name, &query).map_err(|e| fail(anyhow_bad(&e)))?;
-    let tmdb = crate::metadata::require_tmdb(&web.config(), store)
+    let tmdb = crate::metadata::require_tmdb(store)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     let genres = genres(&tmdb).await.map_err(|e| fail(anyhow_bad(&e)))?;
@@ -452,31 +421,20 @@ async fn list(
 
 async fn genre_list(State(web): Shared, headers: HeaderMap) -> WebResult {
     let store = enter(&web, &headers, &Method::GET).await?;
-    let tmdb = crate::metadata::require_tmdb(&web.config(), store)
+    let tmdb = crate::metadata::require_tmdb(store)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
     let genres = genres(&tmdb).await.map_err(|e| fail(anyhow_bad(&e)))?;
-    let hidden: HashSet<_> = store
-        .hidden_genres()
-        .await
-        .map_err(|e| fail(bad(e)))?
-        .into_iter()
-        .map(|g| g.genre_id)
-        .collect();
     ok(
-        &json!({"generos": genres.iter().map(|g| json!({"id": g.id, "nome": g.name, "oculto": hidden.contains(&g.id)})).collect::<Vec<_>>()}),
+        &json!({"generos": genres.iter().map(|g| json!({"id": g.id, "nome": g.name})).collect::<Vec<_>>()}),
     )
 }
 
 async fn hidden(State(web): Shared, headers: HeaderMap) -> WebResult {
     let store = enter(&web, &headers, &Method::GET).await?;
     let titles = store.hidden_titles().await.map_err(|e| fail(bad(e)))?;
-    let weeks = store.hidden_weeks().await.map_err(|e| fail(bad(e)))?;
-    let genres = store.hidden_genres().await.map_err(|e| fail(bad(e)))?;
     ok(&json!({
         "titulos": titles.iter().map(|t| json!({"tipo": t.kind.as_str(), "tmdb": t.tmdb_id, "titulo": t.title, "em": t.hidden_at})).collect::<Vec<_>>(),
-        "semanas": weeks.iter().map(|w| json!({"ano": w.year, "semana": w.week, "em": w.hidden_at})).collect::<Vec<_>>(),
-        "generos": genres.iter().map(|g| json!({"id": g.genre_id, "nome": g.name, "em": g.hidden_at})).collect::<Vec<_>>(),
     }))
 }
 
@@ -486,17 +444,6 @@ struct TitleBody {
     tmdb: u32,
     titulo: String,
 }
-#[derive(Deserialize)]
-struct WeekBody {
-    ano: i32,
-    semana: u8,
-}
-#[derive(Deserialize)]
-struct GenreBody {
-    id: u32,
-    nome: String,
-}
-
 async fn hide_title(
     State(web): Shared,
     headers: HeaderMap,
@@ -524,55 +471,6 @@ async fn unhide_title(
         .unhide_title(kind, id)
         .await
         .map_err(|e| fail(bad(e)))?;
-    ok(&json!({"ok": true, "removido": removed}))
-}
-
-async fn hide_week(
-    State(web): Shared,
-    headers: HeaderMap,
-    axum::Json(body): axum::Json<WeekBody>,
-) -> WebResult {
-    let store = enter(&web, &headers, &Method::POST).await?;
-    week_dates(body.ano, body.semana).map_err(|e| fail(anyhow_bad(&e)))?;
-    store
-        .hide_week(body.ano, body.semana, &now_rfc3339())
-        .await
-        .map_err(|e| fail(bad(e)))?;
-    ok(&json!({"ok": true}))
-}
-
-async fn unhide_week(
-    State(web): Shared,
-    headers: HeaderMap,
-    Path((year, week)): Path<(i32, u8)>,
-) -> WebResult {
-    let store = enter(&web, &headers, &Method::DELETE).await?;
-    week_dates(year, week).map_err(|e| fail(anyhow_bad(&e)))?;
-    let removed = store
-        .unhide_week(year, week)
-        .await
-        .map_err(|e| fail(bad(e)))?;
-    ok(&json!({"ok": true, "removido": removed}))
-}
-
-async fn hide_genre(
-    State(web): Shared,
-    headers: HeaderMap,
-    axum::Json(body): axum::Json<GenreBody>,
-) -> WebResult {
-    let store = enter(&web, &headers, &Method::POST).await?;
-    valid_id(body.id).map_err(|e| fail(anyhow_bad(&e)))?;
-    store
-        .hide_genre(body.id, &body.nome, &now_rfc3339())
-        .await
-        .map_err(|e| fail(bad(e)))?;
-    ok(&json!({"ok": true}))
-}
-
-async fn unhide_genre(State(web): Shared, headers: HeaderMap, Path(id): Path<u32>) -> WebResult {
-    let store = enter(&web, &headers, &Method::DELETE).await?;
-    valid_id(id).map_err(|e| fail(anyhow_bad(&e)))?;
-    let removed = store.unhide_genre(id).await.map_err(|e| fail(bad(e)))?;
     ok(&json!({"ok": true, "removido": removed}))
 }
 
@@ -615,7 +513,6 @@ mod tests {
     fn filtros_das_recomendacoes_e_indicadores_da_busca() {
         let filters = Filters {
             titles: HashSet::from([(StoredKind::Filme, 1)]),
-            genres: HashSet::from([18]),
             movies: HashSet::from([2]),
             series: HashSet::from([3]),
         };
@@ -644,8 +541,8 @@ mod tests {
         assert!(in_catalog(&filters, &item));
         item.tmdb_id = 4;
         item.genre_ids = vec![18];
-        assert!(!filters.visible(&item));
-        assert!(filters.items(&[item.clone()], &[]).is_empty());
+        assert!(filters.visible(&item));
+        assert_eq!(filters.items(&[item.clone()], &[]).len(), 1);
         // A serialização da busca preserva obras que os filtros das listas ocultam.
         assert_eq!(item_json(&item, &HashMap::new())["tmdb"], 4);
     }

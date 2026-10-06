@@ -1,22 +1,13 @@
-//! Catálogo de definições Cardigann: o que a interface oferece para
-//! adicionar e de onde cada indexador cadastrado tira a sua.
-//!
-//! Duas fontes, da mais forte para a mais fraca:
-//!
-//! 1. os diretórios locais (`catalogos`), com as definições customizadas —
-//!    nunca trocadas pelas do repositório;
-//! 2. o banco, com as que a tarefa `definicoes` baixa do repositório oficial.
-//!
-//! Montado na subida e refeito quando os diretórios mudam ou a tarefa traz
-//! definição nova: são centenas de YAML, e o resultado — quais rodam e por
-//! que os outros não — só muda com eles.
+//! Definições Cardigann locais e em uso no banco. O catálogo remoto é baixado
+//! sob demanda, guardado em memória e usado apenas ao cadastrar um indexador.
+//! Diretórios locais e arquivos fixados têm precedência.
 
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use acervo_indexers::{CardigannDefinition, DefinitionHeader};
+use acervo_indexers::{CardigannDefinition, DefinitionHeader, SettingInfo};
 use acervo_store::DefinitionRow;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -36,6 +27,7 @@ pub struct Known {
     pub header: DefinitionHeader,
     /// `None` se roda; senão, o motivo da recusa.
     pub refusal: Option<String>,
+    pub settings: Vec<SettingInfo>,
 }
 
 impl Known {
@@ -154,18 +146,29 @@ impl Definitions {
         if self.by_id.contains_key(&header.id) {
             return false;
         }
-        let refusal = CardigannDefinition::from_yaml_v11(yaml)
-            .err()
-            .map(|error| error.to_string());
+        let (refusal, settings) = match CardigannDefinition::from_yaml_v11(yaml) {
+            Ok(parsed) => (None, parsed.settings().clone()),
+            Err(error) => (Some(error.to_string()), Vec::new()),
+        };
         self.by_id.insert(
             header.id.clone(),
             Known {
                 source,
                 header,
                 refusal,
+                settings,
             },
         );
         true
+    }
+
+    /// Completa os ids ausentes, sem substituir as fontes prioritárias.
+    pub fn extend(&mut self, other: &Self) {
+        for (id, known) in &other.by_id {
+            self.by_id
+                .entry(id.clone())
+                .or_insert_with(|| known.clone());
+        }
     }
 
     #[must_use]
@@ -227,7 +230,7 @@ const MAX_DEFINITION: u64 = 1024 * 1024;
 /// Rede, HTTP diferente de 200, arquivo grande demais ou ilegível.
 pub async fn download(url: &str, timeout: std::time::Duration) -> Result<Vec<(String, String)>> {
     let http = reqwest::Client::builder()
-        .timeout(timeout.max(std::time::Duration::from_secs(120)))
+        .timeout(timeout)
         .user_agent("acervo-hub")
         .build()?;
     let mut response = http

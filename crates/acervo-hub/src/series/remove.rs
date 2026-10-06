@@ -120,7 +120,6 @@ pub async fn delete_episodes(
         .set_skip(&affected, Some(Skip::Deleted), &now_rfc3339())
         .await?;
 
-    let map = config.path_map();
     let mut removal = Removal {
         episodios: affected.len(),
         ..Removal::default()
@@ -131,8 +130,8 @@ pub async fn delete_episodes(
         // O vídeo e as legendas dele: também elas são hardlink do torrent.
         let hosts = std::iter::once(file.file.relative_path.clone())
             .chain(super::subtitle_paths(&entry, file.id))
-            .map(|relative| map.to_host(&PathBuf::from(&entry.series.path).join(relative)))
-            .collect::<Result<Vec<PathBuf>, _>>()?;
+            .map(|relative| PathBuf::from(&entry.series.path).join(relative))
+            .collect::<Vec<PathBuf>>();
         let gone = tokio::task::spawn_blocking(move || super::remove_files(&hosts))
             .await?
             .with_context(|| format!("apagando `{}`", path.display()))?;
@@ -196,7 +195,7 @@ async fn orphaned_torrents(
         .filter(|g| g.state == GrabState::Downloading)
         .map(|g| g.hash)
         .collect();
-    let map = config.path_map();
+
     let qbit = crate::grab::qbit(config).await?;
     let mut candidates: Vec<(DownloadHash, String, Vec<PathBuf>)> = Vec::new();
     for torrent in qbit.torrents().await.context("listando os torrents")? {
@@ -210,10 +209,7 @@ async fn orphaned_torrents(
             .context("listando os arquivos de um torrent")?;
         let paths = files
             .iter()
-            .filter_map(|file| {
-                map.to_host(&acervo_clients::client_path(&torrent, file))
-                    .ok()
-            })
+            .map(|file| acervo_clients::client_path(&torrent, file))
             .collect();
         candidates.push((hash, torrent.name, paths));
     }

@@ -3,7 +3,10 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use acervo_api::{Accounts, Admin, Catalog, DefinitionView, Entry, SettingView, router_with_admin};
+use acervo_api::{
+    Accounts, Admin, Catalog, DefinitionCatalog, DefinitionView, Entry, SettingView,
+    router_with_admin,
+};
 use acervo_indexers::{
     Capabilities, Category, Indexer, IndexerError, Release, SearchQuery, SearchSupport,
 };
@@ -131,29 +134,34 @@ impl Admin for FakeAdmin {
             .collect()
     }
 
-    fn definitions(&self) -> Vec<DefinitionView> {
-        vec![
-            DefinitionView {
-                id: "novo".into(),
-                name: "Novo".into(),
-                description: String::new(),
-                language: "pt-BR".into(),
-                private: false,
-                supported: true,
-                reason: None,
-                added: false,
-            },
-            DefinitionView {
-                id: "api-json".into(),
-                name: "Tracker JSON".into(),
-                description: String::new(),
-                language: "en-US".into(),
-                private: true,
-                supported: false,
-                reason: Some("chave `response` não suportada".into()),
-                added: false,
-            },
-        ]
+    async fn definitions(&self) -> Result<DefinitionCatalog, String> {
+        Ok(DefinitionCatalog {
+            warning: Some("Atualização remota indisponível; usando catálogo em cache".into()),
+            definitions: vec![
+                DefinitionView {
+                    id: "novo".into(),
+                    name: "Novo".into(),
+                    description: String::new(),
+                    language: "pt-BR".into(),
+                    private: false,
+                    supported: true,
+                    reason: None,
+                    added: false,
+                    settings: Vec::new(),
+                },
+                DefinitionView {
+                    id: "api-json".into(),
+                    name: "Tracker JSON".into(),
+                    description: String::new(),
+                    language: "en-US".into(),
+                    private: true,
+                    supported: false,
+                    reason: Some("chave `response` não suportada".into()),
+                    added: false,
+                    settings: Vec::new(),
+                },
+            ],
+        })
     }
 
     fn definition_settings(&self, definition: &str) -> Option<Vec<SettingView>> {
@@ -314,12 +322,18 @@ async fn login(base: &str) -> String {
     cookie.split(';').next().unwrap().to_owned()
 }
 
-/// O status da busca num indexador: 200 se ele está no catálogo servido, 404
-/// se não.
-async fn served(base: &str, cookie: &str, name: &str) -> u16 {
-    get(base, &format!("/ui/api/busca?q=x&indexador={name}"), cookie)
-        .await
-        .0
+/// O teste distingue um indexador servido de um ausente, mesmo com credencial vencida.
+async fn served(base: &str, cookie: &str, name: &str) -> bool {
+    let (status, body) = send(
+        base,
+        reqwest::Method::POST,
+        &format!("/ui/api/indexadores/{name}/testar"),
+        cookie,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    body["erro"] != "indexador desconhecido"
 }
 
 async fn get(base: &str, path: &str, cookie: &str) -> (u16, Value) {
@@ -475,10 +489,18 @@ async fn cookie_vencido_aparece_na_saude_e_trocar_pela_tela_conserta() {
     let base = serve().await;
     let cookie = login(&base).await;
 
-    // Uma busca com cookie vencido registra a falha na saúde do indexador.
-    let (status, body) = get(&base, "/ui/api/busca?q=serie", &cookie).await;
-    assert_eq!(status, 502);
-    assert!(body["erro"].as_str().unwrap().contains("falharam"));
+    // Testar com cookie vencido registra a falha na saúde do indexador.
+    let (status, body) = send(
+        &base,
+        reqwest::Method::POST,
+        "/ui/api/indexadores/privado/testar",
+        &cookie,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["ok"], false);
+    assert!(body["erro"].as_str().unwrap().contains("vencido"));
     let (_, list) = get(&base, "/ui/api/indexadores", &cookie).await;
     let indexer = &list["indexadores"][0];
     assert_eq!(indexer["nome"], "privado");
@@ -513,18 +535,17 @@ async fn cookie_vencido_aparece_na_saude_e_trocar_pela_tela_conserta() {
     let (_, list) = get(&base, "/ui/api/indexadores", &cookie).await;
     assert_eq!(list["indexadores"][0]["saude"]["falhas_seguidas"], 0);
 
-    // Busca agora funciona, e o download sai pela sessão, não direto.
-    let (status, body) = get(&base, "/ui/api/busca?q=serie&cat=5000", &cookie).await;
+    // Testar agora funciona com a credencial nova.
+    let (status, body) = send(
+        &base,
+        reqwest::Method::POST,
+        "/ui/api/indexadores/privado/testar",
+        &cookie,
+        json!({}),
+    )
+    .await;
     assert_eq!(status, 200);
-    let release = &body["resultados"][0];
-    assert_eq!(release["titulo"], "Série <b>.S01E01");
-    assert!(
-        release["download"]
-            .as_str()
-            .unwrap()
-            .starts_with("/ui/baixar?indexador=privado&link=")
-    );
-    assert_eq!(release["detalhes"], "https://privado.invalid/t/1");
+    assert_eq!(body, json!({ "ok": true, "resultados": 1 }));
 }
 
 #[tokio::test]
@@ -569,6 +590,7 @@ async fn catalogo_lista_suportadas_e_recusadas_com_motivo() {
     let cookie = login(&base).await;
     let (status, body) = get(&base, "/ui/api/catalogo", &cookie).await;
     assert_eq!(status, 200);
+    assert!(body["aviso"].as_str().unwrap().contains("cache"));
     let list = body["definicoes"].as_array().unwrap();
     assert_eq!(list[0]["supported"], true);
     assert_eq!(list[1]["supported"], false);
@@ -599,8 +621,8 @@ async fn adicionar_testa_e_entra_no_catalogo_e_remover_tira() {
         .map(|i| i["nome"].clone())
         .collect();
     assert!(names.contains(&json!("novo")));
-    // Entra no catálogo servido: a busca o alcança pelo nome.
-    assert_eq!(served(&base, &cookie, "novo").await, 200);
+    // Entra no catálogo servido: o teste o alcança pelo nome.
+    assert!(served(&base, &cookie, "novo").await);
 
     // Recusa do administrador vira 422.
     let (status, _) = send(
@@ -621,7 +643,7 @@ async fn adicionar_testa_e_entra_no_catalogo_e_remover_tira() {
     )
     .await;
     assert_eq!(status, 200);
-    assert_eq!(served(&base, &cookie, "novo").await, 404);
+    assert!(!served(&base, &cookie, "novo").await);
 }
 
 #[tokio::test]
@@ -637,7 +659,7 @@ async fn desativar_tira_de_circulacao_e_mantem_na_lista() {
     )
     .await;
     assert_eq!(status, 200);
-    assert_eq!(served(&base, &cookie, "privado").await, 404);
+    assert!(!served(&base, &cookie, "privado").await);
     let (_, list) = get(&base, "/ui/api/indexadores", &cookie).await;
     let privado = list["indexadores"]
         .as_array()
@@ -657,7 +679,7 @@ async fn desativar_tira_de_circulacao_e_mantem_na_lista() {
     )
     .await;
     assert_eq!(status, 200);
-    assert_eq!(served(&base, &cookie, "privado").await, 200);
+    assert!(served(&base, &cookie, "privado").await);
 }
 
 #[tokio::test]

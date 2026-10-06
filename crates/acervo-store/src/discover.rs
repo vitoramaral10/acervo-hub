@@ -1,4 +1,4 @@
-//! Preferências persistentes de títulos, semanas e gêneros no Descobrir.
+//! Preferências persistentes de títulos no Descobrir.
 
 use std::collections::HashSet;
 
@@ -29,20 +29,6 @@ pub struct HiddenTitle {
     pub kind: DiscoverKind,
     pub tmdb_id: u32,
     pub title: String,
-    pub hidden_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HiddenWeek {
-    pub year: i32,
-    pub week: u8,
-    pub hidden_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HiddenGenre {
-    pub genre_id: u32,
-    pub name: String,
     pub hidden_at: String,
 }
 
@@ -98,77 +84,6 @@ impl Store {
             .execute(
                 "DELETE FROM discover_hidden_titles WHERE kind = $1 AND tmdb_id = $2",
                 &[&kind.as_str(), &sql_id(tmdb_id)?],
-            )
-            .await?
-            > 0)
-    }
-
-    /// Semanas ocultas, mais recentes primeiro.
-    ///
-    /// # Errors
-    /// Falha de leitura ou registro inconsistente.
-    pub async fn hidden_weeks(&self) -> Result<Vec<HiddenWeek>> {
-        self.pool.get().await?.query("SELECT year, week, hidden_at FROM discover_hidden_weeks ORDER BY hidden_at DESC, year, week", &[]).await?.iter().map(|row| {
-            let week: i32 = row.try_get(1)?;
-            Ok(HiddenWeek { year: row.try_get(0)?, week: u8::try_from(week).map_err(|_| StoreError::Corrupt(format!("semana {week}")))?, hidden_at: row.try_get(2)? })
-        }).collect()
-    }
-
-    /// Oculta a semana sem alterar uma preferência anterior.
-    ///
-    /// # Errors
-    /// Falha de escrita ou semana fora de 1 a 53.
-    pub async fn hide_week(&self, year: i32, week: u8, at: &str) -> Result<()> {
-        self.pool.get().await?.execute("INSERT INTO discover_hidden_weeks (year, week, hidden_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", &[&year, &i32::from(week), &at]).await?;
-        Ok(())
-    }
-
-    /// Mostra a semana de novo; indica se havia uma preferência.
-    ///
-    /// # Errors
-    /// Falha de escrita.
-    pub async fn unhide_week(&self, year: i32, week: u8) -> Result<bool> {
-        Ok(self
-            .pool
-            .get()
-            .await?
-            .execute(
-                "DELETE FROM discover_hidden_weeks WHERE year = $1 AND week = $2",
-                &[&year, &i32::from(week)],
-            )
-            .await?
-            > 0)
-    }
-
-    /// Gêneros ocultos, mais recentes primeiro.
-    ///
-    /// # Errors
-    /// Falha de leitura ou registro inconsistente.
-    pub async fn hidden_genres(&self) -> Result<Vec<HiddenGenre>> {
-        self.pool.get().await?.query("SELECT genre_id, name, hidden_at FROM discover_hidden_genres ORDER BY hidden_at DESC, genre_id", &[]).await?.iter().map(|row| Ok(HiddenGenre { genre_id: id(row.try_get(0)?)?, name: row.try_get(1)?, hidden_at: row.try_get(2)? })).collect()
-    }
-
-    /// Oculta o gênero sem alterar uma preferência anterior.
-    ///
-    /// # Errors
-    /// Falha de escrita ou id fora do intervalo do banco.
-    pub async fn hide_genre(&self, id: u32, name: &str, at: &str) -> Result<()> {
-        self.pool.get().await?.execute("INSERT INTO discover_hidden_genres (genre_id, name, hidden_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", &[&sql_id(id)?, &name, &at]).await?;
-        Ok(())
-    }
-
-    /// Mostra o gênero de novo; indica se havia uma preferência.
-    ///
-    /// # Errors
-    /// Falha de escrita ou id fora do intervalo do banco.
-    pub async fn unhide_genre(&self, id: u32) -> Result<bool> {
-        Ok(self
-            .pool
-            .get()
-            .await?
-            .execute(
-                "DELETE FROM discover_hidden_genres WHERE genre_id = $1",
-                &[&sql_id(id)?],
             )
             .await?
             > 0)
@@ -252,12 +167,6 @@ mod tests {
         assert_eq!(titles[0].kind, DiscoverKind::Serie);
         assert_eq!(titles[1].title, "Um");
         assert_eq!(titles[1].hidden_at, old);
-        store.hide_week(2026, 1, old).await.unwrap();
-        store.hide_week(2026, 1, new).await.unwrap();
-        store.hide_genre(18, "Drama", old).await.unwrap();
-        store.hide_genre(18, "Outro", new).await.unwrap();
-        assert_eq!(store.hidden_weeks().await.unwrap()[0].hidden_at, old);
-        assert_eq!(store.hidden_genres().await.unwrap()[0].name, "Drama");
         let client = store.pool.get().await.unwrap();
         client.batch_execute("INSERT INTO movies (tmdb_id, title, path, monitored) VALUES (10, 'Um', '/filmes/Um', true); INSERT INTO series (tmdb_id, title, path, season_folder, monitor_new) VALUES (20, 'Série', '/series/Serie', true, true);").await.unwrap();
         assert_eq!(
@@ -305,10 +214,6 @@ mod tests {
         assert!(store.unhide_title(DiscoverKind::Filme, 1).await.unwrap());
         assert!(!store.unhide_title(DiscoverKind::Filme, 1).await.unwrap());
         assert_eq!(store.hidden_titles().await.unwrap().len(), 1);
-        assert!(store.unhide_week(2026, 1).await.unwrap());
-        assert!(!store.unhide_week(2026, 1).await.unwrap());
-        assert!(store.unhide_genre(18).await.unwrap());
-        assert!(!store.unhide_genre(18).await.unwrap());
         drop(client);
         db.drop().await;
     }

@@ -5,13 +5,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Skeleton, Switch } from '@/components/ui/misc'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { type DecisionRules, type RulesView, library } from '@/lib/api'
-
-const PROPERS = [
-  { value: 'preferir', label: 'Preferir o PROPER/REPACK' },
-  { value: 'nao_preferir', label: 'Ignorar PROPER/REPACK' },
-] as const
 
 export function Field({ id, label, help, children }: { id: string; label: string; help?: string; children: ReactNode }) {
   return (
@@ -27,7 +21,7 @@ export function Field({ id, label, help, children }: { id: string; label: string
   )
 }
 
-export function Toggle({
+function Toggle({
   id,
   label,
   help,
@@ -71,7 +65,6 @@ export function RulesSection({ view }: { view: RulesView }) {
   useEffect(() => setReserve(String(view.regras.folga_minima_mb / 1024)), [view.regras.folga_minima_mb])
   const set = <K extends keyof DecisionRules>(key: K, value: DecisionRules[K]) =>
     setRules((current) => ({ ...current, [key]: value }))
-  const indexers = Array.from(new Set([...view.indexadores, ...Object.keys(rules.indexadores)])).sort()
 
   return (
     <section aria-labelledby="regras-titulo" className="rounded-lg border border-border bg-surface p-6">
@@ -102,59 +95,12 @@ export function RulesSection({ view }: { view: RulesView }) {
 
         <fieldset className="grid gap-4 sm:grid-cols-2">
           <legend className="mb-2 text-sm font-semibold">Releases</legend>
-          <Field id="propers" label="PROPER e REPACK">
-            <Select
-              value={rules.propers}
-              onValueChange={(value) => set('propers', value as DecisionRules['propers'])}
-            >
-              <SelectTrigger id="propers">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {PROPERS.map((p) => (
-                  <SelectItem key={p.value} value={p.value}>
-                    {p.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </Field>
-          <Field id="carencia" label="Carência após a disponibilidade (dias)">
-            <Input
-              id="carencia"
-              type="number"
-              min={0}
-              value={rules.carencia_dias}
-              onChange={(e) => set('carencia_dias', number(e.target.value))}
-            />
-          </Field>
           <Toggle
             id="legenda"
             label="Aceitar legenda embutida"
             checked={rules.aceitar_legenda_embutida}
             onChange={(on) => set('aceitar_legenda_embutida', on)}
           />
-          <Toggle
-            id="flags"
-            label="Preferir flags do indexador"
-            help="Freeleech, internal e afins pesam na escolha."
-            checked={rules.preferir_flags_do_indexador}
-            onChange={(on) => set('preferir_flags_do_indexador', on)}
-          />
-          <div className="sm:col-span-2">
-            <Field
-              id="liberadas"
-              label="Legendas embutidas liberadas"
-              help="Termos separados por vírgula que liberam a legenda embutida (ex.: PT-BR)."
-            >
-              <Input
-                id="liberadas"
-                value={rules.legendas_embutidas_liberadas}
-                onChange={(e) => set('legendas_embutidas_liberadas', e.target.value)}
-                aria-describedby="liberadas-ajuda"
-              />
-            </Field>
-          </div>
         </fieldset>
 
         <fieldset className="grid gap-4 sm:grid-cols-2">
@@ -227,60 +173,6 @@ export function RulesSection({ view }: { view: RulesView }) {
             />
           </Field>
         </fieldset>
-
-        {indexers.length > 0 && (
-          <fieldset>
-            <legend className="mb-2 text-sm font-semibold">Indexadores</legend>
-            <p className="mb-3 text-xs text-content-subtle">
-              Prioridade menor ganha no empate de qualidade; release com menos seeders que o mínimo é recusado.
-            </p>
-            <table className="w-full text-sm">
-              <thead className="text-left text-xs text-content-subtle">
-                <tr>
-                  <th scope="col" className="py-2 font-medium">
-                    Indexador
-                  </th>
-                  <th scope="col" className="w-32 py-2 font-medium">
-                    Prioridade
-                  </th>
-                  <th scope="col" className="w-32 py-2 font-medium">
-                    Seeders mínimos
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-border">
-                {indexers.map((name) => {
-                  const current = rules.indexadores[name] ?? { prioridade: 25, seeders_minimos: 1 }
-                  const update = (patch: Partial<typeof current>) =>
-                    set('indexadores', { ...rules.indexadores, [name]: { ...current, ...patch } })
-                  return (
-                    <tr key={name}>
-                      <td className="py-2">{name}</td>
-                      <td className="py-2 pr-3">
-                        <Input
-                          type="number"
-                          min={1}
-                          aria-label={`Prioridade de ${name}`}
-                          value={current.prioridade}
-                          onChange={(e) => update({ prioridade: Math.max(1, number(e.target.value)) })}
-                        />
-                      </td>
-                      <td className="py-2">
-                        <Input
-                          type="number"
-                          min={0}
-                          aria-label={`Seeders mínimos de ${name}`}
-                          value={current.seeders_minimos}
-                          onChange={(e) => update({ seeders_minimos: number(e.target.value) })}
-                        />
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </fieldset>
-        )}
 
         <div className="flex gap-2">
           <Button type="submit" variant="primary" disabled={!dirty} loading={save.isPending}>

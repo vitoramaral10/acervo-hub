@@ -43,10 +43,6 @@ export function formatClock(iso: string | null | undefined): string {
   return new Date(iso).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
 }
 
-export function ageInSeconds(iso: string | null | undefined, now = Date.now()): number {
-  return iso ? (now - new Date(iso).getTime()) / 1000 : Number.POSITIVE_INFINITY
-}
-
 /** Link externo só se for http(s): título e link vêm do tracker. */
 export function safeHref(value: string | null | undefined): string | undefined {
   if (!value) return undefined

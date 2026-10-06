@@ -1,9 +1,7 @@
-//! As regras de decisão: tetos, folga no disco, propers, legendas embutidas,
-//! carência, prioridade e seeders por indexador, atraso. Ficam no banco, e a
+//! As regras editáveis: tetos, folga no disco, downloads, legendas e atraso.
+//! Propers, prioridade e seeders são fixos. As regras ficam no banco, e a
 //! tela as edita. Os tamanhos por qualidade não são regra: são a tabela fixa
 //! [`QUALITY_DEFINITIONS`].
-
-use std::collections::BTreeMap;
 
 use acervo_decision::{Delay, QualityDefinition, Settings};
 use acervo_parser::Quality;
@@ -15,23 +13,6 @@ use crate::decide::now_rfc3339;
 
 /// Onde as regras ficam na tabela de configurações.
 pub const RULES_KEY: &str = "decisao.regras";
-
-/// Prioridade e seeders mínimos de um indexador.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IndexerRules {
-    /// Menor é melhor; 25 é o padrão.
-    pub prioridade: i32,
-    pub seeders_minimos: u32,
-}
-
-impl Default for IndexerRules {
-    fn default() -> Self {
-        Self {
-            prioridade: 25,
-            seeders_minimos: 1,
-        }
-    }
-}
 
 /// Tamanho por minuto de filme ou episódio, em megabytes.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -104,17 +85,6 @@ fn quality_definitions() -> Vec<QualityDefinition> {
         .collect()
 }
 
-/// O que fazer com PROPER e REPACK. Não há upgrade de arquivo: só se
-/// prefere, ou não, a revisão nova entre os releases da mesma busca.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum Propers {
-    #[default]
-    #[serde(rename = "preferir")]
-    Prefer,
-    #[serde(rename = "nao_preferir")]
-    DoNotPrefer,
-}
-
 /// Espera antes de pegar automaticamente.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct DelayRules {
@@ -129,18 +99,10 @@ pub struct DecisionRules {
     /// Teto de tamanho, em megabytes; zero é sem teto.
     pub tamanho_maximo_mb: u64,
     pub aceitar_legenda_embutida: bool,
-    /// Termos separados por vírgula que liberam legenda embutida.
-    pub legendas_embutidas_liberadas: String,
-    pub propers: Propers,
-    pub preferir_flags_do_indexador: bool,
     /// Folga que a fila de downloads deixa sempre livre no disco do cliente.
     pub folga_minima_mb: u64,
     /// Quantos torrents do acervo baixam ao mesmo tempo; no mínimo 1.
     pub downloads_simultaneos: u32,
-    /// Dias depois da data de disponibilidade.
-    pub carencia_dias: i64,
-    /// Pelo nome do indexador.
-    pub indexadores: BTreeMap<String, IndexerRules>,
     pub atraso: DelayRules,
 }
 
@@ -149,13 +111,8 @@ impl Default for DecisionRules {
         Self {
             tamanho_maximo_mb: 0,
             aceitar_legenda_embutida: false,
-            legendas_embutidas_liberadas: String::new(),
-            propers: Propers::Prefer,
-            preferir_flags_do_indexador: false,
             folga_minima_mb: 100,
             downloads_simultaneos: 5,
-            carencia_dias: 0,
-            indexadores: BTreeMap::new(),
             atraso: DelayRules::default(),
         }
     }
@@ -178,12 +135,9 @@ impl DecisionRules {
             definitions: quality_definitions(),
             maximum_size_mb: self.tamanho_maximo_mb,
             allow_hardcoded_subs: self.aceitar_legenda_embutida,
-            whitelisted_hardcoded_subs: self.legendas_embutidas_liberadas.clone(),
-            propers: match self.propers {
-                Propers::Prefer => acervo_decision::Propers::DoNotUpgrade,
-                Propers::DoNotPrefer => acervo_decision::Propers::DoNotPrefer,
-            },
-            prefer_indexer_flags: self.preferir_flags_do_indexador,
+            whitelisted_hardcoded_subs: String::new(),
+            propers: acervo_decision::Propers::DoNotUpgrade,
+            prefer_indexer_flags: true,
         }
     }
 
@@ -199,12 +153,6 @@ impl DecisionRules {
     #[must_use]
     pub fn max_downloads(&self) -> usize {
         self.downloads_simultaneos.max(1) as usize
-    }
-
-    /// Prioridade e seeders de um indexador; padrão se não houver regra.
-    #[must_use]
-    pub fn indexer(&self, name: &str) -> IndexerRules {
-        self.indexadores.get(name).copied().unwrap_or_default()
     }
 }
 
@@ -241,13 +189,9 @@ mod tests {
 
     #[test]
     fn regras_gravadas_depois_da_migracao_carregam() {
-        // O formato gravado em produção, já com o `propers` normalizado.
+        // O formato gravado depois de retirar os campos agora fixos.
         let rules = DecisionRules::parse(
-            r#"{"tamanho_maximo_mb": 30000, "aceitar_legenda_embutida": true,
-                "legendas_embutidas_liberadas": "", "propers": "preferir",
-                "preferir_flags_do_indexador": true, "folga_minima_mb": 2048,
-                "carencia_dias": 0,
-                "indexadores": {"um": {"prioridade": 25, "seeders_minimos": 1}},
+            r#"{"tamanho_maximo_mb": 30000, "aceitar_legenda_embutida": true, "folga_minima_mb": 2048,
                 "atraso": {"minutos": 1440, "pular_se_melhor_qualidade": true}}"#,
         );
         assert!(rules.is_ok(), "{rules:?}");
@@ -259,30 +203,6 @@ mod tests {
             DecisionRules::parse(r#"{"folga_minima_mb": 2048, "pular_checagem_de_espaco": true}"#)
                 .is_err()
         );
-    }
-
-    #[test]
-    fn propers_so_aceitam_os_valores_atuais() {
-        for old in ["preferir_e_atualizar", "nao_atualizar"] {
-            assert!(DecisionRules::parse(&format!(r#"{{"propers": "{old}"}}"#)).is_err());
-        }
-        let rules = DecisionRules::parse(r#"{"propers": "preferir"}"#).expect("lê");
-        assert_eq!(rules.propers, Propers::Prefer);
-        assert_eq!(
-            rules.settings().propers,
-            acervo_decision::Propers::DoNotUpgrade
-        );
-        let rules = DecisionRules::parse(r#"{"propers": "nao_preferir"}"#).expect("lê");
-        assert_eq!(rules.propers, Propers::DoNotPrefer);
-        assert_eq!(
-            serde_json::to_value(&rules).unwrap()["propers"],
-            "nao_preferir"
-        );
-        assert_eq!(
-            serde_json::to_value(DecisionRules::default()).unwrap()["propers"],
-            "preferir"
-        );
-        assert!(DecisionRules::parse(r#"{"propers": "talvez"}"#).is_err());
     }
 
     #[test]

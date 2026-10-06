@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, ChevronRight, CircleAlert, Globe, Lock, Plug, Search, SearchX } from 'lucide-react'
+import { ArrowLeft, ChevronRight, CircleAlert, Globe, Lock, Search, SearchX } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { SettingField } from '@/components/SettingField'
@@ -38,7 +38,7 @@ export function AddIndexerDialog({ open, onClose }: { open: boolean; onClose: ()
 }
 
 function CatalogStep({ onChoose }: { onChoose: (definition: Definition) => void }) {
-  const catalog = useQuery({ queryKey: ['catalogo'], queryFn: api.catalog, staleTime: 5 * 60_000 })
+  const catalog = useQuery({ queryKey: ['catalogo'], queryFn: api.catalog, staleTime: 15 * 60_000 })
   const [term, setTerm] = useState('')
   const [showUnsupported, setShowUnsupported] = useState(false)
 
@@ -63,9 +63,15 @@ function CatalogStep({ onChoose }: { onChoose: (definition: Definition) => void 
         <DialogDescription>
           {catalog.data
             ? `${formatCount(supportedCount)} de ${formatCount(all.length)} definições rodam hoje no acervo-hub.`
-            : 'Definições Cardigann do catálogo, mais o Torznab genérico.'}
+            : 'Definições Cardigann locais e do repositório, carregadas sob demanda.'}
         </DialogDescription>
       </DialogHeader>
+
+      {catalog.data?.aviso && (
+        <p role="status" className="rounded-md bg-surface-raised px-3 py-2 text-sm text-warning">
+          {catalog.data.aviso}
+        </p>
+      )}
 
       <div className="grid gap-3 sm:grid-cols-[1fr_auto] sm:items-center">
         <div className="relative">
@@ -125,7 +131,6 @@ function CatalogStep({ onChoose }: { onChoose: (definition: Definition) => void 
 
 function DefinitionRow({ definition, onChoose }: { definition: Definition; onChoose: () => void }) {
   const selectable = definition.supported && !definition.added
-  const generic = definition.id === 'torznab'
   return (
     <button
       type="button"
@@ -139,13 +144,13 @@ function DefinitionRow({ definition, onChoose }: { definition: Definition; onCho
       )}
     >
       <span className="grid size-8 shrink-0 place-items-center rounded-md bg-surface-raised text-content-muted">
-        {generic ? <Plug className="size-4" aria-hidden="true" /> : definition.private ? <Lock className="size-4" aria-hidden="true" /> : <Globe className="size-4" aria-hidden="true" />}
+        {definition.private ? <Lock className="size-4" aria-hidden="true" /> : <Globe className="size-4" aria-hidden="true" />}
       </span>
       <span className="min-w-0 flex-1">
         <span className="flex flex-wrap items-center gap-1.5">
           <span className="font-medium">{definition.name}</span>
           {definition.language && <span className="text-xs text-content-subtle">{definition.language}</span>}
-          {definition.private && !generic && <span className="text-xs text-content-subtle">privado</span>}
+          {definition.private && <span className="text-xs text-content-subtle">privado</span>}
         </span>
         {definition.supported ? (
           <span className="mt-0.5 line-clamp-1 block text-xs text-content-muted">{definition.description}</span>
@@ -176,21 +181,16 @@ function SettingsStep({
   onDone: () => void
 }) {
   const queryClient = useQueryClient()
-  const settings = useQuery({
-    queryKey: ['definicao-settings', definition.id],
-    queryFn: () => api.definitionSettings(definition.id),
-  })
   const [values, setValues] = useState<Record<string, string>>({})
   const [failure, setFailure] = useState<string | null>(null)
 
   useEffect(() => {
-    if (!settings.data) return
     setValues(
       Object.fromEntries(
-        settings.data.settings.map((setting) => [setting.name, setting.secret ? '' : (setting.value ?? '')]),
+        definition.settings.map((setting) => [setting.name, setting.secret ? '' : (setting.value ?? '')]),
       ),
     )
-  }, [settings.data])
+  }, [definition])
 
   const add = useMutation({
     mutationFn: () => api.addIndexer(definition.id, values),
@@ -226,24 +226,11 @@ function SettingsStep({
         {definition.description && <DialogDescription>{definition.description}</DialogDescription>}
       </DialogHeader>
 
-      {settings.isPending ? (
-        <div className="grid gap-4" aria-busy="true" aria-label="Carregando settings">
-          {[0, 1].map((key) => (
-            <div key={key} className="grid gap-2">
-              <Skeleton className="h-3.5 w-24" />
-              <Skeleton className="h-9" />
-            </div>
-          ))}
-        </div>
-      ) : settings.isError ? (
-        <p role="alert" className="rounded-md bg-danger-bg px-3 py-2 text-sm text-danger">
-          {settings.error.message}
-        </p>
-      ) : settings.data.settings.length === 0 ? (
+      {definition.settings.length === 0 ? (
         <p className="text-sm text-content-muted">Esta definição não pede nenhuma configuração.</p>
       ) : (
         <div className="grid gap-4">
-          {settings.data.settings.map((setting) => (
+          {definition.settings.map((setting) => (
             <SettingField
               key={setting.name}
               setting={setting}
@@ -265,7 +252,7 @@ function SettingsStep({
         <Button variant="ghost" onClick={onBack}>
           Voltar
         </Button>
-        <Button type="submit" variant="primary" loading={add.isPending} disabled={!settings.data}>
+        <Button type="submit" variant="primary" loading={add.isPending} disabled={!definition.supported}>
           {add.isPending ? 'Adicionando e testando…' : 'Adicionar e testar'}
         </Button>
       </DialogFooter>

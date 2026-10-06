@@ -1,7 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
-import { LoaderCircle, Plus, SearchX, Star, Tv } from 'lucide-react'
+import { LoaderCircle, SearchX, Star, Tv } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import { AddSeriesDialog } from '@/components/AddSeriesDialog'
 import { MarkedBadge, useMarkedKeys } from '@/components/DeletionMark'
 import { PageHeader } from '@/components/PageHeader'
 import { PriorityBadge } from '@/components/PriorityStar'
@@ -113,7 +112,6 @@ export function SeriesPage() {
     }
     return ids
   }, [marks])
-  const [adding, setAdding] = useState(false)
   const [priority, setPriority] = useState(false)
 
   const list = series.data?.series
@@ -148,20 +146,6 @@ export function SeriesPage() {
             ? `${formatCount(counts.total)} séries, ${formatCount(counts.withFile)} episódios no disco (${formatSize(counts.size)}).`
             : 'Sua biblioteca de séries.'
         }
-        action={
-          <Button variant="primary" onClick={() => setAdding(true)}>
-            <Plus aria-hidden="true" />
-            Adicionar
-          </Button>
-        }
-      />
-      <AddSeriesDialog
-        open={adding}
-        onOpenChange={setAdding}
-        onOpenSeries={(id) => {
-          setAdding(false)
-          setSelected(id)
-        }}
       />
 
       {series.isPending ? (
@@ -176,11 +160,7 @@ export function SeriesPage() {
         <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed border-border-strong px-6 py-16 text-center">
           <Tv className="size-8 text-content-subtle" aria-hidden="true" />
           <p className="font-medium">A biblioteca de séries está vazia</p>
-          <p className="max-w-md text-sm text-content-muted">Adicione séries buscando no TMDB.</p>
-          <Button variant="primary" onClick={() => setAdding(true)}>
-            <Plus aria-hidden="true" />
-            Adicionar
-          </Button>
+          <p className="max-w-md text-sm text-content-muted">Use “Buscar títulos” no menu, / ou Ctrl/Cmd+K para adicionar séries.</p>
         </div>
       ) : (
         <>

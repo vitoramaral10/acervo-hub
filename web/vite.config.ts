@@ -31,7 +31,6 @@ export default defineConfig({
     // `npm run dev` fala com um `acervo-hub serve` local.
     proxy: {
       '/ui/api': 'http://127.0.0.1:9797',
-      '/ui/baixar': 'http://127.0.0.1:9797',
     },
   },
 })

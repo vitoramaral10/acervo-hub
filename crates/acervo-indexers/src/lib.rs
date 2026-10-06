@@ -1,7 +1,7 @@
-//! Busca em indexadores Torznab.
+//! Busca em indexadores Cardigann.
 //!
 //! O crate separa três responsabilidades que costumam ficar misturadas no
-//! agregador: o contrato HTTP/XML, o orçamento temporal de cada tracker e a
+//! agregador: o executor das definições, o orçamento temporal de cada tracker e a
 //! política de falha parcial ao consultar vários indexadores.
 
 mod aggregate;
@@ -9,7 +9,6 @@ mod cardigann;
 mod model;
 mod network;
 mod rate;
-mod torznab;
 
 pub use aggregate::{AggregateSearch, Indexer, IndexerFailure, SearchReport};
 pub use cardigann::{
@@ -21,4 +20,3 @@ pub use model::{
 };
 pub use network::{Challenge, FlareSolverr, Network, Proxy};
 pub use rate::RateBudget;
-pub use torznab::TorznabClient;

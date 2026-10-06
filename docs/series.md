@@ -26,8 +26,15 @@ motivo de existir:
 Episódio novo anunciado pelo TMDB entra sem `skip` se a série tem `monitor_new`, e com
 `unwanted` se não tem. Especiais (temporada 0) entram sempre `unwanted`.
 
-Ao adicionar uma série, a tela escolhe o que buscar: **tudo que falta**, **só a partir da
+A busca global do menu, `/` ou Ctrl/Cmd+K abre filmes e séries do TMDB. O detalhe
+permite adicionar a obra ou abrir seu cadastro existente. Ao adicionar uma série, a tela escolhe o que buscar: **tudo que falta**, **só a partir da
 última temporada** ou **só os próximos episódios**. O que fica de fora entra `unwanted`.
+
+A configuração fica na tela única **Configurações**: `biblioteca.series_root` define a
+pasta raiz, e os caminhos são os mesmos para o serviço e o qBittorrent. Indexadores usam
+Cardigann, com catálogo remoto sob demanda e precedência dos diretórios locais. A busca
+agendada roda a cada 120 minutos, com até 10 séries; os intervalos ficam visíveis em
+**Tarefas**, junto com rodar agora e histórico.
 
 ## Metadados
 

@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
-use acervo_api::{Accounts, Admin, ApiKey, Catalog, DefinitionView, Entry, SettingView};
+use acervo_api::{
+    Accounts, Admin, ApiKey, Catalog, DefinitionCatalog, DefinitionView, Entry, SettingView,
+};
 use acervo_indexers::{CardigannDefinition, SettingInfo, SettingInfoKind};
 use acervo_store::{IndexerRecord, Store};
 use anyhow::{Context, Result};
@@ -19,8 +21,8 @@ use serde_json::json;
 use crate::config::{Config, SERVIDOR, ServerConfig};
 use crate::decide::Progress;
 use crate::registry::{
-    CARDIGANN, FLARESOLVERR_OPTIONS, Registry, TORZNAB, USE_FLARESOLVERR, USE_PROXY, build,
-    cardigann, check_reserved, reserved, scan, torznab,
+    CARDIGANN, FLARESOLVERR_OPTIONS, Registry, USE_FLARESOLVERR, USE_PROXY, build, cardigann,
+    check_reserved, reserved, scan,
 };
 use crate::settings::Settings;
 use crate::tasks::{BUSCA, Tasks};
@@ -106,15 +108,14 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
     let registry = Arc::new(Registry::new(&settings.get(), &rows, records));
     drop(rows);
     let catalog = Catalog::new(entries(&settings.get(), &registry).await)?;
-    // Cada consulta que sai vira estatística do indexador.
-    catalog.observe_with(crate::stats::observer(store.clone()));
     let database = Database::connected(store);
     // O andamento da busca dos que faltam, que a tela de filmes acompanha.
     let missing = Arc::new(Progress::default());
     let tasks = Arc::new(Tasks::new(
         database.clone(),
-        crate::tasks::service(&settings, &database, &catalog, &missing, &registry),
+        crate::tasks::service(&settings, &database, &catalog, &missing),
     ));
+    tasks.watch_settings(settings.subscribe());
     tasks.start().await;
     // Indexador falhando e pouco espaço em disco viram aviso na mudança.
     tokio::spawn(
@@ -125,16 +126,6 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         ))
         .run(tasks.cancel_token()),
     );
-    // Configuração salva pela tela: o agendador recalcula os intervalos.
-    tokio::spawn({
-        let mut changes = settings.subscribe();
-        let tasks = Arc::clone(&tasks);
-        async move {
-            while changes.changed().await.is_ok() {
-                tasks.reschedule();
-            }
-        }
-    });
     let accounts: Option<Arc<dyn Accounts>> = Some(Arc::new(database.clone()));
     // A chave é lida a cada requisição: trocada na tela, vale na hora.
     let api_key = ApiKey::dynamic({
@@ -171,8 +162,6 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         acervo_api::router_with_admin(catalog, api_key, Some(Arc::new(admin)), accounts)
             .merge(crate::web::router(Arc::clone(&web)))
             .merge(crate::agenda::router(Arc::clone(&web)))
-            .merge(crate::stats::router(Arc::clone(&web)))
-            .merge(crate::manual::router(Arc::clone(&web)))
             .merge(crate::marks::router(Arc::clone(&web)))
             .merge(crate::discover::router(Arc::clone(&web)))
             .merge(crate::series::web::router(web))
@@ -201,8 +190,7 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
 
 /// Os indexadores cadastrados: os cadastros ativos que sobem.
 ///
-/// Cadastro que não sobe — definição ilegível, endpoint que não responde
-/// `caps` — fica de fora, com o motivo no log, sem derrubar os outros nem a
+/// Cadastro que não sobe — definição ilegível, configuração de rede inválida — fica de fora, com o motivo no log, sem derrubar os outros nem a
 /// subida: a tela continua de pé para consertá-lo, e ele aparece lá como
 /// desativado até ser reativado.
 pub async fn entries(config: &Config, registry: &Registry) -> Vec<Entry> {
@@ -217,16 +205,6 @@ pub async fn entries(config: &Config, registry: &Registry) -> Vec<Entry> {
         }
     }
     entries
-}
-
-fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        && name != "all"
-        && name != "ui"
 }
 
 fn now() -> String {
@@ -245,8 +223,7 @@ struct HubAdmin {
     missing: Arc<Progress>,
     /// As tarefas de fundo; o botão de buscar os que faltam dispara a `busca`.
     tasks: Arc<Tasks>,
-    /// Os cadastros e o catálogo de definições, divididos com a tarefa que
-    /// atualiza as definições.
+    /// Os cadastros, as definições em uso e o cache do catálogo remoto.
     registry: Arc<Registry>,
 }
 
@@ -279,8 +256,7 @@ fn network_views(record: Option<&IndexerRecord>, with_flaresolverr: bool) -> Vec
 
 /// A rede do servidor mudou: os clientes precisam ser remontados.
 fn network_changed(before: &ServerConfig, after: &ServerConfig) -> bool {
-    before.http_timeout_seconds != after.http_timeout_seconds
-        || before.proxy_url != after.proxy_url
+    before.proxy_url != after.proxy_url
         || before.proxy_username != after.proxy_username
         || before.proxy_password != after.proxy_password
         || before.flaresolverr_url != after.flaresolverr_url
@@ -314,10 +290,6 @@ impl HubAdmin {
         self.database.get()
     }
 
-    fn timeout(&self) -> Duration {
-        self.settings.get().http_timeout()
-    }
-
     /// Grava o cadastro — novo ou alterado — e o espelho.
     async fn persist(&self, record: IndexerRecord, new: bool) -> Result<(), String> {
         let store = self.store()?;
@@ -342,7 +314,7 @@ impl HubAdmin {
         Ok(())
     }
 
-    /// Remonta todos os indexadores cadastrados — o timeout HTTP, o proxy ou
+    /// Remonta todos os indexadores cadastrados — o proxy ou
     /// o `FlareSolverr` mudaram, e eles moram dentro de cada cliente.
     async fn reload_catalog(&self) {
         let records: Vec<_> = self
@@ -437,17 +409,7 @@ impl Admin for HubAdmin {
             views.extend(network_views(Some(&record), true));
             return Some(views);
         }
-        let mut views = vec![
-            plain("url", "URL do endpoint Torznab", "text", record.url.clone()),
-            plain(
-                "api_key",
-                "Chave de API",
-                "password",
-                record.settings.get("api_key").cloned(),
-            ),
-        ];
-        views.extend(network_views(Some(&record), false));
-        Some(views)
+        None
     }
 
     async fn update(
@@ -491,19 +453,7 @@ impl Admin for HubAdmin {
             }
             cardigann(&record, definition, &config).map_err(|e| message(&e))?
         } else {
-            for (name, value) in values {
-                // Em branco mantém o atual, como qualquer segredo.
-                let value = value.trim();
-                match name.as_str() {
-                    _ if value.is_empty() => {}
-                    "url" => record.url = Some(value.to_owned()),
-                    "api_key" => {
-                        record.settings.insert(name, value.to_owned());
-                    }
-                    _ => return Err(format!("setting desconhecido: {name}")),
-                }
-            }
-            torznab(&record, &config).await.map_err(|e| message(&e))?
+            return Err("tipo de indexador desconhecido".into());
         };
         // Monta antes de gravar: credencial que não sobe não substitui a boa.
         self.persist(record, false).await?;
@@ -532,53 +482,36 @@ impl Admin for HubAdmin {
             .collect()
     }
 
-    fn definitions(&self) -> Vec<DefinitionView> {
-        let mut list = vec![DefinitionView {
-            id: TORZNAB.into(),
-            name: "Torznab genérico".into(),
-            description: "Qualquer indexador que já fale Torznab: outro agregador, Jackett, ou \
-                          um tracker com API própria."
-                .into(),
-            language: String::new(),
-            private: false,
-            supported: true,
-            reason: None,
-            added: false,
-        }];
-        let definitions = self.registry.definitions();
-        list.extend(definitions.iter().map(|known| DefinitionView {
-            id: known.header.id.clone(),
-            name: known.header.name.clone(),
-            description: known.header.description.clone(),
-            language: known.header.language.clone(),
-            private: known.header.private,
-            supported: known.refusal.is_none(),
-            reason: known.refusal.clone(),
-            added: self.record(&known.header.id).is_some(),
-        }));
-        list
+    async fn definitions(&self) -> Result<DefinitionCatalog, String> {
+        let definitions = self.registry.available().await.map_err(|e| message(&e))?;
+        Ok(DefinitionCatalog {
+            warning: definitions.warning,
+            definitions: definitions
+                .definitions
+                .iter()
+                .map(|known| DefinitionView {
+                    id: known.header.id.clone(),
+                    name: known.header.name.clone(),
+                    description: known.header.description.clone(),
+                    language: known.header.language.clone(),
+                    private: known.header.private,
+                    supported: known.refusal.is_none(),
+                    reason: known.refusal.clone(),
+                    added: self.record(&known.header.id).is_some(),
+                    settings: known
+                        .settings
+                        .iter()
+                        .map(|info| view(info, None))
+                        .chain(network_views(None, true))
+                        .collect(),
+                })
+                .collect(),
+        })
     }
 
     fn definition_settings(&self, definition: &str) -> Option<Vec<SettingView>> {
-        if definition == TORZNAB {
-            return Some(vec![
-                plain(
-                    "name",
-                    "Nome (letras minúsculas, números e hífens)",
-                    "text",
-                    None,
-                ),
-                plain(
-                    "url",
-                    "URL do endpoint Torznab (termina em /api)",
-                    "text",
-                    None,
-                ),
-                plain("api_key", "Chave de API", "password", None),
-            ]);
-        }
         let yaml = {
-            let definitions = self.registry.definitions();
+            let definitions = self.registry.available_cached();
             let known = definitions.get(definition)?;
             if known.refusal.is_some() {
                 return None;
@@ -602,48 +535,12 @@ impl Admin for HubAdmin {
     ) -> Result<Entry, String> {
         let _guard = self.registry.write.lock().await;
         let config = self.settings.get();
-        if definition == TORZNAB {
-            let field = |name: &str| {
-                values
-                    .get(name)
-                    .map(|value| value.trim().to_owned())
-                    .unwrap_or_default()
-            };
-            let name = field("name");
-            if !valid_name(&name) {
-                return Err("nome inválido: use letras minúsculas, números e hífens".into());
-            }
-            if self.record(&name).is_some() {
-                return Err(format!("já existe um indexador chamado {name}"));
-            }
-            let mut record = IndexerRecord {
-                name: name.clone(),
-                kind: TORZNAB.into(),
-                definition: None,
-                url: Some(field("url")),
-                settings: BTreeMap::new(),
-                enabled: true,
-                added_at: Some(now()),
-            };
-            let key = field("api_key");
-            if !key.is_empty() {
-                record.settings.insert("api_key".into(), key);
-            }
-            if let Some(value) = values.get(USE_PROXY) {
-                check_reserved(USE_PROXY, value)?;
-                record.settings.insert(USE_PROXY.into(), value.clone());
-            }
-            let entry = torznab(&record, &config)
-                .await
-                .map_err(|e| format!("o endpoint não respondeu às capacidades: {e:#}"))?;
-            self.persist(record, true).await?;
-            tracing::info!(indexer = name, "Torznab adicionado pela interface");
-            return Ok(entry);
+        if self.registry.available_cached().get(definition).is_none() {
+            self.registry.available().await.map_err(|e| message(&e))?;
         }
-
         let known = self
             .registry
-            .definitions()
+            .available_cached()
             .get(definition)
             .cloned()
             .ok_or("definição desconhecida")?;
@@ -670,8 +567,7 @@ impl Admin for HubAdmin {
                 settings.insert(name, value);
             }
         }
-        // Só a definição local fica fixada no arquivo; a do banco segue a
-        // precedência, e a atualização a alcança.
+        // A definição local fica fixada no arquivo; a remota é guardada no banco.
         let record = IndexerRecord {
             name: definition.to_owned(),
             kind: CARDIGANN.into(),
@@ -685,7 +581,35 @@ impl Admin for HubAdmin {
             added_at: Some(now()),
         };
         let entry = cardigann(&record, parsed, &config).map_err(|e| message(&e))?;
-        self.persist(record, true).await?;
+        let row = (!known.is_local()).then(|| acervo_store::DefinitionRow {
+            id: definition.to_owned(),
+            sha: crate::definitions::sha(&yaml),
+            yaml: yaml.clone(),
+            updated_at: now(),
+        });
+        if !self
+            .store()?
+            .insert_indexer_with_definition(&record, row.as_ref())
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return Err(format!("{definition} já está adicionado"));
+        }
+        self.registry
+            .records
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(record.name.clone(), record);
+        if row.is_some() {
+            self.registry
+                .definitions
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .offer(
+                    crate::definitions::Source::Database(Arc::from(yaml.as_str())),
+                    &yaml,
+                );
+        }
         tracing::info!(indexer = definition, "indexador adicionado pela interface");
         Ok(entry)
     }
@@ -739,7 +663,7 @@ impl Admin for HubAdmin {
     }
 
     async fn movies(&self) -> Result<serde_json::Value, String> {
-        let list = crate::movies::list(&self.settings.get(), self.store()?)
+        let list = crate::movies::list(self.store()?)
             .await
             .map_err(|e| message(&e))?;
         serde_json::to_value(list).map_err(|e| e.to_string())
@@ -792,11 +716,15 @@ impl Admin for HubAdmin {
                 "tmdb_chave" => {
                     let value = value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
                     if let Some(key) = &value {
-                        acervo_metadata::Tmdb::new(key, crate::metadata::LANGUAGE, self.timeout())
-                            .map_err(|e| e.to_string())?
-                            .validate()
-                            .await
-                            .map_err(|e| e.to_string())?;
+                        acervo_metadata::Tmdb::new(
+                            key,
+                            crate::metadata::LANGUAGE,
+                            crate::config::HTTP_TIMEOUT,
+                        )
+                        .map_err(|e| e.to_string())?
+                        .validate()
+                        .await
+                        .map_err(|e| e.to_string())?;
                     }
                     store
                         .set_setting(crate::metadata::TMDB_KEY, value.as_deref(), &at)
@@ -869,16 +797,8 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
-    use wiremock::matchers::{method, query_param};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-
-    const CAPS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-        <caps>
-          <searching><search available="yes" supportedParams="q" /></searching>
-          <categories><category id="5000" name="TV" /></categories>
-        </caps>"#;
 
     const FIXTURES: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -919,8 +839,16 @@ mod tests {
             return;
         };
         let (admin, settings) = admin(&db).await;
-        let listed = admin.definitions();
-        let known = listed.iter().find(|d| d.id == "cookie-privado").unwrap();
+        *admin.registry.remote.write().unwrap() = Some((
+            std::time::Instant::now(),
+            crate::definitions::Definitions::default(),
+        ));
+        let listed = admin.definitions().await.unwrap();
+        let known = listed
+            .definitions
+            .iter()
+            .find(|d| d.id == "cookie-privado")
+            .unwrap();
         assert!(known.supported && !known.added);
 
         let entry = admin
@@ -1003,70 +931,6 @@ mod tests {
         db.drop().await;
     }
 
-    #[tokio::test]
-    async fn torznab_cadastrado_tem_url_e_chave_editaveis() {
-        let Some(db) = acervo_store::testing::TestDb::new("serve_torznab").await else {
-            return;
-        };
-        let velho = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(query_param("t", "caps"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(CAPS, "application/xml"))
-            .mount(&velho)
-            .await;
-        let novo = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(query_param("t", "caps"))
-            .and(query_param("apikey", "chave-velha"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(CAPS, "application/xml"))
-            .mount(&novo)
-            .await;
-        let (admin, _) = admin(&db).await;
-        admin
-            .add(
-                TORZNAB,
-                values(&[
-                    ("name", "outro"),
-                    ("url", &format!("{}/api", velho.uri())),
-                    ("api_key", "chave-velha"),
-                ]),
-            )
-            .await
-            .unwrap();
-        assert!(
-            admin
-                .add(TORZNAB, values(&[("name", "outro"), ("url", "http://x")]))
-                .await
-                .unwrap_err()
-                .contains("já existe")
-        );
-
-        // URL nova, chave em branco: a guardada vale contra o endpoint novo.
-        let url_nova = format!("{}/api", novo.uri());
-        admin
-            .update("outro", values(&[("url", &url_nova), ("api_key", "")]))
-            .await
-            .unwrap();
-        let views = admin.settings("outro").unwrap();
-        let url = views.iter().find(|s| s.name == "url").unwrap();
-        assert_eq!(url.value.as_deref(), Some(url_nova.as_str()));
-        let key = views.iter().find(|s| s.name == "api_key").unwrap();
-        assert!(key.is_set && key.value.is_none());
-
-        // Endpoint que não responde: nada muda.
-        assert!(
-            admin
-                .update("outro", values(&[("url", "http://127.0.0.1:9/api")]))
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            db.store.indexers().await.unwrap()[0].url.as_deref(),
-            Some(url_nova.as_str())
-        );
-        db.drop().await;
-    }
-
     async fn call(
         client: &reqwest::Client,
         method: reqwest::Method,
@@ -1087,6 +951,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Um cenário de ponta a ponta, pela API.
     async fn api_de_configuracoes_nunca_devolve_segredo() {
         let Some(db) = acervo_store::testing::TestDb::new("serve_api_config").await else {
             return;
@@ -1162,7 +1027,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, 422);
-        assert!(body["erro"].as_str().unwrap().contains("RSS"), "{body}");
+        assert!(
+            body["erro"].as_str().unwrap().contains("desconhecida"),
+            "{body}"
+        );
         let (status, _) = call(&client, reqwest::Method::GET, &url("outra"), first, None).await;
         assert_eq!(status, 404);
 

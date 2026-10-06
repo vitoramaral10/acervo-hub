@@ -387,7 +387,6 @@ pub async fn remove(config: &Config, store: &Store, id: i64, delete_files: bool)
     };
     if delete_files {
         crate::library::delete_folder_within(
-            config,
             path,
             std::slice::from_ref(&config.library.series_root),
         )
@@ -405,7 +404,7 @@ pub async fn remove(config: &Config, store: &Store, id: i64, delete_files: bool)
         match crate::grab::qbit(config).await {
             Ok(client) => {
                 for grab in &queued {
-                    super::grab::drop_queued(config, store, &client, grab).await;
+                    super::grab::drop_queued(store, &client, grab).await;
                 }
             }
             Err(error) => tracing::warn!("torrents da fila não conferidos: {error:#}"),

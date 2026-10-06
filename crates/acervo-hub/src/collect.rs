@@ -6,7 +6,6 @@ use std::collections::HashSet;
 use acervo_clients::{QbitClient, TorrentInfo, client_path, state_from_qbit};
 
 use acervo_core::{Allocated, Download, DownloadHash, FileFacts, Inventory, UnreadableDownload};
-use acervo_fs::PathMap;
 use acervo_store::{Grab, GrabState, SeriesGrab, Store};
 use anyhow::{Context, Result};
 
@@ -32,7 +31,7 @@ pub async fn collect(config: &Config, store: &Store) -> Result<Session> {
         &qbit_config.url,
         &qbit_config.username,
         &qbit_config.password,
-        config.http_timeout(),
+        crate::config::HTTP_TIMEOUT,
     )
     .await
     .context("autenticando no qBittorrent")?;
@@ -47,9 +46,8 @@ pub async fn collect(config: &Config, store: &Store) -> Result<Session> {
     let torrents = qbit.torrents().await.context("listando torrents")?;
     tracing::info!(total = torrents.len(), "torrents no cliente");
 
-    let map = config.path_map();
     for torrent in torrents {
-        match read_download(&qbit, &torrent, &map).await {
+        match read_download(&qbit, &torrent).await {
             Ok(download) => inventory.downloads.push(download),
             Err(unreadable) => {
                 tracing::warn!(
@@ -97,7 +95,6 @@ fn internal_hashes(grabs: &[Grab], series_grabs: &[SeriesGrab]) -> HashSet<Downl
 async fn read_download(
     qbit: &QbitClient,
     torrent: &TorrentInfo,
-    map: &PathMap,
 ) -> Result<Download, UnreadableDownload> {
     let hash = DownloadHash::new(&torrent.hash);
     let now_epoch = std::time::SystemTime::now()
@@ -114,7 +111,7 @@ async fn read_download(
     let mut facts: Vec<FileFacts> = Vec::with_capacity(files.len());
     for file in &files {
         let path = client_path(torrent, file);
-        let fact = match acervo_fs::facts_for(&path, map) {
+        let fact = match acervo_fs::facts_for(&path) {
             Ok(fact) => fact,
             // Download incompleto cujo arquivo o cliente ainda não criou: não
             // há nada no disco, e o torrent segue na decisão — um órfão pausado

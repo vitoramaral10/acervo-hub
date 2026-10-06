@@ -8,14 +8,14 @@ mod ui;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::http::{HeaderValue, StatusCode, header};
-use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 
 pub use catalog::{
     ALL, Catalog, CatalogError, Entry, Health, IndexerView, Page, QueryObserver, QueryRecord,
 };
-pub use ui::{Accounts, Admin, DefinitionView, SettingView, authorize_ui, ui_json};
+pub use ui::{
+    Accounts, Admin, DefinitionCatalog, DefinitionView, SettingView, authorize_ui, ui_json,
+};
 
 /// A chave da interface, lida a cada requisição: trocada pela tela, a nova
 /// vale na hora, sem reiniciar.
@@ -113,15 +113,6 @@ pub fn router_with_admin(
         .route("/health", get(|| async { "ok" }))
         .merge(ui::routes())
         .with_state(server)
-}
-
-/// `301` para o magnet: o navegador o entrega ao cliente de torrent.
-pub(crate) fn magnet_redirect(magnet: &url::Url) -> Response {
-    let mut response = StatusCode::MOVED_PERMANENTLY.into_response();
-    if let Ok(location) = HeaderValue::from_str(magnet.as_str()) {
-        response.headers_mut().insert(header::LOCATION, location);
-    }
-    response
 }
 
 /// Comparação que não termina cedo no primeiro byte diferente.

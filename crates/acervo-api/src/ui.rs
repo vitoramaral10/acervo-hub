@@ -1,5 +1,4 @@
-//! Interface web: estado dos indexadores, teste, troca de credencial e busca
-//! manual.
+//! Interface web: estado dos indexadores, teste e troca de credencial.
 //!
 //! Uma página estática com JS simples, servida pelo próprio binário, e uma
 //! API JSON por baixo. A entrada é por usuário e senha: ela abre uma sessão
@@ -12,11 +11,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use acervo_indexers::{Release, SearchQuery};
 use async_trait::async_trait;
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -24,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::format_description::well_known::Rfc3339;
 
-use crate::{ALL, Entry, SearchError, Server, constant_time_eq};
+use crate::{Entry, Server, constant_time_eq};
 
 const COOKIE: &str = "acervo_sessao";
 const CSRF_HEADER: &str = "x-acervo";
@@ -83,7 +81,7 @@ pub trait Admin: Send + Sync + std::fmt::Debug {
     fn disabled(&self) -> Vec<(String, &'static str)>;
 
     /// Todas as definições conhecidas, suportadas ou não.
-    fn definitions(&self) -> Vec<DefinitionView>;
+    async fn definitions(&self) -> Result<DefinitionCatalog, String>;
 
     /// Settings que uma definição pede para ser adicionada.
     fn definition_settings(&self, definition: &str) -> Option<Vec<SettingView>>;
@@ -231,6 +229,15 @@ pub trait Accounts: Send + Sync + std::fmt::Debug {
     async fn logout(&self, token: &str) -> Result<(), String>;
 }
 
+/// Catálogo com um aviso não bloqueante sobre a atualização remota.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DefinitionCatalog {
+    #[serde(rename = "definicoes")]
+    pub definitions: Vec<DefinitionView>,
+    #[serde(rename = "aviso")]
+    pub warning: Option<String>,
+}
+
 /// Uma definição do catálogo, como a tela a lista.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DefinitionView {
@@ -245,6 +252,8 @@ pub struct DefinitionView {
     pub reason: Option<String>,
     /// Já existe um indexador com este id.
     pub added: bool,
+    /// Esquema de configuração, sem valores secretos.
+    pub settings: Vec<SettingView>,
 }
 
 /// Um setting como a tela o vê. Segredo nunca carrega valor.
@@ -317,8 +326,6 @@ pub(crate) fn routes() -> Router<Arc<Server>> {
             "/ui/api/indexadores/{nome}/settings",
             get(settings).put(update_settings),
         )
-        .route("/ui/api/busca", get(search))
-        .route("/ui/baixar", get(download))
 }
 
 /// Resposta que o navegador não guarda: o `index.html` (que carrega a versão
@@ -711,7 +718,12 @@ async fn definitions(
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::GET).await?;
-    Ok(ok(json!({ "definicoes": admin(&server)?.definitions() })))
+    Ok(ok(json!(
+        admin(&server)?
+            .definitions()
+            .await
+            .map_err(|e| UiError(StatusCode::BAD_GATEWAY, e))?
+    )))
 }
 
 async fn definition_settings(
@@ -930,145 +942,4 @@ async fn update_settings(
     // Testa na hora: credencial salva que não funciona precisa aparecer já.
     let result = test_result(server.catalog.test(&name).await);
     Ok(ok(json!({ "ok": true, "teste": result })))
-}
-
-#[derive(Deserialize)]
-struct SearchParams {
-    #[serde(default)]
-    q: String,
-    #[serde(default)]
-    indexador: Option<String>,
-    #[serde(default)]
-    cat: Option<String>,
-}
-
-fn download_link(server: &Server, release: &Release) -> String {
-    if release.download_url.scheme() == "magnet"
-        || !server.catalog.proxies_downloads(&release.indexer)
-    {
-        return release.download_url.to_string();
-    }
-    let query: String = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("indexador", &release.indexer)
-        .append_pair("link", release.download_url.as_str())
-        .append_pair("nome", &release.title)
-        .finish();
-    format!("/ui/baixar?{query}")
-}
-
-async fn search(
-    State(server): State<Arc<Server>>,
-    headers: HeaderMap,
-    Query(params): Query<SearchParams>,
-) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::GET).await?;
-    let categories: Vec<u32> = params
-        .cat
-        .as_deref()
-        .unwrap_or_default()
-        .split(',')
-        .filter(|id| !id.trim().is_empty())
-        .map(|id| id.trim().parse())
-        .collect::<Result<_, _>>()
-        .map_err(|_| UiError(StatusCode::BAD_REQUEST, "categoria inválida".into()))?;
-    let query = SearchQuery::general(params.q.trim())
-        .with_categories(categories)
-        .with_limit(100);
-    let target = params
-        .indexador
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| ALL.to_owned());
-    let page = server
-        .catalog
-        .search(&target, &query)
-        .await
-        .map_err(|error| match error {
-            SearchError::NoSuchIndexer => {
-                UiError(StatusCode::NOT_FOUND, "indexador desconhecido".into())
-            }
-            other => UiError(StatusCode::BAD_GATEWAY, other.to_string()),
-        })?;
-    let results: Vec<_> = page
-        .releases
-        .iter()
-        .map(|release| {
-            json!({
-                "titulo": release.title,
-                "indexador": release.indexer,
-                "tamanho": release.size,
-                "seeders": release.seeders,
-                "leechers": release.leechers,
-                "downloads": release.grabs,
-                "categorias": release.categories,
-                "publicado": timestamp(release.published),
-                "detalhes": release.info_url.as_ref().map(url::Url::as_str),
-                "download": download_link(&server, release),
-                // O link do indexador, para mandar ao cliente por
-                // `/ui/api/busca/enviar`.
-                "link": release.download_url.as_str(),
-            })
-        })
-        .collect();
-    let failures: Vec<_> = page
-        .failures
-        .iter()
-        .map(|failure| json!({ "indexador": failure.indexer, "erro": failure.error }))
-        .collect();
-    Ok(ok(json!({ "resultados": results, "falhas": failures })))
-}
-
-#[derive(Deserialize)]
-struct DownloadParams {
-    indexador: String,
-    link: String,
-    #[serde(default)]
-    nome: Option<String>,
-}
-
-async fn download(
-    State(server): State<Arc<Server>>,
-    headers: HeaderMap,
-    Query(params): Query<DownloadParams>,
-) -> Result<Response, UiError> {
-    guard(&server, &headers, &Method::GET).await?;
-    let link = url::Url::parse(&params.link)
-        .map_err(|_| UiError(StatusCode::BAD_REQUEST, "link inválido".into()))?;
-    let torrent = match server
-        .catalog
-        .resolve_download(&params.indexador, &link)
-        .await
-        .map_err(|error| UiError(StatusCode::BAD_GATEWAY, error.to_string()))?
-    {
-        acervo_indexers::ResolvedDownload::Torrent(bytes) => bytes,
-        acervo_indexers::ResolvedDownload::Magnet(magnet) => {
-            let mut response = crate::magnet_redirect(&magnet);
-            secure_headers(response.headers_mut());
-            return Ok(response);
-        }
-    };
-    // Nome de arquivo só com caracteres seguros: vem do título do tracker.
-    let base: String = params
-        .nome
-        .unwrap_or_else(|| params.indexador.clone())
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                c
-            } else {
-                '.'
-            }
-        })
-        .take(150)
-        .collect();
-    let mut response = torrent.into_response();
-    let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/x-bittorrent"),
-    );
-    if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{base}.torrent\"")) {
-        headers.insert(header::CONTENT_DISPOSITION, value);
-    }
-    secure_headers(headers);
-    Ok(response)
 }
