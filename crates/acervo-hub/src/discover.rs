@@ -29,6 +29,12 @@ const DETAIL_TTL: Duration = Duration::from_secs(6 * 3600);
 const SEARCH_TTL: Duration = Duration::from_secs(10 * 60);
 const WEEK_TTL: Duration = Duration::from_secs(6 * 3600);
 const LIST_TTL: Duration = Duration::from_secs(3600);
+/// Títulos visíveis que uma chamada de lista tenta entregar.
+const LIST_FILL: usize = 20;
+/// Páginas do TMDB lidas, no máximo, por chamada de lista.
+const LIST_SCAN: u32 = 10;
+/// O TMDB não serve lista além da página 500.
+const LIST_PAGES: u32 = 500;
 const GENRE_TTL: Duration = Duration::from_secs(24 * 3600);
 
 type Cache<T> = LazyLock<Mutex<HashMap<String, (Instant, T)>>>;
@@ -413,24 +419,35 @@ async fn list(
     let tmdb = crate::metadata::require_tmdb(&web.config(), store)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
-    let key = format!("{name}-{}-{}", query.tipo, query.pagina);
-    let page = if let Some(page) = cached(&LISTS, &key, LIST_TTL) {
-        page
-    } else {
-        let page = tmdb
-            .discover_list(list, kind, query.pagina)
-            .await
-            .map_err(|e| fail(bad(e)))?;
-        save(&LISTS, key, &page);
-        page
-    };
     let genres = genres(&tmdb).await.map_err(|e| fail(anyhow_bad(&e)))?;
     let filters = Filters::load(store)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
-    ok(
-        &json!({"itens": filters.items(&page.items, &genres), "pagina": page.page, "total_paginas": page.total_pages}),
-    )
+    // Com quase tudo oculto ou no acervo, uma página do TMDB sai vazia: segue
+    // lendo até encher a grade, e a próxima chamada continua de onde parou.
+    let mut items = Vec::new();
+    let mut number = query.pagina;
+    let mut total = number;
+    for read in 0..LIST_SCAN {
+        let key = format!("{name}-{}-{number}", query.tipo);
+        let page = if let Some(page) = cached(&LISTS, &key, LIST_TTL) {
+            page
+        } else {
+            let page = tmdb
+                .discover_list(list, kind, number)
+                .await
+                .map_err(|e| fail(bad(e)))?;
+            save(&LISTS, key, &page);
+            page
+        };
+        total = page.total_pages.min(LIST_PAGES);
+        items.extend(filters.items(&page.items, &genres));
+        if items.len() >= LIST_FILL || number >= total || read + 1 == LIST_SCAN {
+            break;
+        }
+        number += 1;
+    }
+    ok(&json!({"itens": items, "pagina": number, "total_paginas": total}))
 }
 
 async fn genre_list(State(web): Shared, headers: HeaderMap) -> WebResult {
