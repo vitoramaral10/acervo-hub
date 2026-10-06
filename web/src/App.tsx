@@ -56,10 +56,10 @@ type NavItem<V extends View> = { view: V; label: string; icon: typeof Server }
 
 /** Uso do dia a dia: sempre à vista. */
 const MAIN: NavItem<MainView>[] = [
-  { view: 'inicio', label: 'Início', icon: House },
+  { view: 'descobrir', label: 'Descobrir', icon: Compass },
+  { view: 'inicio', label: 'Painel', icon: House },
   { view: 'filmes', label: 'Filmes', icon: Film },
   { view: 'series', label: 'Séries', icon: MonitorPlay },
-  { view: 'descobrir', label: 'Descobrir', icon: Compass },
   { view: 'faltando', label: 'Faltando', icon: CircleDashed },
   { view: 'apagar', label: 'Para apagar', icon: Trash2 },
   { view: 'calendario', label: 'Calendário', icon: CalendarDays },
@@ -89,7 +89,7 @@ function viewFromHash(): View {
   const hash = window.location.hash.slice(1).split('?')[0]
   // Endereço salvo da antiga página única de configurações.
   if (hash === 'configuracoes') return 'servidor'
-  return VIEWS.includes(hash as View) ? (hash as View) : 'inicio'
+  return VIEWS.includes(hash as View) ? (hash as View) : 'descobrir'
 }
 
 const GROUP_KEY = 'acervo.menu.configuracoes'
@@ -242,7 +242,7 @@ export function App() {
         Pular para o conteúdo
       </a>
       <aside className="sticky top-0 z-30 flex items-center gap-1 border-b border-border bg-surface px-3 py-2.5 md:h-dvh md:flex-col md:items-stretch md:gap-1 md:border-r md:border-b-0 md:px-3 md:py-5">
-        <a href="#inicio" className="flex shrink-0 items-center gap-2.5 rounded-md p-1 md:mb-6 md:px-2">
+        <a href="#descobrir" className="flex shrink-0 items-center gap-2.5 rounded-md p-1 md:mb-6 md:px-2">
           <img src="/ui/icone.svg" alt="" className="size-7" />
           <span className="sr-only leading-tight md:not-sr-only">
             <span className="block text-sm font-semibold tracking-tight">acervo-hub</span>

@@ -363,7 +363,7 @@ export function HomePage() {
   return (
     <>
       <PageHeader
-        title="Início"
+        title="Painel"
         description="O que está baixando, o que travou e quanto disco sobra — num olhar."
       />
       <div className="grid gap-4 lg:grid-cols-2">
