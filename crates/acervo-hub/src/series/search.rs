@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use acervo_api::{ALL, Catalog};
+use crate::api::{ALL, Catalog};
 use acervo_decision::{
     BlockedEpisode, EpisodeDecision, EpisodeEngine, EpisodeState, Indexer, Mode, Scope,
     SeriesTarget, Settings, pick, pick_prefer_pack,

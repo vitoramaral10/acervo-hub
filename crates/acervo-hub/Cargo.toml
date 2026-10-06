@@ -12,11 +12,9 @@ name = "acervo-hub"
 path = "src/main.rs"
 
 [dependencies]
-acervo-api.workspace = true
 acervo-clients.workspace = true
 acervo-core.workspace = true
 acervo-decision.workspace = true
-acervo-fs.workspace = true
 acervo-indexers.workspace = true
 acervo-janitor.workspace = true
 acervo-metadata.workspace = true
@@ -29,6 +27,8 @@ axum.workspace = true
 clap.workspace = true
 fancy-regex.workspace = true
 flate2.workspace = true
+futures.workspace = true
+thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

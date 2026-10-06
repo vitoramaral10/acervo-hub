@@ -11,6 +11,6 @@ config.local.toml
 # Artefatos de desenvolvimento
 /.claude/worktrees/
 
-# Front-end: dependências ficam fora; o build em crates/acervo-api/src/ui/dist entra.
+# Front-end: dependências ficam fora; o build em crates/acervo-hub/src/api/ui/dist entra.
 /web/node_modules/
 /web/*.tsbuildinfo

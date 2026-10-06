@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use acervo_api::{Accounts, Catalog, authorize_ui, ui_json};
+use crate::api::{Catalog, authorize_ui, ui_json};
 use acervo_decision::Mode;
 use acervo_parser::Quality;
 use acervo_store::Store;
@@ -40,7 +40,6 @@ pub struct Web {
     pub settings: Arc<Settings>,
     pub database: Database,
     pub catalog: Catalog,
-    pub accounts: Option<Arc<dyn Accounts>>,
     /// Última busca interativa de cada filme: o grab escolhe dela pelo guid.
     pub searches: tokio::sync::Mutex<HashMap<i64, Cached>>,
     /// O mesmo, de cada série.
@@ -88,14 +87,9 @@ pub(crate) async fn enter<'a>(
     headers: &HeaderMap,
     method: &Method,
 ) -> Result<&'a Store, Response> {
-    authorize_ui(
-        &web.config().server.api_key,
-        web.accounts.as_ref(),
-        headers,
-        method,
-    )
-    .await
-    .map_err(|response| *response)?;
+    authorize_ui(&web.config().server.api_key, &web.database, headers, method)
+        .await
+        .map_err(|response| *response)?;
     web.database
         .get()
         .map_err(|e| fail(WebError(StatusCode::SERVICE_UNAVAILABLE, e)))
@@ -172,7 +166,7 @@ async fn options(State(web): Shared, headers: HeaderMap) -> WebResult {
     let (folders, series_folder) = tokio::task::spawn_blocking(move || {
         let folder = |root: String| {
             let free = Some((std::path::Path::new(&root)).to_path_buf())
-                .and_then(|host| acervo_fs::free_space(&host).ok());
+                .and_then(|host| crate::fs::free_space(&host).ok());
             json!({ "caminho": root, "livre": free })
         };
         (

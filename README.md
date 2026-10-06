@@ -37,13 +37,11 @@ Workspace Cargo, binário único `acervo-hub`:
 | `acervo-parser` | Nome de release: título, ano, temporada e episódio, qualidade, idiomas, grupo |
 | `acervo-decision` | Casamento com o filme ou a série, rejeições e ordem de preferência |
 | `acervo-indexers` | Busca em indexadores (Cardigann), rate limit, proxy e `FlareSolverr` |
-| `acervo-api` | O catálogo de indexadores cadastrados, com cache de consultas, e a interface web |
 | `acervo-metadata` | Metadados do TMDB |
 | `acervo-clients` | qBittorrent e Jellyfin |
-| `acervo-fs` | `stat(2)`, espaço livre e tamanho das raízes |
 | `acervo-janitor` | A limpeza: decide o que apagar do cliente, sem executar nada |
 | `acervo-store` | Catálogo, fila, histórico, configuração e contas no Postgres |
-| `acervo-hub` | Binário: tarefas de fundo, importação, decisão aplicada, interface |
+| `acervo-hub` | Binário: tarefas de fundo, importação, decisão aplicada, catálogo de indexadores, interface e filesystem |
 
 O acervo não expõe API para terceiros. A superfície HTTP é a interface e a API JSON dela;
 script e automação podem usá-la com a chave de API do servidor no cabeçalho `X-Api-Key`.
@@ -311,7 +309,7 @@ Segurança:
   consegue mandar. A CSP só aceita script servido pelo próprio binário.
 
 O front é React + TypeScript + Tailwind, em `web/`. O build é versionado em
-`crates/acervo-api/src/ui/dist` e embutido no binário: `cargo build` e a imagem não
+`crates/acervo-hub/src/api/ui/dist` e embutido no binário: `cargo build` e a imagem não
 precisam de Node.
 
 ```sh

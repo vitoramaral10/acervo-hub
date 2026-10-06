@@ -891,8 +891,7 @@ mod tests {
         let web = Arc::new(Web {
             settings,
             database: crate::serve::Database::connected(store.clone()),
-            catalog: acervo_api::Catalog::default(),
-            accounts: None,
+            catalog: crate::api::Catalog::default(),
             searches: tokio::sync::Mutex::default(),
             series_searches: tokio::sync::Mutex::default(),
         });
@@ -1131,8 +1130,7 @@ mod tests {
         let web = Arc::new(Web {
             settings,
             database: crate::serve::Database::connected(store.clone()),
-            catalog: acervo_api::Catalog::default(),
-            accounts: None,
+            catalog: crate::api::Catalog::default(),
             searches: tokio::sync::Mutex::default(),
             series_searches: tokio::sync::Mutex::default(),
         });

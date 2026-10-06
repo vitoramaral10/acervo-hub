@@ -19,5 +19,5 @@ Dockerfile
 .dockerignore
 deploy/
 
-# O front entra já compilado, em crates/acervo-api/src/ui/dist.
+# O front entra já compilado, em crates/acervo-hub/src/api/ui/dist.
 web/

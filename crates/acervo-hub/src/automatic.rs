@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use acervo_api::{ALL, Catalog};
+use crate::api::{ALL, Catalog};
 use acervo_indexers::SearchQuery;
 use acervo_store::Store;
 use anyhow::Result;

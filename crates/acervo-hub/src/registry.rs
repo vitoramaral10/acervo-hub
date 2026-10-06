@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
-use acervo_api::Entry;
+use crate::api::Entry;
 use acervo_indexers::{
     CardigannClient, CardigannDefinition, Challenge, FlareSolverr, Network, Proxy,
 };

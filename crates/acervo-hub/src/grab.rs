@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
-use acervo_api::Catalog;
+use crate::api::Catalog;
 use acervo_clients::{
     AddOptions, NewTorrent, QbitClient, QbitError, client_path, info_hash, magnet_hash,
 };

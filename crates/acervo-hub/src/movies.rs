@@ -78,7 +78,7 @@ pub struct DownloadView {
 }
 
 fn disk(path: &Path, expected: u64) -> (Disk, Option<String>) {
-    match acervo_fs::facts_for(path) {
+    match crate::fs::facts_for(path) {
         Ok(facts) if facts.apparent.as_u64() == expected => (Disk::Ok, None),
         Ok(facts) => (
             Disk::SizeDiffers,
@@ -87,7 +87,7 @@ fn disk(path: &Path, expected: u64) -> (Disk, Option<String>) {
                 facts.apparent.as_u64()
             )),
         ),
-        Err(acervo_fs::FsError::Stat { source, .. })
+        Err(crate::fs::FsError::Stat { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
             (Disk::Missing, None)

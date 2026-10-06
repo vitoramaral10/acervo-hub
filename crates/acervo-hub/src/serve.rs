@@ -9,13 +9,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
-use acervo_api::{
-    Accounts, Admin, ApiKey, Catalog, DefinitionCatalog, DefinitionView, Entry, SettingView,
-};
+use crate::api::{ApiKey, Catalog, DefinitionCatalog, DefinitionView, Entry, SettingView};
 use acervo_indexers::{CardigannDefinition, SettingInfo, SettingInfoKind};
 use acervo_store::{IndexerRecord, Store};
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use serde_json::json;
 
 use crate::config::{Config, SERVIDOR, ServerConfig};
@@ -47,23 +44,22 @@ impl Database {
     }
 }
 
-#[async_trait]
-impl Accounts for Database {
-    async fn login(&self, user: &str, password: &str) -> Result<Option<String>, String> {
+impl Database {
+    pub(crate) async fn login(&self, user: &str, password: &str) -> Result<Option<String>, String> {
         self.get()?
             .login(user, password)
             .await
             .map_err(|e| e.to_string())
     }
 
-    async fn session_user(&self, token: &str) -> Result<Option<String>, String> {
+    pub(crate) async fn session_user(&self, token: &str) -> Result<Option<String>, String> {
         self.get()?
             .session_user(token)
             .await
             .map_err(|e| e.to_string())
     }
 
-    async fn logout(&self, token: &str) -> Result<(), String> {
+    pub(crate) async fn logout(&self, token: &str) -> Result<(), String> {
         self.get()?.logout(token).await.map_err(|e| e.to_string())
     }
 }
@@ -126,7 +122,7 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         ))
         .run(tasks.cancel_token()),
     );
-    let accounts: Option<Arc<dyn Accounts>> = Some(Arc::new(database.clone()));
+    let accounts = Arc::new(database.clone());
     // A chave é lida a cada requisição: trocada na tela, vale na hora.
     let api_key = ApiKey::dynamic({
         let settings = Arc::clone(&settings);
@@ -136,7 +132,6 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         settings: Arc::clone(&settings),
         database: database.clone(),
         catalog: catalog.clone(),
-        accounts: accounts.clone(),
         searches: tokio::sync::Mutex::default(),
         series_searches: tokio::sync::Mutex::default(),
     });
@@ -159,7 +154,7 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         .with_context(|| format!("abrindo `{bind}`"))?;
     axum::serve(
         listener,
-        acervo_api::router_with_admin(catalog, api_key, Some(Arc::new(admin)), accounts)
+        crate::api::router(catalog, api_key, Arc::new(admin), accounts)
             .merge(crate::web::router(Arc::clone(&web)))
             .merge(crate::agenda::router(Arc::clone(&web)))
             .merge(crate::marks::router(Arc::clone(&web)))
@@ -213,7 +208,7 @@ fn now() -> String {
 
 /// Administração pela interface.
 #[derive(Debug)]
-struct HubAdmin {
+pub(crate) struct HubAdmin {
     settings: Arc<Settings>,
     /// O catálogo servido: a busca dos que faltam e a da tela passam por ele
     /// e dividem as consultas guardadas.
@@ -395,9 +390,8 @@ fn message(error: &anyhow::Error) -> String {
     format!("{error:#}")
 }
 
-#[async_trait]
-impl Admin for HubAdmin {
-    fn settings(&self, indexer: &str) -> Option<Vec<SettingView>> {
+impl HubAdmin {
+    pub(crate) fn settings(&self, indexer: &str) -> Option<Vec<SettingView>> {
         let record = self.record(indexer)?;
         if record.kind == CARDIGANN {
             let definition = self.registry.definition(&record).ok()?;
@@ -412,7 +406,7 @@ impl Admin for HubAdmin {
         None
     }
 
-    async fn update(
+    pub(crate) async fn update(
         &self,
         indexer: &str,
         values: BTreeMap<String, String>,
@@ -461,11 +455,11 @@ impl Admin for HubAdmin {
         Ok(entry)
     }
 
-    fn origin(&self, indexer: &str) -> Option<&'static str> {
+    pub(crate) fn origin(&self, indexer: &str) -> Option<&'static str> {
         self.record(indexer).map(|_| ORIGIN)
     }
 
-    fn disabled(&self) -> Vec<(String, &'static str)> {
+    pub(crate) fn disabled(&self) -> Vec<(String, &'static str)> {
         let served: HashSet<String> = self
             .catalog
             .views()
@@ -482,7 +476,7 @@ impl Admin for HubAdmin {
             .collect()
     }
 
-    async fn definitions(&self) -> Result<DefinitionCatalog, String> {
+    pub(crate) async fn definitions(&self) -> Result<DefinitionCatalog, String> {
         let definitions = self.registry.available().await.map_err(|e| message(&e))?;
         Ok(DefinitionCatalog {
             warning: definitions.warning,
@@ -509,7 +503,7 @@ impl Admin for HubAdmin {
         })
     }
 
-    fn definition_settings(&self, definition: &str) -> Option<Vec<SettingView>> {
+    pub(crate) fn definition_settings(&self, definition: &str) -> Option<Vec<SettingView>> {
         let yaml = {
             let definitions = self.registry.available_cached();
             let known = definitions.get(definition)?;
@@ -528,7 +522,7 @@ impl Admin for HubAdmin {
         Some(views)
     }
 
-    async fn add(
+    pub(crate) async fn add(
         &self,
         definition: &str,
         values: BTreeMap<String, String>,
@@ -614,7 +608,7 @@ impl Admin for HubAdmin {
         Ok(entry)
     }
 
-    async fn remove(&self, indexer: &str) -> Result<(), String> {
+    pub(crate) async fn remove(&self, indexer: &str) -> Result<(), String> {
         let _guard = self.registry.write.lock().await;
         if !self
             .store()?
@@ -633,7 +627,11 @@ impl Admin for HubAdmin {
         Ok(())
     }
 
-    async fn set_enabled(&self, indexer: &str, enabled: bool) -> Result<Option<Entry>, String> {
+    pub(crate) async fn set_enabled(
+        &self,
+        indexer: &str,
+        enabled: bool,
+    ) -> Result<Option<Entry>, String> {
         let _guard = self.registry.write.lock().await;
         let mut record = self.record(indexer).ok_or("indexador desconhecido")?;
         record.enabled = enabled;
@@ -649,27 +647,27 @@ impl Admin for HubAdmin {
         Ok(Some(entry))
     }
 
-    fn tasks(&self) -> serde_json::Value {
+    pub(crate) fn tasks(&self) -> serde_json::Value {
         self.tasks.view()
     }
 
-    async fn task_history(&self) -> Result<serde_json::Value, String> {
+    pub(crate) async fn task_history(&self) -> Result<serde_json::Value, String> {
         self.tasks.history().await
     }
 
-    fn run_task(&self, id: &str) -> Option<serde_json::Value> {
+    pub(crate) fn run_task(&self, id: &str) -> Option<serde_json::Value> {
         let started = self.tasks.run_now(id)?;
         Some(json!({ "iniciada": started, "tarefa": self.tasks.view_one(id) }))
     }
 
-    async fn movies(&self) -> Result<serde_json::Value, String> {
+    pub(crate) async fn movies(&self) -> Result<serde_json::Value, String> {
         let list = crate::movies::list(self.store()?)
             .await
             .map_err(|e| message(&e))?;
         serde_json::to_value(list).map_err(|e| e.to_string())
     }
 
-    async fn search_missing(&self) -> Result<serde_json::Value, String> {
+    pub(crate) fn search_missing(&self) -> Result<serde_json::Value, String> {
         // Falha logo, na resposta, se o banco ainda não subiu.
         self.store()?;
         let started = self
@@ -679,11 +677,15 @@ impl Admin for HubAdmin {
         Ok(self.missing_json(started))
     }
 
-    fn missing_status(&self) -> serde_json::Value {
+    pub(crate) fn missing_status(&self) -> serde_json::Value {
         self.missing_json(false)
     }
 
-    async fn grab_movie(&self, movie_id: i64, apply: bool) -> Result<serde_json::Value, String> {
+    pub(crate) async fn grab_movie(
+        &self,
+        movie_id: i64,
+        apply: bool,
+    ) -> Result<serde_json::Value, String> {
         let report = crate::grab::grab(
             &self.settings.get(),
             self.store()?,
@@ -696,7 +698,7 @@ impl Admin for HubAdmin {
         serde_json::to_value(report).map_err(|e| e.to_string())
     }
 
-    async fn configuration(&self) -> Result<serde_json::Value, String> {
+    pub(crate) async fn configuration(&self) -> Result<serde_json::Value, String> {
         let store = self.store()?;
         let key = store
             .setting(crate::metadata::TMDB_KEY)
@@ -705,7 +707,7 @@ impl Admin for HubAdmin {
         Ok(json!({ "tmdb": { "definida": key.is_some() } }))
     }
 
-    async fn save_configuration(
+    pub(crate) async fn save_configuration(
         &self,
         values: BTreeMap<String, Option<String>>,
     ) -> Result<serde_json::Value, String> {
@@ -737,11 +739,11 @@ impl Admin for HubAdmin {
         self.configuration().await
     }
 
-    async fn config_section(&self, section: &str) -> Result<serde_json::Value, String> {
+    pub(crate) fn config_section(&self, section: &str) -> Result<serde_json::Value, String> {
         self.settings.view(section)
     }
 
-    async fn save_config_section(
+    pub(crate) async fn save_config_section(
         &self,
         section: &str,
         value: serde_json::Value,
@@ -966,8 +968,12 @@ mod tests {
             let settings = Arc::clone(&settings);
             move || settings.get().server.api_key.clone()
         });
-        let app =
-            acervo_api::router_with_admin(Catalog::default(), api_key, Some(Arc::new(admin)), None);
+        let app = crate::api::router(
+            Catalog::default(),
+            api_key,
+            Arc::new(admin),
+            Arc::new(Database::default()),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await });

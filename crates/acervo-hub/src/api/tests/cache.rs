@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use acervo_api::{ALL, Catalog, Entry};
+use crate::api::{ALL, Catalog, Entry};
 use acervo_indexers::{
     Capabilities, Category, Indexer, IndexerError, Release, SearchQuery, SearchSupport,
 };
@@ -214,6 +214,6 @@ async fn ui_pode_ser_nome_de_indexador_e_all_continua_reservado() {
     });
     assert_eq!(
         Catalog::new([entry(indexer)]).unwrap_err(),
-        acervo_api::CatalogError::ReservedName
+        crate::api::CatalogError::ReservedName
     );
 }

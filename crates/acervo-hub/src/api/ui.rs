@@ -11,7 +11,6 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, State};
@@ -22,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::format_description::well_known::Rfc3339;
 
-use crate::{Entry, Server, constant_time_eq};
+use super::{AccountsBackend, Server, constant_time_eq};
 
 const COOKIE: &str = "acervo_sessao";
 const CSRF_HEADER: &str = "x-acervo";
@@ -51,183 +50,6 @@ static VERSIONED_INDEX: LazyLock<String> = LazyLock::new(|| {
             &format!("\"/ui/app.css?v={style:016x}\""),
         )
 });
-
-/// O que a interface administra e só o binário sabe fazer: a configuração,
-/// o catálogo de definições e as tarefas de fundo.
-///
-/// Mensagens de erro vão para a tela e não podem conter valor de setting.
-#[async_trait]
-pub trait Admin: Send + Sync + std::fmt::Debug {
-    /// Settings editáveis do indexador; `None` se ele não tem nenhum.
-    fn settings(&self, indexer: &str) -> Option<Vec<SettingView>>;
-
-    /// Monta o indexador com os valores novos e os persiste. Campo ausente
-    /// mantém o valor atual — é assim que segredo não precisa voltar à tela.
-    ///
-    /// # Errors
-    ///
-    /// Setting desconhecido, valor inválido ou falha ao gravar.
-    async fn update(
-        &self,
-        indexer: &str,
-        values: BTreeMap<String, String>,
-    ) -> Result<Entry, String>;
-
-    /// Se o indexador está cadastrado, e como a tela o rotula.
-    fn origin(&self, indexer: &str) -> Option<&'static str>;
-
-    /// Indexadores cadastrados fora do catálogo servido — desativados, ou
-    /// que não subiram —, ainda listados.
-    fn disabled(&self) -> Vec<(String, &'static str)>;
-
-    /// Todas as definições conhecidas, suportadas ou não.
-    async fn definitions(&self) -> Result<DefinitionCatalog, String>;
-
-    /// Settings que uma definição pede para ser adicionada.
-    fn definition_settings(&self, definition: &str) -> Option<Vec<SettingView>>;
-
-    /// Adiciona um indexador a partir de uma definição do catálogo.
-    ///
-    /// # Errors
-    ///
-    /// Definição desconhecida ou não suportada, id já em uso, settings
-    /// inválidos, falha ao gravar.
-    async fn add(
-        &self,
-        definition: &str,
-        values: BTreeMap<String, String>,
-    ) -> Result<Entry, String>;
-
-    /// Remove um indexador cadastrado.
-    ///
-    /// # Errors
-    ///
-    /// Indexador desconhecido ou falha ao gravar.
-    async fn remove(&self, indexer: &str) -> Result<(), String>;
-
-    /// Ativa ou desativa. Ativar devolve o indexador montado, para entrar no
-    /// catálogo servido.
-    ///
-    /// # Errors
-    ///
-    /// Indexador desconhecido ou falha ao montar ou gravar.
-    async fn set_enabled(&self, indexer: &str, enabled: bool) -> Result<Option<Entry>, String>;
-
-    /// As tarefas de fundo do serviço — busca, RSS, importação, metadados,
-    /// limpeza —, com intervalo, última e próxima execução de cada uma.
-    fn tasks(&self) -> serde_json::Value;
-
-    /// As últimas execuções das tarefas, da mais nova para a mais velha, com
-    /// o detalhe de cada uma.
-    ///
-    /// # Errors
-    ///
-    /// Banco inalcançável.
-    async fn task_history(&self) -> Result<serde_json::Value, String>;
-
-    /// "Rodar agora": dispara a tarefa e responde na hora. Com ela já
-    /// rodando, não dispara outra. `None` se a tarefa não existe.
-    fn run_task(&self, id: &str) -> Option<serde_json::Value>;
-
-    /// O catálogo de filmes, com o estado de cada arquivo no disco.
-    ///
-    /// # Errors
-    ///
-    /// Catálogo ilegível.
-    async fn movies(&self) -> Result<serde_json::Value, String>;
-
-    /// Dispara em segundo plano a busca de todos os filmes que faltam, e pega
-    /// o escolhido de cada um. Responde na hora; com uma busca já rodando,
-    /// não dispara outra.
-    ///
-    /// # Errors
-    ///
-    /// Banco inalcançável.
-    async fn search_missing(&self) -> Result<serde_json::Value, String>;
-
-    /// O andamento da busca dos que faltam: se roda, quantos de quantos.
-    fn missing_status(&self) -> serde_json::Value;
-
-    /// Busca e decide um filme do catálogo; com `apply`, manda o escolhido
-    /// ao cliente de download.
-    ///
-    /// # Errors
-    ///
-    /// Filme desconhecido ou que já tem arquivo, busca que falhou, cliente
-    /// inalcançável.
-    async fn grab_movie(&self, movie_id: i64, apply: bool) -> Result<serde_json::Value, String>;
-
-    /// As configurações guardadas pela tela. Segredo nunca volta: só se está
-    /// definido.
-    ///
-    /// # Errors
-    ///
-    /// Banco inalcançável.
-    async fn configuration(&self) -> Result<serde_json::Value, String>;
-
-    /// Grava configurações. Chave ausente mantém o valor, `null` apaga, texto
-    /// grava — depois de testar, quando dá para testar.
-    ///
-    /// # Errors
-    ///
-    /// Valor recusado no teste ou banco inalcançável.
-    async fn save_configuration(
-        &self,
-        values: BTreeMap<String, Option<String>>,
-    ) -> Result<serde_json::Value, String>;
-
-    /// Uma seção da configuração do serviço. Segredo volta só como
-    /// `{"definida": bool}`.
-    ///
-    /// # Errors
-    ///
-    /// Seção desconhecida.
-    async fn config_section(&self, _section: &str) -> Result<serde_json::Value, String> {
-        Err("este serviço não tem configuração editável".into())
-    }
-
-    /// Valida e grava uma seção; devolve como ela ficou, no formato de
-    /// [`Admin::config_section`]. Segredo vazio ou ausente mantém o atual.
-    ///
-    /// # Errors
-    ///
-    /// Seção desconhecida, valor inválido (a mensagem diz qual) ou falha ao
-    /// gravar.
-    async fn save_config_section(
-        &self,
-        _section: &str,
-        _value: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        Err("este serviço não tem configuração editável".into())
-    }
-}
-
-/// Contas da interface: confere usuário e senha e guarda as sessões.
-///
-/// Mensagens de erro vão para o log, não para a tela.
-#[async_trait]
-pub trait Accounts: Send + Sync + std::fmt::Debug {
-    /// Token de uma sessão nova, se usuário e senha batem.
-    ///
-    /// # Errors
-    ///
-    /// Banco inalcançável — senha errada é `Ok(None)`.
-    async fn login(&self, user: &str, password: &str) -> Result<Option<String>, String>;
-
-    /// Dono da sessão, se ela existe e não venceu.
-    ///
-    /// # Errors
-    ///
-    /// Banco inalcançável.
-    async fn session_user(&self, token: &str) -> Result<Option<String>, String>;
-
-    /// Encerra a sessão.
-    ///
-    /// # Errors
-    ///
-    /// Banco inalcançável.
-    async fn logout(&self, token: &str) -> Result<(), String>;
-}
 
 /// Catálogo com um aviso não bloqueante sobre a atualização remota.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -440,7 +262,7 @@ async fn guard(
 
 async fn check(
     api_key: &str,
-    accounts: Option<&Arc<dyn Accounts>>,
+    accounts: &AccountsBackend,
     headers: &HeaderMap,
     method: &Method,
 ) -> Result<Option<String>, UiError> {
@@ -453,7 +275,7 @@ async fn check(
         }
         None
     } else {
-        let (Some(token), Some(accounts)) = (session_token(headers), accounts) else {
+        let Some(token) = session_token(headers) else {
             return Err(unauthorized());
         };
         match accounts.session_user(token).await {
@@ -468,7 +290,7 @@ async fn check(
     Ok(user)
 }
 
-/// A mesma entrada da tela, para rotas montadas fora deste crate: sessão
+/// A mesma entrada da tela, para as demais rotas do serviço: sessão
 /// (com o cabeçalho anti-CSRF em ação que muda estado) ou chave de API. O
 /// erro já é a resposta a devolver.
 ///
@@ -477,7 +299,7 @@ async fn check(
 /// Sem sessão válida nem chave certa, ou sem o cabeçalho da interface.
 pub async fn authorize_ui(
     api_key: &str,
-    accounts: Option<&Arc<dyn Accounts>>,
+    accounts: &AccountsBackend,
     headers: &HeaderMap,
     method: &Method,
 ) -> Result<Option<String>, Box<Response>> {
@@ -515,12 +337,7 @@ async fn login(
     if headers.get(CSRF_HEADER).is_none() {
         return Err(missing_csrf());
     }
-    let Some(accounts) = &server.accounts else {
-        return Err(UiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "nenhum banco de contas configurado: defina ACERVO_DATABASE_URL".into(),
-        ));
-    };
+    let accounts = &server.accounts;
     let token = match accounts.login(body.usuario.trim(), &body.senha).await {
         Ok(Some(token)) => token,
         Ok(None) => {
@@ -556,8 +373,8 @@ async fn logout(
     if headers.get(CSRF_HEADER).is_none() {
         return Err(missing_csrf());
     }
-    if let (Some(token), Some(accounts)) = (session_token(&headers), &server.accounts)
-        && let Err(error) = accounts.logout(token).await
+    if let Some(token) = session_token(&headers)
+        && let Err(error) = server.accounts.logout(token).await
     {
         return Err(accounts_down(&error));
     }
@@ -583,15 +400,15 @@ fn timestamp(value: Option<time::OffsetDateTime>) -> serde_json::Value {
         .map_or(serde_json::Value::Null, serde_json::Value::String)
 }
 
-fn indexer_json(server: &Server, view: &crate::IndexerView) -> serde_json::Value {
+fn indexer_json(server: &Server, view: &super::IndexerView) -> serde_json::Value {
     let caps = &view.capabilities;
     let admin = server.admin.as_ref();
     json!({
         "nome": view.name,
         "ativo": true,
-        "origem": admin.and_then(|admin| admin.origin(&view.name)).unwrap_or("cadastro"),
+        "origem": admin.origin(&view.name).unwrap_or("cadastro"),
         "privado": view.proxies_downloads,
-        "editavel": admin.and_then(|admin| admin.settings(&view.name)).is_some(),
+        "editavel": admin.settings(&view.name).is_some(),
         "modos": {
             "busca": caps.general.available,
             "series": caps.tv.available,
@@ -623,7 +440,8 @@ async fn indexers(
         .iter()
         .map(|view| indexer_json(&server, view))
         .collect();
-    if let Some(admin) = &server.admin {
+    {
+        let admin = &server.admin;
         for (name, origin) in admin.disabled() {
             list.push(json!({
                 "nome": name,
@@ -657,7 +475,8 @@ async fn add_indexer(
     Json(body): Json<AddBody>,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::POST).await?;
-    let entry = admin(&server)?
+    let entry = server
+        .admin
         .add(&body.definicao, body.settings)
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
@@ -676,7 +495,8 @@ async fn remove_indexer(
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::DELETE).await?;
-    admin(&server)?
+    server
+        .admin
         .remove(&name)
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
@@ -696,7 +516,8 @@ async fn set_enabled(
     Json(body): Json<EnabledBody>,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::PUT).await?;
-    let entry = admin(&server)?
+    let entry = server
+        .admin
         .set_enabled(&name, body.ativo)
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
@@ -719,7 +540,8 @@ async fn definitions(
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::GET).await?;
     Ok(ok(json!(
-        admin(&server)?
+        server
+            .admin
             .definitions()
             .await
             .map_err(|e| UiError(StatusCode::BAD_GATEWAY, e))?
@@ -732,7 +554,8 @@ async fn definition_settings(
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::GET).await?;
-    let views = admin(&server)?
+    let views = server
+        .admin
         .definition_settings(&definition)
         .ok_or_else(|| {
             UiError(
@@ -745,7 +568,7 @@ async fn definition_settings(
 
 async fn tasks(State(server): State<Arc<Server>>, headers: HeaderMap) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::GET).await?;
-    Ok(ok(json!({ "tarefas": admin(&server)?.tasks() })))
+    Ok(ok(json!({ "tarefas": server.admin.tasks() })))
 }
 
 async fn task_history(
@@ -753,7 +576,8 @@ async fn task_history(
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::GET).await?;
-    let history = admin(&server)?
+    let history = server
+        .admin
         .task_history()
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
@@ -766,7 +590,8 @@ async fn run_task(
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::POST).await?;
-    let started = admin(&server)?
+    let started = server
+        .admin
         .run_task(&id)
         .ok_or_else(|| UiError(StatusCode::NOT_FOUND, "tarefa desconhecida".into()))?;
     Ok(ok(started))
@@ -777,7 +602,8 @@ async fn movies(
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::GET).await?;
-    let list = admin(&server)?
+    let list = server
+        .admin
         .movies()
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
@@ -789,9 +615,9 @@ async fn search_missing(
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::POST).await?;
-    let started = admin(&server)?
+    let started = server
+        .admin
         .search_missing()
-        .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     Ok(ok(started))
 }
@@ -801,7 +627,7 @@ async fn missing_status(
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::GET).await?;
-    Ok(ok(admin(&server)?.missing_status()))
+    Ok(ok(server.admin.missing_status()))
 }
 
 #[derive(Deserialize)]
@@ -818,7 +644,8 @@ async fn grab_movie(
     Json(body): Json<GrabBody>,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::POST).await?;
-    let report = admin(&server)?
+    let report = server
+        .admin
         .grab_movie(id, body.aplicar)
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
@@ -830,7 +657,8 @@ async fn configuration(
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::GET).await?;
-    let body = admin(&server)?
+    let body = server
+        .admin
         .configuration()
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
@@ -843,7 +671,8 @@ async fn save_configuration(
     Json(values): Json<BTreeMap<String, Option<String>>>,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::PUT).await?;
-    let body = admin(&server)?
+    let body = server
+        .admin
         .save_configuration(values)
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
@@ -856,9 +685,9 @@ async fn config_section(
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::GET).await?;
-    let body = admin(&server)?
+    let body = server
+        .admin
         .config_section(&section)
-        .await
         .map_err(|error| UiError(StatusCode::NOT_FOUND, error))?;
     Ok(ok(body))
 }
@@ -870,7 +699,8 @@ async fn save_config_section(
     Json(value): Json<serde_json::Value>,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::PUT).await?;
-    let body = admin(&server)?
+    let body = server
+        .admin
         .save_config_section(&section, value)
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
@@ -893,22 +723,13 @@ async fn test(
     Ok(ok(test_result(server.catalog.test(&name).await)))
 }
 
-fn admin(server: &Server) -> Result<&Arc<dyn Admin>, UiError> {
-    server.admin.as_ref().ok_or_else(|| {
-        UiError(
-            StatusCode::NOT_FOUND,
-            "este serviço não permite editar indexadores".into(),
-        )
-    })
-}
-
 async fn settings(
     State(server): State<Arc<Server>>,
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::GET).await?;
-    let views = admin(&server)?.settings(&name).ok_or_else(|| {
+    let views = server.admin.settings(&name).ok_or_else(|| {
         UiError(
             StatusCode::NOT_FOUND,
             "indexador sem settings editáveis".into(),
@@ -924,7 +745,8 @@ async fn update_settings(
     Json(values): Json<BTreeMap<String, String>>,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::PUT).await?;
-    let entry = admin(&server)?
+    let entry = server
+        .admin
         .update(&name, values)
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;

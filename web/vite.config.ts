@@ -13,7 +13,7 @@ export default defineConfig({
     alias: { '@': path.resolve(import.meta.dirname, 'src') },
   },
   build: {
-    outDir: '../crates/acervo-api/src/ui/dist',
+    outDir: '../crates/acervo-hub/src/api/ui/dist',
     emptyOutDir: true,
     assetsInlineLimit: 0,
     cssCodeSplit: false,

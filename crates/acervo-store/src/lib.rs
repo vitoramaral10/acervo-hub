@@ -44,6 +44,11 @@ pub enum StoreError {
     #[error("registro inconsistente no banco: {0}")]
     Corrupt(String),
 
+    #[error(
+        "banco anterior à versão 35: atualize primeiro por uma versão do acervo-hub anterior à consolidação"
+    )]
+    BeforeBase,
+
     #[error("senha: {0}")]
     Password(String),
 }
@@ -243,612 +248,9 @@ pub struct Grab {
 }
 
 /// Cada migração roda uma vez, na ordem; a posição é a versão.
-const MIGRATIONS: &[&str] = &[
-    r"
-    CREATE TABLE quality_profiles (
-        id BIGSERIAL PRIMARY KEY,
-        name TEXT NOT NULL UNIQUE,
-        upgrade_allowed BOOLEAN NOT NULL,
-        cutoff INTEGER,
-        language TEXT,
-        items JSONB NOT NULL,
-        min_format_score INTEGER NOT NULL DEFAULT 0,
-        cutoff_format_score INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE TABLE movies (
-        id BIGSERIAL PRIMARY KEY,
-        tmdb_id BIGINT NOT NULL UNIQUE,
-        imdb_id TEXT,
-        title TEXT NOT NULL,
-        original_title TEXT,
-        original_language TEXT,
-        year INTEGER,
-        status TEXT,
-        minimum_availability TEXT,
-        monitored BOOLEAN NOT NULL,
-        quality_profile_id BIGINT REFERENCES quality_profiles(id),
-        path TEXT NOT NULL,
-        added TEXT,
-        source TEXT,
-        source_id BIGINT,
-        runtime INTEGER NOT NULL DEFAULT 0,
-        secondary_year INTEGER,
-        clean_title TEXT,
-        available BOOLEAN NOT NULL DEFAULT FALSE
-    );
-    CREATE TABLE movie_files (
-        movie_id BIGINT PRIMARY KEY REFERENCES movies(id) ON DELETE CASCADE,
-        relative_path TEXT NOT NULL,
-        size BIGINT NOT NULL,
-        quality SMALLINT NOT NULL,
-        revision_version SMALLINT NOT NULL,
-        revision_real SMALLINT NOT NULL,
-        is_repack BOOLEAN NOT NULL,
-        languages JSONB NOT NULL,
-        release_group TEXT,
-        edition TEXT,
-        scene_name TEXT,
-        date_added TEXT
-    );
-    CREATE TABLE movie_titles (
-        id BIGSERIAL PRIMARY KEY,
-        movie_id BIGINT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
-        title TEXT NOT NULL
-    );
-    CREATE INDEX movie_titles_by_movie ON movie_titles(movie_id);
-    CREATE TABLE quality_definitions (
-        quality SMALLINT PRIMARY KEY,
-        min_size DOUBLE PRECISION,
-        max_size DOUBLE PRECISION,
-        preferred_size DOUBLE PRECISION
-    );
-    CREATE TABLE shadow_runs (
-        id BIGSERIAL PRIMARY KEY,
-        movie_id BIGINT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
-        at TEXT NOT NULL,
-        releases BIGINT NOT NULL,
-        pick_title TEXT,
-        pick_indexer TEXT,
-        pick_quality SMALLINT,
-        pick_size BIGINT,
-        rejections JSONB NOT NULL,
-        error TEXT
-    );
-    CREATE INDEX shadow_runs_by_movie ON shadow_runs(movie_id, at);
-    CREATE TABLE users (
-        name TEXT PRIMARY KEY,
-        password_hash TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    CREATE TABLE sessions (
-        token_hash BYTEA PRIMARY KEY,
-        user_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        expires_at TIMESTAMPTZ NOT NULL
-    );
-    CREATE INDEX sessions_by_expiry ON sessions(expires_at);
-",
-    r"
-    CREATE TABLE grabs (
-        id BIGSERIAL PRIMARY KEY,
-        movie_id BIGINT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
-        hash TEXT NOT NULL UNIQUE,
-        title TEXT NOT NULL,
-        indexer TEXT NOT NULL,
-        quality SMALLINT NOT NULL,
-        size BIGINT NOT NULL,
-        grabbed_at TEXT NOT NULL,
-        state TEXT NOT NULL,
-        message TEXT,
-        imported_path TEXT,
-        finished_at TEXT
-    );
-    CREATE INDEX grabs_by_movie ON grabs(movie_id, grabbed_at);
-",
-    r"
-    CREATE TABLE settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    );
-",
-    r"
-    ALTER TABLE movies
-        ADD COLUMN in_cinemas TEXT,
-        ADD COLUMN digital_release TEXT,
-        ADD COLUMN physical_release TEXT,
-        ADD COLUMN overview TEXT,
-        ADD COLUMN tags JSONB NOT NULL DEFAULT '[]',
-        ADD COLUMN metadata_title TEXT,
-        ADD COLUMN poster TEXT,
-        ADD COLUMN fanart TEXT,
-        ADD COLUMN metadata_refreshed_at TEXT;
-    CREATE TABLE tags (
-        id BIGSERIAL PRIMARY KEY,
-        label TEXT NOT NULL UNIQUE
-    );
-",
-    r"
-    ALTER TABLE quality_profiles ADD COLUMN source_id BIGINT;
-    ALTER TABLE movie_files ADD COLUMN file_id BIGINT, ADD COLUMN media_info JSONB;
-    CREATE SEQUENCE movie_file_ids START 1000000;
-    ALTER TABLE movies DROP CONSTRAINT movies_quality_profile_id_fkey,
-        ADD CONSTRAINT movies_quality_profile_id_fkey FOREIGN KEY (quality_profile_id)
-            REFERENCES quality_profiles(id) ON UPDATE CASCADE;
-    ALTER TABLE movie_files DROP CONSTRAINT movie_files_movie_id_fkey,
-        ADD CONSTRAINT movie_files_movie_id_fkey FOREIGN KEY (movie_id)
-            REFERENCES movies(id) ON DELETE CASCADE ON UPDATE CASCADE;
-    ALTER TABLE movie_titles DROP CONSTRAINT movie_titles_movie_id_fkey,
-        ADD CONSTRAINT movie_titles_movie_id_fkey FOREIGN KEY (movie_id)
-            REFERENCES movies(id) ON DELETE CASCADE ON UPDATE CASCADE;
-    ALTER TABLE shadow_runs DROP CONSTRAINT shadow_runs_movie_id_fkey,
-        ADD CONSTRAINT shadow_runs_movie_id_fkey FOREIGN KEY (movie_id)
-            REFERENCES movies(id) ON DELETE CASCADE ON UPDATE CASCADE;
-    ALTER TABLE grabs DROP CONSTRAINT grabs_movie_id_fkey,
-        ADD CONSTRAINT grabs_movie_id_fkey FOREIGN KEY (movie_id)
-            REFERENCES movies(id) ON DELETE CASCADE ON UPDATE CASCADE;
-",
-    r"
-    ALTER TABLE grabs ADD COLUMN replaces TEXT;
-",
-    r"
-    CREATE TABLE history (
-        id BIGSERIAL PRIMARY KEY,
-        movie_id BIGINT REFERENCES movies(id) ON DELETE SET NULL ON UPDATE CASCADE,
-        movie_title TEXT NOT NULL,
-        event TEXT NOT NULL,
-        at TEXT NOT NULL,
-        source_title TEXT,
-        quality SMALLINT,
-        indexer TEXT,
-        download_id TEXT,
-        data JSONB NOT NULL DEFAULT '{}'
-    );
-    CREATE INDEX history_by_at ON history(at DESC);
-    CREATE INDEX history_by_movie ON history(movie_id, at);
-    CREATE TABLE blocklist (
-        id BIGSERIAL PRIMARY KEY,
-        movie_id BIGINT REFERENCES movies(id) ON DELETE CASCADE ON UPDATE CASCADE,
-        source_title TEXT NOT NULL,
-        indexer TEXT,
-        quality SMALLINT,
-        size BIGINT,
-        hash TEXT,
-        at TEXT NOT NULL,
-        message TEXT
-    );
-    CREATE INDEX blocklist_by_movie ON blocklist(movie_id);
-    CREATE TABLE exclusions (
-        tmdb_id BIGINT PRIMARY KEY,
-        title TEXT NOT NULL,
-        year INTEGER
-    );
-    CREATE TABLE custom_formats (
-        id BIGSERIAL PRIMARY KEY,
-        name TEXT NOT NULL UNIQUE,
-        specifications JSONB NOT NULL,
-        include_when_renaming BOOLEAN NOT NULL DEFAULT FALSE
-    );
-    ALTER TABLE quality_profiles ADD COLUMN format_scores JSONB NOT NULL DEFAULT '{}';
-    CREATE TABLE import_lists (
-        id BIGSERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        settings JSONB NOT NULL,
-        enabled BOOLEAN NOT NULL,
-        monitor BOOLEAN NOT NULL,
-        search_on_add BOOLEAN NOT NULL,
-        quality_profile_id BIGINT REFERENCES quality_profiles(id) ON UPDATE CASCADE,
-        root_folder TEXT NOT NULL,
-        minimum_availability TEXT NOT NULL,
-        tags JSONB NOT NULL DEFAULT '[]',
-        last_sync TEXT,
-        last_error TEXT
-    );
-",
-    // A busca dos que faltam deixou de ser simulação: a tabela vira `searches`.
-    r"
-    ALTER TABLE shadow_runs RENAME TO searches;
-    ALTER SEQUENCE shadow_runs_id_seq RENAME TO searches_id_seq;
-    ALTER INDEX shadow_runs_pkey RENAME TO searches_pkey;
-    ALTER INDEX shadow_runs_by_movie RENAME TO searches_by_movie;
-    ALTER TABLE searches RENAME CONSTRAINT shadow_runs_movie_id_fkey TO searches_movie_id_fkey;
-",
-    // Histórico das tarefas de fundo do serviço. Grava-se no fim de cada
-    // execução; `detail` é o relatório dela, quando a tarefa tem um.
-    r"
-    CREATE TABLE task_runs (
-        id BIGSERIAL PRIMARY KEY,
-        task TEXT NOT NULL,
-        started_at TEXT NOT NULL,
-        finished_at TEXT NOT NULL,
-        ok BOOLEAN NOT NULL,
-        summary TEXT NOT NULL,
-        detail JSONB
-    );
-    CREATE INDEX task_runs_by_task ON task_runs(task, id);
-",
-    // A configuração sai do arquivo e vem para o banco: uma linha por seção,
-    // editada pela tela; os indexadores, todos como cadastro; e os strikes da
-    // limpeza, que antes moravam num JSON ao lado.
-    r"
-    CREATE TABLE config_sections (
-        name TEXT PRIMARY KEY,
-        value JSONB NOT NULL,
-        updated_at TEXT NOT NULL
-    );
-    CREATE TABLE indexers (
-        name TEXT PRIMARY KEY,
-        kind TEXT NOT NULL CHECK (kind IN ('torznab', 'cardigann')),
-        definition TEXT,
-        url TEXT,
-        settings JSONB NOT NULL DEFAULT '{}',
-        enabled BOOLEAN NOT NULL DEFAULT TRUE,
-        added_at TEXT
-    );
-    CREATE TABLE strikes (
-        key TEXT PRIMARY KEY,
-        count INTEGER NOT NULL CHECK (count > 0)
-    );
-",
-    // A disponibilidade mínima por filme deixou de existir: todo filme vale pela
-    // regra de lançado (ver `is_available` no hub).
-    r"
-    ALTER TABLE movies DROP COLUMN minimum_availability;
-",
-    // Sai a API v3 de filmes e o que só ela lia: perfis guardados, tags, a
-    // origem no gerenciador, o id e as faixas do arquivo no formato dela; e
-    // as tabelas que sobraram do espelho do Radarr. Os tamanhos por
-    // qualidade (`quality_definitions`) ficam: o motor de decisão os usa.
-    r"
-    DROP TABLE import_lists;
-    DROP TABLE exclusions;
-    DROP TABLE custom_formats;
-    ALTER TABLE movies
-        DROP COLUMN quality_profile_id,
-        DROP COLUMN tags,
-        DROP COLUMN source,
-        DROP COLUMN source_id;
-    DROP TABLE quality_profiles;
-    DROP TABLE tags;
-    ALTER TABLE movie_files DROP COLUMN file_id, DROP COLUMN media_info;
-    DROP SEQUENCE movie_file_ids;
-",
-    // Séries. O episódio não tem `monitored`: tem `skip`, o motivo de não
-    // ser buscado (`unwanted`, `deleted`, `watched`). Sem arquivo e sem
-    // `skip`, ele é procurado assim que vai ao ar. Um arquivo pode cobrir
-    // vários episódios (multi-episódio); um grab, vários arquivos (pacote).
-    r"
-    CREATE TABLE series (
-        id BIGSERIAL PRIMARY KEY,
-        tmdb_id BIGINT NOT NULL UNIQUE,
-        tvdb_id BIGINT,
-        imdb_id TEXT,
-        title TEXT NOT NULL,
-        original_title TEXT,
-        metadata_title TEXT,
-        original_language TEXT,
-        year INTEGER,
-        status TEXT,
-        overview TEXT,
-        network TEXT,
-        runtime INTEGER NOT NULL DEFAULT 0,
-        poster TEXT,
-        fanart TEXT,
-        path TEXT NOT NULL,
-        season_folder BOOLEAN NOT NULL,
-        monitor_new BOOLEAN NOT NULL,
-        added TEXT,
-        refreshed_at TEXT
-    );
-    CREATE TABLE series_titles (
-        id BIGSERIAL PRIMARY KEY,
-        series_id BIGINT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
-        title TEXT NOT NULL
-    );
-    CREATE INDEX series_titles_by_series ON series_titles(series_id);
-    CREATE TABLE episode_files (
-        id BIGSERIAL PRIMARY KEY,
-        series_id BIGINT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
-        relative_path TEXT NOT NULL,
-        size BIGINT NOT NULL,
-        quality SMALLINT NOT NULL,
-        revision_version SMALLINT NOT NULL,
-        revision_real SMALLINT NOT NULL,
-        is_repack BOOLEAN NOT NULL,
-        languages JSONB NOT NULL,
-        release_group TEXT,
-        scene_name TEXT,
-        date_added TEXT,
-        UNIQUE (series_id, relative_path)
-    );
-    CREATE TABLE episodes (
-        id BIGSERIAL PRIMARY KEY,
-        series_id BIGINT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
-        season INTEGER NOT NULL,
-        number INTEGER NOT NULL,
-        tmdb_id BIGINT,
-        title TEXT,
-        air_date TEXT,
-        overview TEXT,
-        runtime INTEGER NOT NULL DEFAULT 0,
-        skip TEXT CHECK (skip IN ('unwanted', 'deleted', 'watched')),
-        skipped_at TEXT,
-        file_id BIGINT REFERENCES episode_files(id) ON DELETE SET NULL,
-        UNIQUE (series_id, season, number)
-    );
-    CREATE INDEX episodes_by_file ON episodes(file_id);
-    CREATE TABLE series_grabs (
-        id BIGSERIAL PRIMARY KEY,
-        series_id BIGINT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
-        hash TEXT NOT NULL UNIQUE,
-        title TEXT NOT NULL,
-        indexer TEXT NOT NULL,
-        quality SMALLINT NOT NULL,
-        size BIGINT NOT NULL,
-        grabbed_at TEXT NOT NULL,
-        state TEXT NOT NULL,
-        message TEXT,
-        finished_at TEXT
-    );
-    CREATE INDEX series_grabs_by_series ON series_grabs(series_id, grabbed_at);
-    CREATE TABLE series_grab_episodes (
-        grab_id BIGINT NOT NULL REFERENCES series_grabs(id) ON DELETE CASCADE,
-        episode_id BIGINT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
-        PRIMARY KEY (grab_id, episode_id)
-    );
-    CREATE INDEX series_grab_episodes_by_episode ON series_grab_episodes(episode_id);
-    ALTER TABLE history
-        ADD COLUMN series_id BIGINT REFERENCES series(id) ON DELETE SET NULL,
-        ADD COLUMN episode_ids JSONB NOT NULL DEFAULT '[]';
-    CREATE INDEX history_by_series ON history(series_id, at);
-    ALTER TABLE blocklist
-        ADD COLUMN series_id BIGINT REFERENCES series(id) ON DELETE CASCADE;
-    CREATE INDEX blocklist_by_series ON blocklist(series_id);
-",
-    // A busca de cada série: o que se consultou, o que se pegou (uma busca
-    // de série pode pegar vários releases) e por que o resto ficou.
-    r"
-    CREATE TABLE series_searches (
-        id BIGSERIAL PRIMARY KEY,
-        series_id BIGINT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
-        at TEXT NOT NULL,
-        queries JSONB NOT NULL,
-        releases BIGINT NOT NULL,
-        picks JSONB NOT NULL,
-        rejections JSONB NOT NULL,
-        error TEXT
-    );
-    CREATE INDEX series_searches_by_series ON series_searches(series_id, at);
-",
-    // Prioridade: o filme ou a série que passa na frente na fila do acervo,
-    // na do cliente e na busca dos que faltam.
-    r"
-    ALTER TABLE movies ADD COLUMN priority BOOLEAN NOT NULL DEFAULT FALSE;
-    ALTER TABLE series ADD COLUMN priority BOOLEAN NOT NULL DEFAULT FALSE;
-",
-    // Numeração de cena (XEM): o par (temporada, episódio) com que o release
-    // sai, e o do catálogo. Só os pares que diferem; sem linha, é o mesmo.
-    r"
-    CREATE TABLE scene_mappings (
-        series_id BIGINT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
-        scene_season INTEGER NOT NULL,
-        scene_episode INTEGER NOT NULL,
-        season INTEGER NOT NULL,
-        episode INTEGER NOT NULL,
-        PRIMARY KEY (series_id, scene_season, scene_episode)
-    );
-",
-    // Legendas importadas ao lado do vídeo: de um filme ou de um arquivo de
-    // episódio, nunca dos dois. Saem com o dono; o disco é com quem chama.
-    r"
-    CREATE TABLE subtitle_files (
-        id BIGSERIAL PRIMARY KEY,
-        movie_id BIGINT REFERENCES movies(id) ON DELETE CASCADE ON UPDATE CASCADE,
-        episode_file_id BIGINT REFERENCES episode_files(id) ON DELETE CASCADE,
-        relative_path TEXT NOT NULL,
-        language TEXT,
-        forced BOOLEAN NOT NULL DEFAULT FALSE,
-        CHECK ((movie_id IS NULL) <> (episode_file_id IS NULL)),
-        UNIQUE (movie_id, relative_path),
-        UNIQUE (episode_file_id, relative_path)
-    );
-    CREATE INDEX subtitle_files_by_episode_file ON subtitle_files(episode_file_id);
-",
-    // De onde a legenda veio: da importação (hardlink do torrent) ou do
-    // disco (posta à mão, achada pelo verificar ou pelo renomear). Só a da
-    // importação o upgrade apaga sem olhar os links.
-    r"
-    ALTER TABLE subtitle_files
-        ADD COLUMN origin TEXT NOT NULL DEFAULT 'importacao'
-            CHECK (origin IN ('importacao', 'disco'));
-",
-    // Numeração de cena 1:N: um par de cena pode ser mais de um episódio do
-    // catálogo (o duplo), então a chave leva o alvo. O mapa se refaz na
-    // próxima volta da tarefa `cena`.
-    r"
-    DROP TABLE scene_mappings;
-    CREATE TABLE scene_mappings (
-        series_id BIGINT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
-        scene_season INTEGER NOT NULL,
-        scene_episode INTEGER NOT NULL,
-        season INTEGER NOT NULL,
-        episode INTEGER NOT NULL,
-        PRIMARY KEY (series_id, scene_season, scene_episode, season, episode)
-    );
-",
-    // As definições Cardigann baixadas do repositório oficial: o serviço não
-    // tem diretório gravável. `sha` é o SHA-256 do YAML.
-    //
-    // E a estatística de cada indexador por dia (UTC): consultas que saíram,
-    // quantas falharam, quantas foram 429, os grabs e o tempo somado.
-    r"
-    CREATE TABLE definitions (
-        id TEXT PRIMARY KEY,
-        yaml TEXT NOT NULL,
-        sha TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    );
-    CREATE TABLE indexer_stats (
-        indexer TEXT NOT NULL,
-        day DATE NOT NULL,
-        queries INTEGER NOT NULL DEFAULT 0,
-        failures INTEGER NOT NULL DEFAULT 0,
-        rate_limited INTEGER NOT NULL DEFAULT 0,
-        grabs INTEGER NOT NULL DEFAULT 0,
-        total_ms BIGINT NOT NULL DEFAULT 0,
-        PRIMARY KEY (indexer, day)
-    );
-",
-    // Saem os gerenciadores *arr, a sincronização com eles e o passo da
-    // limpeza que cruzava a fila deles: a seção e os campos que só eles
-    // usavam. A configuração recusa campo e seção desconhecidos, e o serviço
-    // não subiria com eles no banco.
-    //
-    // Saem também os tamanhos por qualidade editáveis, que viraram tabela
-    // fixa no código, e a disponibilidade guardada do filme, que se calcula
-    // das datas.
-    r"
-    DELETE FROM config_sections WHERE name = 'gerenciadores';
-    UPDATE config_sections SET value = value - 'public_url' WHERE name = 'servidor';
-    UPDATE config_sections SET value = value - 'skip_orphan_if_missing_in_client'
-        WHERE name = 'limpeza';
-    DROP TABLE quality_definitions;
-    ALTER TABLE movies DROP COLUMN available;
-",
-    // O motivo do bloqueio vira coluna: a expiração e a poda olhavam o texto
-    // da mensagem, que é só para a tela. As linhas que já existem ganham o
-    // motivo pelo texto com que foram gravadas; o resto é `other`, que não
-    // expira.
-    r"
-    ALTER TABLE blocklist ADD COLUMN reason TEXT NOT NULL DEFAULT 'other'
-        CHECK (reason IN ('no_seeds', 'unregistered', 'client_error', 'missing_files',
-            'vanished', 'other'));
-    UPDATE blocklist SET reason = CASE message
-        WHEN 'sem seeds há 30 min' THEN 'no_seeds'
-        WHEN 'o tracker não reconhece mais o torrent' THEN 'unregistered'
-        WHEN 'o cliente marcou o torrent com `error`' THEN 'client_error'
-        WHEN 'o cliente não acha os arquivos do torrent' THEN 'missing_files'
-        WHEN 'o torrent sumiu do cliente' THEN 'vanished'
-        ELSE 'other'
-    END;
-    CREATE INDEX blocklist_by_reason ON blocklist(reason, at);
-",
-    // Assistido deixa de sair sozinho: o usuário marca o que quer apagar (um
-    // filme, uma temporada ou a série inteira, `season` nulo) e confirma na
-    // tela "Para apagar". A marca sai com o filme ou a série. Sai também a
-    // tarefa `assistidos`: o intervalo gravado dela (a configuração recusa
-    // tarefa desconhecida e o serviço não subiria) e o histórico, cujas
-    // remoções seguem no histórico de atividade.
-    r"
-    CREATE TABLE deletion_marks (
-        id BIGSERIAL PRIMARY KEY,
-        movie_id BIGINT REFERENCES movies(id) ON DELETE CASCADE,
-        series_id BIGINT REFERENCES series(id) ON DELETE CASCADE,
-        season INTEGER CHECK (season >= 0),
-        marked_at TEXT NOT NULL,
-        CHECK ((movie_id IS NULL) <> (series_id IS NULL)),
-        CHECK (season IS NULL OR series_id IS NOT NULL)
-    );
-    CREATE UNIQUE INDEX deletion_marks_by_movie ON deletion_marks(movie_id)
-        WHERE movie_id IS NOT NULL;
-    CREATE UNIQUE INDEX deletion_marks_by_series ON deletion_marks(series_id, COALESCE(season, -1))
-        WHERE series_id IS NOT NULL;
-    UPDATE config_sections
-        SET value = jsonb_set(value, '{intervalos}', (value -> 'intervalos') - 'assistidos')
-        WHERE name = 'tarefas' AND jsonb_typeof(value -> 'intervalos') = 'object';
-    DELETE FROM task_runs WHERE task = 'assistidos';
-",
-    // Preferências do Descobrir independem da presença da obra no catálogo.
-    r"
-    CREATE TABLE discover_hidden_titles (
-        kind TEXT NOT NULL CHECK (kind IN ('filme','serie')),
-        tmdb_id INTEGER NOT NULL,
-        title TEXT NOT NULL DEFAULT '',
-        hidden_at TEXT NOT NULL,
-        PRIMARY KEY (kind, tmdb_id)
-    );
-    CREATE TABLE discover_hidden_weeks (
-        year INTEGER NOT NULL,
-        week INTEGER NOT NULL CHECK (week BETWEEN 1 AND 53),
-        hidden_at TEXT NOT NULL,
-        PRIMARY KEY (year, week)
-    );
-    CREATE TABLE discover_hidden_genres (
-        genre_id INTEGER PRIMARY KEY,
-        name TEXT NOT NULL DEFAULT '',
-        hidden_at TEXT NOT NULL
-    );
-",
-    // Episódio apagado por assistido fica fora da busca como qualquer apagado.
-    r"
-    UPDATE episodes SET skip = 'deleted' WHERE skip = 'watched';
-    ALTER TABLE episodes DROP CONSTRAINT episodes_skip_check;
-    ALTER TABLE episodes ADD CONSTRAINT episodes_skip_check
-        CHECK (skip IN ('unwanted', 'deleted'));
-",
-    // O casamento de filmes passa a usar só o ano do catálogo.
-    r"
-    ALTER TABLE movies DROP COLUMN secondary_year;
-",
-    // As regras em settings guardam JSON em texto: saem os nomes antigos.
-    r#"
-    UPDATE settings
-        SET value = ((CASE
-            WHEN value::jsonb ->> 'propers' IN ('preferir_e_atualizar', 'nao_atualizar')
-                THEN jsonb_set(value::jsonb, '{propers}', '"preferir"'::jsonb)
-            ELSE value::jsonb
-        END) - 'pular_checagem_de_espaco')::text
-        WHERE key = 'decisao.regras';
-"#,
-    // Definições vêm dos diretórios locais e do banco, sem catálogo de reserva.
-    r"
-    UPDATE config_sections SET value = value - 'catalogos_reserva' WHERE name = 'servidor';
-",
-    // A carência do Jellyfin só controla quando o assistido vira sugestão.
-    r"
-    UPDATE config_sections
-        SET value = (value - 'delete_watched_after_minutes') ||
-            jsonb_build_object('carencia_sugestao_minutos', value -> 'delete_watched_after_minutes')
-        WHERE name = 'jellyfin' AND value ? 'delete_watched_after_minutes';
-",
-    // Definições só ficam no banco enquanto um cadastro referencia seu id.
-    r"
-    DELETE FROM definitions d WHERE NOT EXISTS (
-        SELECT 1 FROM indexers i WHERE i.name = d.id
-    );
-    DELETE FROM task_runs WHERE task = 'definicoes';
-",
-    // Todos os indexadores usam definições Cardigann.
-    r"
-    DELETE FROM indexers WHERE kind = 'torznab';
-    ALTER TABLE indexers DROP CONSTRAINT indexers_kind_check;
-    ALTER TABLE indexers ADD CONSTRAINT indexers_kind_check CHECK (kind = 'cardigann');
-",
-    // Limpeza e tarefas passam a usar valores fixos, sem seções editáveis.
-    r"
-    DELETE FROM config_sections WHERE name = 'limpeza';
-    DELETE FROM config_sections WHERE name = 'tarefas';
-    UPDATE config_sections SET value = value - 'carencia_sugestao_minutos' WHERE name = 'jellyfin';
-    UPDATE config_sections SET value = value - 'paths' - 'categoria_manual' - 'manual_category' WHERE name = 'biblioteca';
-    UPDATE config_sections SET value = value - 'definicoes_url' - 'http_timeout_seconds' - 'xem_url' WHERE name = 'servidor';
-",
-    // Regras simplificadas: os campos retirados agora são constantes do serviço.
-    r"
-    UPDATE settings SET value = (value::jsonb - 'indexadores' - 'carencia_dias' - 'propers'
-        - 'preferir_flags_do_indexador' - 'legendas_embutidas_liberadas')::text
-        WHERE key = 'decisao.regras';
-",
-    // Estatísticas diárias não são mais mantidas; o circuito fica em memória.
-    r"
-    DROP TABLE indexer_stats;
-",
-    // Descobrir só permite ocultar títulos individuais.
-    r"
-    DROP TABLE discover_hidden_weeks;
-    DROP TABLE discover_hidden_genres;
-",
-];
+/// Versão do schema consolidado; entradas seguintes são 36, 37, ...
+const BASE_VERSION: i32 = 35;
+const MIGRATIONS: &[&str] = &[include_str!("base.sql")];
 
 /// Quanto uma consulta pode levar. A maior consulta real (o catálogo de
 /// séries inteiro, com episódios e arquivos) leva menos de um segundo; o
@@ -943,8 +345,13 @@ impl Store {
             .query_opt("SELECT version FROM schema_version", &[])
             .await?
             .map_or(Ok(0), |row| row.try_get(0))?;
-        let skip = usize::try_from(version).unwrap_or(0);
-        for (index, migration) in (1_i32..).zip(MIGRATIONS).skip(skip) {
+        if version > 0 && version < BASE_VERSION {
+            return Err(StoreError::BeforeBase);
+        }
+        for (index, migration) in (BASE_VERSION..).zip(MIGRATIONS) {
+            if index <= version {
+                continue;
+            }
             tx.batch_execute(migration).await?;
             tx.execute("DELETE FROM schema_version", &[]).await?;
             tx.execute(
@@ -1875,174 +1282,176 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)] // Um cenário de migração: dados antigos e configuração juntos.
-    async fn migra_os_dados_e_as_configuracoes_aposentadas() {
-        let Some(db) = TestDb::new("remocoes_legadas").await else {
+    #[allow(clippy::too_many_lines)] // Verifica constraints, ordem de colunas, FKs, índices e seeds juntos.
+    async fn base_cria_schema_atual_em_banco_vazio() {
+        // TestDb starts with an empty schema and connects through the real migration runner.
+        let Some(db) = TestDb::new("base_schema").await else {
             return;
         };
-        let store = &db.store;
-        let original = movie(10, "Um", false);
-        let movie_id = store
-            .add_movie(&original, &MovieExtras::default())
+        let client = db.store.pool.get().await.unwrap();
+        let version: i32 = client
+            .query_one("SELECT version FROM schema_version", &[])
             .await
-            .unwrap();
-        let mut client = store.pool.get().await.unwrap();
-        let tx = client.transaction().await.unwrap();
-        tx.batch_execute(
-            "ALTER TABLE episodes DROP CONSTRAINT episodes_skip_check;
-             ALTER TABLE episodes ADD CONSTRAINT episodes_skip_check
-                 CHECK (skip IN ('unwanted', 'deleted', 'watched'));
-             ALTER TABLE movies ADD COLUMN secondary_year INTEGER;
-             INSERT INTO series (tmdb_id, title, path, season_folder, monitor_new)
-                 VALUES (10, 'Um', '/series/Um', TRUE, TRUE);
-             INSERT INTO episodes (series_id, season, number, skip, skipped_at)
-                 SELECT id, 1, n, 'watched', '2026-01-01T00:00:00Z'
-                 FROM series CROSS JOIN generate_series(1, 101) AS n;
-             INSERT INTO episodes (series_id, season, number, skip)
-                 SELECT id, 2, n, CASE n WHEN 1 THEN 'unwanted' WHEN 2 THEN 'deleted' END
-                 FROM series CROSS JOIN generate_series(1, 3) AS n;",
-        )
-        .await
-        .unwrap();
-        tx.execute(
-            "UPDATE movies SET secondary_year = 2021 WHERE id = $1",
-            &[&movie_id],
-        )
-        .await
-        .unwrap();
-        let rules = serde_json::json!({
-            "propers": "preferir_e_atualizar", "pular_checagem_de_espaco": true,
-            "folga_minima_mb": 2048
-        })
-        .to_string();
-        tx.execute(
-            "INSERT INTO settings (key, value, updated_at) VALUES ('decisao.regras', $1, 't0')",
-            &[&rules],
-        )
-        .await
-        .unwrap();
-        let server =
-            serde_json::json!({"catalogos_reserva": ["/catalogo"], "catalogos": ["/definicoes"]});
-        let jellyfin = serde_json::json!({"delete_watched_after_minutes": 0, "url": ""});
-        let janitor = serde_json::json!({"managed_categories": ["filmes", "series"]});
-        for (name, value) in [
-            ("servidor", server),
-            ("jellyfin", jellyfin),
-            ("limpeza", janitor.clone()),
+            .unwrap()
+            .get(0);
+        assert_eq!(version, BASE_VERSION);
+        for (table, constraint) in [
+            ("movies", "movies_tmdb_id_key"),
+            ("searches", "searches_pkey"),
+            ("searches", "searches_movie_id_fkey"),
+            ("episodes", "episodes_skip_check"),
+            ("episode_files", "episode_files_series_id_relative_path_key"),
+            ("subtitle_files", "subtitle_files_check"),
+            ("subtitle_files", "subtitle_files_origin_check"),
+            ("deletion_marks", "deletion_marks_season_check"),
+            ("deletion_marks", "deletion_marks_check"),
+            ("deletion_marks", "deletion_marks_check1"),
+            ("scene_mappings", "scene_mappings_pkey"),
+            ("indexers", "indexers_kind_check"),
         ] {
-            tx.execute(
-                "INSERT INTO config_sections (name, value, updated_at) VALUES ($1, $2, 't0')",
-                &[&name, &value],
-            )
-            .await
-            .unwrap();
-        }
-        let first = MIGRATIONS
-            .iter()
-            .position(|sql| sql.contains("UPDATE episodes SET skip = 'deleted'"))
-            .unwrap();
-        for migration in &MIGRATIONS[first..first + 5] {
-            tx.batch_execute(migration).await.unwrap();
-        }
-        let deleted: i64 = tx
-            .query_one("SELECT count(*) FROM episodes WHERE skip = 'deleted'", &[])
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(deleted, 102);
-        let dated: i64 = tx
-            .query_one(
-                "SELECT count(*) FROM episodes WHERE skipped_at = '2026-01-01T00:00:00Z'",
-                &[],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(dated, 101);
-        let unchanged: i64 = tx
-            .query_one(
-                "SELECT count(*) FROM episodes WHERE skip = 'unwanted' OR skip IS NULL",
-                &[],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(unchanged, 2);
-        let text: String = tx
-            .query_one(
-                "SELECT value FROM settings WHERE key = 'decisao.regras'",
-                &[],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        let rules: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(
-            rules,
-            serde_json::json!({"propers": "preferir", "folga_minima_mb": 2048})
-        );
-        // Os dois aliases antigos tinham exatamente o mesmo destino.
-        for propers in ["nao_atualizar", "nao_preferir", "preferir"] {
-            let value = serde_json::json!({"propers": propers}).to_string();
-            tx.execute(
-                "UPDATE settings SET value = $1 WHERE key = 'decisao.regras'",
-                &[&value],
-            )
-            .await
-            .unwrap();
-            tx.batch_execute(MIGRATIONS[first + 2]).await.unwrap();
-            let text: String = tx
+            let exists: bool = client
                 .query_one(
-                    "SELECT value FROM settings WHERE key = 'decisao.regras'",
+                    "SELECT EXISTS (SELECT 1 FROM pg_constraint
+                 WHERE conrelid = $1::text::regclass AND conname = $2)",
+                    &[&table, &constraint],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert!(exists, "{constraint}");
+        }
+        let columns: Vec<String> = client
+            .query(
+                "SELECT attname::text FROM pg_attribute WHERE attrelid = 'movies'::regclass
+             AND attnum > 0 AND NOT attisdropped ORDER BY attnum",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            columns,
+            [
+                "id",
+                "tmdb_id",
+                "imdb_id",
+                "title",
+                "original_title",
+                "original_language",
+                "year",
+                "status",
+                "monitored",
+                "path",
+                "added",
+                "runtime",
+                "clean_title",
+                "in_cinemas",
+                "digital_release",
+                "physical_release",
+                "overview",
+                "metadata_title",
+                "poster",
+                "fanart",
+                "metadata_refreshed_at",
+                "priority",
+            ]
+        );
+        let actions: (i8, i8) = {
+            let row = client
+                .query_one(
+                    "SELECT confupdtype::\"char\", confdeltype::\"char\" FROM pg_constraint
+                 WHERE conrelid = 'searches'::regclass AND conname = 'searches_movie_id_fkey'",
                     &[],
                 )
                 .await
-                .unwrap()
-                .get(0);
-            let rules: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(
-                rules["propers"],
-                if propers == "nao_atualizar" {
-                    "preferir"
-                } else {
-                    propers
-                }
-            );
-        }
-        for (name, expected) in [
-            (
-                "servidor",
-                serde_json::json!({"catalogos": ["/definicoes"]}),
-            ),
-            (
-                "jellyfin",
-                serde_json::json!({"carencia_sugestao_minutos": 0, "url": ""}),
-            ),
-            ("limpeza", janitor),
+                .unwrap();
+            (row.get(0), row.get(1))
+        };
+        assert_eq!(actions, (b'c'.cast_signed(), b'c'.cast_signed()));
+        for index in [
+            "searches_id_seq",
+            "searches_by_movie",
+            "deletion_marks_by_series",
         ] {
-            let value: serde_json::Value = tx
-                .query_one(
-                    "SELECT value FROM config_sections WHERE name = $1",
-                    &[&name],
-                )
+            let exists: bool = client
+                .query_one("SELECT to_regclass($1) IS NOT NULL", &[&index])
                 .await
                 .unwrap()
                 .get(0);
-            assert_eq!(value, expected);
+            assert!(exists, "{index}");
         }
-        tx.commit().await.unwrap();
-        drop(client);
-        assert_eq!(
-            store
-                .movies()
+        for table in ["settings", "config_sections"] {
+            let count: i64 = client
+                .query_one(&format!("SELECT count(*) FROM {table}"), &[])
                 .await
                 .unwrap()
-                .into_iter()
-                .find(|entry| entry.id == movie_id)
-                .unwrap()
-                .movie,
-            original
+                .get(0);
+            assert_eq!(count, 0, "{table}: no migration inserted seed rows");
+        }
+        drop(client);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn versao_35_nao_executa_migracoes() {
+        let Some(db) = TestDb::new("base_noop").await else {
+            return;
+        };
+        db.store
+            .set_setting("preservar", Some("valor"), "t0")
+            .await
+            .unwrap();
+        let client = db.store.pool.get().await.unwrap();
+        let before: String = client
+            .query_one("SELECT xmin::text FROM schema_version", &[])
+            .await
+            .unwrap()
+            .get(0);
+        drop(client);
+        // Reapplying CREATE TABLE would fail; rewriting the version would change xmin.
+        db.store.migrate().await.unwrap();
+        let client = db.store.pool.get().await.unwrap();
+        let after: String = client
+            .query_one("SELECT xmin::text FROM schema_version", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(before, after);
+        assert_eq!(
+            db.store.setting("preservar").await.unwrap().as_deref(),
+            Some("valor")
         );
+        drop(client);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn versao_10_recusa_atualizacao_e_preserva_versao() {
+        let Some(db) = TestDb::new("base_recusa").await else {
+            return;
+        };
+        let client = db.store.pool.get().await.unwrap();
+        client
+            .execute("UPDATE schema_version SET version = 10", &[])
+            .await
+            .unwrap();
+        drop(client);
+        let error = db.store.migrate().await.unwrap_err();
+        assert!(matches!(error, StoreError::BeforeBase));
+        assert_eq!(
+            error.to_string(),
+            "banco anterior à versão 35: atualize primeiro por uma versão do acervo-hub anterior à consolidação"
+        );
+        let client = db.store.pool.get().await.unwrap();
+        let version: i32 = client
+            .query_one("SELECT version FROM schema_version", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(version, 10);
+        drop(client);
         db.drop().await;
     }
 
@@ -2087,132 +1496,6 @@ mod tests {
             .add_movie(&movie, &MovieExtras::default())
             .await
             .unwrap()
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)] // Um snapshot antigo atravessa as seis migrações novas.
-    async fn simplificacao_migra_snapshot_antigo_sem_perder_configuracao() {
-        let Some(db) = TestDb::new("simplificacao").await else {
-            return;
-        };
-        let store = &db.store;
-        let client = store.pool.get().await.unwrap();
-        client.batch_execute("CREATE TABLE indexer_stats (indexer TEXT);
-            CREATE TABLE discover_hidden_weeks (year INTEGER);
-            CREATE TABLE discover_hidden_genres (genre_id INTEGER);
-            ALTER TABLE indexers DROP CONSTRAINT indexers_kind_check;
-            ALTER TABLE indexers ADD CONSTRAINT indexers_kind_check CHECK (kind IN ('torznab', 'cardigann'));
-            INSERT INTO indexers (name, kind, definition, settings, enabled) VALUES
-                ('local', 'cardigann', '/catalogo/local.yml', '{}'::jsonb, true),
-                ('remoto', 'cardigann', NULL, '{}'::jsonb, true),
-                ('legado', 'torznab', NULL, '{}'::jsonb, true);
-            INSERT INTO definitions (id, yaml, sha, updated_at) VALUES
-                ('local', 'id: local', 's1', 't0'), ('remoto', 'id: remoto', 's2', 't0'),
-                ('sem-uso', 'id: sem-uso', 's3', 't0');
-            INSERT INTO task_runs (task, started_at, finished_at, ok, summary) VALUES
-                ('definicoes', 't0', 't0', true, 'feito'), ('rss', 't0', 't0', true, 'feito');
-            UPDATE schema_version SET version = 29;").await.unwrap();
-        let sections = [
-            (
-                "servidor",
-                serde_json::json!({"api_key": "chave-de-teste", "catalogos": ["/catalogo"],
-                "proxy_url": "http://proxy.invalid", "flaresolverr_url": "http://solver.invalid",
-                "definicoes_url": "http://repositorio.invalid", "http_timeout_seconds": 60, "xem_url": "http://xem.invalid"}),
-                serde_json::json!({"api_key": "chave-de-teste", "catalogos": ["/catalogo"],
-                "proxy_url": "http://proxy.invalid", "flaresolverr_url": "http://solver.invalid"}),
-            ),
-            (
-                "biblioteca",
-                serde_json::json!({"roots": ["/media"], "root_folders": ["/media/movies"],
-                "category": "acervo", "paths": {"/media": "/media"}, "categoria_manual": "manual", "manual_category": "manual"}),
-                serde_json::json!({"roots": ["/media"], "root_folders": ["/media/movies"], "category": "acervo"}),
-            ),
-            (
-                "jellyfin",
-                serde_json::json!({"url": "http://media.invalid", "api_key": "chave", "carencia_sugestao_minutos": 60}),
-                serde_json::json!({"url": "http://media.invalid", "api_key": "chave"}),
-            ),
-        ];
-        for (name, old, _) in &sections {
-            store.save_config_section(name, old, "t0").await.unwrap();
-        }
-        for name in ["limpeza", "tarefas"] {
-            store
-                .save_config_section(name, &serde_json::json!({}), "t0")
-                .await
-                .unwrap();
-        }
-        let expected = serde_json::json!({"atraso": {"minutos": 1440, "pular_se_melhor_qualidade": true},
-            "tamanho_maximo_mb": 30000, "folga_minima_mb": 2048, "downloads_simultaneos": 3, "aceitar_legenda_embutida": true});
-        let mut old = expected.clone();
-        for (key, value) in serde_json::json!({"indexadores": {"remoto": {"prioridade": 25, "seeders_minimos": 1}},
-            "carencia_dias": 0, "propers": "preferir", "preferir_flags_do_indexador": true, "legendas_embutidas_liberadas": ""}).as_object().unwrap() {
-            old[key] = value.clone();
-        }
-        store
-            .set_setting("decisao.regras", Some(&old.to_string()), "t0")
-            .await
-            .unwrap();
-        drop(client);
-        store.migrate().await.unwrap();
-        let stored = store.config_sections().await.unwrap();
-        assert_eq!(stored.len(), 3);
-        for (name, _, expected) in sections {
-            assert_eq!(
-                &stored.iter().find(|(n, _)| n == name).unwrap().1,
-                &expected
-            );
-        }
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(
-                &store.setting("decisao.regras").await.unwrap().unwrap()
-            )
-            .unwrap(),
-            expected
-        );
-        assert_eq!(
-            store
-                .definitions()
-                .await
-                .unwrap()
-                .iter()
-                .map(|d| d.id.as_str())
-                .collect::<Vec<_>>(),
-            ["local", "remoto"]
-        );
-        assert_eq!(store.indexers().await.unwrap().len(), 2);
-        assert_eq!(
-            store
-                .task_runs(10)
-                .await
-                .unwrap()
-                .iter()
-                .map(|r| r.task.as_str())
-                .collect::<Vec<_>>(),
-            ["rss"]
-        );
-        let client = store.pool.get().await.unwrap();
-        for table in [
-            "indexer_stats",
-            "discover_hidden_weeks",
-            "discover_hidden_genres",
-        ] {
-            let exists: bool = client
-                .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
-                .await
-                .unwrap()
-                .get(0);
-            assert!(!exists, "{table}");
-        }
-        assert!(client.execute("INSERT INTO indexers (name, kind, settings, enabled) VALUES ('invalido', 'torznab', '{}', true)", &[]).await.is_err());
-        let version: i32 = client
-            .query_one("SELECT version FROM schema_version", &[])
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(version, 35);
-        drop(client);
-        db.drop().await;
     }
 
     #[tokio::test]

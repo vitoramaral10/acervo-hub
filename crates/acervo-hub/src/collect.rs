@@ -61,7 +61,7 @@ pub async fn collect(config: &Config, store: &Store) -> Result<Session> {
         }
     }
 
-    inventory.library_size = acervo_fs::measure_roots(&config.library.roots);
+    inventory.library_size = crate::fs::measure_roots(&config.library.roots);
     tracing::info!(biblioteca = %inventory.library_size, "biblioteca medida");
 
     Ok(Session { inventory, qbit })
@@ -111,14 +111,14 @@ async fn read_download(
     let mut facts: Vec<FileFacts> = Vec::with_capacity(files.len());
     for file in &files {
         let path = client_path(torrent, file);
-        let fact = match acervo_fs::facts_for(&path) {
+        let fact = match crate::fs::facts_for(&path) {
             Ok(fact) => fact,
             // Download incompleto cujo arquivo o cliente ainda não criou: não
             // há nada no disco, e o torrent segue na decisão — um órfão pausado
             // que nunca começou precisa poder sair da fila. Em torrent
             // completo, arquivo ausente é caminho errado, e caminho errado
             // faria um seed parecer sem hardlink: esse continua sendo erro.
-            Err(acervo_fs::FsError::Stat { source, .. })
+            Err(crate::fs::FsError::Stat { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound && torrent.progress < 1.0 =>
             {
                 continue;

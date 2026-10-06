@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use acervo_api::Catalog;
+use crate::api::Catalog;
 use acervo_clients::jellyfin::JellyfinClient;
 use acervo_store::NewTaskRun;
 use anyhow::{Context, Result};

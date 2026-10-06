@@ -3,24 +3,6 @@
 version = 4
 
 [[package]]
-name = "acervo-api"
-version = "0.0.0"
-dependencies = [
- "acervo-indexers",
- "async-trait",
- "axum",
- "futures",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "time",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
 name = "acervo-clients"
 version = "0.0.0"
 dependencies = [
@@ -48,24 +30,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "acervo-fs"
-version = "0.0.0"
-dependencies = [
- "acervo-core",
- "rustix",
- "thiserror",
- "tracing",
-]
-
-[[package]]
 name = "acervo-hub"
 version = "0.0.0"
 dependencies = [
- "acervo-api",
  "acervo-clients",
  "acervo-core",
  "acervo-decision",
- "acervo-fs",
  "acervo-indexers",
  "acervo-janitor",
  "acervo-metadata",
@@ -77,12 +47,14 @@ dependencies = [
  "clap",
  "fancy-regex",
  "flate2",
+ "futures",
  "reqwest",
  "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tar",
+ "thiserror",
  "time",
  "tokio",
  "tracing",

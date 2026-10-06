@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use acervo_api::{ALL, Catalog, Entry, SearchError};
+use crate::api::{ALL, Catalog, Entry, SearchError};
 use acervo_indexers::{Capabilities, Indexer, IndexerError, Release, SearchQuery, SearchSupport};
 use async_trait::async_trait;
 

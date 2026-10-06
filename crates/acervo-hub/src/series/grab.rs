@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use acervo_api::Catalog;
+use crate::api::Catalog;
 use acervo_clients::{NewTorrent, QbitClient, TorrentFile, TorrentInfo, client_path};
 use acervo_core::DownloadHash;
 use acervo_decision::{SceneMapping, scene_to_catalog};

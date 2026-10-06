@@ -3,9 +3,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use acervo_api::{
-    Accounts, Admin, Catalog, DefinitionCatalog, DefinitionView, Entry, SettingView,
-    router_with_admin,
+use crate::api::{
+    Accounts, Admin, Catalog, DefinitionCatalog, DefinitionView, Entry, SettingView, router,
 };
 use acervo_indexers::{
     Capabilities, Category, Indexer, IndexerError, Release, SearchQuery, SearchSupport,
@@ -219,7 +218,7 @@ impl Admin for FakeAdmin {
         Ok(json!([{ "titulo": "Filme", "ano": 2020 }]))
     }
 
-    async fn search_missing(&self) -> Result<Value, String> {
+    fn search_missing(&self) -> Result<Value, String> {
         Ok(json!({ "iniciada": true, "rodando": true, "buscados": 0, "total": 3 }))
     }
 
@@ -299,7 +298,7 @@ async fn serve() -> String {
     let catalog = Catalog::new([entry("vencido")]).unwrap();
     let admin: Arc<dyn Admin> = Arc::new(FakeAdmin::default());
     let accounts: Arc<dyn Accounts> = Arc::new(FakeAccounts::default());
-    let app = router_with_admin(catalog, KEY, Some(admin), Some(accounts));
+    let app = router(catalog, KEY, admin, accounts);
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     format!("http://{address}")
 }

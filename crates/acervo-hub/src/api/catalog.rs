@@ -2,17 +2,19 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use acervo_indexers::{
-    Capabilities, Category, Indexer, IndexerError, IndexerFailure, Release, ResolvedDownload,
-    SearchMode, SearchQuery, SearchSupport,
+    Capabilities, Indexer, IndexerError, IndexerFailure, Release, ResolvedDownload, SearchMode,
+    SearchQuery,
 };
 use futures::future::{BoxFuture, FutureExt, Shared, join_all};
 use time::OffsetDateTime;
 use tokio::time::{Duration, Instant};
 
-use crate::SearchError;
+use super::SearchError;
+#[cfg(test)]
+use acervo_indexers::{Category, SearchSupport};
 
 /// Nome reservado para a busca em todos os indexadores de uma vez.
 pub const ALL: &str = "all";
@@ -211,24 +213,6 @@ impl std::fmt::Debug for Requests {
     }
 }
 
-/// Uma consulta que de fato foi ao indexador — a reaproveitada não conta.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueryRecord {
-    pub indexer: String,
-    pub ok: bool,
-    /// O indexador respondeu 429.
-    pub rate_limited: bool,
-    pub elapsed: std::time::Duration,
-}
-
-/// Quem quer saber de cada consulta: a estatística por indexador. Chamado
-/// fora de qualquer lock, e não pode bloquear.
-pub trait QueryObserver: Send + Sync + std::fmt::Debug {
-    fn observe(&self, record: QueryRecord);
-}
-
-type Observer = Arc<OnceLock<Arc<dyn QueryObserver>>>;
-
 /// Catálogo compartilhado entre as rotas. Clones veem as mesmas entradas, a
 /// mesma saúde e as mesmas consultas guardadas; trocar a credencial de um
 /// indexador troca para todos.
@@ -237,23 +221,6 @@ pub struct Catalog {
     entries: Arc<RwLock<BTreeMap<String, Entry>>>,
     health: Arc<Mutex<HashMap<String, Health>>>,
     requests: Arc<Mutex<Requests>>,
-    observer: Observer,
-}
-
-fn notify(
-    observer: &Observer,
-    name: &str,
-    started: std::time::Instant,
-    outcome: Result<(), &IndexerError>,
-) {
-    if let Some(observer) = observer.get() {
-        observer.observe(QueryRecord {
-            indexer: name.to_owned(),
-            ok: outcome.is_ok(),
-            rate_limited: outcome.err().and_then(IndexerError::rate_limited).is_some(),
-            elapsed: started.elapsed(),
-        });
-    }
 }
 
 /// Resultado de uma consulta servida: página já cortada e falhas parciais.
@@ -290,14 +257,7 @@ impl Catalog {
             entries: Arc::new(RwLock::new(catalog)),
             health: Arc::default(),
             requests: Arc::default(),
-            observer: Arc::default(),
         })
-    }
-
-    /// Passa a avisar `observer` de cada consulta feita — de qualquer clone.
-    /// Só o primeiro vale.
-    pub fn observe_with(&self, observer: Arc<dyn QueryObserver>) {
-        let _ = self.observer.set(observer);
     }
 
     // Nenhum lock atravessa `await`: as entradas são copiadas (são `Arc`) e
@@ -361,13 +321,10 @@ impl Catalog {
         let indexer = Arc::clone(&entry.indexer);
         let health = Arc::clone(&self.health);
         let slots = Arc::clone(&self.requests);
-        let observer = Arc::clone(&self.observer);
         let slot_key = key.clone();
         let started = now;
         let fetch = async move {
-            let clock = std::time::Instant::now();
             let outcome = indexer.search(&query).await;
-            notify(&observer, &name, clock, outcome.as_ref().map(|_| ()));
             record(&health, &name, outcome.as_ref().map(Vec::len));
             let outcome = outcome.map_err(|error| error.to_string());
             if outcome.is_err() {
@@ -408,11 +365,6 @@ impl Catalog {
     #[must_use]
     pub fn len(&self) -> usize {
         self.read().len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.read().is_empty()
     }
 
     fn targets(&self, target: &str) -> Result<Vec<Entry>, SearchError> {
@@ -511,14 +463,6 @@ impl Catalog {
         Ok(())
     }
 
-    /// O indexador precisa intermediar os downloads dele?
-    #[must_use]
-    pub fn proxies_downloads(&self, name: &str) -> bool {
-        self.read()
-            .get(name)
-            .is_some_and(|entry| entry.indexer.proxies_downloads())
-    }
-
     /// Baixa um `.torrent` pela sessão do indexador. O link que resolve para
     /// um magnet é falha aqui: quem aceita magnet usa
     /// [`Catalog::resolve_download`].
@@ -527,6 +471,7 @@ impl Catalog {
     ///
     /// Indexador desconhecido (inclusive `all`), ou falha do indexador — link
     /// fora da origem dele, sessão recusada, resposta que não é `.torrent`.
+    #[cfg(test)]
     pub async fn download(&self, name: &str, link: &url::Url) -> Result<Vec<u8>, SearchError> {
         match self.resolve_download(name, link).await? {
             ResolvedDownload::Torrent(bytes) => Ok(bytes),
@@ -583,25 +528,13 @@ impl Catalog {
         if let Some(until) = self.rate_limited_until(name) {
             return Err(waiting(name, until).to_string());
         }
-        let clock = std::time::Instant::now();
         let outcome = entry
             .indexer
             .search(&SearchQuery::general(""))
             .await
             .map(|releases| releases.len());
-        notify(&self.observer, name, clock, outcome.as_ref().map(|_| ()));
         self.record(name, outcome.as_ref().map(|count| *count));
         outcome.map_err(|error| error.to_string())
-    }
-
-    /// Capacidades de um indexador, ou a união de todos em `all`.
-    ///
-    /// # Errors
-    ///
-    /// Indexador desconhecido.
-    pub fn capabilities(&self, target: &str) -> Result<Capabilities, SearchError> {
-        let targets = self.targets(target)?;
-        Ok(merge(targets.iter().map(|entry| &entry.capabilities)))
     }
 
     /// Consulta os indexadores elegíveis em paralelo e ordena os releases por data.
@@ -837,6 +770,7 @@ fn covers(requested: u32, actual: u32) -> bool {
     requested == actual || (requested.is_multiple_of(1000) && requested / 1000 == actual / 1000)
 }
 
+#[cfg(test)]
 fn merge<'a>(all: impl Iterator<Item = &'a Capabilities>) -> Capabilities {
     let mut merged = Capabilities::default();
     let mut categories: BTreeMap<u32, Category> = BTreeMap::new();
@@ -854,6 +788,7 @@ fn merge<'a>(all: impl Iterator<Item = &'a Capabilities>) -> Capabilities {
     merged
 }
 
+#[cfg(test)]
 fn union(target: &mut SearchSupport, source: &SearchSupport) {
     if source.available {
         target.available = true;

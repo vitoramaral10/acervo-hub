@@ -3,19 +3,31 @@
 //! com ela é a própria tela, ou um script com a chave em `X-Api-Key`.
 
 mod catalog;
+#[cfg(test)]
+mod tests;
 mod ui;
+
+#[cfg(test)]
+pub use tests::support::{Accounts, Admin};
+// Test builds substitute HTTP fixtures without a database.
+#[cfg(test)]
+type AdminBackend = dyn Admin;
+#[cfg(not(test))]
+type AdminBackend = crate::serve::HubAdmin;
+#[cfg(test)]
+type AccountsBackend = dyn Accounts;
+#[cfg(not(test))]
+type AccountsBackend = crate::serve::Database;
 
 use std::sync::Arc;
 
 use axum::Router;
 use axum::routing::get;
 
-pub use catalog::{
-    ALL, Catalog, CatalogError, Entry, Health, IndexerView, Page, QueryObserver, QueryRecord,
-};
-pub use ui::{
-    Accounts, Admin, DefinitionCatalog, DefinitionView, SettingView, authorize_ui, ui_json,
-};
+pub use catalog::{ALL, Catalog, Entry, IndexerView};
+#[cfg(test)]
+pub use catalog::{CatalogError, Health};
+pub use ui::{DefinitionCatalog, DefinitionView, SettingView, authorize_ui, ui_json};
 
 /// A chave da interface, lida a cada requisição: trocada pela tela, a nova
 /// vale na hora, sem reiniciar.
@@ -73,8 +85,8 @@ pub enum SearchError {
 struct Server {
     catalog: Catalog,
     api_key: ApiKey,
-    admin: Option<Arc<dyn Admin>>,
-    accounts: Option<Arc<dyn Accounts>>,
+    admin: Arc<AdminBackend>,
+    accounts: Arc<AccountsBackend>,
 }
 
 impl std::fmt::Debug for Server {
@@ -90,18 +102,11 @@ impl std::fmt::Debug for Server {
 }
 
 /// Monta as rotas: a interface, a API dela e `GET /health`.
-pub fn router(catalog: Catalog, api_key: impl Into<ApiKey>) -> Router {
-    router_with_admin(catalog, api_key, None, None)
-}
-
-/// Como [`router`], com a interface podendo reconfigurar indexadores por meio
-/// de `admin`. Sem ele, a interface lista, testa e busca, mas não edita. Sem
-/// `accounts`, ninguém entra pela tela: só vale a chave em `X-Api-Key`.
-pub fn router_with_admin(
+pub fn router(
     catalog: Catalog,
     api_key: impl Into<ApiKey>,
-    admin: Option<Arc<dyn Admin>>,
-    accounts: Option<Arc<dyn Accounts>>,
+    admin: Arc<AdminBackend>,
+    accounts: Arc<AccountsBackend>,
 ) -> Router {
     let server = Arc::new(Server {
         catalog,

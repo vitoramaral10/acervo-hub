@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use acervo_api::{ALL, Catalog};
+use crate::api::{ALL, Catalog};
 use acervo_decision::{
     BlockedRelease, Decision, Delay, Engine, ExistingFile, Indexer, Mode, Profile, Queued, Release,
     Settings, Target,

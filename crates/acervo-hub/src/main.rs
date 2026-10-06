@@ -15,6 +15,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod agenda;
+mod api;
 mod apply;
 mod automatic;
 mod collect;
@@ -24,6 +25,7 @@ mod decide;
 mod definitions;
 mod discover;
 mod events;
+mod fs;
 mod grab;
 mod heal;
 mod health;
@@ -129,7 +131,7 @@ async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "acervo_hub=info,acervo_fs=info,acervo_api=info".into()),
+                .unwrap_or_else(|_| "acervo_hub=info".into()),
         )
         .with_target(false)
         .init();

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use acervo_api::{ALL, Catalog, Entry, SearchError};
+use crate::api::{ALL, Catalog, Entry, SearchError};
 use acervo_indexers::{Capabilities, Indexer, IndexerError, Release, SearchQuery, SearchSupport};
 use async_trait::async_trait;
 

@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use acervo_api::{Catalog, IndexerView};
+use crate::api::{Catalog, IndexerView};
 use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -222,7 +222,7 @@ pub fn router(readiness: Arc<Readiness>) -> Router {
 
 async fn ready(State(readiness): State<Arc<Readiness>>) -> Response {
     let (status, body) = readiness.check().await;
-    let mut response = acervo_api::ui_json(status, &body);
+    let mut response = crate::api::ui_json(status, &body);
     response.headers_mut().insert(
         axum::http::header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static("no-store"),
@@ -476,7 +476,7 @@ fn total_space(path: &Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use acervo_api::Health;
+    use crate::api::Health;
 
     use super::*;
 

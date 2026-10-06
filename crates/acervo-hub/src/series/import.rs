@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use acervo_api::Catalog;
+use crate::api::Catalog;
 use acervo_clients::{QbitClient, TorrentFile, TorrentInfo, client_path};
 use acervo_core::DownloadHash;
 use acervo_store::{

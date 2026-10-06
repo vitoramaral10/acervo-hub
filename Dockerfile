@@ -15,6 +15,7 @@ RUN apt-get update \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+# Inclui o bundle versionado em crates/acervo-hub/src/api/ui/dist.
 
 # O `target/` e o registry ficam em cache mount: não viram camada, então o
 # build de CI reaproveita a compilação sem carregar nada disso na imagem. Como
