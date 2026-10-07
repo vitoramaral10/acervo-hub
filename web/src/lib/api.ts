@@ -938,18 +938,6 @@ export interface DiscoverSearchResponse extends DiscoverPageResponse {
   itens: DiscoverSearchItem[]
 }
 
-export interface DiscoverWeek {
-  semana: number
-  inicio: string
-  fim: string
-  total: number | null
-}
-
-export interface DiscoverWeeks {
-  ano: number
-  semanas: DiscoverWeek[]
-}
-
 export interface DiscoverReleases {
   ano: number
   semana: number
@@ -973,7 +961,6 @@ export const discover = {
   details: (tipo: MediaKind, tmdb: number) => request<DiscoverDetails>('GET', `${DISCOVER}/titulo/${tipo}/${tmdb}`),
   search: (q: string, pagina: number) =>
     request<DiscoverSearchResponse>('GET', `${DISCOVER}/busca?${new URLSearchParams({ q, pagina: String(pagina) })}`),
-  weeks: (ano: number) => request<DiscoverWeeks>('GET', `${DISCOVER}/semanas/${ano}`),
   releases: (ano: number, semana: number) =>
     request<DiscoverReleases>('GET', `${DISCOVER}/semanas/${ano}/${semana}`),
   list: (lista: DiscoverList, tipo: MediaKind, pagina: number) =>

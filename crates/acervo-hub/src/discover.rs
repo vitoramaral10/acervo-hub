@@ -289,7 +289,6 @@ pub(crate) fn routes() -> Router<Arc<Web>> {
     Router::new()
         .route("/ui/api/descobrir/titulo/{tipo}/{tmdb}", get(details))
         .route("/ui/api/descobrir/busca", get(search))
-        .route("/ui/api/descobrir/semanas/{ano}", get(weeks))
         .route("/ui/api/descobrir/semanas/{ano}/{semana}", get(week))
         .route("/ui/api/descobrir/listas/{lista}", get(list))
         .route("/ui/api/descobrir/generos", get(genre_list))
@@ -299,25 +298,6 @@ pub(crate) fn routes() -> Router<Arc<Web>> {
             "/ui/api/descobrir/ocultos/titulos/{tipo}/{tmdb}",
             delete(unhide_title),
         )
-}
-
-async fn weeks(State(web): Shared, headers: HeaderMap, Path(year): Path<i32>) -> WebResult {
-    let store = enter(&web, &headers, &Method::GET).await?;
-    valid_year(year).map_err(|e| fail(anyhow_bad(&e)))?;
-    crate::metadata::require_tmdb(store)
-        .await
-        .map_err(|e| fail(anyhow_bad(&e)))?;
-    let filters = Filters::load(store)
-        .await
-        .map_err(|e| fail(anyhow_bad(&e)))?;
-    let mut weeks = Vec::new();
-    for week in 1..=time::util::weeks_in_year(year) {
-        let (start, end) = week_dates(year, week).map_err(|e| fail(anyhow_bad(&e)))?;
-        let total = cached(&WEEKS, &week_key(year, week), WEEK_TTL)
-            .map(|items| items.iter().filter(|i| filters.visible(i)).count());
-        weeks.push(json!({"semana": week, "inicio": start, "fim": end, "total": total}));
-    }
-    ok(&json!({"ano": year, "semanas": weeks}))
 }
 
 async fn week(

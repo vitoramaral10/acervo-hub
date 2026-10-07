@@ -98,13 +98,16 @@ não há tradução de caminhos.
 
 ### Descobrir
 
-Lançamentos de filmes no Brasil por semana ISO, além das listas do TMDB de **Em alta**,
+Lançamentos de filmes no Brasil em uma lista contínua, da semana ISO atual para trás,
+com um bloco por semana e **Carregar mais** até dois anos atrás. Semanas sem títulos
+visíveis são puladas, com até oito semanas consultadas por carregamento. Há também as
+listas do TMDB de **Em alta**,
 **Populares**, **Em breve** (filmes) e **No ar** (séries). Obras que já estão no catálogo
 não aparecem nas listas. A busca global, acessível de qualquer tela pelo menu, por `/`
 ou Ctrl/Cmd+K, encontra filmes e séries, incluindo títulos
 ocultos ou já no acervo. Ao abrir um título, aparecem sinopse, elenco, direção ou criação,
 trailer e recomendações, com adição ao acervo ou acesso à obra já cadastrada.
-É possível ocultar títulos individuais e mostrá-los de novo. Semanas e gêneros permanecem visíveis.
+É possível ocultar títulos individuais e mostrá-los de novo.
 A chave do TMDB é configurada em **Configurações → TMDB**.
 
 ### Busca e decisão

@@ -17,23 +17,15 @@ import {
   type DiscoverList,
   type DiscoverPageResponse,
   type DiscoverReleases,
-  type DiscoverWeek,
   type MediaKind,
 } from '@/lib/api'
-import { cn } from '@/lib/utils'
 import { GRID, Poster } from '@/pages/Movies'
 
 type Tab = 'lancamentos' | 'em_alta' | 'populares' | 'proximos' | 'ocultos'
 const queryKey = ['descobrir'] as const
 const itemKey = (item: Pick<DiscoverItem, 'tipo' | 'tmdb'>) => `${item.tipo}-${item.tmdb}`
-const today = () => {
-  const date = new Date()
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
-}
 const dateLabel = (date: string) =>
   new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit' }).format(new Date(`${date}T12:00:00`))
-const weekLabel = (week: DiscoverWeek) =>
-  `Semana ${week.semana} · ${dateLabel(week.inicio)} a ${dateLabel(week.fim)}${week.total == null ? '' : ` · ${week.total} títulos`}`
 
 function ErrorState({ error, retry }: { error: Error; retry: () => void }) {
   return (
@@ -96,9 +88,15 @@ export function DiscoverPage() {
     onMutate: async (item) => {
       await client.cancelQueries({ queryKey })
       const previous = client.getQueriesData({ queryKey })
-      client.setQueriesData<DiscoverReleases>(
-        { queryKey: [...queryKey, 'semana'] },
-        (data) => data && withoutTitle(data, item),
+      client.setQueriesData<InfiniteData<ReleasesPage>>(
+        { queryKey: [...queryKey, 'lancamentos'] },
+        (data) => data && {
+          ...data,
+          pages: data.pages.map((page) => ({
+            ...page,
+            weeks: page.weeks.map((week) => withoutTitle(week, item)),
+          })),
+        },
       )
       client.setQueriesData<InfiniteData<DiscoverPageResponse>>(
         { queryKey: [...queryKey, 'lista'] },
@@ -117,9 +115,15 @@ export function DiscoverPage() {
   const added = () => {
     if (chosen) {
       // Retira da grade imediatamente enquanto o servidor recalcula os filtros.
-      client.setQueriesData<DiscoverReleases>(
-        { queryKey: [...queryKey, 'semana'] },
-        (data) => data && withoutTitle(data, chosen),
+      client.setQueriesData<InfiniteData<ReleasesPage>>(
+        { queryKey: [...queryKey, 'lancamentos'] },
+        (data) => data && {
+          ...data,
+          pages: data.pages.map((page) => ({
+            ...page,
+            weeks: page.weeks.map((week) => withoutTitle(week, chosen)),
+          })),
+        },
       )
       client.setQueriesData<InfiniteData<DiscoverPageResponse>>(
         { queryKey: [...queryKey, 'lista'] },
@@ -250,139 +254,118 @@ function isoWeekYear(date: Date) {
   return thursday.getFullYear()
 }
 
+type IsoWeek = { year: number; week: number }
+type ReleasesPage = { weeks: DiscoverReleases[]; next: IsoWeek | undefined }
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000
+
+// Aritmética UTC evita que o horário de verão altere a distância entre segundas ISO.
+function weekStart({ year, week }: IsoWeek) {
+  const january4 = new Date(Date.UTC(year, 0, 4))
+  return january4.getTime() - ((january4.getUTCDay() + 6) % 7) * (WEEK_MS / 7) + (week - 1) * WEEK_MS
+}
+
+function isoWeek(date: Date): IsoWeek {
+  const year = isoWeekYear(date)
+  const day = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()))
+  const monday = day.getTime() - ((day.getUTCDay() + 6) % 7) * (WEEK_MS / 7)
+  return { year, week: 1 + Math.round((monday - weekStart({ year, week: 1 })) / WEEK_MS) }
+}
+
+function previousWeek(current: IsoWeek): IsoWeek {
+  if (current.week > 1) return { ...current, week: current.week - 1 }
+  // 28 de dezembro sempre pertence à última semana ISO (52 ou 53).
+  return isoWeek(new Date(current.year - 1, 11, 28))
+}
+
 function Releases({ cards }: { cards: Cards }) {
-  const currentYear = isoWeekYear(new Date())
-  const [year, setYear] = useState(currentYear)
-  const [selected, setSelected] = useState<number | null>(null)
-  const [order, setOrder] = useState('nota')
-  const weeks = useQuery({ queryKey: [...queryKey, 'semanas', year], queryFn: () => discover.weeks(year) })
-  const available = weeks.data?.semanas ?? []
-  const week =
-    available.find((entry) => entry.semana === selected) ??
-    available.find((entry) => entry.inicio <= today() && entry.fim >= today()) ??
-    available[0]
-  const releases = useQuery({
-    queryKey: [...queryKey, 'semana', year, week?.semana],
-    queryFn: () => discover.releases(year, week!.semana),
-    enabled: !!week,
+  const [range] = useState(() => {
+    const now = new Date()
+    const oldest = new Date(now)
+    oldest.setFullYear(now.getFullYear() - 2)
+    return { start: isoWeek(now), oldest: weekStart(isoWeek(oldest)) }
   })
-  // A contagem retornada ao abrir uma semana já é filtrada, mesmo se o índice ainda não tinha cache.
-  const labeledWeeks = available.map((entry) => ({
-    ...entry,
-    total:
-      entry.semana === releases.data?.semana && releases.data.ano === year ? releases.data.itens.length : entry.total,
-  }))
+  const [order, setOrder] = useState('nota')
+  const releases = useInfiniteQuery({
+    queryKey: [...queryKey, 'lancamentos', range.start],
+    initialPageParam: range.start,
+    queryFn: async ({ pageParam, signal }): Promise<ReleasesPage> => {
+      let next: IsoWeek | undefined = pageParam
+      const weeks: DiscoverReleases[] = []
+      for (let scanned = 0; scanned < 8 && next; scanned++) {
+        signal.throwIfAborted()
+        const week = await discover.releases(next.year, next.week)
+        signal.throwIfAborted()
+        const previous = previousWeek(next)
+        next = weekStart(previous) >= range.oldest ? previous : undefined
+        if (week.itens.length > 0) {
+          weeks.push(week)
+          break
+        }
+      }
+      return { weeks, next }
+    },
+    getNextPageParam: (page) => page.next,
+  })
+  const weeks = releases.data?.pages.flatMap((page) => page.weeks).filter((week) => week.itens.length > 0) ?? []
   return (
-    <div className="grid gap-5 md:grid-cols-[14rem_minmax(0,1fr)]">
-      <aside className="min-w-0 space-y-4">
-        <div className="grid gap-2">
-          <Label htmlFor="descobrir-ano">Ano</Label>
-          <Select
-            value={String(year)}
-            onValueChange={(value) => {
-              setYear(Number(value))
-              setSelected(null)
-            }}
-          >
-            <SelectTrigger id="descobrir-ano">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {Array.from({ length: 5 }, (_, i) => currentYear - 2 + i).map((value) => (
-                <SelectItem key={value} value={String(value)}>
-                  {value}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        {weeks.isPending ? (
-          <Skeleton className="h-32" />
-        ) : weeks.isError ? (
-          <ErrorState error={weeks.error} retry={() => void weeks.refetch()} />
-        ) : available.length === 0 ? (
-          <Empty>Nenhuma semana disponível neste ano.</Empty>
-        ) : (
-          <>
-            <div className="grid gap-2 md:hidden">
-              <Label htmlFor="descobrir-semana">Semana</Label>
-              <Select value={String(week!.semana)} onValueChange={(value) => setSelected(Number(value))}>
-                <SelectTrigger id="descobrir-semana" className="w-full min-w-0 [&>span]:truncate">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {labeledWeeks.map((entry) => (
-                    <SelectItem key={entry.semana} value={String(entry.semana)}>
-                      {weekLabel(entry)}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <nav aria-label="Semanas de lançamentos" className="hidden max-h-[65vh] space-y-1 overflow-y-auto md:block">
-              {labeledWeeks.map((entry) => (
-                <button
-                  key={entry.semana}
-                  type="button"
-                  aria-current={week?.semana === entry.semana ? 'true' : undefined}
-                  onClick={() => setSelected(entry.semana)}
-                  className={cn(
-                    'grid w-full gap-1 rounded-md px-3 py-2 text-left text-sm hover:bg-surface-raised focus-visible:outline-2 focus-visible:outline-ring',
-                    week?.semana === entry.semana && 'bg-accent-soft text-accent-soft-fg',
-                  )}
-                >
-                  <span className="font-medium">Semana {entry.semana}</span>
-                  <span className="text-xs">
-                    {dateLabel(entry.inicio)} a {dateLabel(entry.fim)}
-                    {entry.total != null && ` · ${entry.total} títulos`}
-                  </span>
-                </button>
-              ))}
-            </nav>
-          </>
-        )}
-      </aside>
-      <section className="min-w-0" aria-label="Lançamentos da semana">
-        {week && (
-          <>
-            <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
-              <div>
-                <h2 className="font-semibold">
-                  Semana {week.semana} de {year}
+    <div className="space-y-5">
+      <div className="grid w-fit gap-1">
+        <Label htmlFor="descobrir-ordem">Ordenar por</Label>
+        <Select value={order} onValueChange={setOrder}>
+          <SelectTrigger id="descobrir-ordem">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="nota">Nota</SelectItem>
+            <SelectItem value="popularidade">Popularidade</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+      {releases.isPending ? (
+        <LoadingGrid />
+      ) : releases.isError && !releases.data ? (
+        <ErrorState error={releases.error} retry={() => void releases.refetch()} />
+      ) : (
+        <>
+          {weeks.length === 0 ? (
+            <Empty>Nenhum título disponível. Títulos do acervo e ocultos ficam fora desta lista.</Empty>
+          ) : (
+            weeks.map((week) => (
+              <section
+                key={`${week.ano}-${week.semana}`}
+                className="space-y-3"
+                aria-labelledby={`semana-${week.ano}-${week.semana}`}
+              >
+                <h2 id={`semana-${week.ano}-${week.semana}`} className="text-sm font-semibold text-content-muted">
+                  Semana de {dateLabel(week.inicio)} a {dateLabel(week.fim)}
                 </h2>
-                <p className="text-sm text-content-muted">
-                  {dateLabel(week.inicio)} a {dateLabel(week.fim)}
-                </p>
-              </div>
-              <div className="flex flex-wrap items-end gap-2">
-                <div className="grid gap-1">
-                  <Label htmlFor="descobrir-ordem">Ordenar por</Label>
-                  <Select value={order} onValueChange={setOrder}>
-                    <SelectTrigger id="descobrir-ordem">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="nota">Nota</SelectItem>
-                      <SelectItem value="popularidade">Popularidade</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-              </div>
+                {cards(
+                  [...week.itens].sort((a, b) =>
+                    order === 'nota' ? b.nota - a.nota : b.popularidade - a.popularidade,
+                  ),
+                )}
+              </section>
+            ))
+          )}
+          {releases.isError && (
+            <ErrorState
+              error={releases.error}
+              retry={() => void (releases.isFetchNextPageError ? releases.fetchNextPage() : releases.refetch())}
+            />
+          )}
+          {releases.hasNextPage && (
+            <div className="flex justify-center">
+              <Button
+                loading={releases.isFetchingNextPage}
+                disabled={releases.isFetching}
+                onClick={() => void releases.fetchNextPage()}
+              >
+                Carregar mais
+              </Button>
             </div>
-            {releases.isPending ? (
-              <LoadingGrid />
-            ) : releases.isError ? (
-              <ErrorState error={releases.error} retry={() => void releases.refetch()} />
-            ) : (
-              cards(
-                [...releases.data.itens].sort((a, b) =>
-                  order === 'nota' ? b.nota - a.nota : b.popularidade - a.popularidade,
-                ),
-              )
-            )}
-          </>
-        )}
-      </section>
+          )}
+        </>
+      )}
     </div>
   )
 }
