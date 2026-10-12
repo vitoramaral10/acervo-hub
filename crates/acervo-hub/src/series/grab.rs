@@ -371,17 +371,56 @@ pub(crate) async fn prepare(
         .map(|s| s.need()))
 }
 
-/// Manda um release ao cliente, escolhe os arquivos e grava o grab com os
-/// episódios `wanted`. Devolve o id do grab.
-///
-/// Torrent que já está no cliente é recusado: é de outro grab, de filme ou
-/// de fora do acervo, e mexer nas prioridades dele ou apagá-lo depois
-/// estragaria o que é dos outros.
+/// Se o torrent `hash`, já no cliente, pode ser reaproveitado por um grab da
+/// série `series_id`, sem IO. Só o de um grab importado da mesma série: o
+/// torrent é dele, e pegá-lo de novo só acrescenta episódios. Grab em
+/// andamento, falho (o motivo continua valendo), de filme, de outra série ou
+/// nenhum (torrent mandado à mão) é de outro: devolve por que recusa. O hash
+/// é a identidade; o título muda com o status do tracker.
 ///
 /// # Errors
 ///
-/// Torrent já no cliente, `.torrent` inválido, cliente inalcançável ou
-/// falha ao registrar.
+/// O motivo da recusa.
+pub fn reusable<'a>(
+    hash: &str,
+    series_id: i64,
+    series: &'a [SeriesGrab],
+    movies: &[acervo_store::Grab],
+) -> Result<&'a SeriesGrab, &'static str> {
+    if movies.iter().any(|g| g.hash.eq_ignore_ascii_case(hash)) {
+        return Err("o torrent já está no cliente, num download de filme");
+    }
+    let mut same = series.iter().filter(|g| g.hash.eq_ignore_ascii_case(hash));
+    let Some(grab) = same.next() else {
+        return Err("o torrent já está no cliente, fora do acervo");
+    };
+    if same.next().is_some() {
+        return Err("o torrent já está no cliente, em mais de um download");
+    }
+    if grab.series_id != series_id {
+        return Err("o torrent já está no cliente, num download de outra série");
+    }
+    match grab.state {
+        GrabState::Imported => Ok(grab),
+        GrabState::Downloading => Err("o torrent já está no cliente, baixando"),
+        GrabState::Failed => Err("o torrent já está no cliente, num download que falhou"),
+    }
+}
+
+/// Manda um release ao cliente, escolhe os arquivos e grava o grab com os
+/// episódios `wanted`. Devolve o id do grab.
+///
+/// Torrent que já está no cliente só é reaproveitado se é de um grab
+/// importado da mesma série ([`reusable`]): o grab volta a baixar com os
+/// episódios dele mais os de agora, e os já importados a importação pula.
+/// Fora isso é recusado: é de outro grab, de filme ou de fora do acervo, e
+/// mexer nas prioridades dele ou apagá-lo depois estragaria o que é dos
+/// outros.
+///
+/// # Errors
+///
+/// Torrent já no cliente e não reaproveitável, `.torrent` inválido, cliente
+/// inalcançável ou falha ao registrar.
 pub async fn send(
     config: &Config,
     store: &Store,
@@ -401,20 +440,44 @@ pub async fn send(
     let (torrent, hash) = crate::grab::fetch_torrent(catalog, release).await?;
     let magnet = matches!(torrent, NewTorrent::Magnet(_));
     let client = qbit(config).await?;
-    if client.torrent(&hash).await?.is_some() {
-        bail!("o torrent já está no cliente");
+    // Os episódios do grab: os de agora e, reaproveitado, os de antes.
+    let mut episodes = wanted.to_vec();
+    let mut hash = hash;
+    // Torrent parado de um grab reaproveitado: volta a andar, depois do grab
+    // gravado, se falta baixar algum dos escolhidos.
+    let mut stopped = false;
+    let existing = client.torrent(&hash).await?;
+    if let Some(existing) = &existing {
+        let (series, movies) = (store.series_grabs().await?, store.grabs().await?);
+        let grab = reusable(&hash, series_id, &series, &movies).map_err(anyhow::Error::msg)?;
+        // A união: os já importados a importação pula ([`super::import::to_link`]).
+        for id in &grab.episode_ids {
+            if !episodes.contains(id) {
+                episodes.push(*id);
+            }
+        }
+        // O hash do grab, como gravado: é por ele que o registro é achado.
+        hash.clone_from(&grab.hash);
+        stopped = existing.state.starts_with("stopped") || existing.state.starts_with("paused");
+        tracing::info!(
+            release = release.title,
+            "torrent de um grab importado da série: reaproveitado"
+        );
+    } else {
+        crate::grab::add_queued(config, &client, torrent, &hash, magnet, false).await?;
     }
-    crate::grab::add_queued(config, &client, torrent, &hash, magnet, false).await?;
     // O `.torrent` traz a lista de arquivos: o cliente a mostra assim que
     // termina de carregá-lo. O magnet só depois dos metadados; aí a fila e a
-    // importação escolhem.
+    // importação escolhem. O reaproveitado já tem a lista, venha como vier.
     let mut size = release.size;
-    if !magnet {
+    let mut need = None;
+    if !magnet || existing.is_some() {
         let mut last = None;
         for _ in 0..10 {
-            match apply_selection(&client, &hash, &entry, wanted, &release.title, true).await {
+            match apply_selection(&client, &hash, &entry, &episodes, &release.title, true).await {
                 Ok(Some(selection)) => {
                     size = selection.size();
+                    need = Some(selection.need());
                     last = None;
                     break;
                 }
@@ -432,7 +495,7 @@ pub async fn send(
         .record_series_grab(&SeriesGrab {
             id: 0,
             series_id,
-            episode_ids: wanted.to_vec(),
+            episode_ids: episodes,
             hash: hash.clone(),
             title: release.title.clone(),
             indexer: release.indexer.clone(),
@@ -440,11 +503,19 @@ pub async fn send(
             size,
             grabbed_at: now_rfc3339(),
             state: GrabState::Downloading,
-            message: Some(QUEUED.into()),
+            message: existing.is_none().then(|| QUEUED.into()),
             finished_at: None,
         })
         .await
         .context("registrando o grab")?;
+    // Sem a tag da fila: com ela, se o grab falhasse, o torrent viraria
+    // órfão da fila e sairia do cliente com os arquivos.
+    if stopped
+        && need != Some(0)
+        && let Err(error) = client.start(&[&hash]).await
+    {
+        tracing::warn!(release = release.title, "torrent reaproveitado parado: {error}");
+    }
     if let Err(error) = start_queued(config, store, &client).await {
         tracing::warn!("fila de downloads: {error:#}");
     }
@@ -993,6 +1064,87 @@ mod tests {
         assert!(!deletable(grabbed, at, false, None));
         assert!(!deletable(0, at, false, Some(&one)));
         assert!(!deletable(grabbed, "ontem", false, Some(&one)));
+    }
+
+    fn series_grab(series_id: i64, hash: &str, state: GrabState) -> SeriesGrab {
+        SeriesGrab {
+            id: 27,
+            series_id,
+            episode_ids: vec![261],
+            hash: hash.into(),
+            title: "Reacher.S04.1080p.WEB-DL-GRP".into(),
+            indexer: "tracker".into(),
+            quality: acervo_parser::Quality::WebDl1080p,
+            size: 1_000,
+            grabbed_at: "2026-10-05T16:54:00Z".into(),
+            state,
+            message: None,
+            finished_at: None,
+        }
+    }
+
+    fn movie_grab(hash: &str) -> acervo_store::Grab {
+        acervo_store::Grab {
+            id: 3,
+            movie_id: 9,
+            hash: hash.into(),
+            title: "Filme.2024.1080p.WEB-DL-GRP".into(),
+            indexer: "tracker".into(),
+            quality: acervo_parser::Quality::WebDl1080p,
+            size: 1_000,
+            grabbed_at: "2026-10-01T00:00:00Z".into(),
+            state: GrabState::Imported,
+            message: None,
+            imported_path: None,
+            finished_at: None,
+            replaces: None,
+        }
+    }
+
+    #[test]
+    fn reaproveita_o_torrent_de_grab_importado_da_mesma_serie() {
+        let grabs = [series_grab(5, "c8cd9036", GrabState::Imported)];
+        // O cliente devolve o hash em outra caixa: conta igual.
+        let grab = reusable("C8CD9036", 5, &grabs, &[]).unwrap();
+        assert_eq!(grab.id, 27);
+        assert_eq!(grab.episode_ids, [261]);
+    }
+
+    #[test]
+    fn recusa_torrent_que_e_de_outro() {
+        let imported = [series_grab(5, "aaaa", GrabState::Imported)];
+        // Grab em andamento: o store também recusaria.
+        let downloading = [series_grab(5, "aaaa", GrabState::Downloading)];
+        assert!(reusable("aaaa", 5, &downloading, &[]).is_err());
+        // Grab falho: o bloqueio ou o erro continua valendo.
+        let failed = [series_grab(5, "aaaa", GrabState::Failed)];
+        assert!(reusable("aaaa", 5, &failed, &[]).is_err());
+        // De outra série.
+        assert!(reusable("aaaa", 6, &imported, &[]).is_err());
+        // De filme, mesmo com um grab da série no mesmo hash.
+        assert!(reusable("aaaa", 5, &imported, &[movie_grab("aaaa")]).is_err());
+        // Sem grab: torrent mandado à mão.
+        assert!(reusable("bbbb", 5, &imported, &[]).is_err());
+        assert!(reusable("bbbb", 5, &[], &[]).is_err());
+        // Dois grabs no mesmo hash: na dúvida, não mexe.
+        let twice = [
+            series_grab(5, "aaaa", GrabState::Imported),
+            series_grab(5, "AAAA", GrabState::Imported),
+        ];
+        assert!(reusable("aaaa", 5, &twice, &[]).is_err());
+    }
+
+    #[test]
+    fn torrent_reaproveitado_nao_sai_pelo_grab_de_agora() {
+        // O grab ganha `grabbed_at` novo; o torrent entrou no cliente dias
+        // antes, no grab original.
+        let added = 1_791_028_800; // 2026-10-03T12:00:00Z
+        let one = [OnDisk {
+            dev: 1,
+            ino: 1,
+            nlink: 1,
+        }];
+        assert!(!deletable(added, "2026-10-12T12:00:00Z", false, Some(&one)));
     }
 
     #[test]

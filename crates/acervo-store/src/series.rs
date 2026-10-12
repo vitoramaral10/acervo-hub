@@ -1934,6 +1934,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grab_importado_reaproveitado_com_a_uniao_dos_episodios() {
+        let Some(db) = TestDb::new("series_grab_uniao").await else {
+            return;
+        };
+        let store = &db.store;
+        let id = store
+            .add_series(
+                &series(10, "Um"),
+                &[episode(1, 1), episode(1, 2), episode(1, 3)],
+            )
+            .await
+            .unwrap();
+        let ids: Vec<i64> = store
+            .series(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .episodes
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        let old = store
+            .record_series_grab(&grab(id, "aaaa", ids[..1].to_vec(), "2026-01-01T00:00:00Z"))
+            .await
+            .unwrap();
+        store
+            .update_series_grab(
+                old,
+                GrabState::Imported,
+                None,
+                Some("2026-01-02T00:00:00Z"),
+            )
+            .await
+            .unwrap();
+
+        // O pacote pego de novo para o que falta: os episódios de antes
+        // continuam no grab.
+        let again = store
+            .record_series_grab(&grab(id, "aaaa", ids.clone(), "2026-01-03T00:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(again, old);
+        let reused = store
+            .series_grabs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|g| g.id == old)
+            .unwrap();
+        assert_eq!(reused.state, GrabState::Downloading);
+        assert_eq!(reused.finished_at, None);
+        assert_eq!(reused.grabbed_at, "2026-01-03T00:00:00Z");
+        let mut episodes = reused.episode_ids.clone();
+        episodes.sort_unstable();
+        assert_eq!(episodes, ids);
+
+        db.drop().await;
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)] // Um cenário só: a falha no meio, o parcial, o fecho e a corrida.
     async fn importacao_da_serie_e_uma_transacao_e_so_mexe_no_grab_baixando() {
         let Some(db) = TestDb::new("series_importa").await else {
