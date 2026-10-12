@@ -514,7 +514,10 @@ pub async fn send(
         && need != Some(0)
         && let Err(error) = client.start(&[&hash]).await
     {
-        tracing::warn!(release = release.title, "torrent reaproveitado parado: {error}");
+        tracing::warn!(
+            release = release.title,
+            "torrent reaproveitado parado: {error}"
+        );
     }
     if let Err(error) = start_queued(config, store, &client).await {
         tracing::warn!("fila de downloads: {error:#}");

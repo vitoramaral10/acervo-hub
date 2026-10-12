@@ -1960,12 +1960,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .update_series_grab(
-                old,
-                GrabState::Imported,
-                None,
-                Some("2026-01-02T00:00:00Z"),
-            )
+            .update_series_grab(old, GrabState::Imported, None, Some("2026-01-02T00:00:00Z"))
             .await
             .unwrap();
 
