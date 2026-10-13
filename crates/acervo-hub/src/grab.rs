@@ -301,6 +301,34 @@ fn is_active(torrent: &acervo_clients::TorrentInfo) -> bool {
         && torrent.progress < 1.0
 }
 
+/// O que ainda falta reservar no disco para um torrent da fila: o que falta
+/// baixar menos o que o cliente já pré-alocou além do baixado.
+///
+/// O espaço livre que o cliente informa já não inclui o que um torrent parado
+/// pré-alocou ao ser iniciado antes. Contar o que falta dele inteiro contra
+/// esse livre desconta o mesmo espaço duas vezes: com o disco cheio de
+/// pré-alocações a zero por cento, nenhum cabe e a fila trava para sempre.
+fn unreserved(need: u64, allocated: u64, downloaded: u64) -> u64 {
+    need.saturating_sub(allocated.saturating_sub(downloaded))
+}
+
+/// Bytes que os arquivos do torrent ocupam de fato no disco (`st_blocks`), só
+/// os que existem. Qualquer falha de leitura vale zero: sem saber, o torrent
+/// continua contando inteiro, que é o lado seguro.
+async fn allocated_on_disk(client: &QbitClient, torrent: &acervo_clients::TorrentInfo) -> u64 {
+    let Ok(files) = client
+        .files(&acervo_core::DownloadHash::new(torrent.hash.clone()))
+        .await
+    else {
+        return 0;
+    };
+    files
+        .iter()
+        .filter_map(|file| crate::fs::facts_for(&client_path(torrent, file)).ok())
+        .map(|facts| facts.allocated.as_u64())
+        .sum()
+}
+
 /// Quem sai da fila agora: do menor para o maior, pulando quem não cabe, e
 /// no máximo até o limite de downloads ativos.
 ///
@@ -538,6 +566,9 @@ pub(crate) async fn start_queued(
             },
             None => left(size(torrent), torrent.progress),
         };
+        // Parado com o arquivo já pré-alocado: o espaço dele já saiu do livre.
+        let downloaded = size(torrent).saturating_sub(left(size(torrent), torrent.progress));
+        let need = unreserved(need, allocated_on_disk(client, torrent).await, downloaded);
         queue.push((torrent.hash.clone(), need));
     }
     let mut started = Vec::new();
@@ -2344,6 +2375,32 @@ mod tests {
         assert_eq!(picked, ["h5", "h30", "h40"]);
         let picked = pick_starts(&queue(&[95, 20]), &[], 100, 10, 10);
         assert_eq!(picked, ["h20"]);
+    }
+
+    #[test]
+    fn espaco_ja_reservado_nao_conta_de_novo() {
+        // Pré-alocado e a zero por cento: o espaço já saiu do livre.
+        assert_eq!(unreserved(20, 20, 0), 0);
+        // Esparso e pela metade: o alocado é só o baixado, falta tudo isso.
+        assert_eq!(unreserved(10, 10, 10), 10);
+        // Pré-alocação pela metade: falta reservar o resto.
+        assert_eq!(unreserved(20, 8, 0), 12);
+        // Alocado além do que falta nunca dá orçamento negativo.
+        assert_eq!(unreserved(5, 30, 0), 0);
+    }
+
+    #[test]
+    fn fila_travada_por_pre_alocacao_volta_a_andar() {
+        // Disco com 5 livres e folga 1: quem precisa de 20 nunca cabe...
+        let travada = pick_starts(&queue(&[20, 30]), &[], 5, 1, 5);
+        assert!(travada.is_empty());
+        // ...mas quem já tem os 20 e os 30 reservados cabe, no limite de vagas.
+        let net = [
+            ("h20".to_owned(), unreserved(20, 20, 0)),
+            ("h30".to_owned(), unreserved(30, 30, 0)),
+        ];
+        assert_eq!(pick_starts(&net, &[], 5, 1, 5), ["h20", "h30"]);
+        assert_eq!(pick_starts(&net, &[], 5, 1, 1), ["h20"]);
     }
 
     #[test]
