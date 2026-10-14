@@ -41,22 +41,28 @@ pub fn reconcile(
     // O que não apareceu neste ciclo perde os strikes.
     ledger.retain_only(&seen);
 
-    check_batch_is_within_limits(reclaim, inv.library_size, policy)?;
-
-    Ok(Plan {
+    let plan = Plan {
         actions,
         skipped,
         reclaim,
-    })
+    };
+    let deletes = plan.destructive().next().is_some();
+    check_batch_is_within_limits(reclaim, deletes, inv.library_size, policy)?;
+
+    Ok(plan)
 }
 
 /// Travas de tamanho: rodam depois, sobre o lote já montado.
+/// A biblioteca zerada aborta qualquer remoção, não só a que libera espaço:
+/// raiz fora do ar também esconde os arquivos dos torrents, e o que não se vê
+/// libera zero byte.
 fn check_batch_is_within_limits(
     reclaim: Allocated,
+    deletes: bool,
     library: Allocated,
     policy: &Policy,
 ) -> Result<(), Abort> {
-    if library == Allocated::ZERO && reclaim > Allocated::ZERO {
+    if library == Allocated::ZERO && deletes {
         return Err(Abort::LibraryUnmeasured { reclaim });
     }
 
@@ -135,12 +141,16 @@ fn plan_unowned_downloads(
     let mut seen = Vec::new();
 
     for download in &inv.downloads {
-        // `Unknown` é "não sei", não "parado": não vira candidato.
+        // `Unknown` é "não sei", não "parado": não vira candidato. Nem
+        // `MissingFiles`: arquivo que não se vê não é arquivo sem hardlink.
         if queued.contains(&download.hash)
             || !policy.managed_categories.contains(&download.category)
             || download.state.is_seeding()
             || download.keeps_seeding()
-            || download.state == DownloadState::Unknown
+            || matches!(
+                download.state,
+                DownloadState::Unknown | DownloadState::MissingFiles
+            )
         {
             continue;
         }
@@ -207,6 +217,9 @@ fn evaluate_download(
     }
     if download.keeps_seeding() {
         return Some(SkipReason::KeepSeeding);
+    }
+    if download.state == DownloadState::MissingFiles {
+        return Some(SkipReason::FilesMissing);
     }
     if !download.state.is_seeding() {
         return Some(SkipReason::NotSeeding);

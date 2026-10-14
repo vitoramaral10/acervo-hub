@@ -49,6 +49,10 @@ pub enum SkipReason {
     StillLinked,
     /// Só seed entra na avaliação.
     NotSeeding,
+    /// O cliente não acha os arquivos: disco fora ou caminho errado. Nunca
+    /// sai pela limpeza — apagar aqui perde o torrent de tracker privado
+    /// junto com a obrigação de seed, e o dado pode voltar com o disco.
+    FilesMissing,
     /// Arquivo mexido dentro da janela de carência.
     RecentlyModified,
     /// Tracker privado dentro da carência de seed.
@@ -63,6 +67,7 @@ impl fmt::Display for SkipReason {
             Self::KeepSeeding => "tag de semear: o tracker está construindo ratio",
             Self::StillLinked => "ainda tem hardlink na biblioteca",
             Self::NotSeeding => "não está em seeding",
+            Self::FilesMissing => "o cliente não acha os arquivos (disco fora?)",
             Self::RecentlyModified => "arquivo mexido recentemente",
             Self::SeedGrace => "privado dentro da carência de seed",
         };
@@ -86,7 +91,8 @@ pub enum Abort {
     },
     /// O lote passou do teto proporcional à biblioteca.
     BatchFractionTooLarge { fraction: f64, limit: f64 },
-    /// A biblioteca mediu zero mas há remoção planejada.
+    /// A biblioteca mediu zero mas há remoção planejada, mesmo que libere
+    /// zero byte (torrent cujos arquivos não se veem também libera zero).
     ///
     /// Biblioteca de tamanho zero desliga silenciosamente a trava proporcional
     /// — qualquer lote seria 0% dela. Quase sempre significa raiz não montada,
