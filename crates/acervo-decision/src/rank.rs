@@ -1,5 +1,9 @@
 //! Ordem de preferência entre releases do mesmo filme.
 //!
+//! No indexador em modo "construir ratio", freeleech procurado (muitos
+//! leechers por seeder) vem antes de tudo, saúde e qualidade inclusive; fora
+//! desse modo o critério vale zero e a ordem é a de sempre.
+//!
 //! Com `healthy_seeders` no perfil, a saúde do torrent vem antes de tudo:
 //! bem semeado, fraco, morto. Depois, critérios em cascata, como na
 //! referência: qualidade (posição no perfil, depois revisão), prioridade do
@@ -15,10 +19,15 @@ use acervo_parser::{ParsedMovie, QualityModel};
 use crate::{Decision, Engine, Indexer, Profile, Propers, Release, Settings};
 
 const DEFAULT_PRIORITY: i32 = 25;
+/// Leechers mínimos para o freeleech contar como procurado.
+const RATIO_MIN_LEECHERS: u64 = 3;
 
-const FREELEECH: u32 = 1;
-const HALFLEECH: u32 = 2;
-const DOUBLE_UPLOAD: u32 = 4;
+/// Bit de freeleech.
+pub const FREELEECH: u32 = 1;
+/// Bit de halfleech.
+pub const HALFLEECH: u32 = 2;
+/// Bit de upload dobrado.
+pub const DOUBLE_UPLOAD: u32 = 4;
 const GOLDEN: u32 = 8;
 const APPROVED: u32 = 16;
 const INTERNAL: u32 = 32;
@@ -81,10 +90,34 @@ fn health(seeders: Option<u32>, healthy: u32) -> u8 {
     }
 }
 
+/// Faixa do modo ratio: 2 com leechers a partir de 4 vezes (seeders + 1), 1 a
+/// partir de 1 vez; 0 fora do modo, sem freeleech, sem seeder, com menos de
+/// `RATIO_MIN_LEECHERS` leechers (peers menos seeders) ou sem procura.
+fn ratio_band(indexer: Option<&Indexer>, release: &Release) -> u8 {
+    if !indexer.is_some_and(|i| i.ratio_mode) || release.flags & FREELEECH == 0 {
+        return 0;
+    }
+    let Some(seeders) = release.seeders.filter(|s| *s > 0) else {
+        return 0;
+    };
+    let leechers = u64::from(release.peers.unwrap_or(0).saturating_sub(seeders));
+    if leechers < RATIO_MIN_LEECHERS {
+        return 0;
+    }
+    let base = u64::from(seeders) + 1;
+    if leechers >= 4 * base {
+        2
+    } else {
+        u8::from(leechers >= base)
+    }
+}
+
 /// Os critérios de preferência de um release, já na ordem em que decidem:
 /// comparar duas chaves é o `compare`. Maior é melhor.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Key {
+    /// Faixa do modo ratio: 0 fora do modo, sem freeleech, sem seeder ou sem procura.
+    ratio: u8,
     health: u8,
     quality: i64,
     version: u8,
@@ -106,9 +139,10 @@ pub(crate) fn key(
     size: i64,
 ) -> Key {
     let propers = settings.propers != Propers::DoNotPrefer;
-    let priority =
-        crate::find_indexer(indexers, &release.indexer).map_or(DEFAULT_PRIORITY, |i| i.priority);
+    let indexer = crate::find_indexer(indexers, &release.indexer);
+    let priority = indexer.map_or(DEFAULT_PRIORITY, |i| i.priority);
     Key {
+        ratio: ratio_band(indexer, release),
         health: profile
             .healthy_seeders
             .map_or(0, |healthy| health(release.seeders, healthy)),
@@ -208,5 +242,51 @@ mod tests {
         assert_eq!(health(None, 5), 1);
         assert_eq!(health(Some(5), 5), 2);
         assert_eq!(health(Some(500), 5), 2);
+    }
+
+    #[test]
+    fn faixas_de_ratio() {
+        let indexer = |ratio_mode| Indexer {
+            name: "t".into(),
+            priority: 25,
+            minimum_seeders: 1,
+            multi_languages: vec![],
+            ratio_mode,
+        };
+        let release = |seeders, peers, flags| Release {
+            title: "x".into(),
+            indexer: "t".into(),
+            size: 0,
+            seeders,
+            peers,
+            imdb_id: None,
+            tmdb_id: None,
+            tvdb_id: None,
+            languages: Vec::new(),
+            container: None,
+            flags,
+            age_hours: None,
+        };
+        let on = indexer(true);
+        let band = |s, p| ratio_band(Some(&on), &release(s, p, FREELEECH));
+        assert_eq!(band(Some(5), Some(45)), 2);
+        assert_eq!(band(Some(1), Some(4)), 1);
+        assert_eq!(band(Some(1), Some(9)), 2);
+        assert_eq!(band(Some(1), Some(3)), 0);
+        assert_eq!(band(Some(10), Some(20)), 0);
+        assert_eq!(band(Some(10), Some(21)), 1);
+        assert_eq!(band(Some(10), Some(54)), 2);
+        assert_eq!(band(Some(0), Some(10)), 0);
+        assert_eq!(band(None, Some(10)), 0);
+        assert_eq!(band(Some(5), None), 0);
+        assert_eq!(
+            ratio_band(Some(&on), &release(Some(5), Some(45), HALFLEECH)),
+            0
+        );
+        let both = release(Some(5), Some(45), FREELEECH | DOUBLE_UPLOAD);
+        assert_eq!(ratio_band(Some(&on), &both), 2);
+        let off = indexer(false);
+        assert_eq!(ratio_band(Some(&off), &both), 0);
+        assert_eq!(ratio_band(None, &both), 0);
     }
 }

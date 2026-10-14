@@ -572,6 +572,8 @@ impl HubAdmin {
             url: None,
             settings,
             enabled: true,
+            priority: acervo_store::DEFAULT_INDEXER_PRIORITY,
+            ratio_mode: false,
             added_at: Some(now()),
         };
         let entry = cardigann(&record, parsed, &config).map_err(|e| message(&e))?;
@@ -610,6 +612,7 @@ impl HubAdmin {
 
     pub(crate) async fn remove(&self, indexer: &str) -> Result<(), String> {
         let _guard = self.registry.write.lock().await;
+        let ratio_mode = self.record(indexer).is_some_and(|r| r.ratio_mode);
         if !self
             .store()?
             .delete_indexer(indexer)
@@ -624,6 +627,9 @@ impl HubAdmin {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(indexer);
         tracing::info!(indexer, "indexador removido pela interface");
+        if ratio_mode {
+            self.retag_seeds(indexer, false).await;
+        }
         Ok(())
     }
 
@@ -645,6 +651,60 @@ impl HubAdmin {
             .map_err(|e| message(&e))?;
         self.persist(record, false).await?;
         Ok(Some(entry))
+    }
+
+    pub(crate) fn preferences(&self, indexer: &str) -> Option<(i32, bool)> {
+        self.record(indexer).map(|r| (r.priority, r.ratio_mode))
+    }
+
+    /// Grava prioridade e modo ratio. A decisão lê do banco, então o
+    /// catálogo não é remontado.
+    pub(crate) async fn set_preferences(
+        &self,
+        indexer: &str,
+        priority: i32,
+        ratio_mode: bool,
+    ) -> Result<(), String> {
+        if !acervo_store::INDEXER_PRIORITIES.contains(&priority) {
+            return Err("a prioridade vai de 1 a 50".into());
+        }
+        let _guard = self.registry.write.lock().await;
+        let mut record = self.record(indexer).ok_or("indexador desconhecido")?;
+        let toggled = record.ratio_mode != ratio_mode;
+        record.priority = priority;
+        record.ratio_mode = ratio_mode;
+        self.persist(record, false).await?;
+        tracing::info!(
+            indexer,
+            prioridade = priority,
+            modo_ratio = ratio_mode,
+            "preferências atualizadas pela interface"
+        );
+        if toggled {
+            self.retag_seeds(indexer, ratio_mode).await;
+        }
+        Ok(())
+    }
+
+    /// Leva o modo ratio às tags do cliente. Falha não desfaz a gravação:
+    /// vira aviso, e ligar ou desligar de novo tenta outra vez.
+    async fn retag_seeds(&self, indexer: &str, on: bool) {
+        let Ok(store) = self.store() else {
+            return;
+        };
+        match crate::grab::retag_seeds(&self.settings.get(), store, indexer, on).await {
+            Ok(count) => tracing::info!(
+                indexer,
+                modo_ratio = on,
+                torrents = count,
+                "tag de semear sincronizada no cliente"
+            ),
+            Err(error) => tracing::warn!(
+                indexer,
+                modo_ratio = on,
+                "tag de semear não sincronizada no cliente: {error:#}"
+            ),
+        }
     }
 
     pub(crate) fn tasks(&self) -> serde_json::Value {
@@ -863,6 +923,19 @@ mod tests {
         let stored = db.store.indexers().await.unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].settings["cookie"], "do-cadastro");
+        assert_eq!((stored[0].priority, stored[0].ratio_mode), (25, false));
+        admin
+            .set_preferences("cookie-privado", 10, true)
+            .await
+            .unwrap();
+        assert_eq!(admin.preferences("cookie-privado"), Some((10, true)));
+        assert!(
+            admin
+                .set_preferences("cookie-privado", 0, true)
+                .await
+                .is_err()
+        );
+        assert!(admin.set_preferences("nao-existe", 10, true).await.is_err());
         assert_eq!(entries(&settings.get(), &admin.registry).await.len(), 1);
 
         // Segredo em branco mantém; o resto troca, e nada volta com valor.
@@ -878,6 +951,9 @@ mod tests {
         assert_eq!(freeleech.value.as_deref(), Some("true"));
         let cookie = views.iter().find(|s| s.name == "cookie").unwrap();
         assert!(cookie.is_set && cookie.value.is_none());
+        // O update de settings não zera as preferências.
+        let stored = db.store.indexers().await.unwrap();
+        assert_eq!((stored[0].priority, stored[0].ratio_mode), (10, true));
         assert_eq!(
             db.store.indexers().await.unwrap()[0].settings["cookie"],
             "do-cadastro"

@@ -120,7 +120,7 @@ fn plan_unlinked_downloads(
 /// incompleto, parado ou com erro. O seed é do passo 1. Um strike por ciclo,
 /// com chave pelo hash; só no limite vira remoção. Devolve as chaves vistas.
 ///
-/// Os motivos de pulo que o passo 1 já registra (fila, categoria, estado) não
+/// Os motivos de pulo que o passo 1 já registra (fila, categoria, tag de semear, estado) não
 /// se repetem aqui, para o relatório não contar o mesmo torrent duas vezes.
 fn plan_unowned_downloads(
     inv: &Inventory,
@@ -139,6 +139,7 @@ fn plan_unowned_downloads(
         if queued.contains(&download.hash)
             || !policy.managed_categories.contains(&download.category)
             || download.state.is_seeding()
+            || download.keeps_seeding()
             || download.state == DownloadState::Unknown
         {
             continue;
@@ -203,6 +204,9 @@ fn evaluate_download(
     }
     if !policy.managed_categories.contains(&download.category) {
         return Some(SkipReason::UnmanagedCategory);
+    }
+    if download.keeps_seeding() {
+        return Some(SkipReason::KeepSeeding);
     }
     if !download.state.is_seeding() {
         return Some(SkipReason::NotSeeding);

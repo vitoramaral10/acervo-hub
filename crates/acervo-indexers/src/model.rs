@@ -153,6 +153,13 @@ fn nonempty(value: impl Into<String>) -> Option<String> {
     (!value.trim().is_empty()).then_some(value)
 }
 
+/// Tag de download grátis (fator de download 0).
+pub const FREELEECH_TAG: &str = "freeleech";
+/// Tag de download com desconto parcial (fator de download entre 0 e 1).
+pub const HALFLEECH_TAG: &str = "halfleech";
+/// Tag de upload contado em dobro ou mais (fator de upload >= 2).
+pub const DOUBLE_UPLOAD_TAG: &str = "doubleupload";
+
 /// Candidato devolvido por um indexador.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Release {
@@ -167,6 +174,7 @@ pub struct Release {
     pub leechers: Option<u32>,
     pub grabs: Option<u32>,
     pub categories: Vec<u32>,
+    /// Flags do indexador, no vocabulário do Torznab: [`FREELEECH_TAG`], [`HALFLEECH_TAG`], [`DOUBLE_UPLOAD_TAG`].
     pub tags: Vec<String>,
 }
 

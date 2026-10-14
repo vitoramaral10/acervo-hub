@@ -66,6 +66,25 @@ pub trait Admin: Send + Sync + std::fmt::Debug {
     /// Indexador desconhecido ou falha ao montar ou gravar.
     async fn set_enabled(&self, indexer: &str, enabled: bool) -> Result<Option<Entry>, String>;
 
+    /// Prioridade e modo ratio do cadastro; `None` sem cadastro.
+    fn preferences(&self, _indexer: &str) -> Option<(i32, bool)> {
+        None
+    }
+
+    /// Grava prioridade e modo ratio.
+    ///
+    /// # Errors
+    ///
+    /// Indexador desconhecido, prioridade fora da faixa ou falha ao gravar.
+    async fn set_preferences(
+        &self,
+        _indexer: &str,
+        _priority: i32,
+        _ratio_mode: bool,
+    ) -> Result<(), String> {
+        Err("este serviço não edita preferências de indexador".into())
+    }
+
     /// As tarefas de fundo do serviço — busca, RSS, importação, metadados,
     /// limpeza —, com intervalo, última e próxima execução de cada uma.
     fn tasks(&self) -> serde_json::Value;
@@ -230,6 +249,17 @@ impl Admin for HubAdmin {
     }
     async fn set_enabled(&self, indexer: &str, enabled: bool) -> Result<Option<Entry>, String> {
         HubAdmin::set_enabled(self, indexer, enabled).await
+    }
+    fn preferences(&self, indexer: &str) -> Option<(i32, bool)> {
+        HubAdmin::preferences(self, indexer)
+    }
+    async fn set_preferences(
+        &self,
+        indexer: &str,
+        priority: i32,
+        ratio_mode: bool,
+    ) -> Result<(), String> {
+        HubAdmin::set_preferences(self, indexer, priority, ratio_mode).await
     }
     fn tasks(&self) -> serde_json::Value {
         HubAdmin::tasks(self)

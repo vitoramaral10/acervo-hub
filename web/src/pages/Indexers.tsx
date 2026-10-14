@@ -13,9 +13,10 @@ import {
   Search,
   ServerOff,
   Trash2,
+  TrendingUp,
   Tv,
 } from 'lucide-react'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { AddIndexerDialog } from '@/components/AddIndexerDialog'
 import { CredentialsDialog } from '@/components/CredentialsDialog'
@@ -29,6 +30,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
 import { Badge, Skeleton, Switch, Tooltip } from '@/components/ui/misc'
 import { type Indexer, api } from '@/lib/api'
 import { formatAgo, formatClock, formatCount } from '@/lib/format'
@@ -168,6 +170,29 @@ function IndexerCard({
     onError: (error: Error) => toast.error(error.message),
     onSettled: () => void queryClient.invalidateQueries({ queryKey: ['indexadores'] }),
   })
+  const prioridadeInput = useRef<HTMLInputElement>(null)
+  const preferences = useMutation({
+    mutationFn: (p: { prioridade: number; modo_ratio: boolean }) => api.setPreferences(indexer.nome, p),
+    onSuccess: (saved) => {
+      toast.success(`${indexer.nome}: preferências salvas`)
+      // O card já mostra o gravado; a próxima alteração parte dele, não do snapshot velho da lista.
+      queryClient.setQueryData<{ indexadores: Indexer[] }>(['indexadores'], (old) =>
+        old && {
+          ...old,
+          indexadores: old.indexadores.map((i) =>
+            i.nome === indexer.nome ? { ...i, prioridade: saved.prioridade, modo_ratio: saved.modo_ratio } : i,
+          ),
+        },
+      )
+    },
+    onError: (error: Error) => {
+      toast.error(error.message)
+      // O campo não é controlado: sem isto ele seguiria mostrando o que não foi gravado.
+      if (prioridadeInput.current) prioridadeInput.current.value = String(indexer.prioridade)
+    },
+    // Devolver a promise segura o isPending até o refetch chegar.
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ['indexadores'] }),
+  })
   const [confirming, setConfirming] = useState(false)
   const remove = useMutation({
     mutationFn: () => api.removeIndexer(indexer.nome),
@@ -225,6 +250,11 @@ function IndexerCard({
               </Badge>
             )}
             {indexer.ativo && <Badge>{indexer.categorias.length} categorias</Badge>}
+            {indexer.modo_ratio && (
+              <Badge tone="success">
+                <TrendingUp aria-hidden="true" /> Construindo ratio
+              </Badge>
+            )}
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-3">
@@ -274,6 +304,56 @@ function IndexerCard({
       </dl>
       )}
 
+      <div className="flex flex-wrap items-center gap-x-6 gap-y-3 border-t border-border pt-4 text-sm">
+        <label className="flex items-center gap-2">
+          <Tooltip content="Menor vem primeiro: com saúde e qualidade iguais, o release deste indexador ganha. Padrão 25.">
+            <span>Prioridade</span>
+          </Tooltip>
+          <Input
+            type="number"
+            min={1}
+            max={50}
+            step={1}
+            inputMode="numeric"
+            className="h-8 w-16 tabular-nums"
+            ref={prioridadeInput}
+            key={indexer.prioridade}
+            defaultValue={indexer.prioridade}
+            disabled={preferences.isPending}
+            aria-label={`Prioridade de ${indexer.nome}`}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') e.currentTarget.blur()
+            }}
+            onBlur={(e) => {
+              const n = Number(e.currentTarget.value)
+              if (e.currentTarget.value.trim() === '' || !Number.isInteger(n) || n < 1 || n > 50) {
+                e.currentTarget.value = String(indexer.prioridade)
+                toast.error('A prioridade vai de 1 a 50')
+                return
+              }
+              if (n === indexer.prioridade) return
+              preferences.mutate({ prioridade: n, modo_ratio: indexer.modo_ratio })
+            }}
+          />
+        </label>
+        <div className="flex items-center gap-2">
+          <Switch
+            checked={indexer.modo_ratio}
+            disabled={preferences.isPending}
+            onCheckedChange={(modo_ratio) => preferences.mutate({ prioridade: indexer.prioridade, modo_ratio })}
+            aria-label={
+              indexer.modo_ratio
+                ? `Desligar construir ratio em ${indexer.nome}`
+                : `Ligar construir ratio em ${indexer.nome}`
+            }
+          />
+          <Tooltip
+            content={`Só neste indexador: freeleech com muitos leechers por seeder passa na frente da qualidade. O torrent ganha a tag acervo:semear:${indexer.nome} no qBittorrent e a limpeza não o apaga.`}
+          >
+            <span>Construir ratio</span>
+          </Tooltip>
+        </div>
+      </div>
 
       {health.falhas_seguidas > 0 && health.ultimo_erro && (
         <p className="rounded-md bg-danger-bg px-3 py-2 text-sm text-danger">

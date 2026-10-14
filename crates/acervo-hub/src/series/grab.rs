@@ -421,6 +421,7 @@ pub fn reusable<'a>(
 ///
 /// Torrent já no cliente e não reaproveitável, `.torrent` inválido, cliente
 /// inalcançável ou falha ao registrar.
+#[allow(clippy::too_many_lines)] // A sequência do grab; dividir só espalharia.
 pub async fn send(
     config: &Config,
     store: &Store,
@@ -459,12 +460,24 @@ pub async fn send(
         // O hash do grab, como gravado: é por ele que o registro é achado.
         hash.clone_from(&grab.hash);
         stopped = existing.state.starts_with("stopped") || existing.state.starts_with("paused");
+        // O indexador pode ter ligado o modo ratio depois do primeiro grab.
+        crate::grab::tag_seed(store, &client, &release.indexer, &hash).await;
         tracing::info!(
             release = release.title,
             "torrent de um grab importado da série: reaproveitado"
         );
     } else {
-        crate::grab::add_queued(config, &client, torrent, &hash, magnet, false).await?;
+        let seed = crate::grab::seed_tag(store, &release.indexer).await;
+        crate::grab::add_queued(
+            config,
+            &client,
+            torrent,
+            &hash,
+            magnet,
+            false,
+            seed.as_deref(),
+        )
+        .await?;
     }
     // O `.torrent` traz a lista de arquivos: o cliente a mostra assim que
     // termina de carregá-lo. O magnet só depois dos metadados; aí a fila e a

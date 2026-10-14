@@ -125,12 +125,13 @@ impl Parts {
     pub async fn load(store: &Store, catalog: &Catalog) -> Result<Self> {
         let rules = crate::rules::stored(store).await?;
         let blocked = store.blocklist().await?;
+        let records = store.indexers().await?;
         let served: Vec<String> = catalog.views().into_iter().map(|view| view.name).collect();
         if served.is_empty() {
             bail!("nenhum indexador ativo para buscar");
         }
         Ok(Self {
-            indexers: crate::decide::indexers(&served),
+            indexers: crate::decide::indexers(&served, &records),
             settings: rules.settings(),
             // Bloqueio de filme não diz nada a série.
             blocklist: blocked

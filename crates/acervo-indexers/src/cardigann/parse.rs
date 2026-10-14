@@ -15,7 +15,7 @@ use super::filters::{parse_count, parse_date, parse_size};
 use super::json::{self, JsonPath};
 use super::selector::Css;
 use super::template::{Value as Var, Vars};
-use crate::{IndexerError, Release};
+use crate::{DOUBLE_UPLOAD_TAG, FREELEECH_TAG, HALFLEECH_TAG, IndexerError, Release};
 
 /// A linha de onde um campo lê: elemento HTML, ou objeto JSON com a linha
 /// original (seletores `..` leem dela, não do filho de `multiple`).
@@ -301,7 +301,15 @@ impl CardigannDefinition {
                 leechers: count("leechers"),
                 grabs: count("grabs"),
                 categories,
-                tags: Vec::new(),
+                // Campo ausente é fator 1: sem tag.
+                tags: volume_tags(
+                    values
+                        .get("downloadvolumefactor")
+                        .and_then(|v| volume_factor(v)),
+                    values
+                        .get("uploadvolumefactor")
+                        .and_then(|v| volume_factor(v)),
+                ),
             },
             haystack,
         ))
@@ -544,6 +552,31 @@ pub(super) fn and_match(releases: &mut Vec<(Release, String)>, term: &str) {
     });
 }
 
+/// Fator de volume do site: aceita vírgula decimal; o que não for número finito e >= 0 vira `None`.
+fn volume_factor(value: &str) -> Option<f64> {
+    value
+        .trim()
+        .replace(',', ".")
+        .parse::<f64>()
+        .ok()
+        .filter(|factor| factor.is_finite() && *factor >= 0.0)
+}
+
+/// Flags de freeleech, halfleech e upload dobrado a partir dos fatores de volume.
+pub(super) fn volume_tags(download: Option<f64>, upload: Option<f64>) -> Vec<String> {
+    let mut tags = Vec::new();
+    match download {
+        Some(d) if d <= 0.0 => tags.push(FREELEECH_TAG.to_owned()),
+        // Desconto de metade ou mais (0.5, 0.25); 0.75 mal conta e fica sem tag.
+        Some(d) if d <= 0.5 => tags.push(HALFLEECH_TAG.to_owned()),
+        _ => {}
+    }
+    if upload.is_some_and(|u| u >= 2.0) {
+        tags.push(DOUBLE_UPLOAD_TAG.to_owned());
+    }
+    tags
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,6 +599,24 @@ mod tests {
             },
             title.into(),
         )
+    }
+
+    #[test]
+    fn fatores_de_volume_viram_tags() {
+        assert_eq!(volume_tags(Some(0.0), None), ["freeleech"]);
+        assert_eq!(volume_tags(Some(0.5), None), ["halfleech"]);
+        assert_eq!(volume_tags(Some(0.25), None), ["halfleech"]);
+        assert!(volume_tags(Some(0.75), None).is_empty());
+        assert!(volume_tags(Some(1.0), Some(1.0)).is_empty());
+        assert_eq!(volume_tags(None, Some(2.0)), ["doubleupload"]);
+        assert_eq!(
+            volume_tags(Some(0.0), Some(2.0)),
+            ["freeleech", "doubleupload"]
+        );
+        assert_eq!(volume_factor("0,5"), Some(0.5));
+        assert_eq!(volume_factor("x"), None);
+        assert_eq!(volume_factor("-1"), None);
+        assert_eq!(volume_factor("NaN"), None);
     }
 
     #[test]

@@ -55,6 +55,10 @@ export interface Indexer {
   modos: { busca: boolean; series: boolean; filmes: boolean }
   categorias: { id: number; nome: string }[]
   saude: Health
+  /** Menor vem primeiro; 1 a 50, padrão 25. */
+  prioridade: number
+  /** Construir ratio: freeleech procurado passa na frente da qualidade e o torrent ganha a tag de semear. */
+  modo_ratio: boolean
 }
 
 export interface TestResult {
@@ -282,6 +286,12 @@ export const api = {
     request<{ ok: boolean }>('DELETE', `/ui/api/indexadores/${encodeURIComponent(name)}`),
   setEnabled: (name: string, ativo: boolean) =>
     request<{ ok: boolean }>('PUT', `/ui/api/indexadores/${encodeURIComponent(name)}/ativo`, { ativo }),
+  setPreferences: (name: string, preferencias: { prioridade: number; modo_ratio: boolean }) =>
+    request<{ ok: boolean; prioridade: number; modo_ratio: boolean }>(
+      'PUT',
+      `/ui/api/indexadores/${encodeURIComponent(name)}/preferencias`,
+      preferencias,
+    ),
   tasks: () => request<{ tarefas: Task[] }>('GET', '/ui/api/tarefas'),
   taskHistory: () => request<{ historico: TaskRun[] }>('GET', '/ui/api/tarefas/historico'),
   runTask: (id: string) =>

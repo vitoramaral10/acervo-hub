@@ -22,7 +22,7 @@ pub use episodes::{
     BlockedEpisode, EpisodeDecision, EpisodeEngine, EpisodeState, EpisodeTarget, SceneMapping,
     Scope, SeriesTarget, catalog_to_scene, pick, pick_prefer_pack, scene_to_catalog,
 };
-pub use rank::compare;
+pub use rank::{DOUBLE_UPLOAD, FREELEECH, HALFLEECH, compare};
 
 /// Tamanhos por minuto de filme, em megabytes, de uma qualidade.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -233,6 +233,8 @@ pub struct Indexer {
     pub name: String,
     /// Menor é melhor; o padrão da referência é 25.
     pub priority: i32,
+    /// Modo "construir ratio": ver rank.
+    pub ratio_mode: bool,
     pub minimum_seeders: u32,
     /// Idiomas que "MULTI" significa neste indexador.
     pub multi_languages: Vec<Language>,
@@ -682,6 +684,7 @@ mod tests {
         let indexers = [Indexer {
             name: "tracker".into(),
             priority: 25,
+            ratio_mode: false,
             minimum_seeders: 1,
             multi_languages: Vec::new(),
         }];
@@ -693,6 +696,76 @@ mod tests {
             delay: Delay::default(),
         }
         .search(library[0].id, releases, Mode::UserInvoked)
+    }
+
+    fn decide_ratio(library: &[Target], releases: &[Release]) -> Vec<Decision> {
+        let settings = Settings::default();
+        let indexer = |name: &str, ratio_mode| Indexer {
+            name: name.into(),
+            priority: 25,
+            minimum_seeders: 1,
+            multi_languages: Vec::new(),
+            ratio_mode,
+        };
+        let indexers = [indexer("tracker", true), indexer("outro", false)];
+        Engine {
+            library,
+            indexers: &indexers,
+            settings: &settings,
+            blocklist: &[],
+            delay: Delay::default(),
+        }
+        .search(library[0].id, releases, Mode::UserInvoked)
+    }
+
+    fn ratio_release(title: &str, seeders: u32, peers: u32, flags: u32) -> Release {
+        Release {
+            seeders: Some(seeders),
+            peers: Some(peers),
+            flags,
+            ..release(title)
+        }
+    }
+
+    fn first_approved(decisions: &[Decision]) -> usize {
+        decisions.iter().find(|d| d.approved()).unwrap().release
+    }
+
+    #[test]
+    fn modo_ratio_poe_freeleech_procurado_na_frente_da_qualidade() {
+        let library = [movie(1, "The Housemaid", "tt0000001")];
+        let r0 = ratio_release("The Housemaid 2025 2160p WEB-DL", 50, 55, 0);
+        let r1 = ratio_release("The Housemaid 2025 1080p WEB-DL", 5, 45, FREELEECH);
+        let releases = [r0, r1];
+        assert_eq!(first_approved(&decide_ratio(&library, &releases)), 1);
+        assert_eq!(first_approved(&decide(&library, &releases)), 0);
+    }
+
+    #[test]
+    fn modo_ratio_nao_mexe_sem_procura_sem_freeleech_nem_fora_do_indexador() {
+        let library = [movie(1, "The Housemaid", "tt0000001")];
+        let r0 = ratio_release("The Housemaid 2025 2160p WEB-DL", 50, 55, 0);
+        let r1 = ratio_release("The Housemaid 2025 1080p WEB-DL", 5, 45, FREELEECH);
+        let casos = [
+            ratio_release("The Housemaid 2025 1080p WEB-DL", 50, 60, FREELEECH),
+            ratio_release("The Housemaid 2025 1080p WEB-DL", 5, 45, 0),
+            Release {
+                indexer: "outro".into(),
+                ..r1.clone()
+            },
+        ];
+        for r1 in casos {
+            let decisions = decide_ratio(&library, &[r0.clone(), r1]);
+            assert_eq!(first_approved(&decisions), 0);
+        }
+        let r1 = Release {
+            title: "The Housemaid 2025 TELESYNC".into(),
+            ..r1
+        };
+        let decisions = decide_ratio(&library, &[r0, r1]);
+        assert_eq!(first_approved(&decisions), 0);
+        let rejected = decisions.iter().find(|d| d.release == 1).unwrap();
+        assert_eq!(reasons(rejected), ["QualityNotWanted"]);
     }
 
     fn reasons(decision: &Decision) -> Vec<&'static str> {

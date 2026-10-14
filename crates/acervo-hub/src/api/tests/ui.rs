@@ -85,6 +85,7 @@ fn entry(cookie: &str) -> Entry {
 struct FakeAdmin {
     saved: Mutex<BTreeMap<String, String>>,
     disabled: Mutex<Vec<String>>,
+    preferences: Mutex<BTreeMap<String, (i32, bool)>>,
 }
 
 #[async_trait]
@@ -200,6 +201,33 @@ impl Admin for FakeAdmin {
             disabled.push(indexer.to_owned());
             Ok(None)
         }
+    }
+
+    fn preferences(&self, indexer: &str) -> Option<(i32, bool)> {
+        (indexer == "privado").then(|| {
+            self.preferences
+                .lock()
+                .unwrap()
+                .get(indexer)
+                .copied()
+                .unwrap_or((25, false))
+        })
+    }
+
+    async fn set_preferences(
+        &self,
+        indexer: &str,
+        priority: i32,
+        ratio_mode: bool,
+    ) -> Result<(), String> {
+        if indexer != "privado" {
+            return Err("indexador desconhecido".into());
+        }
+        self.preferences
+            .lock()
+            .unwrap()
+            .insert(indexer.to_owned(), (priority, ratio_mode));
+        Ok(())
     }
 
     fn tasks(&self) -> Value {
@@ -679,6 +707,47 @@ async fn desativar_tira_de_circulacao_e_mantem_na_lista() {
     .await;
     assert_eq!(status, 200);
     assert!(served(&base, &cookie, "privado").await);
+}
+
+#[tokio::test]
+async fn prioridade_e_modo_ratio_vao_e_voltam() {
+    let base = serve().await;
+    let cookie = login(&base).await;
+    let privado = |list: &Value| {
+        list["indexadores"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["nome"] == "privado")
+            .unwrap()
+            .clone()
+    };
+    let (_, list) = get(&base, "/ui/api/indexadores", &cookie).await;
+    assert_eq!(privado(&list)["prioridade"], 25);
+    assert_eq!(privado(&list)["modo_ratio"], false);
+
+    let put = |path: &'static str, body: Value| {
+        let (base, cookie) = (base.clone(), cookie.clone());
+        async move { send(&base, reqwest::Method::PUT, path, &cookie, body).await }
+    };
+    let caminho = "/ui/api/indexadores/privado/preferencias";
+    let (status, body) = put(caminho, json!({ "prioridade": 10, "modo_ratio": true })).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["prioridade"], 10);
+    let (_, list) = get(&base, "/ui/api/indexadores", &cookie).await;
+    assert_eq!(privado(&list)["prioridade"], 10);
+    assert_eq!(privado(&list)["modo_ratio"], true);
+
+    for fora in [0, 51] {
+        let (status, _) = put(caminho, json!({ "prioridade": fora, "modo_ratio": true })).await;
+        assert_eq!(status, 422);
+    }
+    let (status, _) = put(
+        "/ui/api/indexadores/fantasma/preferencias",
+        json!({ "prioridade": 10, "modo_ratio": true }),
+    )
+    .await;
+    assert_eq!(status, 422);
 }
 
 #[tokio::test]

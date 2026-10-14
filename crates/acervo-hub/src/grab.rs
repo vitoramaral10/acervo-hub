@@ -582,6 +582,8 @@ fn orphans(
     torrents
         .iter()
         .filter(|t| t.has_tag(QUEUE_TAG) && t.category == category)
+        // Terminado e com a tag de semear, segue construindo ratio.
+        .filter(|t| !(t.progress >= 1.0 && has_seed_tag(t)))
         .filter(|t| !known.contains_key(&t.hash))
         .filter(|t| t.added_on > 0 && now - t.added_on >= ORPHAN_GRACE)
         .map(|t| t.hash.clone())
@@ -836,7 +838,17 @@ pub async fn send(
     ensure_none_downloading(store, movie_id, swapping).await?;
     let (torrent, hash) = fetch_torrent(catalog, release).await?;
     let client = qbit(config).await?;
-    add_queued(config, &client, torrent, &hash, false, true).await?;
+    let seed = seed_tag(store, &release.indexer).await;
+    add_queued(
+        config,
+        &client,
+        torrent,
+        &hash,
+        false,
+        true,
+        seed.as_deref(),
+    )
+    .await?;
     store
         .record_grab(&Grab {
             id: 0,
@@ -926,9 +938,117 @@ pub(crate) async fn resolve(
     })
 }
 
+/// As tags de um torrent novo na fila: a da fila e, se houver, a de semear.
+fn queue_tags(seed: Option<&str>) -> Vec<String> {
+    std::iter::once(QUEUE_TAG.to_owned())
+        .chain(seed.map(str::to_owned))
+        .collect()
+}
+
+/// A tag de semear do indexador, se ele está no modo "construir ratio". Banco que falha não segura o grab: sai sem a tag, com aviso.
+pub(crate) async fn seed_tag(store: &Store, indexer: &str) -> Option<String> {
+    match store.indexers().await {
+        Ok(records) => records
+            .iter()
+            .any(|r| r.name == indexer && r.ratio_mode)
+            .then(|| acervo_core::seed_tag(indexer)),
+        Err(error) => {
+            tracing::warn!(
+                indexer,
+                "modo ratio ilegível; torrent sem tag de semear: {error}"
+            );
+            None
+        }
+    }
+}
+
+/// Os torrents cuja tag de semear muda quando o modo ratio do indexador
+/// liga ou desliga. Ligando, os que vieram dele (`from_indexer`) e ainda não
+/// a têm; desligando, todos que a têm, inclusive os marcados à mão.
+fn retag_targets(
+    torrents: &[acervo_clients::TorrentInfo],
+    from_indexer: &HashSet<String>,
+    tag: &str,
+    on: bool,
+) -> Vec<String> {
+    torrents
+        .iter()
+        .filter(|t| {
+            if on {
+                !t.has_tag(tag) && from_indexer.contains(&t.hash.to_ascii_lowercase())
+            } else {
+                t.has_tag(tag)
+            }
+        })
+        .map(|t| t.hash.clone())
+        .collect()
+}
+
+/// Acompanha o modo ratio do indexador no cliente: ligado, os torrents que
+/// vieram dele (grabs de filme e de série) ganham a tag de semear; desligado
+/// ou removido, ela sai de todos que a têm e a limpeza volta a valer para
+/// eles. Devolve quantos torrents mudaram.
+///
+/// # Errors
+///
+/// Cliente inalcançável ou banco ilegível.
+pub(crate) async fn retag_seeds(
+    config: &Config,
+    store: &Store,
+    indexer: &str,
+    on: bool,
+) -> Result<usize> {
+    let mut from_indexer = HashSet::new();
+    if on {
+        from_indexer.extend(
+            store
+                .grabs()
+                .await?
+                .into_iter()
+                .filter(|g| g.indexer == indexer)
+                .map(|g| g.hash.to_ascii_lowercase()),
+        );
+        from_indexer.extend(
+            store
+                .series_grabs()
+                .await?
+                .into_iter()
+                .filter(|g| g.indexer == indexer)
+                .map(|g| g.hash.to_ascii_lowercase()),
+        );
+    }
+    let client = qbit(config).await?;
+    let tag = acervo_core::seed_tag(indexer);
+    let hashes = retag_targets(&client.torrents().await?, &from_indexer, &tag, on);
+    if hashes.is_empty() {
+        return Ok(0);
+    }
+    let refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
+    if on {
+        client.add_tag(&refs, &tag).await?;
+    } else {
+        client.remove_tag(&refs, &tag).await?;
+    }
+    Ok(hashes.len())
+}
+
+/// Põe a tag de semear num torrent que já estava no cliente, se o indexador
+/// está no modo ratio. Erro vira aviso.
+pub(crate) async fn tag_seed(store: &Store, client: &QbitClient, indexer: &str, hash: &str) {
+    if let Some(tag) = seed_tag(store, indexer).await
+        && let Err(error) = client.add_tag(&[hash], &tag).await
+    {
+        tracing::warn!(
+            hash,
+            "tag de semear não aplicada ao torrent existente: {error}"
+        );
+    }
+}
+
 /// Põe o torrent no cliente, na categoria do acervo e na fila: parado ou,
 /// com `metadata_first`, andando só até ter a lista de arquivos. Com
-/// `adopt`, um torrent que já estava no cliente conta como adicionado.
+/// `adopt`, um torrent que já estava no cliente conta como adicionado. Com
+/// `seed`, o torrent leva também a tag de semear.
 ///
 /// # Errors
 ///
@@ -941,6 +1061,7 @@ pub(crate) async fn add_queued(
     hash: &str,
     metadata_first: bool,
     adopt: bool,
+    seed: Option<&str>,
 ) -> Result<()> {
     client
         .ensure_category(&config.library.category)
@@ -954,7 +1075,7 @@ pub(crate) async fn add_queued(
                 save_path: None,
                 stopped: !metadata_first,
                 stop_after_metadata: metadata_first,
-                tags: vec![QUEUE_TAG.into()],
+                tags: queue_tags(seed),
             },
         )
         .await;
@@ -962,7 +1083,16 @@ pub(crate) async fn add_queued(
         // O mesmo release de um grab que falhou, ou de um registro que não
         // chegou ao banco: o torrent já está no cliente, só falta o grab.
         Err(QbitError::AddRefused) if adopt => match client.torrent(hash).await? {
-            Some(_) => {}
+            Some(_) => {
+                if let Some(tag) = seed
+                    && let Err(error) = client.add_tag(&[hash], tag).await
+                {
+                    tracing::warn!(
+                        hash,
+                        "tag de semear não aplicada ao torrent adotado: {error}"
+                    );
+                }
+            }
             None => Err(QbitError::AddRefused).context("mandando o torrent ao qBittorrent")?,
         },
         added => added.context("mandando o torrent ao qBittorrent")?,
@@ -1707,6 +1837,14 @@ pub async fn remove_download(
     Ok(())
 }
 
+/// O torrent tem a tag de semear de algum indexador.
+fn has_seed_tag(torrent: &acervo_clients::TorrentInfo) -> bool {
+    torrent
+        .tags
+        .split(',')
+        .any(|t| t.trim().starts_with(acervo_core::SEED_TAG_PREFIX))
+}
+
 /// Apaga do cliente o torrent de um grab de filme, com os arquivos, se
 /// nenhum deles tem outro link. Com link, fica, com aviso.
 async fn delete_unlinked(
@@ -1805,7 +1943,10 @@ impl MovieImport {
         // outro caminho no meio. O torrent, que nada ligou, sai do cliente.
         let current = movie.file.as_ref().map(|f| f.relative_path.as_str());
         if current.is_some() && current != grab.replaces.as_deref() {
-            if let Some(torrent) = &torrent {
+            // Terminado e com a tag de semear, ele segue construindo ratio.
+            if let Some(torrent) = &torrent
+                && !(torrent.progress >= 1.0 && has_seed_tag(torrent))
+            {
                 delete_unlinked(client, torrent, "grab que perdeu o motivo").await?;
             }
             return Ok(Step::Superseded);
@@ -2178,6 +2319,15 @@ pub async fn import_downloads(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fila_leva_a_tag_de_semear_so_no_modo_ratio() {
+        assert_eq!(queue_tags(None), [QUEUE_TAG]);
+        assert_eq!(
+            queue_tags(Some("acervo:semear:x")),
+            [QUEUE_TAG, "acervo:semear:x"]
+        );
+    }
 
     #[test]
     fn ausencia_do_cliente_so_vira_perda_sem_bloqueio_depois_de_30_min_seguidos() {
@@ -2678,6 +2828,30 @@ mod tests {
     }
 
     #[test]
+    fn modo_ratio_marca_os_do_indexador_e_desmarca_todos() {
+        let tag = acervo_core::seed_tag("asc");
+        let torrent = |hash: &str, tags: &str| {
+            serde_json::from_value::<acervo_clients::TorrentInfo>(serde_json::json!({
+                "hash": hash, "name": hash, "state": "uploading", "save_path": "/",
+                "category": "acervo", "tags": tags, "added_on": 1,
+            }))
+            .unwrap()
+        };
+        let torrents = [
+            torrent("do-asc", ""),
+            torrent("do-asc-marcado", &tag),
+            torrent("outro", ""),
+            torrent("a-mao", &format!("{QUEUE_TAG}, {tag}")),
+        ];
+        let from = HashSet::from(["do-asc".to_owned(), "do-asc-marcado".to_owned()]);
+        assert_eq!(retag_targets(&torrents, &from, &tag, true), ["do-asc"]);
+        assert_eq!(
+            retag_targets(&torrents, &from, &tag, false),
+            ["do-asc-marcado", "a-mao"]
+        );
+    }
+
+    #[test]
     fn fila_sem_grab_so_com_tag_categoria_e_passada_a_carencia() {
         let now = 1_000_000;
         let queued = |hash: &str, category: &str, tags: &str, added_on: i64| {
@@ -2687,6 +2861,12 @@ mod tests {
             }))
             .unwrap()
         };
+        let seeding = |hash: &str, progress: f64| {
+            let tags = format!("{QUEUE_TAG},{}", acervo_core::seed_tag("asc"));
+            let mut torrent = queued(hash, "acervo", &tags, now - ORPHAN_GRACE);
+            torrent.progress = progress;
+            torrent
+        };
         let old = now - ORPHAN_GRACE;
         let torrents = [
             queued("orfao", "acervo", QUEUE_TAG, old),
@@ -2695,9 +2875,14 @@ mod tests {
             queued("sem-data", "acervo", QUEUE_TAG, 0),
             queued("outro", "outra", QUEUE_TAG, old),
             queued("sem-tag", "acervo", "", old),
+            seeding("semeando", 1.0),
+            seeding("semear-incompleto", 0.5),
         ];
         let known = HashMap::from([("com-grab".to_owned(), 1)]);
-        assert_eq!(orphans(&torrents, &known, "acervo", now), ["orfao"]);
+        assert_eq!(
+            orphans(&torrents, &known, "acervo", now),
+            ["orfao", "semear-incompleto"]
+        );
     }
 
     #[test]

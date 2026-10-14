@@ -1,5 +1,7 @@
 //! Política de limpeza. O padrão é conservador: não apaga seed nem arquivo
-//! de tracker privado sem que a configuração diga.
+//! de tracker privado sem que a configuração diga. Torrent terminado com tag
+//! de semear (`acervo_core::SEED_TAG_PREFIX`) a limpeza não apaga; remoção
+//! pedida na tela, sim.
 
 use std::time::Duration;
 

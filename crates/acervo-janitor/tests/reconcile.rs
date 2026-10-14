@@ -36,6 +36,8 @@ fn seed(hash: &str, links: u64, bytes: u64) -> Download {
         state: DownloadState::Seeding,
         private: false,
         category: "tv-sonarr".into(),
+        tags: Vec::new(),
+        complete: true,
         ratio: 0.0,
         seeded_for: 500 * HORA,
         idle_for: None,
@@ -112,6 +114,48 @@ fn item_em_fila_nunca_e_avaliado_como_seed_solto() {
     assert!(plano.is_empty());
     assert_eq!(plano.skipped.len(), 1);
     assert_eq!(plano.skipped[0].reason, SkipReason::InQueue);
+}
+
+#[test]
+fn tag_de_semear_segura_seed_sem_vinculo() {
+    // Seed sem hardlink sairia (DeleteUnlinked); a tag do modo ratio o segura.
+    let mut inv = Inventory::new(Allocated::from_bytes(100 * GIB));
+    inv.downloads = vec![Download {
+        tags: vec![acervo_core::seed_tag("amigos")],
+        ..seed("aa", 1, 4 * GIB)
+    }];
+
+    let plano = reconcile(
+        &inv,
+        &politica_aplicando(),
+        &mut StrikeLedger::new(),
+        agora(),
+    )
+    .expect("sem abort");
+
+    assert!(plano.is_empty());
+    assert_eq!(plano.skipped[0].reason, SkipReason::KeepSeeding);
+}
+
+#[test]
+fn seed_sem_tag_continua_saindo() {
+    let mut inv = Inventory::new(Allocated::from_bytes(100 * GIB));
+    inv.downloads = vec![seed("aa", 1, 4 * GIB)];
+
+    let plano = reconcile(
+        &inv,
+        &politica_aplicando(),
+        &mut StrikeLedger::new(),
+        agora(),
+    )
+    .expect("sem abort");
+
+    let saidas = plano
+        .actions
+        .iter()
+        .filter(|a| matches!(a, Action::DeleteUnlinked { .. }))
+        .count();
+    assert_eq!(saidas, 1);
 }
 
 #[test]
@@ -211,6 +255,7 @@ fn sem_categorias_gerenciadas_a_regra_de_hardlink_nao_apaga_nada() {
 fn sem_dono(hash: &str, bytes: u64) -> Download {
     Download {
         state: DownloadState::Paused,
+        complete: false,
         seeded_for: Duration::ZERO,
         ..seed(hash, 1, bytes)
     }
@@ -486,4 +531,50 @@ fn privado_com_hardlink_nunca_sai() {
     let plano =
         reconcile(&inv, &politica_de_seed(), &mut StrikeLedger::new(), agora()).expect("sem abort");
     assert!(plano.actions.is_empty());
+}
+
+#[test]
+fn tag_de_semear_segura_download_completo_sem_dono() {
+    let politica = politica_aplicando();
+    let inv = inventario_com(
+        vec![Download {
+            tags: vec![acervo_core::seed_tag("amigos")],
+            complete: true,
+            ..sem_dono("bb", GIB)
+        }],
+        vec![],
+    );
+    let mut ledger = StrikeLedger::new();
+
+    for _ in 0..=politica.orphan_strikes {
+        let plano = reconcile(&inv, &politica, &mut ledger, agora()).expect("sem abort");
+        assert!(!plano.actions.iter().any(|a| matches!(
+            a,
+            Action::StrikeUnowned { .. } | Action::DeleteUnowned { .. }
+        )));
+    }
+}
+
+#[test]
+fn tag_de_semear_nao_segura_download_incompleto_sem_dono() {
+    // Parado a 40% e sem dono, nunca vai semear: a tag não o salva dos strikes.
+    let politica = politica_aplicando();
+    let inv = inventario_com(
+        vec![Download {
+            tags: vec![acervo_core::seed_tag("amigos")],
+            complete: false,
+            ..sem_dono("cc", GIB)
+        }],
+        vec![],
+    );
+    let mut ledger = StrikeLedger::new();
+
+    let plano = reconcile(&inv, &politica, &mut ledger, agora()).expect("sem abort");
+
+    assert!(
+        plano
+            .actions
+            .iter()
+            .any(|a| matches!(a, Action::StrikeUnowned { .. }))
+    );
 }

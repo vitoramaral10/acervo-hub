@@ -342,6 +342,8 @@ mod tests {
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                 .collect(),
             enabled: true,
+            priority: acervo_store::DEFAULT_INDEXER_PRIORITY,
+            ratio_mode: false,
             added_at: None,
         }
     }
