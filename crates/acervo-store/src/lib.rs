@@ -19,7 +19,7 @@ use serde::Serialize;
 use tokio_postgres::{NoTls, Row};
 
 pub use accounts::SESSION_DAYS;
-pub use config::IndexerRecord;
+pub use config::{DEFAULT_INDEXER_PRIORITY, INDEXER_PRIORITIES, IndexerRecord};
 pub use definitions::DefinitionRow;
 pub use discover::{DiscoverKind, HiddenTitle};
 pub use manage::{Blocked, FailReason, HistoryEvent, HistoryPage, NewHistory};
@@ -250,7 +250,11 @@ pub struct Grab {
 /// Cada migração roda uma vez, na ordem; a posição é a versão.
 /// Versão do schema consolidado; entradas seguintes são 36, 37, ...
 const BASE_VERSION: i32 = 35;
-const MIGRATIONS: &[&str] = &[include_str!("base.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("base.sql"),
+    // 36: prioridade e modo "construir ratio" por indexador.
+    r"ALTER TABLE indexers ADD COLUMN priority INTEGER NOT NULL DEFAULT 25 CHECK (priority BETWEEN 1 AND 50), ADD COLUMN ratio_mode BOOLEAN NOT NULL DEFAULT FALSE;",
+];
 
 /// Quanto uma consulta pode levar. A maior consulta real (o catálogo de
 /// séries inteiro, com episódios e arquivos) leva menos de um segundo; o
@@ -1294,7 +1298,10 @@ mod tests {
             .await
             .unwrap()
             .get(0);
-        assert_eq!(version, BASE_VERSION);
+        assert_eq!(
+            version,
+            BASE_VERSION + i32::try_from(MIGRATIONS.len()).unwrap() - 1
+        );
         for (table, constraint) in [
             ("movies", "movies_tmdb_id_key"),
             ("searches", "searches_pkey"),
@@ -1308,6 +1315,7 @@ mod tests {
             ("deletion_marks", "deletion_marks_check1"),
             ("scene_mappings", "scene_mappings_pkey"),
             ("indexers", "indexers_kind_check"),
+            ("indexers", "indexers_priority_check"),
         ] {
             let exists: bool = client
                 .query_one(
@@ -2177,6 +2185,45 @@ mod tests {
                 .subtitles
                 .is_empty()
         );
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn migracao_36_da_prioridade_e_modo_ratio_aos_indexadores() {
+        let Some(db) = TestDb::new("migracao_36").await else {
+            return;
+        };
+        {
+            let client = db.store.pool.get().await.unwrap();
+            client
+                .batch_execute(
+                    "ALTER TABLE indexers DROP COLUMN priority, DROP COLUMN ratio_mode;
+                     UPDATE schema_version SET version = 35;
+                     INSERT INTO indexers (name, kind) VALUES ('antigo', 'cardigann')",
+                )
+                .await
+                .unwrap();
+        }
+        db.store.migrate().await.unwrap();
+        let client = db.store.pool.get().await.unwrap();
+        let version: i32 = client
+            .query_one("SELECT version FROM schema_version", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(version, 36);
+        let indexers = db.store.indexers().await.unwrap();
+        assert_eq!(indexers.len(), 1);
+        assert_eq!(indexers[0].name, "antigo");
+        assert_eq!(indexers[0].priority, 25);
+        assert!(!indexers[0].ratio_mode);
+        assert!(
+            client
+                .batch_execute("UPDATE indexers SET priority = 0")
+                .await
+                .is_err()
+        );
+        drop(client);
         db.drop().await;
     }
 }

@@ -587,9 +587,20 @@ mod tests {
         scope: Option<&Scope>,
         releases: &[Release],
     ) -> Vec<EpisodeDecision> {
+        run_with(false, library, settings, scope, releases)
+    }
+
+    fn run_with(
+        ratio_mode: bool,
+        library: &[SeriesTarget],
+        settings: &Settings,
+        scope: Option<&Scope>,
+        releases: &[Release],
+    ) -> Vec<EpisodeDecision> {
         let indexers = [Indexer {
             name: "tracker".into(),
             priority: 25,
+            ratio_mode,
             minimum_seeders: 1,
             multi_languages: Vec::new(),
         }];
@@ -609,6 +620,10 @@ mod tests {
         run(library, &Settings::default(), None, releases)
     }
 
+    fn run_ratio(library: &[SeriesTarget], releases: &[Release]) -> Vec<EpisodeDecision> {
+        run_with(true, library, &Settings::default(), None, releases)
+    }
+
     fn scope(series: i64) -> Scope {
         Scope {
             series,
@@ -619,6 +634,25 @@ mod tests {
 
     fn reasons(decision: &EpisodeDecision) -> Vec<&'static str> {
         decision.rejections.iter().map(Rejection::reason).collect()
+    }
+
+    #[test]
+    fn modo_ratio_vale_tambem_para_episodio() {
+        let library = [last_missing()];
+        let r0 = Release {
+            seeders: Some(50),
+            peers: Some(55),
+            ..release("Some.Show.S01E10.2160p.WEB-DL.x264-GRP")
+        };
+        let r1 = Release {
+            seeders: Some(5),
+            peers: Some(45),
+            flags: crate::FREELEECH,
+            ..release("Some.Show.S01E10.1080p.WEB-DL.x264-GRP")
+        };
+        let releases = [r0, r1];
+        assert_eq!(pick(&run_ratio(&library, &releases))[0].0.release, 1);
+        assert_eq!(pick(&rss(&library, &releases))[0].0.release, 0);
     }
 
     #[test]

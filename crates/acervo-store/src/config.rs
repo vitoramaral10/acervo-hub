@@ -10,6 +10,11 @@ use serde_json::Value;
 
 use crate::{Result, Store, StoreError};
 
+/// Prioridade de quem não escolheu, a da referência; menor vem primeiro.
+pub const DEFAULT_INDEXER_PRIORITY: i32 = 25;
+/// Faixa aceita de prioridade.
+pub const INDEXER_PRIORITIES: std::ops::RangeInclusive<i32> = 1..=50;
+
 /// Um indexador cadastrado.
 #[derive(Clone, PartialEq, Eq)]
 pub struct IndexerRecord {
@@ -24,6 +29,10 @@ pub struct IndexerRecord {
     /// Settings da definição e da rede. Guarda segredo.
     pub settings: BTreeMap<String, String>,
     pub enabled: bool,
+    /// Menor vem primeiro; [`INDEXER_PRIORITIES`], padrão [`DEFAULT_INDEXER_PRIORITY`].
+    pub priority: i32,
+    /// Modo "construir ratio": freeleech procurado deste indexador vem antes da qualidade, e o torrent ganha a tag de semear.
+    pub ratio_mode: bool,
     pub added_at: Option<String>,
 }
 
@@ -36,6 +45,8 @@ impl std::fmt::Debug for IndexerRecord {
             .field("kind", &self.kind)
             .field("definition", &self.definition)
             .field("enabled", &self.enabled)
+            .field("priority", &self.priority)
+            .field("ratio_mode", &self.ratio_mode)
             .field("settings", &self.settings.keys().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
@@ -74,12 +85,14 @@ fn read_indexer(row: &tokio_postgres::Row) -> Result<IndexerRecord> {
         settings: settings_map(row.try_get(4)?)?,
         enabled: row.try_get(5)?,
         added_at: row.try_get(6)?,
+        priority: row.try_get(7)?,
+        ratio_mode: row.try_get(8)?,
     })
 }
 
 const INSERT_INDEXER: &str =
-    "INSERT INTO indexers (name, kind, definition, url, settings, enabled, added_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+    "INSERT INTO indexers (name, kind, definition, url, settings, enabled, added_at, priority, ratio_mode)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      ON CONFLICT (name) DO NOTHING";
 
 fn count(value: u32) -> i32 {
@@ -129,7 +142,7 @@ impl Store {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "SELECT name, kind, definition, url, settings, enabled, added_at
+                "SELECT name, kind, definition, url, settings, enabled, added_at, priority, ratio_mode
                  FROM indexers ORDER BY name",
                 &[],
             )
@@ -155,6 +168,8 @@ impl Store {
                     &settings_value(&record.settings),
                     &record.enabled,
                     &record.added_at,
+                    &record.priority,
+                    &record.ratio_mode,
                 ],
             )
             .await?;
@@ -183,6 +198,8 @@ impl Store {
                     &settings_value(&record.settings),
                     &record.enabled,
                     &record.added_at,
+                    &record.priority,
+                    &record.ratio_mode,
                 ],
             )
             .await?;
@@ -208,7 +225,7 @@ impl Store {
         let updated = client
             .execute(
                 "UPDATE indexers SET kind = $2, definition = $3, url = $4, settings = $5,
-                     enabled = $6
+                     enabled = $6, priority = $7, ratio_mode = $8
                  WHERE name = $1",
                 &[
                     &record.name,
@@ -217,6 +234,8 @@ impl Store {
                     &record.url,
                     &settings_value(&record.settings),
                     &record.enabled,
+                    &record.priority,
+                    &record.ratio_mode,
                 ],
             )
             .await?;
@@ -294,6 +313,8 @@ mod tests {
             url: Some("http://x/api".into()),
             settings: [("api_key".to_owned(), "segredo".to_owned())].into(),
             enabled: true,
+            priority: DEFAULT_INDEXER_PRIORITY,
+            ratio_mode: false,
             added_at: Some("2026-01-01T00:00:00Z".into()),
         }
     }
@@ -322,6 +343,8 @@ mod tests {
         assert!(!store.insert_indexer(&record("um")).await.unwrap());
         let mut changed = record("um");
         changed.enabled = false;
+        changed.priority = 10;
+        changed.ratio_mode = true;
         changed.settings.insert("api_key".into(), "outra".into());
         assert!(store.update_indexer(&changed).await.unwrap());
         assert_eq!(store.indexers().await.unwrap(), [changed]);

@@ -141,6 +141,14 @@ async fn read_download(
         state: state_from_qbit(&torrent.state),
         private: torrent.is_private(),
         category: torrent.category.clone(),
+        tags: torrent
+            .tags
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        complete: torrent.progress >= 1.0,
         ratio: torrent.ratio,
         seeded_for: torrent.seeded_for(),
         idle_for: Some(torrent.idle_for(now_epoch)),

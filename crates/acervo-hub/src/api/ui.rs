@@ -121,6 +121,10 @@ pub(crate) fn routes() -> Router<Arc<Server>> {
             "/ui/api/indexadores/{nome}/ativo",
             axum::routing::put(set_enabled),
         )
+        .route(
+            "/ui/api/indexadores/{nome}/preferencias",
+            axum::routing::put(set_preferences),
+        )
         .route("/ui/api/catalogo", get(definitions))
         .route(
             "/ui/api/catalogo/{definicao}/settings",
@@ -403,9 +407,14 @@ fn timestamp(value: Option<time::OffsetDateTime>) -> serde_json::Value {
 fn indexer_json(server: &Server, view: &super::IndexerView) -> serde_json::Value {
     let caps = &view.capabilities;
     let admin = server.admin.as_ref();
+    let (priority, ratio) = admin
+        .preferences(&view.name)
+        .unwrap_or((acervo_store::DEFAULT_INDEXER_PRIORITY, false));
     json!({
         "nome": view.name,
         "ativo": true,
+        "prioridade": priority,
+        "modo_ratio": ratio,
         "origem": admin.origin(&view.name).unwrap_or("cadastro"),
         "privado": view.proxies_downloads,
         "editavel": admin.settings(&view.name).is_some(),
@@ -443,9 +452,14 @@ async fn indexers(
     {
         let admin = &server.admin;
         for (name, origin) in admin.disabled() {
+            let (priority, ratio) = admin
+                .preferences(&name)
+                .unwrap_or((acervo_store::DEFAULT_INDEXER_PRIORITY, false));
             list.push(json!({
                 "nome": name,
                 "ativo": false,
+                "prioridade": priority,
+                "modo_ratio": ratio,
                 "origem": origin,
                 "privado": false,
                 "editavel": admin.settings(&name).is_some(),
@@ -532,6 +546,37 @@ async fn set_enabled(
         server.catalog.remove(&name);
     }
     Ok(ok(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct PreferencesBody {
+    prioridade: i32,
+    modo_ratio: bool,
+}
+
+async fn set_preferences(
+    State(server): State<Arc<Server>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<PreferencesBody>,
+) -> Result<Response, UiError> {
+    guard(&server, &headers, &Method::PUT).await?;
+    if !acervo_store::INDEXER_PRIORITIES.contains(&body.prioridade) {
+        return Err(UiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a prioridade vai de 1 a 50".into(),
+        ));
+    }
+    server
+        .admin
+        .set_preferences(&name, body.prioridade, body.modo_ratio)
+        .await
+        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+    Ok(ok(json!({
+        "ok": true,
+        "prioridade": body.prioridade,
+        "modo_ratio": body.modo_ratio,
+    })))
 }
 
 async fn definitions(

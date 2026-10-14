@@ -55,6 +55,8 @@ mod tests {
             url: None,
             settings: std::collections::BTreeMap::new(),
             enabled: true,
+            priority: crate::DEFAULT_INDEXER_PRIORITY,
+            ratio_mode: false,
             added_at: None,
         };
         let row = DefinitionRow {

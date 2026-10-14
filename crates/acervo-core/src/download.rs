@@ -7,6 +7,18 @@ use std::time::{Duration, SystemTime};
 use crate::ids::DownloadHash;
 use crate::size::{Allocated, Apparent};
 
+/// Prefixo da tag que segura o torrent semeando: a limpeza automática não
+/// apaga torrent terminado com uma tag começando por ele (o modo "construir
+/// ratio" do indexador a aplica e tira; posta à mão, também vale). Remoção
+/// pedida na tela apaga mesmo assim.
+pub const SEED_TAG_PREFIX: &str = "acervo:semear:";
+
+/// A tag de semear de um indexador. Vírgula separa tags no qBittorrent: vira hífen.
+#[must_use]
+pub fn seed_tag(indexer: &str) -> String {
+    format!("{SEED_TAG_PREFIX}{}", indexer.replace(',', "-"))
+}
+
 /// Estado do torrent no cliente.
 ///
 /// `Paused` é um estado próprio, e **não** é sinônimo de órfão: a maior parte
@@ -62,6 +74,10 @@ pub struct Download {
     /// Categoria no cliente. Só as categorias gerenciadas entram na limpeza;
     /// as outras são downloads manuais, fora da conta do acervo.
     pub category: String,
+    /// Tags no cliente, já separadas.
+    pub tags: Vec<String>,
+    /// Baixou por inteiro. Torrent parado ou com erro a meio caminho não semeia.
+    pub complete: bool,
     pub ratio: f64,
     pub seeded_for: Duration,
     /// Tempo desde a última transferência. `None` é desconhecido, e
@@ -79,6 +95,13 @@ impl Download {
     #[must_use]
     pub fn has_library_link(&self) -> bool {
         self.files.iter().any(FileFacts::is_shared)
+    }
+
+    /// Tem tag de semear e já terminou: fica no cliente, seja qual for o
+    /// resto. Incompleto com a tag não semeia nada e segue a regra comum.
+    #[must_use]
+    pub fn keeps_seeding(&self) -> bool {
+        self.complete && self.tags.iter().any(|t| t.starts_with(SEED_TAG_PREFIX))
     }
 
     /// Espaço que volta ao apagar: só os arquivos sem outro link.
@@ -119,6 +142,8 @@ mod tests {
             state: DownloadState::Seeding,
             private: true,
             category: "tv-sonarr".into(),
+            tags: Vec::new(),
+            complete: true,
             ratio: 0.0,
             seeded_for: Duration::ZERO,
             idle_for: None,
@@ -147,6 +172,24 @@ mod tests {
         let d = download(vec![facts(2, 1000), facts(1, 40)]);
         assert!(d.has_library_link());
         assert_eq!(d.reclaimable(), Allocated::from_blocks(40));
+    }
+
+    #[test]
+    fn tag_de_semear_por_indexador_e_reconhecida_pelo_prefixo() {
+        assert_eq!(seed_tag("amigos-share"), "acervo:semear:amigos-share");
+        assert_eq!(seed_tag("a,b"), "acervo:semear:a-b");
+        let com_tags = |tags: Vec<String>| Download {
+            tags,
+            ..download(Vec::new())
+        };
+        assert!(com_tags(vec!["acervo:fila".into(), seed_tag("x")]).keeps_seeding());
+        assert!(!com_tags(vec!["acervo:fila".into()]).keeps_seeding());
+        assert!(!com_tags(vec!["acervo:semear".into()]).keeps_seeding());
+        let incompleto = Download {
+            complete: false,
+            ..com_tags(vec![seed_tag("x")])
+        };
+        assert!(!incompleto.keeps_seeding());
     }
 
     #[test]

@@ -10,10 +10,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::api::{ALL, Catalog};
 use acervo_decision::{
-    BlockedRelease, Decision, Delay, Engine, ExistingFile, Indexer, Mode, Profile, Queued, Release,
-    Settings, Target,
+    BlockedRelease, DOUBLE_UPLOAD, Decision, Delay, Engine, ExistingFile, FREELEECH, HALFLEECH,
+    Indexer, Mode, Profile, Queued, Release, Settings, Target,
 };
-use acervo_indexers::SearchQuery;
+use acervo_indexers::{DOUBLE_UPLOAD_TAG, FREELEECH_TAG, HALFLEECH_TAG, SearchQuery};
 use acervo_parser::{Language, QualityModel, Revision, clean_movie_title};
 use acervo_store::{CatalogMovie, SearchPick, SearchRun, Store};
 use anyhow::{Result, bail};
@@ -24,9 +24,6 @@ use crate::rules::DecisionRules;
 
 /// Categoria Newznab de filmes.
 const MOVIES: u32 = 2000;
-
-/// Bit de freeleech, no formato de flags da referência.
-const FREELEECH: u32 = 1;
 
 /// O título da base de metadados (em inglês) não sai na API do gerenciador;
 /// a pasta nasce dele.
@@ -104,15 +101,20 @@ fn target(entry: &CatalogMovie, now: time::OffsetDateTime) -> Target {
     }
 }
 
-/// Os indexadores cadastrados, com prioridade 25 e mínimo de um seeder.
-pub(crate) fn indexers(served: &[String]) -> Vec<Indexer> {
+/// Os indexadores servidos, com prioridade e modo ratio do cadastro; sem
+/// cadastro, prioridade padrão e modo desligado. Mínimo de um seeder.
+pub(crate) fn indexers(served: &[String], records: &[acervo_store::IndexerRecord]) -> Vec<Indexer> {
     served
         .iter()
-        .map(|name| Indexer {
-            name: name.clone(),
-            priority: 25,
-            minimum_seeders: 1,
-            multi_languages: Vec::new(),
+        .map(|name| {
+            let record = records.iter().find(|r| r.name == *name);
+            Indexer {
+                name: name.clone(),
+                priority: record.map_or(acervo_store::DEFAULT_INDEXER_PRIORITY, |r| r.priority),
+                ratio_mode: record.is_some_and(|r| r.ratio_mode),
+                minimum_seeders: 1,
+                multi_languages: Vec::new(),
+            }
         })
         .collect()
 }
@@ -182,8 +184,12 @@ impl Decider {
     #[allow(clippy::too_many_lines)] // Leitura em sequência; dividir só espalharia.
     pub async fn load(store: &Store, catalog: &Catalog) -> Result<Self> {
         let rules = crate::rules::stored(store).await?;
-        let (movies, grabs, blocked) =
-            tokio::try_join!(store.movies(), store.grabs(), store.blocklist())?;
+        let (movies, grabs, blocked, records) = tokio::try_join!(
+            store.movies(),
+            store.grabs(),
+            store.blocklist(),
+            store.indexers()
+        )?;
         if movies.is_empty() {
             bail!("catálogo vazio: adicione filmes antes");
         }
@@ -210,7 +216,7 @@ impl Decider {
             bail!("nenhum indexador ativo para buscar");
         }
         Ok(Self {
-            indexers: indexers(&served),
+            indexers: indexers(&served, &records),
             settings: remote.rules.settings(),
             delay: remote.rules.delay(),
             // Bloqueio por falta de seeds expira; a linha fica na tela.
@@ -303,6 +309,18 @@ impl Decider {
     }
 }
 
+/// Bits de flag das tags do release, no formato da referência.
+fn release_flags(tags: &[String]) -> u32 {
+    [
+        (FREELEECH_TAG, FREELEECH),
+        (HALFLEECH_TAG, HALFLEECH),
+        (DOUBLE_UPLOAD_TAG, DOUBLE_UPLOAD),
+    ]
+    .iter()
+    .filter(|(name, _)| tags.iter().any(|t| t.eq_ignore_ascii_case(name)))
+    .fold(0, |flags, (_, bit)| flags | bit)
+}
+
 /// Os releases do indexador no formato que a decisão lê.
 pub(crate) fn candidates(releases: &[acervo_indexers::Release]) -> Vec<Release> {
     releases
@@ -318,11 +336,7 @@ pub(crate) fn candidates(releases: &[acervo_indexers::Release]) -> Vec<Release> 
             tvdb_id: None,
             languages: Vec::new(),
             container: None,
-            flags: if r.tags.iter().any(|t| t.eq_ignore_ascii_case("freeleech")) {
-                FREELEECH
-            } else {
-                0
-            },
+            flags: release_flags(&r.tags),
             #[allow(clippy::cast_precision_loss)]
             age_hours: r
                 .published
@@ -550,4 +564,59 @@ pub(crate) fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn release(tags: &[&str]) -> acervo_indexers::Release {
+        acervo_indexers::Release {
+            indexer: "x".into(),
+            guid: "g".into(),
+            title: "t".into(),
+            download_url: url::Url::parse("https://tracker.invalid/d").unwrap(),
+            info_url: None,
+            size: 1,
+            published: None,
+            seeders: None,
+            leechers: None,
+            grabs: None,
+            categories: Vec::new(),
+            tags: tags.iter().map(|t| (*t).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn candidatos_leem_as_flags_das_tags() {
+        let flags = |tags: &[&str]| candidates(&[release(tags)])[0].flags;
+        assert_eq!(
+            flags(&["FreeLeech", "doubleupload"]),
+            FREELEECH | DOUBLE_UPLOAD
+        );
+        assert_eq!(flags(&["halfleech", "outra"]), HALFLEECH);
+        assert_eq!(flags(&[]), 0);
+    }
+
+    #[test]
+    fn indexadores_leem_prioridade_e_modo_ratio_do_cadastro() {
+        let record = acervo_store::IndexerRecord {
+            name: "amigos".into(),
+            kind: "cardigann".into(),
+            definition: None,
+            url: None,
+            settings: BTreeMap::new(),
+            enabled: true,
+            priority: 10,
+            ratio_mode: true,
+            added_at: None,
+        };
+        let served = ["amigos".to_owned(), "outro".to_owned()];
+        let found = indexers(&served, &[record]);
+        let got: Vec<_> = found
+            .iter()
+            .map(|i| (i.name.as_str(), i.priority, i.ratio_mode))
+            .collect();
+        assert_eq!(got, [("amigos", 10, true), ("outro", 25, false)]);
+    }
 }

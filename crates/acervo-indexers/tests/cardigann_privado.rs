@@ -149,6 +149,8 @@ async fn cookie_vai_em_todo_request_e_a_consulta_sai_como_o_site_espera() {
     );
     assert_eq!(results[0].size, 1_610_612_736);
     assert_eq!(results[0].grabs, Some(10));
+    assert_eq!(results[0].tags, ["freeleech"]);
+    assert!(results[1].tags.is_empty());
     assert_eq!(results[0].seeders, Some(12));
     assert_eq!(results[0].leechers, Some(3));
     assert_eq!(results[0].categories, [5000]);
@@ -241,6 +243,8 @@ async fn formulario_loga_uma_vez_e_junta_as_paginas() {
         ]
     );
     assert_eq!(results[0].categories, [2000]);
+    assert!(results[0].tags.is_empty());
+    assert_eq!(results[1].tags, ["freeleech"]);
     assert_eq!(results[1].categories, [5070]);
     assert_eq!(results[2].categories, [5000]);
     assert_eq!(results[0].size, 1_610_612_736);

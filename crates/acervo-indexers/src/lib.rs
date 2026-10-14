@@ -15,8 +15,8 @@ pub use cardigann::{
     CardigannClient, CardigannDefinition, DefinitionHeader, SettingInfo, SettingInfoKind,
 };
 pub use model::{
-    Capabilities, Category, IndexerError, Release, ResolvedDownload, SearchMode, SearchQuery,
-    SearchSupport,
+    Capabilities, Category, DOUBLE_UPLOAD_TAG, FREELEECH_TAG, HALFLEECH_TAG, IndexerError, Release,
+    ResolvedDownload, SearchMode, SearchQuery, SearchSupport,
 };
 pub use network::{Challenge, FlareSolverr, Network, Proxy};
 pub use rate::RateBudget;
