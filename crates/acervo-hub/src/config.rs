@@ -195,7 +195,7 @@ impl Default for LibraryConfig {
 }
 
 /// Intervalos fixos das tarefas, em minutos.
-pub const TASK_DEFAULTS: [(&str, u64); 7] = [
+pub const TASK_DEFAULTS: [(&str, u64); 8] = [
     ("busca", 120),
     ("rss", 30),
     ("importacao", 5),
@@ -203,6 +203,7 @@ pub const TASK_DEFAULTS: [(&str, u64); 7] = [
     ("limpeza", 60),
     ("cena", 1440),
     ("disco", 360),
+    ("cross-seed", 30),
 ];
 pub const SEARCH_LIMIT: usize = 10;
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(60);

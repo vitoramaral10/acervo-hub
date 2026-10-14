@@ -20,6 +20,7 @@ mod apply;
 mod automatic;
 mod collect;
 mod config;
+mod crossseed;
 mod cycle;
 mod decide;
 mod definitions;

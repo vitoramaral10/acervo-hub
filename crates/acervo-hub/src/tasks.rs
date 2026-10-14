@@ -736,6 +736,18 @@ pub fn service(
             }),
         },
         Task {
+            id: "cross-seed",
+            name: "Cross-seed entre trackers",
+            interval: interval("cross-seed"),
+            // Busca nos trackers: não soma à subida do serviço.
+            first: First::AfterInterval,
+            job: Arc::new(CrossSeed {
+                settings: Arc::clone(settings),
+                database: database.clone(),
+                catalog: catalog.clone(),
+            }),
+        },
+        Task {
             id: DISCO,
             name: "Conferência do disco",
             interval: interval(DISCO),
@@ -1229,6 +1241,30 @@ impl Job for Cleanup {
             .janitor()
             .err()
             .map(|error| format!("{error:#}"))
+    }
+}
+
+/// Acha o mesmo release em outro tracker e semeia para os dois dos mesmos
+/// arquivos ([`crate::crossseed`]).
+#[derive(Debug)]
+struct CrossSeed {
+    settings: Arc<Settings>,
+    database: Database,
+    catalog: Catalog,
+}
+
+#[async_trait]
+impl Job for CrossSeed {
+    async fn run(&self, _: Trigger) -> Result<Outcome> {
+        let store = store(&self.database)?;
+        let config = self.settings.get();
+        crate::crossseed::run(&config, store, &self.catalog)
+            .await
+            .map(|summary| Outcome::new(true, summary))
+    }
+
+    fn unavailable(&self) -> Option<String> {
+        without_client(&self.settings)
     }
 }
 
