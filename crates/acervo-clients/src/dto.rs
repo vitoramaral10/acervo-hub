@@ -57,6 +57,10 @@ pub struct TorrentInfo {
     /// é fora dela (completo, ou fila do cliente desligada).
     #[serde(default)]
     pub priority: i64,
+    /// O arquivo (torrent de um arquivo) ou a pasta raiz, como o cliente vê.
+    /// Dois torrents com o mesmo caminho semeiam dos mesmos arquivos.
+    #[serde(default)]
+    pub content_path: String,
 }
 
 impl TorrentInfo {

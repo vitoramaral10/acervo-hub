@@ -1,6 +1,7 @@
 //! Cliente do qBittorrent (`WebUI` API v2) e, em [`jellyfin`], o mínimo do
 //! Jellyfin.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ pub mod jellyfin;
 mod torrent;
 
 pub use dto::{TorrentFile, TorrentInfo, Tracker};
-pub use torrent::{info_hash, magnet_hash};
+pub use torrent::{info_hash, layout, magnet_hash};
 
 #[derive(Debug, thiserror::Error)]
 pub enum QbitError {
@@ -44,6 +45,12 @@ pub enum NewTorrent {
     File(Vec<u8>),
     Magnet(String),
 }
+
+/// Serializa adicionar torrent e apagar com arquivos: a conferência de
+/// conteúdo compartilhado de [`QbitClient::delete`] só vale se nenhum irmão
+/// entrar entre ela e a remoção. Vale para o processo, que é quem fala com o
+/// cliente.
+static CONTENT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Onde e como o torrent novo entra.
 #[derive(Debug, Clone)]
@@ -296,6 +303,7 @@ impl QbitClient {
     ///
     /// Falha de transporte, status não-2xx ou torrent recusado.
     pub async fn add(&self, torrent: NewTorrent, options: &AddOptions) -> Result<(), QbitError> {
+        let _guard = CONTENT_LOCK.lock().await;
         let path = "api/v2/torrents/add";
         let mut form = reqwest::multipart::Form::new().text("category", options.category.clone());
         if let Some(save_path) = &options.save_path {
@@ -424,10 +432,37 @@ impl QbitClient {
 
     /// Apaga torrents, opcionalmente com os arquivos.
     ///
+    /// Com os arquivos, o torrent cujo conteúdo outro torrent do cliente
+    /// também usa (cross-seed: o mesmo arquivo semeando para dois trackers)
+    /// sai **sem** eles: apagar levaria o dado do outro junto, e ele passaria
+    /// a baixar tudo de novo ou viraria hit&run. O último a sair leva os
+    /// arquivos.
+    ///
     /// # Errors
     ///
-    /// Falha de transporte ou status não-2xx.
+    /// Falha de transporte ou status não-2xx; com os arquivos, também a
+    /// lista de torrents ilegível (sem ela, nada é apagado).
     pub async fn delete(
+        &self,
+        hashes: &[DownloadHash],
+        delete_files: bool,
+    ) -> Result<(), QbitError> {
+        if hashes.is_empty() || !delete_files {
+            return self.delete_raw(hashes, delete_files).await;
+        }
+        // A leitura e a remoção ficam juntas: um irmão adicionado entre as
+        // duas perderia os arquivos.
+        let _guard = CONTENT_LOCK.lock().await;
+        let shared = shared_content(hashes, &self.torrents().await?);
+        let (keep, free): (Vec<DownloadHash>, Vec<DownloadHash>) = hashes
+            .iter()
+            .cloned()
+            .partition(|h| shared.contains(&h.as_str().to_ascii_lowercase()));
+        self.delete_raw(&free, true).await?;
+        self.delete_raw(&keep, false).await
+    }
+
+    async fn delete_raw(
         &self,
         hashes: &[DownloadHash],
         delete_files: bool,
@@ -532,6 +567,55 @@ impl QbitClient {
 
 /// Traduz o estado do qBittorrent para o do domínio.
 ///
+/// Dos `targets`, os que dividem o conteúdo com um torrent que fica no
+/// cliente: mesmo caminho, ou um dentro do outro. Hashes em minúsculas.
+///
+/// Caminho desconhecido (cliente que não informa `content_path`) é "não
+/// sei", e na dúvida o arquivo fica: o alvo sem caminho conta como
+/// compartilhado, e um torrent que fica sem caminho pode ser irmão de
+/// qualquer um.
+#[must_use]
+pub fn shared_content(targets: &[DownloadHash], all: &[TorrentInfo]) -> HashSet<String> {
+    let leaving: HashSet<String> = targets
+        .iter()
+        .map(|h| h.as_str().to_ascii_lowercase())
+        .collect();
+    let (going, staying): (Vec<&TorrentInfo>, Vec<&TorrentInfo>) = all
+        .iter()
+        .partition(|t| leaving.contains(&t.hash.to_ascii_lowercase()));
+    let staying: Vec<Option<String>> = staying
+        .iter()
+        .map(|t| normalized(&t.content_path))
+        .collect();
+    going
+        .iter()
+        .filter(|t| match normalized(&t.content_path) {
+            None => true,
+            Some(path) => staying.iter().any(|other| match other {
+                None => true,
+                Some(other) => overlaps(&path, other),
+            }),
+        })
+        .map(|t| t.hash.to_ascii_lowercase())
+        .collect()
+}
+
+/// O caminho com `/` como separador e sem barra no fim; vazio é `None`.
+fn normalized(path: &str) -> Option<String> {
+    let path = path.replace('\\', "/");
+    let path = path.trim_end_matches('/');
+    (!path.is_empty()).then(|| path.to_owned())
+}
+
+/// Mesmo caminho, ou um dentro do outro, componente a componente.
+fn overlaps(a: &str, b: &str) -> bool {
+    let inside = |long: &str, short: &str| {
+        long.strip_prefix(short)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    };
+    inside(a, b) || inside(b, a)
+}
+
 /// Só o que está **de fato semeando** conta como seeding. Torrent completo mas
 /// parado é `Paused`: ele não está devolvendo nada ao tracker, e tratá-lo como
 /// seed o colocaria na avaliação de limpeza junto com os seeds reais.
@@ -624,5 +708,54 @@ mod tests {
         .unwrap();
 
         assert!(!torrent.is_private());
+    }
+
+    fn com_caminho(hash: &str, path: &str) -> TorrentInfo {
+        serde_json::from_value(serde_json::json!({
+            "hash": hash, "name": hash, "state": "stalledUP", "save_path": "/d",
+            "content_path": path,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn cross_seed_nao_perde_os_arquivos_quando_o_irmao_sai() {
+        let all = [
+            com_caminho("BJ", "/d/Filme.mkv"),
+            com_caminho("amigos", "/d/Filme.mkv"),
+            com_caminho("pack", "/d/Serie.S01"),
+            com_caminho("ep", "/d/Serie.S01/E01.mkv"),
+            com_caminho("sozinho", "/d/Outro.mkv"),
+            com_caminho("prefixo", "/d/Outro.mkv.parte"),
+        ];
+        let saindo = |hs: &[&str]| -> Vec<DownloadHash> {
+            hs.iter().map(|h| DownloadHash::new(*h)).collect()
+        };
+        // Um irmão fica: o que sai não leva os arquivos.
+        assert_eq!(
+            shared_content(&saindo(&["BJ"]), &all),
+            HashSet::from(["bj".to_owned()])
+        );
+        // Os dois saem juntos: os arquivos vão.
+        assert!(shared_content(&saindo(&["BJ", "amigos"]), &all).is_empty());
+        // Pasta e arquivo dentro dela também dividem conteúdo.
+        assert_eq!(shared_content(&saindo(&["pack"]), &all).len(), 1);
+        // Mesmo começo de nome não é o mesmo conteúdo.
+        assert!(shared_content(&saindo(&["sozinho"]), &all).is_empty());
+        // Barra no fim e separador do Windows não escondem o irmão.
+        let barras = [
+            com_caminho("p", "/d/Pack/"),
+            com_caminho("e", "/d/Pack/E01.mkv"),
+        ];
+        assert_eq!(shared_content(&saindo(&["p"]), &barras).len(), 1);
+        let windows = [
+            com_caminho("p", "D:\\Pack"),
+            com_caminho("e", "D:/Pack/E01.mkv"),
+        ];
+        assert_eq!(shared_content(&saindo(&["p"]), &windows).len(), 1);
+        // Caminho desconhecido: na dúvida, o arquivo fica.
+        let sem = [com_caminho("x", ""), com_caminho("y", "/d/Y.mkv")];
+        assert_eq!(shared_content(&saindo(&["x"]), &sem).len(), 1);
+        assert_eq!(shared_content(&saindo(&["y"]), &sem).len(), 1);
     }
 }

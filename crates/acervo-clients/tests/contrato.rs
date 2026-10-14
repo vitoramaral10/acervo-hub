@@ -246,6 +246,11 @@ async fn remocao_manda_os_hashes_juntos_e_diz_se_apaga_arquivo() {
     let server = MockServer::start().await;
     let cliente = sessao(&server).await;
 
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrents/info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/api/v2/torrents/delete"))
         .and(header("referer", server.uri() + "/"))
@@ -262,6 +267,49 @@ async fn remocao_manda_os_hashes_juntos_e_diz_se_apaga_arquivo() {
                 DownloadHash::new("a1b2c3d4e5f6"),
                 DownloadHash::new("FFEEDDCCBBAA"),
             ],
+            true,
+        )
+        .await
+        .expect("remoção aceita");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn remocao_com_arquivos_poupa_o_conteudo_de_um_cross_seed() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrents/info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"hash": "aaaa", "name": "F", "state": "stalledUP", "save_path": "/d", "content_path": "/d/F.mkv"},
+            {"hash": "bbbb", "name": "F", "state": "stalledUP", "save_path": "/d", "content_path": "/d/F.mkv"},
+            {"hash": "cccc", "name": "G", "state": "stalledUP", "save_path": "/d", "content_path": "/d/G.mkv"},
+        ])))
+        .mount(&server)
+        .await;
+    // O irmão `bbbb` fica: `aaaa` sai sem os arquivos; `cccc`, com.
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/delete"))
+        .and(body_string_contains("hashes=aaaa&"))
+        .and(body_string_contains("deleteFiles=false"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/delete"))
+        .and(body_string_contains("hashes=cccc&"))
+        .and(body_string_contains("deleteFiles=true"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    cliente
+        .delete(
+            &[DownloadHash::new("aaaa"), DownloadHash::new("cccc")],
             true,
         )
         .await

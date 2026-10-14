@@ -34,6 +34,112 @@ fn string(bytes: &[u8], at: usize) -> Option<(&[u8], usize)> {
     Some((&bytes[colon + 1..end], end))
 }
 
+/// Um inteiro bencode em `at`: o valor e onde ele termina.
+fn integer(bytes: &[u8], at: usize) -> Option<(i64, usize)> {
+    if *bytes.get(at)? != b'i' {
+        return None;
+    }
+    let end = skip(bytes, at)?;
+    let value = std::str::from_utf8(&bytes[at + 1..end - 1])
+        .ok()?
+        .parse()
+        .ok()?;
+    Some((value, end))
+}
+
+/// As entradas de um dicionário bencode em `at`: chave e onde o valor começa.
+fn entries(bytes: &[u8], at: usize) -> Option<Vec<(&[u8], usize)>> {
+    if *bytes.get(at)? != b'd' {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut at = at + 1;
+    while *bytes.get(at)? != b'e' {
+        let (key, value_at) = string(bytes, at)?;
+        out.push((key, value_at));
+        at = skip(bytes, value_at)?;
+    }
+    Some(out)
+}
+
+/// Os itens de uma lista bencode em `at`: onde cada um começa.
+fn items(bytes: &[u8], at: usize) -> Option<Vec<usize>> {
+    if *bytes.get(at)? != b'l' {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut at = at + 1;
+    while *bytes.get(at)? != b'e' {
+        out.push(at);
+        at = skip(bytes, at)?;
+    }
+    Some(out)
+}
+
+/// O valor da chave, preferindo a variante `.utf-8` quando o torrent a traz
+/// (é a que o cliente usa para nomear o arquivo).
+fn utf8_or(found: &[(&[u8], usize)], key: &str) -> Option<usize> {
+    let utf8 = format!("{key}.utf-8");
+    found
+        .iter()
+        .find(|(k, _)| *k == utf8.as_bytes())
+        .or_else(|| found.iter().find(|(k, _)| *k == key.as_bytes()))
+        .map(|(_, at)| *at)
+}
+
+/// Os arquivos de um `.torrent`, como o cliente os põe no disco: caminho
+/// relativo à pasta de download (com a pasta raiz, se há mais de um) e
+/// tamanho. É o que decide se dois torrents de trackers diferentes são o
+/// mesmo conteúdo e podem semear dos mesmos arquivos.
+#[must_use]
+pub fn layout(torrent: &[u8]) -> Option<Vec<(String, u64)>> {
+    let top = entries(torrent, 0)?;
+    let info = top.iter().find(|(k, _)| *k == b"info")?.1;
+    let info = entries(torrent, info)?;
+    let name = String::from_utf8(string(torrent, utf8_or(&info, "name")?)?.0.to_vec()).ok()?;
+    if let Some(at) = info
+        .iter()
+        .find(|(k, _)| *k == b"length")
+        .map(|(_, at)| *at)
+    {
+        let (length, _) = integer(torrent, at)?;
+        return Some(vec![(name, u64::try_from(length).ok()?)]);
+    }
+    let files = info.iter().find(|(k, _)| *k == b"files")?.1;
+    let mut out = Vec::new();
+    for file in items(torrent, files)? {
+        let fields = entries(torrent, file)?;
+        // Preenchimento do BEP 47: nunca vai ao disco nem à lista do cliente.
+        let padding = fields
+            .iter()
+            .find(|(k, _)| *k == b"attr")
+            .and_then(|(_, at)| string(torrent, *at))
+            .is_some_and(|(attr, _)| attr.contains(&b'p'));
+        if padding {
+            continue;
+        }
+        let path_at = utf8_or(&fields, "path")?;
+        let parts = items(torrent, path_at)?;
+        // Preenchimento do BitComet, sem `attr`: o cliente também o esconde.
+        let bitcomet = parts
+            .last()
+            .and_then(|at| string(torrent, *at))
+            .is_some_and(|(last, _)| last.starts_with(b"_____padding_file_"));
+        if bitcomet {
+            continue;
+        }
+        let length = fields.iter().find(|(k, _)| *k == b"length")?.1;
+        let (length, _) = integer(torrent, length)?;
+        let mut path = name.clone();
+        for part in parts {
+            path.push('/');
+            path.push_str(std::str::from_utf8(string(torrent, part)?.0).ok()?);
+        }
+        out.push((path, u64::try_from(length).ok()?));
+    }
+    Some(out)
+}
+
 /// Infohash v1 (hex minúsculo) de um arquivo `.torrent`.
 #[must_use]
 pub fn info_hash(torrent: &[u8]) -> Option<String> {
@@ -119,6 +225,29 @@ mod tests {
         assert_eq!(info_hash(b"<html>login</html>"), None);
         assert_eq!(info_hash(b"d8:announce3:urle"), None);
         assert_eq!(info_hash(b"d4:info99999999999999999999:xe"), None);
+    }
+
+    #[test]
+    fn layout_de_arquivo_unico_e_de_pasta() {
+        let single = b"d4:infod6:lengthi10e4:name5:a.mkv12:piece lengthi16384e6:pieces0:ee";
+        assert_eq!(layout(single), Some(vec![("a.mkv".to_owned(), 10)]));
+        let multi = b"d4:infod5:filesld6:lengthi3e4:pathl3:sub5:b.mkveed6:lengthi4e4:pathl5:c.srteee4:name4:Raiz6:pieces0:ee";
+        assert_eq!(
+            layout(multi),
+            Some(vec![
+                ("Raiz/sub/b.mkv".to_owned(), 3),
+                ("Raiz/c.srt".to_owned(), 4)
+            ])
+        );
+        // Arquivo de preenchimento (BEP 47) fica de fora.
+        let pad = b"d4:infod5:filesld6:lengthi3e4:pathl1:aeed4:attr1:p6:lengthi5e4:pathl4:.pad1:5eee4:name1:R6:pieces0:ee";
+        assert_eq!(layout(pad), Some(vec![("R/a".to_owned(), 3)]));
+        let bitcomet = b"d4:infod5:filesld6:lengthi3e4:pathl1:aeed6:lengthi5e4:pathl30:_____padding_file_0_if_you_seeeee4:name1:R6:pieces0:ee";
+        assert_eq!(layout(bitcomet), Some(vec![("R/a".to_owned(), 3)]));
+        // A variante `.utf-8` vence a outra.
+        let utf8 = b"d4:infod6:lengthi1e4:name1:x10:name.utf-81:ye6:pieces0:e";
+        assert_eq!(layout(utf8), Some(vec![("y".to_owned(), 1)]));
+        assert_eq!(layout(b"<html>login</html>"), None);
     }
 
     #[test]

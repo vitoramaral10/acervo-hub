@@ -4,6 +4,7 @@
 
 mod accounts;
 mod config;
+mod crossseed;
 mod definitions;
 mod discover;
 mod manage;
@@ -20,6 +21,7 @@ use tokio_postgres::{NoTls, Row};
 
 pub use accounts::SESSION_DAYS;
 pub use config::{DEFAULT_INDEXER_PRIORITY, INDEXER_PRIORITIES, IndexerRecord};
+pub use crossseed::CrossSeedCheck;
 pub use definitions::DefinitionRow;
 pub use discover::{DiscoverKind, HiddenTitle};
 pub use manage::{Blocked, FailReason, HistoryEvent, HistoryPage, NewHistory};
@@ -254,6 +256,15 @@ const MIGRATIONS: &[&str] = &[
     include_str!("base.sql"),
     // 36: prioridade e modo "construir ratio" por indexador.
     r"ALTER TABLE indexers ADD COLUMN priority INTEGER NOT NULL DEFAULT 25 CHECK (priority BETWEEN 1 AND 50), ADD COLUMN ratio_mode BOOLEAN NOT NULL DEFAULT FALSE;",
+    // 37: consultas de cross-seed por torrent e indexador.
+    r"CREATE TABLE cross_seed_checks (
+        hash TEXT NOT NULL,
+        indexer TEXT NOT NULL,
+        checked_at TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 1,
+        found TEXT,
+        PRIMARY KEY (hash, indexer)
+    );",
 ];
 
 /// Quanto uma consulta pode levar. A maior consulta real (o catálogo de
@@ -2189,6 +2200,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consulta_de_cross_seed_soma_tentativas_e_guarda_o_irmao() {
+        let Some(db) = TestDb::new("cross_seed").await else {
+            return;
+        };
+        let store = &db.store;
+        store
+            .record_cross_seed_check("ABCD", "amigos", "2026-10-14T00:00:00Z", None)
+            .await
+            .unwrap();
+        store
+            .record_cross_seed_check("abcd", "amigos", "2026-10-15T00:00:00Z", Some("ef01"))
+            .await
+            .unwrap();
+        // Uma volta sem achar não apaga o irmão já achado.
+        store
+            .record_cross_seed_check("abcd", "amigos", "2026-10-16T00:00:00Z", None)
+            .await
+            .unwrap();
+        let checks = store.cross_seed_checks().await.unwrap();
+        assert_eq!(
+            checks,
+            [CrossSeedCheck {
+                hash: "abcd".into(),
+                indexer: "amigos".into(),
+                checked_at: "2026-10-16T00:00:00Z".into(),
+                attempts: 3,
+                found: Some("ef01".into()),
+            }]
+        );
+        // Irmão recusado na conferência: o par volta a ser procurado.
+        store.forget_cross_seed("EF01").await.unwrap();
+        assert_eq!(store.cross_seed_checks().await.unwrap()[0].found, None);
+        db.drop().await;
+    }
+
+    #[tokio::test]
     async fn migracao_36_da_prioridade_e_modo_ratio_aos_indexadores() {
         let Some(db) = TestDb::new("migracao_36").await else {
             return;
@@ -2198,6 +2245,7 @@ mod tests {
             client
                 .batch_execute(
                     "ALTER TABLE indexers DROP COLUMN priority, DROP COLUMN ratio_mode;
+                     DROP TABLE cross_seed_checks;
                      UPDATE schema_version SET version = 35;
                      INSERT INTO indexers (name, kind) VALUES ('antigo', 'cardigann')",
                 )
@@ -2211,7 +2259,7 @@ mod tests {
             .await
             .unwrap()
             .get(0);
-        assert_eq!(version, 36);
+        assert_eq!(version, 37);
         let indexers = db.store.indexers().await.unwrap();
         assert_eq!(indexers.len(), 1);
         assert_eq!(indexers[0].name, "antigo");

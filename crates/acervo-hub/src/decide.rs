@@ -23,7 +23,7 @@ use crate::config::Config;
 use crate::rules::DecisionRules;
 
 /// Categoria Newznab de filmes.
-const MOVIES: u32 = 2000;
+pub(crate) const MOVIES: u32 = 2000;
 
 /// O título da base de metadados (em inglês) não sai na API do gerenciador;
 /// a pasta nasce dele.
