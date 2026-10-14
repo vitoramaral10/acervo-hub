@@ -578,3 +578,52 @@ fn tag_de_semear_nao_segura_download_incompleto_sem_dono() {
             .any(|a| matches!(a, Action::StrikeUnowned { .. }))
     );
 }
+
+#[test]
+fn torrent_que_o_cliente_nao_acha_nunca_sai() {
+    // O incidente de 2026-10-05: o HD de mídia sumiu num reboot, o qBittorrent
+    // subiu sem achar os arquivos e a limpeza apagou 71 torrents — entre eles
+    // os do Amigos com menos de 72 h de seed, que viraram hit&run. Sem ver o
+    // arquivo, não há como saber se ele tem hardlink.
+    let sumido = Download {
+        state: DownloadState::MissingFiles,
+        private: true,
+        files: Vec::new(),
+        ..sem_dono("sumido", GIB)
+    };
+    let inv = inventario_com(vec![sumido], vec![]);
+    let mut ledger = StrikeLedger::new();
+
+    for _ in 0..5 {
+        let plano = reconcile(&inv, &politica_aplicando(), &mut ledger, agora())
+            .expect("inventário íntegro não aborta");
+        assert!(plano.actions.is_empty());
+        assert_eq!(plano.skipped.len(), 1);
+        assert_eq!(plano.skipped[0].reason, SkipReason::FilesMissing);
+    }
+    assert!(ledger.is_empty());
+}
+
+#[test]
+fn biblioteca_zerada_aborta_mesmo_quando_a_remocao_libera_zero() {
+    // Raiz fora do ar esconde também os arquivos dos torrents: o lote libera
+    // zero byte e passava pela trava, que só olhava o espaço.
+    let mut com_erro = Download {
+        state: DownloadState::Errored,
+        files: Vec::new(),
+        ..sem_dono("erro", GIB)
+    };
+    com_erro.private = true;
+    let mut inv = inventario_com(vec![com_erro], vec![]);
+    inv.library_size = Allocated::ZERO;
+    let mut ledger = StrikeLedger::new();
+    let politica = politica_aplicando();
+
+    for _ in 1..politica.orphan_strikes {
+        reconcile(&inv, &politica, &mut ledger, agora()).expect("strike não apaga, não aborta");
+    }
+    let erro = reconcile(&inv, &politica, &mut ledger, agora())
+        .expect_err("remoção com biblioteca zerada tem de abortar");
+
+    assert!(matches!(erro, Abort::LibraryUnmeasured { .. }));
+}

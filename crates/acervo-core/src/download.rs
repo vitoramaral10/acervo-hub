@@ -30,6 +30,10 @@ pub enum DownloadState {
     Paused,
     Seeding,
     Errored,
+    /// O cliente não acha os arquivos (`missingFiles`): disco fora ou caminho
+    /// errado. Não diz que o dado sumiu, diz que não dá para ver — e sem ver
+    /// o dado, "sem hardlink" é falso.
+    MissingFiles,
     Unknown,
 }
 

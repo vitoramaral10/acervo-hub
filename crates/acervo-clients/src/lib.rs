@@ -546,7 +546,8 @@ pub fn state_from_qbit(raw: &str) -> DownloadState {
             DownloadState::Downloading
         }
         "pausedUP" | "stoppedUP" | "pausedDL" | "stoppedDL" => DownloadState::Paused,
-        "error" | "missingFiles" => DownloadState::Errored,
+        "error" => DownloadState::Errored,
+        "missingFiles" => DownloadState::MissingFiles,
         _ => DownloadState::Unknown,
     }
 }
@@ -580,6 +581,7 @@ mod tests {
     #[test]
     fn estado_desconhecido_nao_vira_seeding() {
         // Estado novo numa versão futura não pode abrir caminho para remoção.
+        assert_eq!(state_from_qbit("missingFiles"), DownloadState::MissingFiles);
         assert_eq!(state_from_qbit("algoNovo"), DownloadState::Unknown);
         assert!(!state_from_qbit("algoNovo").is_seeding());
     }
