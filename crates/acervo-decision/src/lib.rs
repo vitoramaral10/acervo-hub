@@ -147,19 +147,14 @@ impl Profile {
     /// que mal baixaria (ver [`HEALTHY_SEEDERS`]).
     ///
     /// Fica de fora o que não é arquivo de filme (BR-DISK é o disco inteiro,
-    /// Raw-HD é gravação crua) e as cópias de cinema (CAM, TELESYNC e afins):
-    /// sem upgrade, uma delas ficaria para sempre. `WEB-DL` e `WEBRip` da mesma
+    /// Raw-HD é gravação crua), as cópias de cinema (CAM, TELESYNC e afins) e
+    /// tudo abaixo de 720p (SDTV, DVD, 480p, 576p): sem upgrade, uma delas
+    /// ficaria para sempre. `WEB-DL` e `WEBRip` da mesma
     /// resolução valem o mesmo, como na referência.
     #[must_use]
     pub fn automatic(language: Language) -> Self {
         use Quality as Q;
-        let rungs: [(&str, &[Quality]); 17] = [
-            ("SDTV", &[Q::Sdtv]),
-            ("DVD", &[Q::Dvd]),
-            ("DVD-R", &[Q::DvdR]),
-            ("WEB 480p", &[Q::WebDl480p, Q::WebRip480p]),
-            ("Bluray-480p", &[Q::Bluray480p]),
-            ("Bluray-576p", &[Q::Bluray576p]),
+        let rungs: [(&str, &[Quality]); 11] = [
             ("HDTV-720p", &[Q::Hdtv720p]),
             ("WEB 720p", &[Q::WebDl720p, Q::WebRip720p]),
             ("Bluray-720p", &[Q::Bluray720p]),
@@ -593,8 +588,7 @@ mod tests {
         use Quality as Q;
         let profile = Profile::automatic(Language::Original);
         let order = [
-            Q::Sdtv,
-            Q::Dvd,
+            Q::Hdtv720p,
             Q::WebDl720p,
             Q::WebDl1080p,
             Q::Bluray1080p,
@@ -613,6 +607,13 @@ mod tests {
             Q::Workprint,
             Q::BrDisk,
             Q::RawHd,
+            Q::Sdtv,
+            Q::Dvd,
+            Q::DvdR,
+            Q::WebDl480p,
+            Q::WebRip480p,
+            Q::Bluray480p,
+            Q::Bluray576p,
         ] {
             assert_eq!(profile.index(fora), -1, "{fora:?}");
         }
