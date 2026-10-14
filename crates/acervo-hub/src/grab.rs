@@ -329,6 +329,53 @@ async fn allocated_on_disk(client: &QbitClient, torrent: &acervo_clients::Torren
         .sum()
 }
 
+/// A reserva que não serve a ninguém: torrent da fila que ficou de fora nesta
+/// volta, nunca baixou nada e tem espaço pré-alocado. `reserved` traz só esses
+/// (hash, bytes alocados).
+///
+/// Pré-alocação pela metade (o disco encheu no meio dela) prende espaço sem
+/// dado nenhum e só serve ao próprio torrent, e só no dia em que couber o
+/// resto. Devolvida, o espaço volta ao orçamento de quem cabe já; quando a
+/// vez dele chegar, o cliente aloca de novo. O que saiu agora fica com a sua.
+fn stranded(reserved: &[(String, u64)], picked: &[String]) -> Vec<String> {
+    reserved
+        .iter()
+        .filter(|(hash, allocated)| *allocated > 0 && !picked.contains(hash))
+        .map(|(hash, _)| hash.clone())
+        .collect()
+}
+
+/// Apaga os arquivos pré-alocados de um torrent parado que nunca baixou nada
+/// ([`stranded`]). Só se nenhum arquivo dele tem outro link: hardlink seria
+/// dado de verdade. Falha só avisa: a reserva fica para a próxima volta.
+async fn release_reservation(client: &QbitClient, torrent: &acervo_clients::TorrentInfo) {
+    if !only_link(client, torrent).await {
+        return;
+    }
+    let Ok(files) = client
+        .files(&acervo_core::DownloadHash::new(torrent.hash.clone()))
+        .await
+    else {
+        return;
+    };
+    let paths: Vec<PathBuf> = files
+        .iter()
+        .map(|file| client_path(torrent, file))
+        .collect();
+    match tokio::task::spawn_blocking(move || crate::series::remove_files(&paths)).await {
+        Ok(Ok(_)) => tracing::info!(
+            torrent = %torrent.name,
+            "reserva parcial devolvida: não cabe agora e não tinha dado"
+        ),
+        Ok(Err(error)) => {
+            tracing::warn!(torrent = %torrent.name, "reserva parcial não devolvida: {error}");
+        }
+        Err(error) => {
+            tracing::warn!(torrent = %torrent.name, "reserva parcial não devolvida: {error}");
+        }
+    }
+}
+
 /// Quem sai da fila agora: do menor para o maior, pulando quem não cabe, e
 /// no máximo até o limite de downloads ativos.
 ///
@@ -549,6 +596,7 @@ pub(crate) async fn start_queued(
     let reserve = rules.folga_minima_mb << 20;
     let free = client.free_space().await?;
     let mut queue = Vec::new();
+    let mut reserved = Vec::new();
     for torrent in torrents
         .iter()
         .filter(|t| t.has_tag(QUEUE_TAG) && size(t) > 0 && waiting(t))
@@ -568,11 +616,14 @@ pub(crate) async fn start_queued(
         };
         // Parado com o arquivo já pré-alocado: o espaço dele já saiu do livre.
         let downloaded = size(torrent).saturating_sub(left(size(torrent), torrent.progress));
-        let need = unreserved(need, allocated_on_disk(client, torrent).await, downloaded);
+        let allocated = allocated_on_disk(client, torrent).await;
+        if torrent.progress <= 0.0 && !is_active(torrent) {
+            reserved.push((torrent.hash.clone(), allocated));
+        }
+        let need = unreserved(need, allocated, downloaded);
         queue.push((torrent.hash.clone(), need));
     }
-    let mut started = Vec::new();
-    for hash in pick_starts_prioritized(
+    let picked = pick_starts_prioritized(
         &queue,
         &priority,
         &active_left,
@@ -580,7 +631,25 @@ pub(crate) async fn start_queued(
         reserve,
         limit,
         client_queues,
-    ) {
+    );
+    for hash in stranded(&reserved, &picked) {
+        if let Some(torrent) = torrents.iter().find(|t| t.hash == hash) {
+            release_reservation(client, torrent).await;
+        }
+    }
+    start_picked(client, &torrents, &priority, picked).await
+}
+
+/// Inicia os escolhidos da fila e os tira dela; o prioritário vai ao topo da
+/// fila do cliente.
+async fn start_picked(
+    client: &QbitClient,
+    torrents: &[acervo_clients::TorrentInfo],
+    priority: &HashSet<String>,
+    picked: Vec<String>,
+) -> Result<Vec<String>> {
+    let mut started = Vec::new();
+    for hash in picked {
         let Some(torrent) = torrents.iter().find(|t| t.hash == hash) else {
             continue;
         };
@@ -2551,6 +2620,21 @@ mod tests {
         ];
         assert_eq!(pick_starts(&net, &[], 5, 1, 5), ["h20", "h30"]);
         assert_eq!(pick_starts(&net, &[], 5, 1, 1), ["h20"]);
+    }
+
+    #[test]
+    fn reserva_parcial_de_quem_ficou_de_fora_e_devolvida() {
+        // O incidente de 2026-10-14: 11 temporadas paradas a 0% prendiam
+        // 82 GiB de pré-alocação pela metade, nenhuma cabia, e os filmes que
+        // caberiam nesse espaço esperavam.
+        let reserved = [
+            ("pack".to_owned(), 16),
+            ("saiu".to_owned(), 8),
+            ("sem_reserva".to_owned(), 0),
+        ];
+        assert_eq!(stranded(&reserved, &["saiu".to_owned()]), ["pack"]);
+        // Quem sai na volta fica com o que já reservou.
+        assert!(stranded(&reserved, &["pack".to_owned(), "saiu".to_owned()]).is_empty());
     }
 
     #[test]
