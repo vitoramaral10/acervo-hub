@@ -87,13 +87,23 @@ pub struct Launch {
     pub updated_at: String,
     /// RFC 3339, em UTC: quando o usuário marcou como enviado.
     pub sent_at: Option<String>,
+    /// Pasta adaptada (legenda separada para o BJ), quando o pacote precisou
+    /// de uma.
+    pub adapted_path: Option<String>,
+    /// `[[caminho, tamanho]]` dos arquivos da pasta adaptada, relativo ao pai
+    /// dela.
+    pub adapted_layout: Option<Value>,
+    /// Infohash do `.torrent` baixado do site depois do envio, quando o site
+    /// trocou o hash do gerado.
+    pub site_hash: Option<String>,
 }
 
 /// Agora, em RFC 3339 UTC, como o resto do schema guarda datas.
 const NOW: &str = "to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')";
 
 const COLUMNS: &str = "hash, indexer, state, progress, report, fields, screens, \
-                       torrent IS NOT NULL, error, created_at, updated_at, sent_at";
+                       torrent IS NOT NULL, error, created_at, updated_at, sent_at, \
+                       adapted_path, adapted_layout, site_hash";
 
 fn launch_from(row: &Row) -> Result<Launch> {
     let state: String = row.try_get(2)?;
@@ -110,6 +120,9 @@ fn launch_from(row: &Row) -> Result<Launch> {
         created_at: row.try_get(9)?,
         updated_at: row.try_get(10)?,
         sent_at: row.try_get(11)?,
+        adapted_path: row.try_get(12)?,
+        adapted_layout: row.try_get(13)?,
+        site_hash: row.try_get(14)?,
     })
 }
 
@@ -362,6 +375,86 @@ impl Store {
             .map(|row| row.try_get::<_, Option<Vec<u8>>>(0))
             .transpose()?
             .flatten())
+    }
+
+    /// Grava (ou limpa, com `None`) a pasta adaptada e o layout dela. Devolve
+    /// se o par existe.
+    ///
+    /// # Errors
+    ///
+    /// Banco inalcançável.
+    pub async fn save_launch_adaptation(
+        &self,
+        hash: &str,
+        indexer: &str,
+        path: Option<&str>,
+        layout: Option<&Value>,
+    ) -> Result<bool> {
+        let client = self.pool.get().await?;
+        let updated = client
+            .execute(
+                &format!(
+                    "UPDATE launches SET adapted_path = $3, adapted_layout = $4, updated_at = {NOW}
+                     WHERE hash = $1 AND indexer = $2"
+                ),
+                &[&hash.to_ascii_lowercase(), &indexer, &path, &layout],
+            )
+            .await?;
+        Ok(updated > 0)
+    }
+
+    /// Grava (ou limpa, com `None`) o erro do pacote sem mexer no estado: o
+    /// pacote enviado segue enviado com o aviso. Devolve se o par existe.
+    ///
+    /// # Errors
+    ///
+    /// Banco inalcançável.
+    pub async fn set_launch_error(
+        &self,
+        hash: &str,
+        indexer: &str,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        let client = self.pool.get().await?;
+        let updated = client
+            .execute(
+                &format!(
+                    "UPDATE launches SET error = $3, updated_at = {NOW}
+                     WHERE hash = $1 AND indexer = $2"
+                ),
+                &[&hash.to_ascii_lowercase(), &indexer, &error],
+            )
+            .await?;
+        Ok(updated > 0)
+    }
+
+    /// Grava o infohash do `.torrent` que o site entregou. Devolve se o par
+    /// existe.
+    ///
+    /// # Errors
+    ///
+    /// Banco inalcançável.
+    pub async fn save_launch_site_hash(
+        &self,
+        hash: &str,
+        indexer: &str,
+        site_hash: &str,
+    ) -> Result<bool> {
+        let client = self.pool.get().await?;
+        let updated = client
+            .execute(
+                &format!(
+                    "UPDATE launches SET site_hash = $3, updated_at = {NOW}
+                     WHERE hash = $1 AND indexer = $2"
+                ),
+                &[
+                    &hash.to_ascii_lowercase(),
+                    &indexer,
+                    &site_hash.to_ascii_lowercase(),
+                ],
+            )
+            .await?;
+        Ok(updated > 0)
     }
 
     /// Marca como enviado ao site, em `at` (RFC 3339, UTC). Devolve se o par
@@ -698,6 +791,107 @@ mod tests {
                 .is_err()
         );
         drop(client);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn pasta_adaptada_vai_e_volta_e_pode_ser_limpa() {
+        let Some(db) = TestDb::new("launch_adaptada").await else {
+            return;
+        };
+        let store = &db.store;
+        store
+            .upsert_launch_state("abcd", "bj", LaunchState::Pronto, None, None)
+            .await
+            .unwrap();
+        let novo = store.launch("abcd", "bj").await.unwrap().unwrap();
+        assert_eq!(novo.adapted_path, None);
+        assert_eq!(novo.adapted_layout, None);
+
+        let layout = json!([["Filme/Filme.mkv", 1000], ["Filme/Filme.pt-BR.srt", 42]]);
+        assert!(
+            store
+                .save_launch_adaptation(
+                    "ABCD",
+                    "bj",
+                    Some("/media/lancamentos/bj/Filme"),
+                    Some(&layout)
+                )
+                .await
+                .unwrap()
+        );
+        let launch = store.launch("abcd", "bj").await.unwrap().unwrap();
+        assert_eq!(
+            launch.adapted_path.as_deref(),
+            Some("/media/lancamentos/bj/Filme")
+        );
+        assert_eq!(launch.adapted_layout, Some(layout));
+        assert_eq!(launch.state, LaunchState::Pronto);
+
+        assert!(
+            store
+                .save_launch_adaptation("abcd", "bj", None, None)
+                .await
+                .unwrap()
+        );
+        let limpo = store.launch("abcd", "bj").await.unwrap().unwrap();
+        assert_eq!(limpo.adapted_path, None);
+        assert_eq!(limpo.adapted_layout, None);
+
+        // Par que não existe não é criado.
+        assert!(
+            !store
+                .save_launch_adaptation("0000", "bj", Some("/x"), None)
+                .await
+                .unwrap()
+        );
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn erro_e_hash_do_site_sao_gravados_sem_mudar_o_estado() {
+        let Some(db) = TestDb::new("launch_erro_hash_site").await else {
+            return;
+        };
+        let store = &db.store;
+        store
+            .upsert_launch_state("abcd", "bj", LaunchState::Enviado, None, None)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .set_launch_error("ABCD", "bj", Some("cliente fora do ar"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .save_launch_site_hash("ABCD", "bj", "EF01")
+                .await
+                .unwrap()
+        );
+        let launch = store.launch("abcd", "bj").await.unwrap().unwrap();
+        assert_eq!(launch.state, LaunchState::Enviado);
+        assert_eq!(launch.error.as_deref(), Some("cliente fora do ar"));
+        assert_eq!(launch.site_hash.as_deref(), Some("ef01"));
+        assert!(store.set_launch_error("abcd", "bj", None).await.unwrap());
+        assert_eq!(
+            store.launch("abcd", "bj").await.unwrap().unwrap().error,
+            None
+        );
+        // Par que não existe não é criado.
+        assert!(
+            !store
+                .set_launch_error("0000", "bj", Some("x"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .save_launch_site_hash("0000", "bj", "ef01")
+                .await
+                .unwrap()
+        );
         db.drop().await;
     }
 }

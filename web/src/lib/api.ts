@@ -15,14 +15,16 @@ export const isUnauthorized = (error: unknown) => error instanceof ApiError && e
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (method !== 'GET') headers['X-Acervo'] = '1'
-  if (body !== undefined) headers['Content-Type'] = 'application/json'
+  // Arquivo (o `.torrent` do site) vai como está; o resto, em JSON.
+  const raw = body instanceof Blob
+  if (body !== undefined) headers['Content-Type'] = raw ? 'application/x-bittorrent' : 'application/json'
   let response: Response
   try {
     response = await fetch(path, {
       method,
       headers,
       credentials: 'same-origin',
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body: body === undefined ? undefined : raw ? body : JSON.stringify(body),
     })
   } catch {
     throw new ApiError(0, 'Sem conexão com o acervo-hub.')
@@ -1004,6 +1006,8 @@ export type LaunchState =
 
 export type LaunchSite = 'bj' | 'amigos'
 
+export type LaunchTrackerStatus = 'funcionando' | 'não registrado' | 'erro' | 'sem resposta'
+
 export type LaunchOutcome = 'found' | 'not_found' | 'layout_differs' | 'error' | 'skipped'
 
 /** Uma linha da lista: o par (torrent de origem, destino) e o estado do pacote. */
@@ -1057,11 +1061,26 @@ export interface LaunchDestinationRelease {
   codec: 'h264' | 'h265' | 'av1' | null
 }
 
+/** Uma legenda PT embutida que a pasta adaptada do BJ ganha como `.srt` ao lado do vídeo. */
+export interface LaunchAdaptation {
+  /** Vídeo de origem, com a pasta raiz do torrent. */
+  video: string
+  /** Índice absoluto da faixa no vídeo. */
+  stream: number
+  /** O `.srt` a criar, relativo ao pai da pasta adaptada. */
+  output: string
+  forced: boolean
+  /** Título da faixa (ou o idioma), quando o preparo o leu. */
+  faixa?: string
+}
+
 /** Vazio (`{}`) enquanto o pacote não passou da checagem. */
 export interface LaunchReport {
   checks: LaunchCheck[]
   destination: LaunchDestinationRelease[]
   verdict: 'elegivel' | 'inelegivel'
+  /** Ausente em laudos anteriores à pasta adaptada. */
+  adaptations?: LaunchAdaptation[]
 }
 
 /** O texto gerado; cada campo vira um botão de copiar. */
@@ -1077,6 +1096,8 @@ export interface LaunchFields {
   ficha: string
   tecnico: string
   descricao: string
+  /** Relatório do MediaInfo (texto) do vídeo principal; ausente em pacote antigo, vazio se o BJ não o gerou. */
+  mediainfo?: string
 }
 
 export interface LaunchScreen {
@@ -1099,6 +1120,14 @@ export interface LaunchDetail {
   criado_em: string | null
   atualizado_em: string | null
   enviado_em: string | null
+  /** Pasta adaptada (`<raiz>/lancamentos/bj/<nome>`), de onde sai o `.torrent`. */
+  pasta_adaptada: string | null
+  /** `[caminho, tamanho]` dos arquivos da pasta adaptada, relativos ao pai dela. */
+  layout_adaptado: [string, number][] | null
+  /** Tracker do destino para o torrent semeado, só depois do envio; sem URL. */
+  status_tracker: LaunchTrackerStatus | null
+  /** O `.torrent` do site já foi enviado e é o semeado. */
+  torrent_do_site: boolean
 }
 
 const launchPair = (hash: string, indexer: string) =>
@@ -1110,10 +1139,26 @@ export const launchApi = {
   detail: (hash: string, indexer: string) => request<LaunchDetail>('GET', launchPair(hash, indexer)),
   prepare: (hash: string, indexer: string) =>
     request<{ ok: boolean; estado: LaunchState }>('POST', `${launchPair(hash, indexer)}/preparar`),
+  /** `aviso`: marcado como enviado, mas o `.torrent` não entrou no cliente para semear (o motivo vai em `erro`). */
   sent: (hash: string, indexer: string) =>
-    request<{ ok: boolean; estado: LaunchState }>('POST', `${launchPair(hash, indexer)}/enviado`),
+    request<{ ok: boolean; estado: LaunchState; aviso?: string | null }>('POST', `${launchPair(hash, indexer)}/enviado`),
+  /**
+   * O `.torrent` que o site entregou (o hash pode ter mudado): o corpo é o arquivo; 400 diz o que difere do pacote.
+   * `aviso`: o pacote ficou enviado, mas o `.torrent` não entrou no cliente (o motivo vai em `erro`).
+   */
+  siteTorrent: (hash: string, indexer: string, file: File) =>
+    request<{ ok: boolean; estado: LaunchState; adicionado: boolean; aviso?: string | null }>(
+      'POST',
+      `${launchPair(hash, indexer)}/torrent-do-site`,
+      file,
+    ),
+  /** `aviso`: a pasta adaptada ficou no disco (com o que o acervo não criou, ou sem a origem para conferir). */
   discard: (hash: string, indexer: string) =>
-    request<{ ok: boolean; estado: LaunchState }>('POST', `${launchPair(hash, indexer)}/descartar`),
+    request<{ ok: boolean; estado: LaunchState; aviso?: string | null }>(
+      'POST',
+      `${launchPair(hash, indexer)}/descartar`,
+    ),
   /** O download não passa por `request` (que só lê JSON): é um `<a href download>` com a sessão. */
   torrentUrl: (hash: string, indexer: string) => `${launchPair(hash, indexer)}/torrent`,
+  mediainfoUrl: (hash: string, indexer: string) => `${launchPair(hash, indexer)}/mediainfo.txt`,
 }

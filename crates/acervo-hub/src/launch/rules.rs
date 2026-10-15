@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::mediainfo::{AudioFacts, Hdr, MediaFacts, VideoFacts};
 
+use super::adapt::{self, Extraction, Obstacle};
+
 /// Diferença de tamanho (relativa ao release do destino) abaixo da qual dois
 /// releases de mesma resolução, fonte e áudio contam como o mesmo arquivo.
 const DUPLICATE_SIZE_TOLERANCE: f64 = 0.10;
@@ -335,6 +337,10 @@ pub struct Report {
     pub checks: Vec<Check>,
     pub destination: Vec<DestinationRelease>,
     pub verdict: Verdict,
+    /// Os `.srt` que a pasta adaptada vai criar (só BJ; vazio no resto). Laudos
+    /// gravados antes da adaptação não têm o campo.
+    #[serde(default)]
+    pub adaptations: Vec<Extraction>,
 }
 
 // Consultas que só os testes fazem: o preparo grava o relatório inteiro.
@@ -360,7 +366,7 @@ impl Report {
 /// Aplica as regras do site aos fatos.
 #[must_use]
 pub fn check(site: Site, facts: &Facts) -> Report {
-    let ctx = Context::new(facts);
+    let ctx = Context::new(facts, site);
     let mut checks = Vec::new();
     if facts.videos.is_empty() {
         checks.push(Check::fail(
@@ -381,6 +387,7 @@ pub fn check(site: Site, facts: &Facts) -> Report {
         checks,
         destination: facts.destination.clone(),
         verdict,
+        adaptations: ctx.adaptations,
     }
 }
 
@@ -394,10 +401,12 @@ struct Context<'a> {
     audio: Option<AudioKind>,
     codec: Option<Codec>,
     size: u64,
+    /// Legendas PT embutidas que o BJ vai ganhar em arquivo (pasta adaptada).
+    adaptations: Vec<Extraction>,
 }
 
 impl<'a> Context<'a> {
-    fn new(facts: &'a Facts) -> Self {
+    fn new(facts: &'a Facts, site: Site) -> Self {
         let size_of = |path: &str| {
             facts
                 .files
@@ -427,6 +436,13 @@ impl<'a> Context<'a> {
             audio,
             codec,
             size: facts.files.iter().map(|f| f.size).sum(),
+            // Obra nacional dispensa a legenda: nada a extrair.
+            adaptations: if site == Site::Bj && !facts.original_language.is_some_and(is_portuguese)
+            {
+                adapt::extractions(&facts.files, &facts.videos)
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -485,7 +501,7 @@ fn portuguese_available(ctx: &Context<'_>) -> Check {
         );
     }
     // Cada vídeo precisa do seu: legenda de outro episódio não vale.
-    let missing = videos_without_portuguese(facts, Site::Amigos);
+    let missing = videos_without_portuguese(&facts.files, &facts.videos, Site::Amigos);
     if missing.is_empty() {
         let audio = facts
             .videos
@@ -524,9 +540,12 @@ fn list_names(videos: &[&ProbedVideo]) -> String {
 /// Os vídeos sem português: sem faixa de áudio PT e sem legenda PT (embutida,
 /// só no Amigos; ou em arquivo ao lado, associada ao vídeo pelo nome-base e,
 /// no BJ, na mesma pasta).
-fn videos_without_portuguese(facts: &Facts, site: Site) -> Vec<&ProbedVideo> {
-    facts
-        .videos
+pub(super) fn videos_without_portuguese<'a>(
+    files: &[SourceFile],
+    videos: &'a [ProbedVideo],
+    site: Site,
+) -> Vec<&'a ProbedVideo> {
+    videos
         .iter()
         .filter(|video| {
             let audio = video.media.audio.iter().any(is_portuguese_audio);
@@ -536,17 +555,28 @@ fn videos_without_portuguese(facts: &Facts, site: Site) -> Vec<&ProbedVideo> {
                     .subtitles
                     .iter()
                     .any(|s| is_portuguese_subtitle(s.language, s.raw_language.as_deref()));
-            !(audio || embedded || has_external_portuguese(facts, &video.path, site == Site::Bj))
+            !(audio
+                || embedded
+                || has_external_portuguese(files, &video.path, site == Site::Bj, site == Site::Bj))
         })
         .collect()
 }
 
 /// Há legenda PT em arquivo associada ao vídeo: mesmo nome-base, com sufixos
 /// de idioma (`.pt-BR`, `.por`, `.forced`), e na mesma pasta se `same_folder`.
-fn has_external_portuguese(facts: &Facts, video: &str, same_folder: bool) -> bool {
+/// Com `full_only` (BJ), a forçada não conta: ela não é a legenda exigida.
+fn has_external_portuguese(
+    files: &[SourceFile],
+    video: &str,
+    same_folder: bool,
+    full_only: bool,
+) -> bool {
     let video_stem = stem(file_name(video)).to_lowercase();
-    facts.files.iter().any(|f| {
+    files.iter().any(|f| {
         if !is_subtitle_file(&f.path) || !subtitle_name_is_portuguese(&f.path) {
+            return false;
+        }
+        if full_only && subtitle_name_is_forced(&f.path) {
             return false;
         }
         if same_folder && parent(&f.path) != parent(video) {
@@ -559,7 +589,7 @@ fn has_external_portuguese(facts: &Facts, video: &str, same_folder: bool) -> boo
     })
 }
 
-fn stem(name: &str) -> &str {
+pub(super) fn stem(name: &str) -> &str {
     name.rsplit_once('.').map_or(name, |(stem, _)| stem)
 }
 
@@ -640,7 +670,7 @@ fn bj(ctx: &Context<'_>, checks: &mut Vec<Check>) {
     checks.extend(minimum_resolution(ctx));
     checks.extend(hdr_only_at_top(ctx));
     checks.push(original_plus_portuguese(ctx));
-    checks.push(portuguese_subtitle_file(ctx));
+    checks.extend(portuguese_subtitle_file(ctx));
     checks.extend(movie_contents(ctx));
     checks.push(site_reference(ctx, "4.1.2 / 4.1.3"));
     checks.extend(season_package(ctx));
@@ -859,44 +889,102 @@ fn original_plus_portuguese(ctx: &Context<'_>) -> Check {
 }
 
 /// 4.2.1.5 / 4.2.1.4: sem áudio PT, a legenda PT tem de ser um arquivo
-/// separado, na mesma pasta do vídeo.
-fn portuguese_subtitle_file(ctx: &Context<'_>) -> Check {
+/// separado, na mesma pasta do vídeo. Legenda PT só embutida e em texto não
+/// reprova: a pasta adaptada a extrai (`Ok` + `Warn` 4.2.1.6); em imagem, sim.
+fn portuguese_subtitle_file(ctx: &Context<'_>) -> Vec<Check> {
     const RULE: &str = "4.2.1.5 / 4.2.1.4";
     let facts = ctx.facts;
     // A regra é para vídeo estrangeiro não dublado; obra nacional não precisa
     // de legenda PT, mesmo com o áudio sem tag de idioma (Amigos 3.3).
     if facts.original_language.is_some_and(is_portuguese) {
-        return Check::ok(RULE, "obra falada em português: não precisa de legenda");
+        return vec![Check::ok(
+            RULE,
+            "obra falada em português: não precisa de legenda",
+        )];
     }
     if facts.videos.is_empty() {
-        return Check::fail(RULE, "sem vídeo lido");
+        return vec![Check::fail(RULE, "sem vídeo lido")];
     }
     // Cada vídeo precisa de áudio PT ou de legenda PT em arquivo próprio, na
     // mesma pasta e com o mesmo nome-base.
-    let missing = videos_without_portuguese(facts, Site::Bj);
+    let missing = videos_without_portuguese(&facts.files, &facts.videos, Site::Bj);
     if missing.is_empty() {
-        return Check::ok(RULE, "áudio PT ou legenda PT em arquivo separado");
+        return vec![Check::ok(
+            RULE,
+            "áudio PT ou legenda PT em arquivo separado",
+        )];
     }
-    let embedded = missing.iter().any(|v| {
+    let unfixable: Vec<&ProbedVideo> = missing
+        .iter()
+        .copied()
+        .filter(|v| adapt::pick(&v.media.subtitles).is_err())
+        .collect();
+    if unfixable.is_empty() {
+        return vec![
+            Check::ok(
+                RULE,
+                format!(
+                    "a legenda PT embutida será extraída para arquivo separado ({} de {} vídeos)",
+                    missing.len(),
+                    facts.videos.len(),
+                ),
+            ),
+            Check::warn(
+                "4.2.1.6",
+                "confira que a legenda é oficial (não de tradutor)",
+            ),
+        ];
+    }
+    let obstacles: Vec<Obstacle> = unfixable
+        .iter()
+        .filter_map(|v| adapt::pick(&v.media.subtitles).err())
+        .collect();
+    let hint = if let Some(Obstacle::Image(codec)) =
+        obstacles.iter().find(|o| matches!(o, Obstacle::Image(_)))
+    {
+        format!(
+            " (a legenda PT embutida é imagem, {codec}: não dá para extrair para texto sem OCR)"
+        )
+    } else if let Some(Obstacle::UnknownCodec(codec)) = obstacles
+        .iter()
+        .find(|o| matches!(o, Obstacle::UnknownCodec(_)))
+    {
+        format!(" (a legenda PT embutida usa o codec {codec}, que não se sabe extrair para texto)")
+    } else if unfixable.iter().any(|v| {
+        v.media.subtitles.iter().any(|s| {
+            !s.forced
+                && adapt::is_commentary(s)
+                && is_portuguese_subtitle(s.language, s.raw_language.as_deref())
+        })
+    }) && unfixable.iter().all(|v| {
+        !v.media.subtitles.iter().any(|s| {
+            !s.forced
+                && !adapt::is_commentary(s)
+                && is_portuguese_subtitle(s.language, s.raw_language.as_deref())
+        })
+    }) {
+        " (só há legenda PT de comentários: a completa, do diálogo, tem de estar em arquivo separado)"
+            .to_owned()
+    } else if unfixable.iter().any(|v| {
         v.media
             .subtitles
             .iter()
             .any(|s| is_portuguese_subtitle(s.language, s.raw_language.as_deref()))
-    });
-    let hint = if embedded {
-        " (legenda PT embutida não vale: o BJ exige a legenda em arquivo separado)"
+    }) {
+        " (só há legenda PT forçada embutida: a completa tem de estar em arquivo separado)"
+            .to_owned()
     } else {
-        ""
+        String::new()
     };
-    Check::fail(
+    vec![Check::fail(
         RULE,
         format!(
             "{} de {} vídeos sem áudio PT e sem legenda PT em arquivo separado, na mesma pasta e com o mesmo nome do vídeo: {}{hint}",
-            missing.len(),
+            unfixable.len(),
             facts.videos.len(),
-            list_names(&missing),
+            list_names(&unfixable),
         ),
-    )
+    )]
 }
 
 /// 4.2.1.10: filme com um só vídeo e no máximo quatro legendas.
@@ -922,11 +1010,18 @@ fn movie_contents(ctx: &Context<'_>) -> Option<Check> {
         .count();
     // O limite fala dos arquivos que acompanham o vídeo; faixa embutida no
     // contêiner não é arquivo (WEB-DL multilegenda traz dezenas delas).
-    let subtitles = external;
+    // Os `.srt` que a pasta adaptada vai criar contam: existirão ao lado.
+    let extracted = ctx.adaptations.len();
+    let subtitles = external + extracted;
     Some(if subtitles > BJ_MAX_SUBTITLES {
+        let detail = if extracted > 0 {
+            format!(" ({external} em arquivo e {extracted} a extrair)")
+        } else {
+            String::new()
+        };
         Check::fail(
             RULE,
-            format!("{subtitles} legendas: o BJ aceita no máximo {BJ_MAX_SUBTITLES}"),
+            format!("{subtitles} legendas{detail}: o BJ aceita no máximo {BJ_MAX_SUBTITLES}"),
         )
     } else {
         Check::ok(RULE, "um vídeo e até quatro legendas")
@@ -1469,7 +1564,7 @@ fn is_portuguese_audio(track: &AudioFacts) -> bool {
     is_portuguese_tag(track.language, track.raw_language.as_deref())
 }
 
-fn is_portuguese_subtitle(language: Language, raw: Option<&str>) -> bool {
+pub(super) fn is_portuguese_subtitle(language: Language, raw: Option<&str>) -> bool {
     is_portuguese_tag(language, raw)
 }
 
@@ -1545,11 +1640,11 @@ const fn hdr_label(hdr: Hdr) -> &'static str {
     }
 }
 
-fn file_name(path: &str) -> &str {
+pub(super) fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-fn parent(path: &str) -> &str {
+pub(super) fn parent(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
 
@@ -1578,6 +1673,16 @@ fn is_archive(path: &str) -> bool {
 
 /// Marcas que vêm depois do idioma no nome da legenda: `Filme.pt.forced.srt`.
 const SUBTITLE_QUALIFIERS: &[&str] = &["forced", "forcada", "sdh", "hi", "cc", "default"];
+
+/// O nome marca a legenda como forçada (`Filme.pt-BR.forced.srt`).
+fn subtitle_name_is_forced(path: &str) -> bool {
+    let name = file_name(path).to_lowercase();
+    let stem = name
+        .rsplit_once('.')
+        .map_or(name.as_str(), |(stem, _)| stem);
+    stem.split(|c: char| !c.is_alphanumeric())
+        .any(|t| matches!(t, "forced" | "forcada"))
+}
 
 /// Idioma da legenda em arquivo, pelo nome: `Filme.pt-BR.srt`, `Filme.por.srt`.
 ///
@@ -2272,19 +2377,30 @@ mod tests {
             status(Site::Bj, &facts, "4.2.1.5 / 4.2.1.4"),
             Some(Status::Fail)
         );
-        // Só embutida.
+        // Só embutida, em texto: a pasta adaptada a extrai.
+        set_video(&mut facts, |m| m.subtitles = vec![embedded_pt()]);
+        let report = check(Site::Bj, &facts);
+        assert_eq!(report.status_of("4.2.1.5 / 4.2.1.4"), Some(Status::Ok));
+        assert_eq!(report.status_of("4.2.1.6"), Some(Status::Warn));
+        assert_eq!(report.verdict, Verdict::Elegivel);
+        assert!(report.checks.iter().any(|c| {
+            c.message
+                .contains("a legenda PT embutida será extraída para arquivo separado")
+        }));
+        assert_eq!(report.adaptations.len(), 1);
+        // Só embutida, em imagem: continua reprovando.
         set_video(&mut facts, |m| {
             m.subtitles = vec![crate::mediainfo::SubtitleFacts {
-                language: Language::Portuguese,
-                raw_language: Some("por".to_owned()),
-                codec: "subrip".to_owned(),
-                forced: false,
-                title: None,
+                kind: crate::mediainfo::SubtitleKind::Image,
+                codec: "hdmv_pgs_subtitle".to_owned(),
+                ..embedded_pt()
             }];
         });
         let report = check(Site::Bj, &facts);
         assert_eq!(report.status_of("4.2.1.5 / 4.2.1.4"), Some(Status::Fail));
-        assert!(report.checks.iter().any(|c| c.message.contains("embutida")));
+        assert!(report.checks.iter().any(|c| c.message.contains("é imagem")));
+        assert!(report.adaptations.is_empty());
+        set_video(&mut facts, |m| m.subtitles = vec![embedded_pt()]);
         // Em arquivo, na mesma pasta.
         facts.files.push(file(
             "Filme.2024.1080p.WEB-DL.DUAL.x264-GRP/Filme.2024.1080p.WEB-DL.DUAL.x264-GRP.pt-BR.srt",
@@ -2308,6 +2424,8 @@ mod tests {
 
     fn embedded_pt() -> crate::mediainfo::SubtitleFacts {
         crate::mediainfo::SubtitleFacts {
+            index: 0,
+            kind: crate::mediainfo::SubtitleKind::Text,
             language: Language::Portuguese,
             raw_language: Some("por".to_owned()),
             codec: "subrip".to_owned(),
@@ -2371,20 +2489,52 @@ mod tests {
             status(Site::Bj, &facts, "4.2.1.5 / 4.2.1.4"),
             Some(Status::Fail)
         );
-        // Embutida também não vale no BJ.
-        facts.videos[1].media.subtitles = vec![embedded_pt()];
+        // Embutida em imagem também não vale no BJ.
+        facts.videos[1].media.subtitles = vec![crate::mediainfo::SubtitleFacts {
+            kind: crate::mediainfo::SubtitleKind::Image,
+            codec: "hdmv_pgs_subtitle".to_owned(),
+            ..embedded_pt()
+        }];
         assert_eq!(
             status(Site::Bj, &facts, "4.2.1.5 / 4.2.1.4"),
             Some(Status::Fail)
         );
+        // A forçada em arquivo não é a legenda exigida.
         facts.files.push(file(
             &format!("{folder}/Serie.S01E02.1080p.WEB-DL.pt.forced.srt"),
             1000,
         ));
         assert_eq!(
             status(Site::Bj, &facts, "4.2.1.5 / 4.2.1.4"),
+            Some(Status::Fail)
+        );
+        facts.files.push(file(
+            &format!("{folder}/Serie.S01E02.1080p.WEB-DL.pt.srt"),
+            1000,
+        ));
+        assert_eq!(
+            status(Site::Bj, &facts, "4.2.1.5 / 4.2.1.4"),
             Some(Status::Ok)
         );
+    }
+
+    #[test]
+    fn bj_legenda_forcada_externa_nao_impede_extrair_a_completa_embutida() {
+        let mut facts = movie();
+        set_video(&mut facts, |m| {
+            m.audio = vec![eng()];
+            m.subtitles = vec![embedded_pt()];
+        });
+        let stem = stem(file_name(&facts.videos[0].path)).to_owned();
+        let folder = parent(&facts.videos[0].path).to_owned();
+        facts
+            .files
+            .push(file(&format!("{folder}/{stem}.pt-BR.forced.srt"), 1000));
+        assert_eq!(
+            videos_without_portuguese(&facts.files, &facts.videos, Site::Bj).len(),
+            1
+        );
+        assert!(videos_without_portuguese(&facts.files, &facts.videos, Site::Amigos).is_empty());
     }
 
     #[test]
@@ -2426,6 +2576,96 @@ mod tests {
     }
 
     #[test]
+    fn bj_4_2_1_5_legenda_embutida_so_forcada_continua_reprovando() {
+        let mut facts = movie();
+        set_video(&mut facts, |m| {
+            m.audio = vec![eng()];
+            m.subtitles = vec![crate::mediainfo::SubtitleFacts {
+                forced: true,
+                ..embedded_pt()
+            }];
+        });
+        let report = check(Site::Bj, &facts);
+        assert_eq!(report.status_of("4.2.1.5 / 4.2.1.4"), Some(Status::Fail));
+        assert!(report.checks.iter().any(|c| c.message.contains("forçada")));
+    }
+
+    #[test]
+    fn bj_4_2_1_5_legenda_embutida_so_de_comentarios_reprova() {
+        let mut facts = movie();
+        set_video(&mut facts, |m| {
+            m.audio = vec![eng()];
+            m.subtitles = vec![crate::mediainfo::SubtitleFacts {
+                title: Some("Comentários do diretor".to_owned()),
+                ..embedded_pt()
+            }];
+        });
+        let report = check(Site::Bj, &facts);
+        assert_eq!(report.status_of("4.2.1.5 / 4.2.1.4"), Some(Status::Fail));
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.message.contains("legenda PT de comentários")),
+            "{:?}",
+            report.checks
+        );
+        assert!(report.adaptations.is_empty());
+    }
+
+    #[test]
+    fn bj_4_2_1_5_obra_nacional_nao_gera_adaptacao() {
+        let mut facts = movie();
+        facts.original_language = Some(Language::Portuguese);
+        set_video(&mut facts, |m| {
+            m.audio = vec![eng()];
+            m.subtitles = vec![embedded_pt()];
+        });
+        let report = check(Site::Bj, &facts);
+        assert_eq!(report.status_of("4.2.1.5 / 4.2.1.4"), Some(Status::Ok));
+        assert!(report.adaptations.is_empty());
+        assert_eq!(report.status_of("4.2.1.6"), None);
+    }
+
+    #[test]
+    fn amigos_com_legenda_embutida_nao_lista_adaptacao() {
+        let mut facts = movie();
+        set_video(&mut facts, |m| {
+            m.audio = vec![eng()];
+            m.subtitles = vec![embedded_pt()];
+        });
+        assert!(check(Site::Amigos, &facts).adaptations.is_empty());
+    }
+
+    #[test]
+    fn bj_4_2_1_10_conta_as_legendas_que_serao_extraidas() {
+        let mut facts = movie();
+        set_video(&mut facts, |m| {
+            m.audio = vec![eng()];
+            m.subtitles = vec![
+                embedded_pt(),
+                crate::mediainfo::SubtitleFacts {
+                    index: 1,
+                    forced: true,
+                    ..embedded_pt()
+                },
+            ];
+        });
+        // 2 a extrair + 3 em arquivo (não PT, para a faixa embutida ser necessária).
+        let folder = parent(&facts.files[0].path).to_owned();
+        for n in 0..3 {
+            facts
+                .files
+                .push(file(&format!("{folder}/Filme.{n}.eng.srt"), 100));
+        }
+        let report = check(Site::Bj, &facts);
+        assert_eq!(report.adaptations.len(), 2);
+        assert_eq!(report.status_of("4.2.1.10"), Some(Status::Fail));
+        facts.files.pop();
+        assert_eq!(status(Site::Bj, &facts, "4.2.1.10"), Some(Status::Ok));
+    }
+
+    #[test]
     fn bj_4_2_1_10_filme_com_dois_videos_ou_muitas_legendas() {
         let mut facts = movie();
         assert_eq!(status(Site::Bj, &facts, "4.2.1.10"), Some(Status::Ok));
@@ -2446,6 +2686,8 @@ mod tests {
         set_video(&mut facts, |m| {
             m.subtitles = (0..25)
                 .map(|_| crate::mediainfo::SubtitleFacts {
+                    index: 0,
+                    kind: crate::mediainfo::SubtitleKind::Text,
                     language: Language::Portuguese,
                     raw_language: None,
                     codec: "subrip".to_owned(),

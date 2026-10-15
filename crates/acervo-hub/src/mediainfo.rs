@@ -95,13 +95,39 @@ pub struct AudioFacts {
     pub title: Option<String>,
 }
 
+/// Se a legenda é texto (dá para extrair para `.srt`) ou imagem (PGS,
+/// `VobSub`: só o OCR a converteria).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitleKind {
+    Text,
+    Image,
+    /// Codec que o acervo não conhece: não se presume que seja texto.
+    Unknown,
+}
+
+impl SubtitleKind {
+    /// Classifica pelo `codec_name` do ffprobe.
+    #[must_use]
+    pub fn of_codec(codec: &str) -> Self {
+        match codec {
+            "subrip" | "srt" | "ass" | "ssa" | "mov_text" | "webvtt" => Self::Text,
+            "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvb_subtitle" | "xsub" => Self::Image,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// Uma legenda embutida.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubtitleFacts {
+    /// Índice absoluto do stream no arquivo (`-map 0:<índice>`).
+    pub index: u32,
+    pub kind: SubtitleKind,
     pub language: Language,
     pub raw_language: Option<String>,
     pub codec: String,
-    /// Disposição `forced` do arquivo.
+    /// Disposição `forced` do arquivo ou, na falta dela, título que diz
+    /// "forçada" (muita release marca só pelo título).
     pub forced: bool,
     pub title: Option<String>,
 }
@@ -156,6 +182,21 @@ async fn run_ffprobe(path: &Path, show: &[&str]) -> Option<Value> {
 
 fn text(value: &Value) -> Option<String> {
     value.as_str().filter(|t| !t.is_empty()).map(str::to_owned)
+}
+
+/// O título da faixa traz "forced", "forçada(s)" ou "foreign" como palavra.
+fn title_says_forced(title: Option<&str>) -> bool {
+    title.is_some_and(|title| {
+        title
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|t| {
+                matches!(
+                    t,
+                    "forced" | "forcada" | "forcadas" | "forçada" | "forçadas" | "foreign"
+                )
+            })
+    })
 }
 
 fn raw_language(stream: &Value) -> Option<String> {
@@ -248,11 +289,20 @@ pub fn facts_from_ffprobe(value: &Value) -> MediaFacts {
     let subtitles = streams(value, "subtitle")
         .map(|s| {
             let raw = raw_language(s);
+            let codec = s["codec_name"].as_str().unwrap_or_default().to_owned();
             SubtitleFacts {
+                // O ffprobe sempre grava `index`; sem ele o `-map` falharia
+                // alto no ffmpeg em vez de pegar a faixa errada.
+                index: s["index"]
+                    .as_u64()
+                    .and_then(|i| u32::try_from(i).ok())
+                    .unwrap_or(0),
+                kind: SubtitleKind::of_codec(&codec),
                 language: language_of(raw.as_deref()),
                 raw_language: raw,
-                codec: s["codec_name"].as_str().unwrap_or_default().to_owned(),
-                forced: s["disposition"]["forced"].as_i64() == Some(1),
+                codec,
+                forced: s["disposition"]["forced"].as_i64() == Some(1)
+                    || title_says_forced(text(&s["tags"]["title"]).as_deref()),
                 title: text(&s["tags"]["title"]),
             }
         })
@@ -330,6 +380,149 @@ pub async fn screenshot(path: &Path, at_seconds: f64) -> anyhow::Result<Vec<u8>>
         anyhow::bail!("ffmpeg não devolveu um PNG (posição além do fim do vídeo?)");
     }
     Ok(output.stdout)
+}
+
+/// Binário do `mediainfo`: `ACERVO_MEDIAINFO` ou o do caminho.
+fn mediainfo_binary() -> String {
+    std::env::var("ACERVO_MEDIAINFO").unwrap_or_else(|_| "mediainfo".into())
+}
+
+/// O relatório do `MediaInfo` (`--Output=TEXT`) do vídeo, que o formulário do
+/// Amigos exige. Roda na pasta do vídeo com só o nome do arquivo como
+/// argumento: assim o "Complete name" sai sem o caminho do servidor.
+pub async fn mediainfo_report(video: &Path) -> anyhow::Result<String> {
+    report_with(&mediainfo_binary(), video).await
+}
+
+async fn report_with(binary: &str, video: &Path) -> anyhow::Result<String> {
+    let name = video
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("o vídeo {} não tem nome de arquivo", video.display()))?;
+    let dir = match video.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    // Pasta ausente faria o spawn falhar com `NotFound`, igual a binário ausente.
+    anyhow::ensure!(
+        dir.is_dir(),
+        "a pasta do vídeo sumiu: {}",
+        dir.file_name().map_or_else(
+            || "(raiz)".into(),
+            |nome| nome.to_string_lossy().into_owned()
+        )
+    );
+    // O CLI trata como opção todo argumento que começa com '-' e não aceita
+    // `--`: o nome vem do torrent, então ganha o `./`.
+    let dash = name.as_encoded_bytes().first() == Some(&b'-');
+    let arg = if dash {
+        Path::new(".").join(name)
+    } else {
+        name.into()
+    };
+    let output = tokio::time::timeout(
+        Duration::from_secs(120),
+        tokio::process::Command::new(binary)
+            .current_dir(dir)
+            .arg("--Output=TEXT")
+            .arg(&arg)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("o mediainfo demorou demais para ler o vídeo"))?
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!(
+                "o mediainfo não está instalado ({binary} não existe); sem ele não há \
+                 relatório para o formulário"
+            )
+        } else {
+            anyhow::anyhow!("mediainfo indisponível: {error}")
+        }
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "o mediainfo falhou ({}): {}",
+            output.status,
+            stderr.lines().last().unwrap_or("sem mensagem")
+        );
+    }
+    let report = String::from_utf8(output.stdout)
+        .map_err(|_| anyhow::anyhow!("o relatório do mediainfo não é UTF-8"))?;
+    let report = report.trim().to_owned();
+    anyhow::ensure!(
+        !report.is_empty(),
+        "o mediainfo devolveu um relatório vazio"
+    );
+    Ok(if dash {
+        strip_dot_slash(&report)
+    } else {
+        report
+    })
+}
+
+/// Tira o `./` que `report_with` pôs no "Complete name" (o `MediaInfo` repete o
+/// caminho como recebeu).
+fn strip_dot_slash(report: &str) -> String {
+    report
+        .lines()
+        .map(|line| match line.split_once(" : ") {
+            Some((key, value)) if key.trim_end() == "Complete name" => {
+                format!("{key} : {}", value.strip_prefix("./").unwrap_or(value))
+            }
+            _ => line.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A legenda de texto embutida, como `.srt` em UTF-8: o stream `stream_index`
+/// (índice absoluto do arquivo) convertido pelo `ffmpeg`.
+pub async fn extract_subtitle_srt(path: &Path, stream_index: u32) -> anyhow::Result<Vec<u8>> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(120),
+        tokio::process::Command::new(ffmpeg_binary())
+            .args(["-nostdin", "-loglevel", "error", "-i"])
+            .arg(path)
+            .arg("-map")
+            .arg(format!("0:{stream_index}"))
+            .args(["-c:s", "srt", "-f", "srt", "-"])
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("ffmpeg demorou demais para extrair a legenda"))?
+    .map_err(|error| anyhow::anyhow!("ffmpeg indisponível: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "ffmpeg falhou ({}): {}",
+            output.status,
+            stderr.lines().last().unwrap_or("sem mensagem")
+        );
+    }
+    check_srt(output.stdout, &output.stderr)
+}
+
+/// Confere a saída do ffmpeg antes de ela virar arquivo de lançamento. Com
+/// `-loglevel error`, qualquer coisa no stderr é falha: o ffmpeg sai com 0 mesmo
+/// descartando em silêncio as falas que não são UTF-8. Também recusa a saída
+/// vazia ou sem nenhuma fala.
+fn check_srt(stdout: Vec<u8>, stderr: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let stderr = String::from_utf8_lossy(stderr);
+    if let Some(line) = stderr.lines().rev().find(|l| !l.trim().is_empty()) {
+        anyhow::bail!("o ffmpeg reclamou ao extrair a legenda, que pode estar incompleta: {line}");
+    }
+    // O srt do ffmpeg é UTF-8; se vier outra coisa, não vira arquivo de lançamento.
+    let text = std::str::from_utf8(&stdout)
+        .map_err(|_| anyhow::anyhow!("a legenda extraída não é UTF-8 válido"))?;
+    if !text.contains(" --> ") {
+        anyhow::bail!("a faixa de legenda não tem falas");
+    }
+    Ok(stdout)
 }
 
 #[cfg(test)]
@@ -461,6 +654,98 @@ mod tests {
     }
 
     #[test]
+    fn legenda_forcada_so_pelo_titulo_conta_como_forcada() {
+        let fatos = facts_from_ffprobe(&json!({
+            "streams": [
+                {"codec_type": "subtitle", "codec_name": "subrip", "index": 3,
+                 "tags": {"language": "por", "title": "Forçada"}, "disposition": {"forced": 0}},
+                {"codec_type": "subtitle", "codec_name": "subrip", "index": 4,
+                 "tags": {"language": "por", "title": "Forced Narrative"}},
+                {"codec_type": "subtitle", "codec_name": "subrip", "index": 5,
+                 "tags": {"language": "por", "title": "Completa"}}
+            ],
+            "format": {"format_name": "matroska,webm"}
+        }));
+        let forced: Vec<bool> = fatos.subtitles.iter().map(|s| s.forced).collect();
+        assert_eq!(forced, [true, true, false]);
+    }
+
+    #[test]
+    fn extracao_recusa_saida_com_aviso_do_ffmpeg_mesmo_com_falas() {
+        let srt = b"1\n00:00:00,100 --> 00:00:01,000\nOla\n".to_vec();
+        let error = check_srt(
+            srt,
+            b"[srt] Invalid UTF-8 in decoded subtitles text; maybe missing -sub_charenc option\n",
+        )
+        .unwrap_err();
+        assert!(format!("{error}").contains("Invalid UTF-8"), "{error}");
+    }
+
+    #[test]
+    fn extracao_recusa_legenda_vazia_ou_sem_falas() {
+        for empty in [&b""[..], b"\n"] {
+            let error = check_srt(empty.to_vec(), b"").unwrap_err();
+            assert!(format!("{error}").contains("não tem falas"), "{error}");
+        }
+    }
+
+    #[test]
+    fn extracao_aceita_srt_utf8_com_falas_e_sem_aviso() {
+        let srt = "1\n00:00:00,100 --> 00:00:01,000\nAção rápida\n"
+            .as_bytes()
+            .to_vec();
+        assert_eq!(check_srt(srt.clone(), b"").unwrap(), srt);
+    }
+
+    #[test]
+    fn legenda_guarda_o_indice_absoluto_do_stream() {
+        let fatos = facts_from_ffprobe(&json!({
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1,
+                 "height": 1},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                {"index": 2, "codec_type": "audio", "codec_name": "aac"},
+                {"index": 3, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "por"}},
+                {"index": 4, "codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle",
+                 "tags": {"language": "eng"}}
+            ],
+            "format": {"format_name": "matroska,webm"}
+        }));
+        let indices: Vec<u32> = fatos.subtitles.iter().map(|s| s.index).collect();
+        assert_eq!(indices, [3, 4]);
+    }
+
+    #[test]
+    fn classifica_legenda_em_texto_imagem_ou_desconhecida() {
+        for codec in ["subrip", "ass", "ssa", "mov_text", "webvtt"] {
+            assert_eq!(SubtitleKind::of_codec(codec), SubtitleKind::Text, "{codec}");
+        }
+        for codec in ["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"] {
+            assert_eq!(
+                SubtitleKind::of_codec(codec),
+                SubtitleKind::Image,
+                "{codec}"
+            );
+        }
+        assert_eq!(SubtitleKind::of_codec("eia_608"), SubtitleKind::Unknown);
+        assert_eq!(SubtitleKind::of_codec(""), SubtitleKind::Unknown);
+    }
+
+    #[test]
+    fn legenda_do_ffprobe_traz_a_classificacao_do_codec() {
+        let fatos = facts_from_ffprobe(&json!({
+            "streams": [
+                {"index": 2, "codec_type": "subtitle", "codec_name": "ass"},
+                {"index": 3, "codec_type": "subtitle", "codec_name": "dvd_subtitle"}
+            ],
+            "format": {"format_name": "matroska,webm"}
+        }));
+        assert_eq!(fatos.subtitles[0].kind, SubtitleKind::Text);
+        assert_eq!(fatos.subtitles[1].kind, SubtitleKind::Image);
+    }
+
+    #[test]
     fn profundidade_vem_do_pix_fmt_sem_bits_por_amostra() {
         for (pix_fmt, esperado) in [
             ("yuv420p", 8),
@@ -551,5 +836,162 @@ mod tests {
         assert_eq!(png[25], 2, "RGB sem alfa");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn extrai_de_volta_a_legenda_srt_embutida_no_mkv() {
+        if !binario_existe(&ffmpeg_binary()) || !binario_existe(&binary()) {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("acervo-legenda-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let srt = dir.join("entrada.srt");
+        std::fs::write(
+            &srt,
+            "1\n00:00:00,100 --> 00:00:01,000\nOlá, ação!\n\n2\n00:00:01,200 --> 00:00:01,900\nSegunda fala\n",
+        )
+        .unwrap();
+        let video = dir.join("com-legenda.mkv");
+        let gerado = std::process::Command::new(ffmpeg_binary())
+            .args(["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=duration=2:size=160x120:rate=10")
+            .arg("-i")
+            .arg(&srt)
+            .args(["-map", "0:v", "-map", "1:s", "-c:v", "mpeg4", "-c:s", "srt"])
+            .arg(&video)
+            .status();
+        if !gerado.is_ok_and(|s| s.success()) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let fatos = probe_full(&video).await.expect("ffprobe leu o arquivo");
+        assert_eq!(fatos.subtitles.len(), 1);
+        let legenda = &fatos.subtitles[0];
+        assert_eq!(legenda.kind, SubtitleKind::Text);
+        assert_eq!(legenda.index, 1);
+
+        let bytes = extract_subtitle_srt(&video, legenda.index)
+            .await
+            .expect("legenda extraída");
+        let texto = String::from_utf8(bytes).unwrap();
+        assert!(texto.contains("Olá, ação!"), "{texto}");
+        assert!(texto.contains("Segunda fala"), "{texto}");
+        assert!(texto.contains("00:00:00,100 --> 00:00:01,000"), "{texto}");
+        // Stream que não existe: erro claro, não arquivo vazio.
+        assert!(extract_subtitle_srt(&video, 9).await.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Binário falso: imprime o diretório de trabalho e os argumentos.
+    #[cfg(unix)]
+    fn mediainfo_falso(dir: &Path, corpo: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("mediainfo-falso.sh");
+        std::fs::write(&script, format!("#!/bin/sh\n{corpo}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relatorio_roda_na_pasta_do_video_com_so_o_nome() {
+        let dir = std::env::temp_dir().join(format!("acervo-mi-falso-{}", std::process::id()));
+        let pasta = dir.join("Filme 2024");
+        std::fs::create_dir_all(&pasta).unwrap();
+        let script = mediainfo_falso(
+            &dir,
+            "echo \"cwd=$(pwd)\"; echo \"n=$#\"; for a in \"$@\"; do echo \"arg=$a\"; done",
+        );
+        let video = pasta.join("Filme 2024.mkv");
+        let relatorio = report_with(script.to_str().unwrap(), &video).await.unwrap();
+        let cwd = std::fs::canonicalize(&pasta).unwrap();
+        assert!(
+            relatorio.contains(&format!("cwd={}", cwd.display())),
+            "{relatorio}"
+        );
+        assert!(relatorio.contains("n=2"), "{relatorio}");
+        assert!(relatorio.contains("arg=--Output=TEXT"), "{relatorio}");
+        assert!(relatorio.contains("arg=Filme 2024.mkv"), "{relatorio}");
+        assert!(!relatorio.contains("arg=/"), "{relatorio}");
+
+        // Falha do binário: erro com a última linha do stderr.
+        let ruim = mediainfo_falso(&dir, "echo 'arquivo ilegível' >&2; exit 3");
+        let erro = report_with(ruim.to_str().unwrap(), &video)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(erro.contains("arquivo ilegível"), "{erro}");
+
+        // Saída vazia não vira relatório.
+        let vazio = mediainfo_falso(&dir, "exit 0");
+        assert!(report_with(vazio.to_str().unwrap(), &video).await.is_err());
+
+        // Nome que começa com '-' não pode virar opção do CLI; o "./" sai do relatório.
+        let traco = pasta.join("--Filme.mkv");
+        let eco = mediainfo_falso(
+            &dir,
+            "for a in \"$@\"; do echo \"arg=$a\"; done; echo \"Complete name : $2\"",
+        );
+        let relatorio = report_with(eco.to_str().unwrap(), &traco).await.unwrap();
+        assert!(relatorio.contains("arg=./--Filme.mkv"), "{relatorio}");
+        assert!(
+            relatorio.contains("Complete name : --Filme.mkv"),
+            "{relatorio}"
+        );
+
+        // Pasta ausente: não é "mediainfo não instalado".
+        let erro = report_with(eco.to_str().unwrap(), &dir.join("sumiu/Filme.mkv"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(erro.contains("pasta do vídeo sumiu"), "{erro}");
+        assert!(!erro.contains("instalado"), "{erro}");
+
+        // Binário inexistente: mensagem clara.
+        let inexistente = dir.join("nao-existe");
+        let erro = report_with(inexistente.to_str().unwrap(), &video)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(erro.contains("não está instalado"), "{erro}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn relatorio_real_do_mediainfo_traz_o_nome_sem_caminho() {
+        if !binario_existe(&ffmpeg_binary()) || !binario_existe_com("mediainfo", "--Version") {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("acervo-mi-real-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("real.mkv");
+        let gerado = std::process::Command::new(ffmpeg_binary())
+            .args(["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=duration=1:size=160x120:rate=10")
+            .args(["-c:v", "mpeg4"])
+            .arg(&video)
+            .status();
+        if gerado.is_ok_and(|s| s.success()) {
+            let relatorio = mediainfo_report(&video).await.unwrap();
+            let linha = relatorio
+                .lines()
+                .find(|l| l.starts_with("Complete name"))
+                .unwrap_or_default();
+            assert!(linha.trim_end().ends_with(": real.mkv"), "{relatorio}");
+            assert!(!relatorio.contains(&dir.to_string_lossy().into_owned()));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn binario_existe_com(nome: &str, flag: &str) -> bool {
+        std::process::Command::new(nome)
+            .arg(flag)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
     }
 }

@@ -106,6 +106,10 @@ pub struct Fields {
     pub technical: String,
     #[serde(rename = "descricao")]
     pub description: String,
+    /// Relatório do `mediainfo --Output=TEXT` do vídeo principal; vazio no BJ
+    /// se o `MediaInfo` falhou. Preenchido pelo passo de texto do job.
+    #[serde(rename = "mediainfo", default)]
+    pub mediainfo: String,
 }
 
 /// Os campos e os avisos que entram no `Report`.
@@ -148,6 +152,7 @@ pub fn build_fields(site: Site, input: &Input) -> Built {
         sheet,
         technical,
         description,
+        mediainfo: String::new(),
     };
     Built { fields, warnings }
 }
@@ -568,6 +573,8 @@ mod tests {
 
     fn subtitle(language: Language, raw: &str, forced: bool) -> SubtitleFacts {
         SubtitleFacts {
+            index: 0,
+            kind: crate::mediainfo::SubtitleKind::Text,
             language,
             raw_language: Some(raw.into()),
             codec: "subrip".into(),
@@ -912,6 +919,7 @@ mod tests {
                 "duracao",
                 "ficha",
                 "imdb",
+                "mediainfo",
                 "release",
                 "sinopse",
                 "tamanho",

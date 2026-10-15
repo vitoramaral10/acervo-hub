@@ -262,3 +262,95 @@ Página "Para lançar" (`#lancar`), entre as principais.
   "Baixar .torrent"; "Marquei como enviado"; "Descartar"; enquanto
   `preparando`, o andamento com polling de 3 s.
 - Configurações → Imagens: chave do ImgBB.
+
+## Pasta adaptada (legenda separada para o BJ)
+
+O BJ exige a legenda PT-BR em arquivo separado, ao lado do vídeo (4.2.1.5) e
+proíbe muxá-la (4.2.1.4). Release sem áudio PT cuja legenda PT só existe
+**embutida** e **em texto** (SubRip, ASS/SSA, mov_text, WebVTT) é adaptado em
+vez de recusado. O vídeo continua intacto: o que muda é a pasta.
+
+- **Onde:** `<raiz>/lancamentos/<site>/<nome>/`, onde `<raiz>` é o pai do
+  `save_path` da origem (em produção `/media`, o mesmo sistema de arquivos dos
+  downloads: hardlink exige isso; `EXDEV` → `falhou` com mensagem). `<site>` é
+  `bj`. `<nome>` é a pasta raiz da origem; para origem de arquivo único, o
+  nome do arquivo sem a extensão.
+- **Conteúdo:** hardlink de **todos** os arquivos da origem, na mesma
+  estrutura relativa (para origem de arquivo único, o arquivo vai dentro da
+  pasta nova), mais, para cada vídeo sem áudio PT e sem legenda PT externa:
+  `<stem do vídeo>.pt-BR.srt` com a faixa PT completa (não forçada) e, se
+  houver faixa PT forçada, `<stem>.pt-BR.forced.srt`. Extração:
+  `ffmpeg -nostdin -loglevel error -i VIDEO -map 0:<índice> -c:s srt -f srt -`,
+  UTF-8, timeout 120 s. Entre várias faixas PT completas, a de título com
+  "Brasil"/"Brazil"/"BR" ou idioma `pob`, senão a primeira.
+- **Regra:** no BJ, 4.2.1.5 com legenda PT só embutida em texto vira `Ok`
+  com mensagem "a legenda PT embutida será extraída para arquivo separado" e
+  um `Warn` 4.2.1.6 "confira que a legenda é oficial (não de tradutor)". Só
+  embutida em imagem (PGS `hdmv_pgs_subtitle`, VobSub `dvd_subtitle`, DVB) →
+  continua `Fail`, dizendo que é imagem. O limite de 4 legendas (4.2.1.10)
+  conta as que existirão depois da adaptação. `Report.adaptations` lista o que
+  será criado (arquivo, faixa de origem).
+- **Fluxo:** passo novo "adaptando a pasta" entre capturas e `.torrent`;
+  `sourcePath` do `torrentcreator` passa a ser a pasta adaptada; o layout
+  conferido é o da pasta adaptada. `launches.adapted_path` e
+  `launches.adapted_layout` (migração 39) guardam a pasta e a lista
+  `[[caminho, tamanho]]` relativa ao pai dela.
+- **Antes de recriar e ao descartar:** apaga a pasta adaptada do par, mas só
+  se estiver dentro de `<raiz>/lancamentos/`, e só os arquivos que o acervo
+  criou: vídeos/arquivos que são hardlink (mesmo dev+inode) do arquivo da
+  origem, e os `.srt` gerados. Qualquer outra coisa na pasta → não apaga nada
+  e registra aviso. Pasta de par em `enviado` ou `semeando` nunca é apagada
+  por `preparar` (o irmão semeia dela): `preparar` nesses estados é recusado.
+- **Cross-seed:** par lançado com `adapted_layout` compara os candidatos com
+  esse layout (não com o da origem) e adiciona o irmão com `save_path` = pai
+  da pasta adaptada. O resto do fluxo (parado, conferido, 100%, tag de
+  semear) é o mesmo.
+
+## MediaInfo
+
+O formulário do Amigos exige o relatório do MediaInfo em texto ("fonte da
+verdade": qualidade, extensão, codecs e resolução saem dele) e o preenche
+sozinho a partir dele. O relatório tem de ser do MediaInfo de verdade, não uma
+imitação a partir do ffprobe.
+
+- **Binário:** `mediainfo` (CLI da MediaArea) **estático**, compilado num
+  estágio próprio do Dockerfile (a imagem final é distroless sem libc) e
+  copiado para `/usr/local/bin/mediainfo`; `ACERVO_MEDIAINFO` troca o binário.
+  Versão fixada; o estágio confere que o binário é estático e roda.
+- **Relatório:** `mediainfo --Output=TEXT <arquivo>` com o diretório de
+  trabalho na pasta do vídeo e o argumento sendo só o nome do arquivo, para o
+  "Complete name" sair só com o nome (sem caminho do servidor). Timeout 120 s,
+  `kill_on_drop`. Gerado para o vídeo principal no passo "texto" do pacote e
+  guardado em `Fields.mediainfo`; para o BJ com pasta adaptada, o relatório é o
+  mesmo (o vídeo não muda).
+- **Tela:** campo "MediaInfo" no pacote, com botão de copiar e "Baixar .txt"
+  (`GET .../mediainfo.txt`, `text/plain; charset=utf-8`, `attachment;
+  filename="<nome do vídeo sem extensão>.txt"`), para o "Abrir arquivo .txt"
+  do formulário.
+- O `.txt` nunca entra no `.torrent`.
+
+## Semear antes da aprovação
+
+Os dois sites só liberam envio com seeder (Amigos 4.6: sem seed some em
+12 h). O torrent publicado ainda não aparece na busca antes da aprovação, então
+o cross-seed não o acha a tempo. O acervo semeia o próprio `.torrent` gerado,
+que é privado e já leva o announce do destino. O Amigos diz que só converte
+torrent não privado, e então o hash publicado tende a ser o mesmo.
+
+- **"Marquei como enviado"** adiciona o `.torrent` gerado ao cliente **parado**,
+  categoria do acervo, `save_path` = o da origem (ou o pai da pasta adaptada),
+  tags `acervo:cross-seed` + tag de semear do destino; o `verify` do cross-seed
+  confere e só inicia com 100%. Já no cliente (mesmo hash) não adiciona de
+  novo. Falha ao adicionar não desfaz o `enviado`: vira `error` no pacote e
+  aviso na tela.
+- **"Enviar o .torrent do site"** (`POST .../torrent-do-site`, corpo = bytes
+  do `.torrent`, até 10 MiB): para quando o site troca o hash. Confere
+  `layout(bytes)` igual ao do pacote (origem ou pasta adaptada); diferente →
+  400 dizendo o que difere. Igual → adiciona do mesmo jeito (parado,
+  conferido, só inicia com 100%) e passa o pacote a `enviado` se ainda não
+  estava.
+- **Status do tracker no pacote:** o detalhe mostra, para o torrent semeado
+  (o gerado ou o do site), o status do tracker do destino (funcionando, não
+  registrado, erro), sem a URL. "Não registrado" logo após o envio é
+  esperado até o site processar ou aprovar; persistindo, a tela sugere enviar
+  o `.torrent` do site.

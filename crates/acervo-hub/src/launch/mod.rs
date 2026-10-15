@@ -6,11 +6,16 @@
 //! andamento em `launches.progress`, que a tela acompanha. Falha técnica vira
 //! `falhou` com a mensagem; regra reprovada vira `inelegivel`. Os arquivos
 //! nunca mudam: o `.torrent` é dos arquivos da origem como estão, e o layout
-//! dele é conferido contra a origem antes de valer.
+//! dele é conferido contra a origem antes de valer. A única exceção é a pasta
+//! adaptada do BJ (legenda PT embutida que vira `.srt` ao lado do vídeo): uma
+//! pasta nova em `<raiz>/lancamentos/bj/` com hardlinks da origem e os `.srt`
+//! ([`adapt`] planeja, [`folder`] monta e apaga); aí o `.torrent` é dela.
 //!
 //! Segredo não sai: o announce (com a passkey) e a chave do `ImgBB` são
 //! tirados de qualquer mensagem de erro gravada ([`redact`]).
 
+pub(crate) mod adapt;
+pub(crate) mod folder;
 pub(crate) mod imgbb;
 pub(crate) mod rules;
 pub(crate) mod text;
@@ -22,14 +27,15 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use acervo_clients::{
-    CreateTorrentOptions, QbitClient, TorrentInfo, TorrentTaskState, working_announce,
+    AddOptions, CreateTorrentOptions, NewTorrent, QbitClient, TorrentInfo, TorrentTaskState,
+    working_announce,
 };
 use acervo_core::DownloadHash;
 use acervo_metadata::{DiscoverKind, country_name_pt};
 use acervo_parser::Language;
-use acervo_store::{LaunchState, Store};
+use acervo_store::{Launch, LaunchState, Store};
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 
 use crate::api::Catalog;
@@ -37,8 +43,10 @@ use crate::config::Config;
 use crate::crossseed::{Origin, Source};
 use crate::tasks::Cancel;
 use crate::web::Web;
+use adapt::{AdaptationPlan, Extraction};
+use folder::Cleanup;
 use rules::{
-    DestinationRelease, Facts, Kind, ProbedVideo, SeriesStatus, Site, SourceFile, Verdict,
+    DestinationRelease, Facts, Kind, ProbedVideo, Report, SeriesStatus, Site, SourceFile, Verdict,
 };
 use text::{Credits, Input, Work};
 
@@ -428,12 +436,17 @@ pub(crate) fn ensure_root(torrent: &TorrentInfo, files: &[SourceFile]) -> Result
     Ok(())
 }
 
-/// O `.torrent` gerado tem exatamente os arquivos da origem: sem isso o
-/// cross-seed nunca acharia o publicado.
-pub(crate) fn layout_matches(torrent: &[u8], files: &[SourceFile]) -> bool {
-    let origin: Vec<(String, u64)> = files.iter().map(|f| (f.path.clone(), f.size)).collect();
+/// Os `(caminho, tamanho)` dos arquivos da origem.
+fn origin_layout(files: &[SourceFile]) -> Vec<(String, u64)> {
+    files.iter().map(|f| (f.path.clone(), f.size)).collect()
+}
+
+/// O `.torrent` gerado tem exatamente o layout `expected` (os arquivos da
+/// origem, ou os da pasta adaptada): sem isso o cross-seed nunca acharia o
+/// publicado.
+pub(crate) fn has_layout(torrent: &[u8], expected: &[(String, u64)]) -> bool {
     acervo_clients::layout(torrent)
-        .is_some_and(|generated| crate::crossseed::same_layout(&origin, &generated))
+        .is_some_and(|generated| crate::crossseed::same_layout(expected, &generated))
 }
 
 /// Episódio avulso ou temporada, pelo nome do torrent de série. Mais de um
@@ -754,9 +767,14 @@ async fn create_torrent(
 /// No reinício, apaga as tarefas de criação que um acervo anterior deixou
 /// para pacotes que não estão mais `preparando` (`packages`: hash → se algum
 /// destino dele está preparando). Só toca tarefa cujo `sourcePath` é o
-/// `content_path` de um pacote do acervo; qualquer outra é do usuário.
-/// Devolve quantas apagou.
-async fn sweep_stale_tasks(client: &QbitClient, packages: &HashMap<String, bool>) -> usize {
+/// `content_path` de um pacote do acervo, ou a pasta adaptada de um par que
+/// não está preparando (`adapted`); qualquer outra é do usuário. Devolve
+/// quantas apagou.
+async fn sweep_stale_tasks(
+    client: &QbitClient,
+    packages: &HashMap<String, bool>,
+    adapted: &HashSet<String>,
+) -> usize {
     let (tasks, torrents) = match tokio::try_join!(
         async { client.torrent_tasks().await.map_err(anyhow::Error::new) },
         async { client.torrents().await.map_err(anyhow::Error::new) },
@@ -771,6 +789,7 @@ async fn sweep_stale_tasks(client: &QbitClient, packages: &HashMap<String, bool>
         .iter()
         .filter(|t| packages.get(&t.hash.to_ascii_lowercase()) == Some(&false))
         .map(|t| plain(&t.content_path))
+        .chain(adapted.iter().map(|path| plain(path)))
         .filter(|path| !path.is_empty())
         .collect();
     let mut deleted = 0;
@@ -807,11 +826,15 @@ pub(crate) fn spawn_clear_stale_tasks(config: Arc<Config>, store: Store) {
 /// Banco inalcançável.
 async fn clear_stale_tasks(config: &Config, store: &Store) -> Result<usize> {
     let mut packages: HashMap<String, bool> = HashMap::new();
+    let mut adapted = HashSet::new();
     for launch in store.launches().await? {
-        let preparing = packages
+        let preparing = launch.state == LaunchState::Preparando;
+        *packages
             .entry(launch.hash.to_ascii_lowercase())
-            .or_default();
-        *preparing |= launch.state == LaunchState::Preparando;
+            .or_default() |= preparing;
+        if !preparing && let Some(path) = launch.adapted_path {
+            adapted.insert(path);
+        }
     }
     if packages.is_empty() || config.qbittorrent().is_none() {
         return Ok(0);
@@ -819,7 +842,7 @@ async fn clear_stale_tasks(config: &Config, store: &Store) -> Result<usize> {
     let Ok(client) = crate::grab::qbit(config).await else {
         return Ok(0);
     };
-    Ok(sweep_stale_tasks(&client, &packages).await)
+    Ok(sweep_stale_tasks(&client, &packages, &adapted).await)
 }
 
 /// Conta uma falha ao consultar o andamento: dentro da tolerância segue
@@ -871,6 +894,681 @@ async fn follow_task(client: &QbitClient, job: &mut Job<'_>, task: &str) -> Resu
             "o qBittorrent levou mais de 2 h para criar o .torrent"
         );
         tokio::time::sleep(CREATOR_POLL).await;
+    }
+}
+
+// ---------------------------------------------------------------- pasta adaptada
+
+/// Por que um pacote já enviado não tem a pasta mexida.
+const SENT_FOLDER: &str = "o pacote já foi enviado ao site: a pasta adaptada é de onde o publicado \
+                           semeia, e não é apagada nem refeita";
+
+/// A pasta adaptada montada: onde está e o layout dela, relativo ao pai.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Adapted {
+    target: PathBuf,
+    layout: Vec<(String, u64)>,
+}
+
+/// O layout gravado da pasta adaptada (`[[caminho, tamanho]]`), se o pacote
+/// tem uma.
+pub(crate) fn adapted_layout(launch: &Launch) -> Option<Vec<(String, u64)>> {
+    launch
+        .adapted_layout
+        .as_ref()
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .filter(|layout: &Vec<(String, u64)>| !layout.is_empty())
+}
+
+/// A pasta adaptada do pacote pode ser apagada: ele não foi ao site. Depois
+/// do envio, o irmão do cross-seed semeia dela.
+pub(crate) fn may_remove_folder(launch: &Launch) -> bool {
+    launch.sent_at.is_none()
+        && !matches!(launch.state, LaunchState::Enviado | LaunchState::Semeando)
+}
+
+/// Outro par, já enviado ou semeando, usa a mesma pasta.
+fn folder_in_use(launches: &[Launch], hash: &str, indexer: &str, target: &Path) -> bool {
+    launches.iter().any(|l| {
+        !(l.hash.eq_ignore_ascii_case(hash) && l.indexer == indexer)
+            && l.adapted_path
+                .as_deref()
+                .is_some_and(|p| Path::new(p) == target)
+            && !may_remove_folder(l)
+    })
+}
+
+/// Os caminhos, relativos ao pai da pasta adaptada, que os arquivos da origem
+/// têm nela: os mesmos, ou dentro da pasta nova no arquivo único.
+fn origin_in_folder(files: &[SourceFile]) -> HashSet<String> {
+    let single = files.len() == 1 && !files[0].path.contains('/');
+    match adapt::folder_name(files) {
+        Some(name) if single => files.iter().map(|f| format!("{name}/{}", f.path)).collect(),
+        _ => files.iter().map(|f| f.path.clone()).collect(),
+    }
+}
+
+/// Os `.srt` que o acervo gerou na pasta adaptada `target` do pacote, com o
+/// tamanho gravado no layout (`None`: montagem interrompida, sem layout, e
+/// qualquer tamanho serve). Só vale para a pasta que o pacote registrou como
+/// dele (`adapted_path`): sem isso nenhum `.srt` é do acervo, e a limpeza
+/// recusa a pasta. É o que ela pode apagar além dos hardlinks.
+fn generated_subtitles(
+    files: &[SourceFile],
+    launch: Option<&Launch>,
+    target: &Path,
+) -> HashMap<String, Option<u64>> {
+    let mut out = HashMap::new();
+    let Some(launch) = launch else {
+        return out;
+    };
+    if launch.adapted_path.as_deref().map(Path::new) != Some(target) {
+        return out;
+    }
+    if let Some(layout) = adapted_layout(launch) {
+        let origin = origin_in_folder(files);
+        out.extend(
+            layout
+                .into_iter()
+                .filter(|(path, _)| folder::is_srt(path) && !origin.contains(path))
+                .map(|(path, size)| (path, Some(size))),
+        );
+    } else {
+        // Caminho gravado e layout não: a montagem caiu no meio. O que o laudo
+        // mandou extrair pode estar no disco, com o tamanho que for.
+        let planned: Vec<Extraction> = launch
+            .report
+            .get("adaptations")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default();
+        out.extend(planned.into_iter().map(|e| (e.output, None)));
+    }
+    out
+}
+
+/// O laudo como vai ao banco, com o nome de cada faixa a extrair
+/// (`adaptations[].faixa`): a tela diz "a partir da faixa 3 (Português -
+/// Brasil)".
+fn report_value(report: &Report, videos: &[ProbedVideo]) -> Result<Value> {
+    let mut value = serde_json::to_value(report)?;
+    if let Some(list) = value.get_mut("adaptations").and_then(Value::as_array_mut) {
+        for (item, extraction) in list.iter_mut().zip(&report.adaptations) {
+            if let Some(label) = track_label(videos, extraction) {
+                item["faixa"] = json!(label);
+            }
+        }
+    }
+    Ok(value)
+}
+
+/// O nome da faixa de legenda que a extração lê: o título dela, ou o idioma.
+fn track_label(videos: &[ProbedVideo], extraction: &Extraction) -> Option<String> {
+    let track = videos
+        .iter()
+        .find(|v| v.path == extraction.video)?
+        .media
+        .subtitles
+        .iter()
+        .find(|s| s.index == extraction.stream)?;
+    Some(non_empty(track.title.as_deref()).unwrap_or_else(|| {
+        match track.raw_language.as_deref().filter(|r| !r.is_empty()) {
+            Some(raw) => format!("Português, {raw}"),
+            None => "Português".to_owned(),
+        }
+    }))
+}
+
+/// Roda a limpeza de [`folder::remove`] fora do runtime.
+async fn clean(
+    target: PathBuf,
+    root: PathBuf,
+    origin: Vec<PathBuf>,
+    generated: HashMap<String, Option<u64>>,
+) -> Result<Cleanup> {
+    tokio::task::spawn_blocking(move || folder::remove(&target, &root, &origin, &generated))
+        .await
+        .context("a limpeza da pasta adaptada parou")?
+}
+
+/// Onde ficam as pastas adaptadas da origem: o pai do `save_path`.
+fn launch_root(save_path: &Path) -> Result<PathBuf> {
+    save_path
+        .parent()
+        .map(Path::to_path_buf)
+        .context("a pasta de download da origem não tem pasta acima: sem onde pôr `lancamentos`")
+}
+
+/// O passo "adaptando a pasta". Apaga a pasta adaptada anterior do par (e
+/// qualquer coisa já no lugar da nova), sempre pela limpeza segura; com
+/// adaptação no laudo, extrai as legendas, monta a pasta e grava caminho e
+/// layout. Sem adaptação, `None`: o `.torrent` é da origem.
+///
+/// # Errors
+///
+/// Origem que não deixa montar o plano, pasta com o que o acervo não criou
+/// (nada é apagado), extração ou montagem que falhou (o que foi criado é
+/// desfeito), banco inalcançável.
+async fn adapt_folder(
+    job: &mut Job<'_>,
+    torrent: &TorrentInfo,
+    files: &[SourceFile],
+    videos: &[ProbedVideo],
+    report: &Report,
+    site: Site,
+) -> Result<Option<Adapted>> {
+    let store = job.store;
+    let save_path = PathBuf::from(&torrent.save_path);
+    let plan: Option<AdaptationPlan> = if report.adaptations.is_empty() {
+        None
+    } else {
+        let content = PathBuf::from(source_path(torrent, files));
+        Some(
+            adapt::plan(files, videos, &content, &save_path, site).context(
+                "a legenda PT precisa ir para arquivo separado, mas a origem não deixa montar \
+                 a pasta adaptada",
+            )?,
+        )
+    };
+    let launches = store.launches().await?;
+    let own = launches
+        .iter()
+        .find(|l| l.hash.eq_ignore_ascii_case(&job.hash) && l.indexer == job.indexer);
+    let previous = own.and_then(|l| l.adapted_path.clone()).map(PathBuf::from);
+    if plan.is_none() && previous.is_none() {
+        return Ok(None);
+    }
+    job.step("adaptando a pasta").await;
+    if let Some(own) = own {
+        ensure!(may_remove_folder(own), SENT_FOLDER);
+    }
+    let root = launch_root(&save_path)?;
+    let origin: Vec<PathBuf> = files.iter().map(|f| save_path.join(&f.path)).collect();
+    let mut targets: Vec<PathBuf> = previous.into_iter().collect();
+    if let Some(plan) = &plan
+        && !targets.contains(&plan.target)
+    {
+        targets.push(plan.target.clone());
+    }
+    for target in targets {
+        ensure!(
+            !folder_in_use(&launches, &job.hash, &job.indexer, &target),
+            "a pasta `{}` é de outro pacote já enviado ao site: nada foi apagado",
+            target.display()
+        );
+        let generated = generated_subtitles(files, own, &target);
+        match clean(target, root.clone(), origin.clone(), generated).await? {
+            Cleanup::Absent | Cleanup::Removed => {}
+            Cleanup::Refused(reason) => {
+                tracing::warn!(indexer = job.indexer, "pasta adaptada não limpa: {reason}");
+                bail!("{reason}; tire à mão o que não é do acervo e prepare de novo");
+            }
+        }
+    }
+    store
+        .save_launch_adaptation(&job.hash, &job.indexer, None, None)
+        .await?;
+    let Some(plan) = plan else {
+        return Ok(None);
+    };
+
+    build_folder(job, plan, &save_path).await.map(Some)
+}
+
+/// Extrai as legendas do plano, monta a pasta e grava caminho e layout no
+/// pacote. As legendas vêm primeiro: falha do ffmpeg não deixa nada no disco.
+async fn build_folder(
+    job: &mut Job<'_>,
+    plan: AdaptationPlan,
+    save_path: &Path,
+) -> Result<Adapted> {
+    let store = job.store;
+    let total = plan.extractions.len();
+    let mut subtitles = Vec::with_capacity(total);
+    for (index, extraction) in plan.extractions.iter().enumerate() {
+        job.step(&format!(
+            "adaptando a pasta: extraindo a legenda {} de {total}",
+            index + 1
+        ))
+        .await;
+        let video = save_path.join(&extraction.video);
+        let bytes = crate::mediainfo::extract_subtitle_srt(&video, extraction.stream)
+            .await
+            .with_context(|| {
+                format!(
+                    "extraindo a legenda da faixa {} de {}",
+                    extraction.stream, extraction.video
+                )
+            })?;
+        subtitles.push((extraction.output.clone(), bytes));
+    }
+    job.step("adaptando a pasta: hardlinks e legendas").await;
+    let target = plan.target.to_string_lossy().into_owned();
+    // Gravada antes de criar: uma queda no meio deixa o rastro para a limpeza.
+    store
+        .save_launch_adaptation(&job.hash, &job.indexer, Some(&target), None)
+        .await?;
+    let built = {
+        let plan = plan.clone();
+        let root = launch_root(save_path)?;
+        tokio::task::spawn_blocking(move || folder::build(&plan, &root, &subtitles))
+            .await
+            .context("a montagem da pasta adaptada parou")?
+    };
+    let layout = match built {
+        Ok(layout) => layout,
+        Err(error) => {
+            // `build` já desfez o que criou.
+            if let Err(failure) = store
+                .save_launch_adaptation(&job.hash, &job.indexer, None, None)
+                .await
+            {
+                tracing::warn!(
+                    indexer = job.indexer,
+                    "pasta adaptada desfeita, banco não: {failure}"
+                );
+            }
+            return Err(error.context("montando a pasta adaptada"));
+        }
+    };
+    store
+        .save_launch_adaptation(
+            &job.hash,
+            &job.indexer,
+            Some(&target),
+            Some(&serde_json::to_value(&layout)?),
+        )
+        .await?;
+    Ok(Adapted {
+        target: plan.target,
+        layout,
+    })
+}
+
+/// Apaga a pasta adaptada do pacote descartado, pela limpeza segura. Devolve o
+/// aviso para a tela quando ela fica no disco (enviado, com o que o acervo não
+/// criou, ou sem a origem para conferir os hardlinks).
+pub(crate) async fn discard_folder(
+    config: &Config,
+    store: &Store,
+    launch: &Launch,
+) -> Option<String> {
+    let target = launch.adapted_path.as_deref()?;
+    if !may_remove_folder(launch) {
+        return Some(format!("a pasta adaptada `{target}` fica: {SENT_FOLDER}"));
+    }
+    match remove_folder(config, store, launch, Path::new(target)).await {
+        Ok(Cleanup::Absent | Cleanup::Removed) => {
+            if let Err(error) = store
+                .save_launch_adaptation(&launch.hash, &launch.indexer, None, None)
+                .await
+            {
+                tracing::warn!(
+                    indexer = launch.indexer,
+                    "pasta adaptada apagada, banco não: {error}"
+                );
+            }
+            None
+        }
+        Ok(Cleanup::Refused(reason)) => {
+            tracing::warn!(
+                indexer = launch.indexer,
+                "pasta adaptada não apagada: {reason}"
+            );
+            Some(reason)
+        }
+        Err(error) => {
+            let message = format!("a pasta adaptada `{target}` ficou no disco: {error:#}");
+            tracing::warn!(indexer = launch.indexer, "{message}");
+            Some(message)
+        }
+    }
+}
+
+/// A limpeza da pasta de um pacote fora do preparo: a origem vem do cliente
+/// (sem ela não há inode para conferir, e nada é apagado). Pasta que já não
+/// existe não pede o cliente: não há o que conferir nem o que apagar.
+async fn remove_folder(
+    config: &Config,
+    store: &Store,
+    launch: &Launch,
+    target: &Path,
+) -> Result<Cleanup> {
+    match std::fs::symlink_metadata(target) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Cleanup::Absent),
+        _ => {}
+    }
+    let launches = store.launches().await?;
+    if folder_in_use(&launches, &launch.hash, &launch.indexer, target) {
+        return Ok(Cleanup::Refused(format!(
+            "a pasta `{}` é de outro pacote já enviado ao site: nada foi apagado",
+            target.display()
+        )));
+    }
+    let client = crate::grab::qbit(config).await?;
+    let torrents = client
+        .torrents()
+        .await
+        .context("lendo os torrents do cliente")?;
+    let Some(torrent) = torrents
+        .iter()
+        .find(|t| t.hash.eq_ignore_ascii_case(&launch.hash))
+    else {
+        return Ok(Cleanup::Refused(format!(
+            "a pasta adaptada `{}` ficou no disco: o torrent de origem saiu do cliente, e sem ele \
+             não há como conferir que os arquivos são hardlinks dele",
+            target.display()
+        )));
+    };
+    let files: Vec<SourceFile> = client
+        .files(&DownloadHash::new(torrent.hash.clone()))
+        .await
+        .context("lendo os arquivos do torrent")?
+        .into_iter()
+        .map(|f| SourceFile {
+            path: f.name,
+            size: f.size,
+        })
+        .collect();
+    let save_path = PathBuf::from(&torrent.save_path);
+    let root = launch_root(&save_path)?;
+    let origin = files.iter().map(|f| save_path.join(&f.path)).collect();
+    let generated = generated_subtitles(&files, Some(launch), target);
+    clean(target.to_path_buf(), root, origin, generated).await
+}
+
+// ---------------------------------------------------------------- semear
+
+/// Quantos nomes a mensagem de "o que difere" lista de cada tipo.
+const DIFF_LISTED: usize = 5;
+
+/// Se o `.torrent` já estava no cliente (mesmo hash) ou foi adicionado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Seeded {
+    Added,
+    AlreadyThere,
+}
+
+/// A pasta de download do pacote, como o cliente a vê: o pai da pasta
+/// adaptada, ou a da origem.
+fn seed_path(torrents: &[TorrentInfo], launch: &Launch) -> Result<String> {
+    if let (Some(_), Some(path)) = (adapted_layout(launch), launch.adapted_path.as_deref()) {
+        let parent = Path::new(path)
+            .parent()
+            .context("a pasta adaptada não tem pasta pai")?;
+        return Ok(parent.to_string_lossy().into_owned());
+    }
+    torrents
+        .iter()
+        .find(|t| t.hash.eq_ignore_ascii_case(&launch.hash))
+        .map(|t| t.save_path.clone())
+        .context("o torrent de origem saiu do cliente: sem ele não há onde semear o pacote")
+}
+
+/// Os arquivos que o pacote publica: o layout da pasta adaptada, ou o dos
+/// arquivos do torrent de origem no cliente.
+///
+/// # Errors
+///
+/// Cliente inalcançável ou torrent de origem fora dele.
+pub(crate) async fn package_layout(config: &Config, launch: &Launch) -> Result<Vec<(String, u64)>> {
+    if let Some(layout) = adapted_layout(launch) {
+        return Ok(layout);
+    }
+    let client = crate::grab::qbit(config).await?;
+    let torrents = client.torrents().await.context("lendo o cliente")?;
+    ensure!(
+        torrents
+            .iter()
+            .any(|t| t.hash.eq_ignore_ascii_case(&launch.hash)),
+        "o torrent de origem saiu do cliente: sem ele não há como conferir o layout"
+    );
+    let files = client
+        .files(&DownloadHash::new(launch.hash.clone()))
+        .await
+        .context("lendo os arquivos do torrent de origem")?;
+    Ok(files.into_iter().map(|f| (f.name, f.size)).collect())
+}
+
+/// O host de uma URL de tracker, minúsculo. A URL leva a passkey: só o host
+/// sai daqui.
+fn tracker_host(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()?
+        .host_str()
+        .map(str::to_ascii_lowercase)
+}
+
+/// Adiciona o `.torrent` do pacote ao cliente **parado**, na categoria do
+/// acervo, com a tag da fila de conferência e a de semear do destino: o
+/// `verify` do cross-seed confere os arquivos e só inicia com 100%.
+///
+/// Mesmo hash já no cliente (o torrent de outro tracker, ou o gerado de um
+/// envio anterior): não adiciona de novo, mas o adota: põe a tag de semear do
+/// destino; se ele está incompleto ou parado sem estar na fila, para e
+/// encaminha à conferência (`PENDING_TAG`); e, se nenhum tracker dele é o do
+/// destino, acrescenta o announce do `.torrent` (segredo: não é logado).
+///
+/// # Errors
+///
+/// Cliente inalcançável, `.torrent` ilegível ou origem fora do cliente.
+pub(crate) async fn seed_package(
+    config: &Config,
+    launch: &Launch,
+    torrent: Vec<u8>,
+) -> Result<Seeded> {
+    let hash =
+        acervo_clients::info_hash(&torrent).context("o .torrent não tem infohash legível")?;
+    let client = crate::grab::qbit(config).await?;
+    let torrents = client.torrents().await.context("lendo o cliente")?;
+    if let Some(existing) = torrents.iter().find(|t| t.hash.eq_ignore_ascii_case(&hash)) {
+        adopt_existing(&client, existing, launch, &torrent).await?;
+        return Ok(Seeded::AlreadyThere);
+    }
+    let options = AddOptions {
+        category: config.library.category.clone(),
+        save_path: Some(seed_path(&torrents, launch)?),
+        stopped: true,
+        stop_after_metadata: false,
+        tags: vec![
+            crate::crossseed::PENDING_TAG.to_owned(),
+            acervo_core::seed_tag(&launch.indexer),
+        ],
+    };
+    client
+        .add(NewTorrent::File(torrent), &options)
+        .await
+        .context("adicionando o .torrent ao cliente")?;
+    Ok(Seeded::Added)
+}
+
+/// O torrent do pacote já estava no cliente: garante a semeadura no destino.
+async fn adopt_existing(
+    client: &QbitClient,
+    existing: &TorrentInfo,
+    launch: &Launch,
+    torrent: &[u8],
+) -> Result<()> {
+    let hash = existing.hash.as_str();
+    let seed = acervo_core::seed_tag(&launch.indexer);
+    if !existing.has_tag(&seed) {
+        client
+            .add_tag(&[hash], &seed)
+            .await
+            .context("pondo a tag de semear no torrent do cliente")?;
+    }
+    // O announce do destino: sem um tracker dele no torrent, o pacote nunca
+    // semeia lá, por mais que esteja no cliente.
+    if let Some(announce) = acervo_clients::announce(torrent) {
+        let host = tracker_host(&announce);
+        let trackers = client
+            .trackers(hash)
+            .await
+            .context("lendo os trackers do torrent do cliente")?;
+        let present = trackers
+            .iter()
+            .filter(|t| t.is_real())
+            .any(|t| host.is_some() && tracker_host(&t.url) == host);
+        if !present {
+            client
+                .add_trackers(hash, &[announce])
+                .await
+                .context("acrescentando o tracker do destino ao torrent do cliente")?;
+        }
+    }
+    let stopped = existing.state.starts_with("stopped") || existing.state.starts_with("paused");
+    if !existing.has_tag(crate::crossseed::PENDING_TAG) && (existing.progress < 1.0 || stopped) {
+        // Incompleto, ou parado sem ninguém que o confira: para (nada de
+        // baixar por cima) e vai à fila, onde o `verify` confere e só inicia
+        // com 100%.
+        client
+            .stop(&[hash])
+            .await
+            .context("parando o torrent do cliente")?;
+        client
+            .add_tag(&[hash], crate::crossseed::PENDING_TAG)
+            .await
+            .context("pondo o torrent do cliente na conferência")?;
+    }
+    Ok(())
+}
+
+/// Diz, sem tocar em nada além de nomes de arquivo e tamanhos, o que o
+/// `.torrent` do site tem de diferente do pacote.
+pub(crate) fn layout_diff(expected: &[(String, u64)], got: &[(String, u64)]) -> String {
+    let expected: HashMap<&str, u64> = expected.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+    let got: HashMap<&str, u64> = got.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+    let mut missing: Vec<&str> = expected
+        .keys()
+        .filter(|p| !got.contains_key(*p))
+        .copied()
+        .collect();
+    let mut extra: Vec<&str> = got
+        .keys()
+        .filter(|p| !expected.contains_key(*p))
+        .copied()
+        .collect();
+    let mut sizes: Vec<String> = expected
+        .iter()
+        .filter_map(|(path, size)| {
+            got.get(path)
+                .filter(|other| *other != size)
+                .map(|other| format!("{path} (pacote {size} B, torrent {other} B)"))
+        })
+        .collect();
+    missing.sort_unstable();
+    extra.sort_unstable();
+    sizes.sort_unstable();
+    let list = |label: &str, items: &[String]| -> Option<String> {
+        if items.is_empty() {
+            return None;
+        }
+        let shown = items
+            .iter()
+            .take(DIFF_LISTED)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = items.len().saturating_sub(DIFF_LISTED);
+        Some(if more > 0 {
+            format!("{label}: {shown} e mais {more}")
+        } else {
+            format!("{label}: {shown}")
+        })
+    };
+    let owned = |names: Vec<&str>| names.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    let parts: Vec<String> = [
+        list("faltam no torrent", &owned(missing)),
+        list("a mais no torrent", &owned(extra)),
+        list("tamanho diferente", &sizes),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if parts.is_empty() {
+        "os arquivos têm a mesma lista, mas em ordem ou forma que o acervo não reconhece".into()
+    } else {
+        parts.join("; ")
+    }
+}
+
+/// O status do tracker do destino para um torrent já no cliente, em texto
+/// e sem a URL: funcionando, não registrado, erro ou sem resposta (ainda
+/// não contatado, atualizando ou desligado). Com `host` (o do destino), só o
+/// tracker desse host conta: o torrent de outro tracker, com o announce do
+/// destino acrescentado, tem o status dos dois misturado. Sem tracker desse
+/// host: "sem resposta".
+fn tracker_status_of(trackers: &[acervo_clients::Tracker], host: Option<&str>) -> &'static str {
+    let only: Vec<acervo_clients::Tracker>;
+    let trackers = if let Some(host) = host {
+        only = trackers
+            .iter()
+            .filter(|t| t.is_real() && tracker_host(&t.url).as_deref() == Some(host))
+            .cloned()
+            .collect();
+        &only[..]
+    } else {
+        trackers
+    };
+    if crate::grab::unregistered(trackers) {
+        return "não registrado";
+    }
+    let real: Vec<&acervo_clients::Tracker> = trackers.iter().filter(|t| t.is_real()).collect();
+    if real.iter().any(|t| t.status == 2) {
+        "funcionando"
+    } else if real.iter().any(|t| t.status == 4) {
+        "erro"
+    } else {
+        "sem resposta"
+    }
+}
+
+/// O status do tracker do pacote enviado: do torrent do site, se ele está
+/// no cliente, senão do gerado. Torrent fora do cliente ou cliente fora do
+/// ar: "sem resposta".
+pub(crate) async fn seeded_tracker_status(
+    config: &Config,
+    store: &Store,
+    launch: &Launch,
+) -> &'static str {
+    const NONE: &str = "sem resposta";
+    let bytes = match store.launch_torrent(&launch.hash, &launch.indexer).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(
+                indexer = launch.indexer,
+                "torrent do pacote ilegível: {error}"
+            );
+            None
+        }
+    };
+    let generated = bytes.as_deref().and_then(acervo_clients::info_hash);
+    // O tracker que importa é o do destino, pelo host do announce do `.torrent`
+    // do pacote (só o host: a URL leva a passkey).
+    let host = bytes
+        .as_deref()
+        .and_then(acervo_clients::announce)
+        .and_then(|announce| tracker_host(&announce));
+    let Ok(client) = crate::grab::qbit(config).await else {
+        return NONE;
+    };
+    let Ok(torrents) = client.torrents().await else {
+        return NONE;
+    };
+    let in_client = |hash: &str| torrents.iter().find(|t| t.hash.eq_ignore_ascii_case(hash));
+    let Some(torrent) = launch
+        .site_hash
+        .as_deref()
+        .and_then(in_client)
+        .or_else(|| generated.as_deref().and_then(in_client))
+    else {
+        return NONE;
+    };
+    match client.trackers(&torrent.hash).await {
+        Ok(trackers) => tracker_status_of(&trackers, host.as_deref()),
+        Err(error) => {
+            tracing::warn!(indexer = launch.indexer, "trackers ilegíveis: {error}");
+            NONE
+        }
     }
 }
 
@@ -1013,14 +1711,27 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
     };
     let mut report = rules::check(site, &facts);
     store
-        .save_launch_report(&job.hash, &indexer, &serde_json::to_value(&report)?)
+        .save_launch_report(&job.hash, &indexer, &report_value(&report, &facts.videos)?)
         .await?;
     if report.verdict == Verdict::Inelegivel {
+        // Preparo anterior que montou a pasta: sem pacote a enviar, ela não
+        // pode ficar segurando o vídeo no disco.
+        let launches = store.launches().await?;
+        if let Some(own) = launches
+            .iter()
+            .find(|l| l.hash.eq_ignore_ascii_case(&job.hash) && l.indexer == indexer)
+            && let Some(warning) = discard_folder(config, store, own).await
+        {
+            tracing::warn!(indexer, "pasta adaptada anterior fica: {warning}");
+        }
         return Ok(Finish::Ineligible);
     }
 
     // 5. Texto: os dados agora; o texto sai depois das capturas, que entram
-    // na descrição.
+    // na descrição. O MediaInfo vem antes de gastar TMDB e upload: no Amigos
+    // a falta dele reprova o pacote.
+    job.step("gerando o relatório do MediaInfo").await;
+    let (mediainfo, mediainfo_warning) = mediainfo_for(site, &main_path).await?;
     job.step("buscando a ficha no TMDB").await;
     let tmdb = tmdb_text(store, &work).await?;
     let national = matches!(
@@ -1069,16 +1780,22 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
         media: main_media,
         screens: screens.iter().map(|s| s.url.clone()).collect(),
     };
-    let built = text::build_fields(site, &input);
+    let mut built = text::build_fields(site, &input);
+    built.fields.mediainfo = mediainfo;
     report.checks.extend(built.warnings);
+    report.checks.extend(mediainfo_warning);
     store
-        .save_launch_report(&job.hash, &indexer, &serde_json::to_value(&report)?)
+        .save_launch_report(&job.hash, &indexer, &report_value(&report, &facts.videos)?)
         .await?;
     store
         .save_launch_fields(&job.hash, &indexer, &serde_json::to_value(&built.fields)?)
         .await?;
 
-    // 7. `.torrent`, com o announce do destino, conferido contra a origem.
+    // 7. Pasta adaptada: a legenda PT só embutida vira `.srt` ao lado do vídeo.
+    let adapted = adapt_folder(job, torrent, &files, &facts.videos, &report, site).await?;
+
+    // 8. `.torrent`, com o announce do destino, conferido contra a origem (ou
+    // contra a pasta adaptada, que é o que ele empacota).
     job.step(&format!("lendo o announce do {}", site.label()))
         .await;
     let announce = announce(&client, &torrents, &owners, &indexer)
@@ -1091,11 +1808,22 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
         })?;
     job.secrets.push(announce.clone());
     job.step("gerando o .torrent").await;
-    let path = source_path(torrent, &files);
+    let (path, expected) = match &adapted {
+        Some(adapted) => (
+            adapted.target.to_string_lossy().into_owned(),
+            adapted.layout.clone(),
+        ),
+        None => (source_path(torrent, &files), origin_layout(&files)),
+    };
     let bytes = create_torrent(&client, job, &path, announce, &SHUTDOWN).await?;
     ensure!(
-        layout_matches(&bytes, &files),
-        "o .torrent gerado não tem os mesmos arquivos da origem; nada foi guardado"
+        has_layout(&bytes, &expected),
+        "o .torrent gerado não tem os mesmos arquivos da {}; nada foi guardado",
+        if adapted.is_some() {
+            "pasta adaptada"
+        } else {
+            "origem"
+        }
     );
     store
         .save_launch_torrent(&job.hash, &indexer, &bytes)
@@ -1103,9 +1831,42 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
     Ok(Finish::Ready)
 }
 
+/// O relatório do `MediaInfo` do vídeo principal. O formulário do Amigos o exige
+/// (e se preenche a partir dele): lá a falha derruba o pacote. O BJ não pede,
+/// então a falha vira só um aviso e o campo fica vazio.
+async fn mediainfo_for(site: Site, video: &Path) -> Result<(String, Option<rules::Check>)> {
+    match crate::mediainfo::mediainfo_report(video).await {
+        Ok(report) => Ok((report, None)),
+        Err(error) => match site {
+            Site::Amigos => Err(error.context("relatório do MediaInfo (o Amigos exige)")),
+            Site::Bj => Ok((
+                String::new(),
+                Some(rules::Check {
+                    rule: "MediaInfo".to_owned(),
+                    status: rules::Status::Warn,
+                    message: format!("sem o relatório do MediaInfo: {error}"),
+                }),
+            )),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn falha_do_mediainfo_reprova_o_amigos_e_so_avisa_no_bj() {
+        // Pasta que não existe: o processo nem sobe, com ou sem MediaInfo no host.
+        let video = Path::new("/nao-existe-acervo/Filme.mkv");
+        let erro = mediainfo_for(Site::Amigos, video).await.unwrap_err();
+        assert!(format!("{erro:#}").contains("MediaInfo"), "{erro:#}");
+        let (relatorio, aviso) = mediainfo_for(Site::Bj, video).await.unwrap();
+        assert!(relatorio.is_empty());
+        let aviso = aviso.expect("aviso");
+        assert_eq!(aviso.status, rules::Status::Warn);
+        assert!(aviso.message.contains("sem o relatório do MediaInfo"));
+    }
 
     fn file(path: &str, size: u64) -> SourceFile {
         SourceFile {
@@ -1234,18 +1995,24 @@ mod tests {
     fn torrent_gerado_precisa_dos_mesmos_arquivos_da_origem() {
         let origin = [file("Filme/Filme.mkv", 4_000), file("Filme/Filme.srt", 10)];
         let same = torrent("Filme", &[(&["Filme.srt"], 10), (&["Filme.mkv"], 4_000)]);
-        assert!(layout_matches(&same, &origin));
+        assert!(has_layout(&same, &origin_layout(&origin)));
         // Pasta raiz renomeada, arquivo a menos ou tamanho diferente: não vale.
         let renamed = torrent("Outro", &[(&["Filme.mkv"], 4_000), (&["Filme.srt"], 10)]);
-        assert!(!layout_matches(&renamed, &origin));
+        assert!(!has_layout(&renamed, &origin_layout(&origin)));
         let missing = torrent("Filme", &[(&["Filme.mkv"], 4_000)]);
-        assert!(!layout_matches(&missing, &origin));
+        assert!(!has_layout(&missing, &origin_layout(&origin)));
         let bigger = torrent("Filme", &[(&["Filme.mkv"], 4_001), (&["Filme.srt"], 10)]);
-        assert!(!layout_matches(&bigger, &origin));
+        assert!(!has_layout(&bigger, &origin_layout(&origin)));
         // Arquivo avulso.
         let single = torrent("Filme.mkv", &[(&[], 4_000)]);
-        assert!(layout_matches(&single, &[file("Filme.mkv", 4_000)]));
-        assert!(!layout_matches(b"lixo", &[file("Filme.mkv", 4_000)]));
+        assert!(has_layout(
+            &single,
+            &origin_layout(&[file("Filme.mkv", 4_000)])
+        ));
+        assert!(!has_layout(
+            b"lixo",
+            &origin_layout(&[file("Filme.mkv", 4_000)])
+        ));
     }
 
     #[test]
@@ -1503,6 +2270,8 @@ mod tests {
             {"taskID": "velha", "sourcePath": "/media/Filme/", "status": "Running"},
             {"taskID": "viva", "sourcePath": "/media/Serie", "status": "Running"},
             {"taskID": "alheia", "sourcePath": "/media/Outro", "status": "Finished"},
+            {"taskID": "adaptada", "sourcePath": "/media/lancamentos/bj/Filme",
+             "status": "Running"},
         ]))
         .await;
         let torrent = |hash: &str, path: &str| {
@@ -1518,7 +2287,7 @@ mod tests {
             ])))
             .mount(&server)
             .await;
-        for (task, times) in [("velha", 1), ("viva", 0), ("alheia", 0)] {
+        for (task, times) in [("velha", 1), ("viva", 0), ("alheia", 0), ("adaptada", 1)] {
             Mock::given(method("POST"))
                 .and(path("/api/v2/torrentcreator/deleteTask"))
                 .and(body_string_contains(format!("taskID={task}")))
@@ -1528,9 +2297,10 @@ mod tests {
                 .await;
         }
         // `a` é pacote do acervo parado; `b` ainda está preparando; `c` não é
-        // pacote do acervo.
+        // pacote do acervo; a pasta adaptada é de um par parado.
         let packages = HashMap::from([("a".repeat(40), false), ("b".repeat(40), true)]);
-        assert_eq!(sweep_stale_tasks(&client, &packages).await, 1);
+        let adapted = HashSet::from(["/media/lancamentos/bj/Filme".to_owned()]);
+        assert_eq!(sweep_stale_tasks(&client, &packages, &adapted).await, 2);
         drop(server);
     }
 
@@ -1624,6 +2394,544 @@ mod tests {
         db.drop().await;
     }
 
+    /// Um `.mkv` de 2 s com uma legenda `SubRip` em português embutida, gerado
+    /// pelo ffmpeg. `None` sem ffmpeg na máquina.
+    fn mkv_with_portuguese_subtitle(dir: &Path) -> Option<PathBuf> {
+        let ffmpeg = std::env::var("ACERVO_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
+        let srt = dir.join("entrada.srt");
+        std::fs::write(
+            &srt,
+            "1\n00:00:00,100 --> 00:00:01,000\nOlá, ação!\n\n2\n00:00:01,200 --> 00:00:01,900\nSegunda fala\n",
+        )
+        .unwrap();
+        let video = dir.join("Filme.mkv");
+        let made = std::process::Command::new(ffmpeg)
+            .args(["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=duration=2:size=160x120:rate=10")
+            .arg("-i")
+            .arg(&srt)
+            .args(["-map", "0:v", "-map", "1:s", "-c:v", "mpeg4", "-c:s", "srt"])
+            .args(["-metadata:s:s:0", "language=por"])
+            .args(["-metadata:s:s:0", "title=Português - Brasil"])
+            .arg(&video)
+            .status();
+        std::fs::remove_file(&srt).unwrap();
+        made.is_ok_and(|s| s.success()).then_some(video)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Um cenário inteiro: monta, refaz, recusa.
+    async fn pasta_adaptada_e_montada_refeita_e_nunca_apaga_o_alheio() {
+        use std::os::unix::fs::MetadataExt;
+
+        let Some(db) = acervo_store::testing::TestDb::new("lancar_pasta_adaptada").await else {
+            return;
+        };
+        let root = std::env::temp_dir().join(format!("acervo-lancar-pasta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let content = root.join("downloads/Filme");
+        std::fs::create_dir_all(&content).unwrap();
+        let Some(video) = mkv_with_portuguese_subtitle(&content) else {
+            let _ = std::fs::remove_dir_all(&root);
+            db.drop().await;
+            return;
+        };
+        let size = std::fs::metadata(&video).unwrap().len();
+        let files = vec![file("Filme/Filme.mkv", size)];
+        let media = crate::mediainfo::probe_full(&video).await.expect("ffprobe");
+        let videos = vec![ProbedVideo {
+            path: "Filme/Filme.mkv".into(),
+            media,
+        }];
+        let report = Report {
+            checks: Vec::new(),
+            destination: Vec::new(),
+            verdict: Verdict::Elegivel,
+            adaptations: adapt::extractions(&files, &videos),
+        };
+        assert_eq!(report.adaptations.len(), 1, "a faixa PT vira um .srt");
+        // O nome da faixa vai junto ao laudo, para a tela.
+        let value = report_value(&report, &videos).unwrap();
+        assert_eq!(value["adaptations"][0]["faixa"], "Português - Brasil");
+        assert_eq!(value["adaptations"][0]["output"], "Filme/Filme.pt-BR.srt");
+
+        let origin_torrent = info(
+            root.join("downloads").to_str().unwrap(),
+            content.to_str().unwrap(),
+        );
+        let hash = "d".repeat(40);
+        let store = &db.store;
+        store
+            .upsert_launch_state(&hash, "bjsharecustom", LaunchState::Preparando, None, None)
+            .await
+            .unwrap();
+        let mut job = Job {
+            store,
+            hash: hash.clone(),
+            indexer: "bjsharecustom".into(),
+            secrets: Vec::new(),
+            shown: QUEUED.to_owned(),
+        };
+        let target = root.join("lancamentos/bj/Filme");
+
+        // Monta: hardlink do vídeo (o mesmo inode), .srt extraído, layout gravado.
+        let adapted = adapt_folder(
+            &mut job,
+            &origin_torrent,
+            &files,
+            &videos,
+            &report,
+            Site::Bj,
+        )
+        .await
+        .expect("pasta montada")
+        .expect("havia o que adaptar");
+        assert_eq!(adapted.target, target);
+        let (origin, linked) = (
+            std::fs::metadata(&video).unwrap(),
+            std::fs::metadata(target.join("Filme.mkv")).unwrap(),
+        );
+        assert_eq!((origin.dev(), origin.ino()), (linked.dev(), linked.ino()));
+        let srt = std::fs::read_to_string(target.join("Filme.pt-BR.srt")).unwrap();
+        assert!(
+            srt.contains("Olá, ação!") && srt.contains("Segunda fala"),
+            "{srt}"
+        );
+        let srt_size = u64::try_from(srt.len()).unwrap();
+        assert_eq!(
+            adapted.layout,
+            vec![
+                ("Filme/Filme.mkv".to_owned(), size),
+                ("Filme/Filme.pt-BR.srt".to_owned(), srt_size),
+            ]
+        );
+        let launch = store.launch(&hash, "bjsharecustom").await.unwrap().unwrap();
+        assert_eq!(launch.adapted_path.as_deref(), target.to_str());
+        assert_eq!(adapted_layout(&launch), Some(adapted.layout.clone()));
+        // Um .torrent da pasta tem o layout dela, não o da origem.
+        let bytes = torrent(
+            "Filme",
+            &[(&["Filme.mkv"], size), (&["Filme.pt-BR.srt"], srt_size)],
+        );
+        assert!(has_layout(&bytes, &adapted.layout));
+        assert!(!has_layout(&bytes, &origin_layout(&files)));
+
+        // Preparar de novo: a pasta anterior sai pela limpeza e volta igual.
+        let again = adapt_folder(
+            &mut job,
+            &origin_torrent,
+            &files,
+            &videos,
+            &report,
+            Site::Bj,
+        )
+        .await
+        .expect("pasta refeita")
+        .expect("havia o que adaptar");
+        assert_eq!(again, adapted);
+
+        // Arquivo do usuário na pasta: nada é apagado e o preparo falha dizendo.
+        std::fs::write(target.join("minhas-notas.txt"), b"x").unwrap();
+        let error = adapt_folder(
+            &mut job,
+            &origin_torrent,
+            &files,
+            &videos,
+            &report,
+            Site::Bj,
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("minhas-notas.txt"), "{message}");
+        assert!(message.contains("nada foi apagado"), "{message}");
+        for name in ["Filme.mkv", "Filme.pt-BR.srt", "minhas-notas.txt"] {
+            assert!(target.join(name).exists(), "{name}");
+        }
+        std::fs::remove_file(target.join("minhas-notas.txt")).unwrap();
+
+        // Sem adaptação no laudo (ex.: a legenda virou arquivo na origem), a
+        // pasta anterior sai e o pacote volta a ser da origem.
+        let plain = Report {
+            adaptations: Vec::new(),
+            ..report.clone()
+        };
+        let none = adapt_folder(&mut job, &origin_torrent, &files, &videos, &plain, Site::Bj)
+            .await
+            .unwrap();
+        assert!(none.is_none());
+        assert!(!target.exists());
+        assert!(video.is_file(), "a origem nunca é tocada");
+        let launch = store.launch(&hash, "bjsharecustom").await.unwrap().unwrap();
+        assert_eq!(launch.adapted_path, None);
+        assert_eq!(launch.adapted_layout, None);
+
+        // Pacote já enviado: a pasta é de onde o publicado semeia.
+        adapt_folder(
+            &mut job,
+            &origin_torrent,
+            &files,
+            &videos,
+            &report,
+            Site::Bj,
+        )
+        .await
+        .unwrap();
+        store
+            .mark_launch_sent(&hash, "bjsharecustom", "2026-10-14T10:00:00Z")
+            .await
+            .unwrap();
+        let error = adapt_folder(
+            &mut job,
+            &origin_torrent,
+            &files,
+            &videos,
+            &report,
+            Site::Bj,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("enviado"), "{error:#}");
+        assert!(target.join("Filme.mkv").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+        db.drop().await;
+    }
+
+    /// O `.torrent` do pacote, com o announce do destino (a passkey é segredo).
+    const DEST_ANNOUNCE: &str = "https://destino.exemplo/announce?passkey=PASSKEY123";
+
+    fn package_torrent() -> Vec<u8> {
+        format!(
+            "d8:announce{}:{DEST_ANNOUNCE}4:infod6:lengthi1e4:name1:a6:pieces1:xee",
+            DEST_ANNOUNCE.len()
+        )
+        .into_bytes()
+    }
+
+    fn launch_of(indexer: &str) -> Launch {
+        Launch {
+            hash: "a".repeat(40),
+            indexer: indexer.into(),
+            state: LaunchState::Pronto,
+            progress: None,
+            report: json!({}),
+            fields: json!({}),
+            screens: json!([]),
+            has_torrent: true,
+            error: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            sent_at: None,
+            adapted_path: None,
+            site_hash: None,
+            adapted_layout: None,
+        }
+    }
+
+    /// Um qBittorrent de mentira com os trackers do torrent `hash`. Devolve o
+    /// servidor, o cliente e o que o torrent `existing` (json) reporta.
+    async fn adopt_with(
+        existing: serde_json::Value,
+        trackers: serde_json::Value,
+    ) -> (wiremock::MockServer, QbitClient, TorrentInfo) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/trackers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(trackers))
+            .mount(&server)
+            .await;
+        let client = QbitClient::login(&server.uri(), "u", "s", Duration::from_secs(5))
+            .await
+            .unwrap();
+        (server, client, serde_json::from_value(existing).unwrap())
+    }
+
+    /// Quantas vezes o cliente recebeu `POST path` (e o corpo da primeira).
+    async fn posts(server: &wiremock::MockServer, path: &str) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "POST" && r.url.path() == path)
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect()
+    }
+
+    async fn accept_posts(server: &wiremock::MockServer) {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+    }
+
+    fn existing(state: &str, progress: f64, tags: &str) -> serde_json::Value {
+        json!({
+            "hash": "a".repeat(40), "name": "Raiz", "state": state,
+            "save_path": "/downloads", "progress": progress, "tags": tags,
+        })
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Um cenário por estado do torrent no cliente.
+    async fn torrent_que_ja_esta_no_cliente_e_adotado_com_a_tag_o_tracker_e_a_conferencia() {
+        let seed = acervo_core::seed_tag("bjsharecustom");
+        let origin_only = json!([
+            { "url": "** [DHT] **", "status": 0, "msg": "" },
+            { "url": "https://origem.exemplo/announce?passkey=OUTRA", "status": 2, "msg": "" },
+        ]);
+
+        // Completo e semeando para a origem: ganha a tag e o announce do
+        // destino, e continua rodando (nada de parar nem de fila).
+        let (server, client, torrent) =
+            adopt_with(existing("stalledUP", 1.0, ""), origin_only.clone()).await;
+        accept_posts(&server).await;
+        adopt_existing(
+            &client,
+            &torrent,
+            &launch_of("bjsharecustom"),
+            &package_torrent(),
+        )
+        .await
+        .unwrap();
+        let tags = posts(&server, "/api/v2/torrents/addTags").await;
+        assert_eq!(tags.len(), 1, "{tags:?}");
+        assert!(tags[0].contains(&seed.replace(':', "%3A")), "{tags:?}");
+        let added = posts(&server, "/api/v2/torrents/addTrackers").await;
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert!(added[0].contains("destino.exemplo"), "{added:?}");
+        assert!(posts(&server, "/api/v2/torrents/stop").await.is_empty());
+
+        // Já tem o tracker do destino (e a tag): nada a acrescentar.
+        let both = json!([
+            { "url": "https://origem.exemplo/announce", "status": 2, "msg": "" },
+            { "url": "https://DESTINO.exemplo/announce?passkey=OUTRA", "status": 2, "msg": "" },
+        ]);
+        let (server, client, torrent) = adopt_with(existing("stalledUP", 1.0, &seed), both).await;
+        accept_posts(&server).await;
+        adopt_existing(
+            &client,
+            &torrent,
+            &launch_of("bjsharecustom"),
+            &package_torrent(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| { r.method.as_str() == "GET" || r.url.path() == "/api/v2/auth/login" })
+        );
+
+        // Incompleto rodando: para e vai à conferência.
+        let (server, client, torrent) =
+            adopt_with(existing("downloading", 0.4, ""), origin_only.clone()).await;
+        accept_posts(&server).await;
+        adopt_existing(
+            &client,
+            &torrent,
+            &launch_of("bjsharecustom"),
+            &package_torrent(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(posts(&server, "/api/v2/torrents/stop").await.len(), 1);
+        let tags = posts(&server, "/api/v2/torrents/addTags").await;
+        assert!(
+            tags.iter().any(|t| t.contains("acervo%3Across-seed")),
+            "{tags:?}"
+        );
+
+        // Completo mas parado, fora da fila: também vai à conferência, que
+        // inicia com 100%; o cliente é que não o inicia aqui.
+        let (server, client, torrent) =
+            adopt_with(existing("stoppedUP", 1.0, &seed), origin_only.clone()).await;
+        accept_posts(&server).await;
+        adopt_existing(
+            &client,
+            &torrent,
+            &launch_of("bjsharecustom"),
+            &package_torrent(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(posts(&server, "/api/v2/torrents/stop").await.len(), 1);
+        let tags = posts(&server, "/api/v2/torrents/addTags").await;
+        assert_eq!(tags.len(), 1, "só a da fila: {tags:?}");
+        assert!(tags[0].contains("acervo%3Across-seed"), "{tags:?}");
+        assert!(posts(&server, "/api/v2/torrents/start").await.is_empty());
+
+        // Parado mas já na fila: o `verify` decide, nada é refeito.
+        let queued = format!("{seed}, {}", crate::crossseed::PENDING_TAG);
+        let (server, client, torrent) =
+            adopt_with(existing("stoppedUP", 1.0, &queued), both_trackers()).await;
+        accept_posts(&server).await;
+        adopt_existing(
+            &client,
+            &torrent,
+            &launch_of("bjsharecustom"),
+            &package_torrent(),
+        )
+        .await
+        .unwrap();
+        assert!(posts(&server, "/api/v2/torrents/stop").await.is_empty());
+        assert!(posts(&server, "/api/v2/torrents/addTags").await.is_empty());
+
+        // O cliente recusando o tracker é erro (o envio avisa), sem a passkey.
+        let (server, client, torrent) =
+            adopt_with(existing("stalledUP", 1.0, ""), origin_only).await;
+        {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, ResponseTemplate};
+            Mock::given(method("POST"))
+                .and(path("/api/v2/torrents/addTrackers"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+            accept_posts(&server).await;
+        }
+        let error = adopt_existing(
+            &client,
+            &torrent,
+            &launch_of("bjsharecustom"),
+            &package_torrent(),
+        )
+        .await
+        .unwrap_err();
+        assert!(!format!("{error:?}").contains("PASSKEY123"), "{error:?}");
+    }
+
+    fn both_trackers() -> serde_json::Value {
+        json!([
+            { "url": "https://destino.exemplo/announce", "status": 2, "msg": "" },
+        ])
+    }
+
+    #[test]
+    fn status_do_tracker_olha_so_o_host_do_destino() {
+        let tracker = |url: &str, status: i64, msg: &str| acervo_clients::Tracker {
+            url: url.to_owned(),
+            status,
+            msg: msg.to_owned(),
+        };
+        // A origem funciona e o destino não conhece o torrent: o status é o do
+        // destino, não o "funcionando" da origem.
+        let trackers = [
+            tracker("https://origem.exemplo/announce?passkey=A", 2, ""),
+            tracker(
+                "https://destino.exemplo/announce?passkey=B",
+                4,
+                "Torrent not registered with this tracker",
+            ),
+        ];
+        assert_eq!(tracker_status_of(&trackers, None), "funcionando");
+        assert_eq!(
+            tracker_status_of(&trackers, Some("destino.exemplo")),
+            "não registrado"
+        );
+        assert_eq!(
+            tracker_status_of(&trackers, Some("origem.exemplo")),
+            "funcionando"
+        );
+        // O destino não está entre os trackers do torrent: sem resposta.
+        assert_eq!(
+            tracker_status_of(&trackers[..1], Some("destino.exemplo")),
+            "sem resposta"
+        );
+        assert_eq!(tracker_host("não é url"), None);
+        assert_eq!(
+            tracker_host("https://Destino.Exemplo:8443/a?k=1").as_deref(),
+            Some("destino.exemplo")
+        );
+    }
+
+    #[test]
+    fn srt_gerado_so_vale_na_pasta_do_pacote_e_com_o_tamanho_do_layout() {
+        let files = [file("Filme/Filme.mkv", 10), file("Filme/Filme.en.srt", 1)];
+        let mut launch = Launch {
+            hash: "a".into(),
+            indexer: "bjsharecustom".into(),
+            state: LaunchState::Pronto,
+            progress: None,
+            report: json!({ "adaptations": [{
+                "video": "Filme/Filme.mkv", "stream": 3,
+                "output": "Filme/Filme.pt-BR.forced.srt", "forced": true,
+            }]}),
+            fields: json!({}),
+            screens: json!([]),
+            has_torrent: false,
+            error: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            sent_at: None,
+            adapted_path: Some("/media/lancamentos/bj/Filme".into()),
+            site_hash: None,
+            adapted_layout: Some(json!([
+                ["Filme/Filme.mkv", 10],
+                ["Filme/Filme.en.srt", 1],
+                ["Filme/Filme.pt-BR.srt", 5],
+            ])),
+        };
+        let target = Path::new("/media/lancamentos/bj/Filme");
+        let generated = generated_subtitles(&files, Some(&launch), target);
+        // Do layout gravado, com o tamanho, menos os arquivos da origem.
+        assert_eq!(
+            generated,
+            HashMap::from([("Filme/Filme.pt-BR.srt".to_owned(), Some(5))])
+        );
+        // Pasta que não é a registrada pelo pacote: nenhum .srt é do acervo.
+        let other = Path::new("/media/lancamentos/bj/Outra");
+        assert!(generated_subtitles(&files, Some(&launch), other).is_empty());
+        assert!(generated_subtitles(&files, None, target).is_empty());
+        // Montagem interrompida (caminho sem layout): vale o que o laudo planejou.
+        launch.adapted_layout = None;
+        assert_eq!(
+            generated_subtitles(&files, Some(&launch), target),
+            HashMap::from([("Filme/Filme.pt-BR.forced.srt".to_owned(), None)])
+        );
+        // Arquivo único: na pasta ele fica dentro da pasta nova.
+        let single = [file("Filme.2024.srt", 1)];
+        assert_eq!(
+            origin_in_folder(&single),
+            HashSet::from(["Filme.2024/Filme.2024.srt".to_owned()])
+        );
+        assert!(may_remove_folder(&launch));
+        launch.sent_at = Some("2026-10-14T10:00:00Z".into());
+        assert!(!may_remove_folder(&launch));
+        launch.sent_at = None;
+        launch.state = LaunchState::Semeando;
+        assert!(!may_remove_folder(&launch));
+        // Outro par enviado com a mesma pasta a segura.
+        launch.hash = "b".into();
+        let target = Path::new("/media/lancamentos/bj/Filme");
+        assert!(folder_in_use(
+            std::slice::from_ref(&launch),
+            "a",
+            "bjsharecustom",
+            target
+        ));
+        assert!(!folder_in_use(
+            std::slice::from_ref(&launch),
+            "b",
+            "bjsharecustom",
+            target
+        ));
+    }
+
     #[test]
     fn um_job_por_par() {
         let first = claim("ABCD", "bjsharecustom").unwrap();
@@ -1633,5 +2941,58 @@ mod tests {
         drop(first);
         assert!(claim("abcd", "bjsharecustom").is_some());
         drop(other);
+    }
+
+    fn pair_of(items: &[(&str, u64)]) -> Vec<(String, u64)> {
+        items.iter().map(|(p, s)| ((*p).to_owned(), *s)).collect()
+    }
+
+    #[test]
+    fn diferenca_de_layout_diz_o_que_falta_sobra_e_muda_de_tamanho() {
+        let pacote = pair_of(&[("R/a.mkv", 100), ("R/a.srt", 5), ("R/b.nfo", 1)]);
+        let site = pair_of(&[("R/a.mkv", 99), ("R/a.srt", 5), ("R/c.txt", 2)]);
+        let texto = layout_diff(&pacote, &site);
+        assert_eq!(
+            texto,
+            "faltam no torrent: R/b.nfo; a mais no torrent: R/c.txt; \
+             tamanho diferente: R/a.mkv (pacote 100 B, torrent 99 B)"
+        );
+        // Lista longa é cortada.
+        let muitos: Vec<(String, u64)> = (0..8).map(|n| (format!("R/{n}.mkv"), 1)).collect();
+        let texto = layout_diff(&muitos, &[]);
+        assert!(texto.ends_with("e mais 3"), "{texto}");
+    }
+
+    fn tracker(url: &str, status: i64, msg: &str) -> acervo_clients::Tracker {
+        acervo_clients::Tracker {
+            url: url.into(),
+            status,
+            msg: msg.into(),
+        }
+    }
+
+    #[test]
+    fn status_do_tracker_sai_em_texto_sem_url() {
+        let dht = tracker("** [DHT] **", 0, "");
+        let ok = tracker("https://t.exemplo/announce?passkey=SEGREDO", 2, "");
+        let nao = tracker(
+            "https://t.exemplo/announce?passkey=SEGREDO",
+            4,
+            "Torrent not registered with this tracker",
+        );
+        let erro = tracker("https://t.exemplo/announce?passkey=SEGREDO", 4, "timed out");
+        let novo = tracker("https://t.exemplo/announce?passkey=SEGREDO", 1, "");
+        assert_eq!(tracker_status_of(&[dht.clone(), ok], None), "funcionando");
+        assert_eq!(
+            tracker_status_of(&[dht.clone(), nao], None),
+            "não registrado"
+        );
+        assert_eq!(tracker_status_of(&[dht.clone(), erro], None), "erro");
+        assert_eq!(
+            tracker_status_of(&[dht.clone(), novo], None),
+            "sem resposta"
+        );
+        assert_eq!(tracker_status_of(&[dht], None), "sem resposta");
+        assert_eq!(tracker_status_of(&[], None), "sem resposta");
     }
 }

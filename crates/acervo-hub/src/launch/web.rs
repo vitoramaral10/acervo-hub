@@ -17,8 +17,9 @@ use std::sync::Arc;
 use acervo_clients::TorrentInfo;
 use acervo_store::{CrossSeedCheck, CrossSeedOutcome, Launch, LaunchState, Store};
 use axum::Router;
-use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::body::{Body, Bytes};
+use axum::extract::rejection::BytesRejection;
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -27,6 +28,9 @@ use serde_json::{Value, json};
 use super::rules::Site;
 use crate::crossseed::{Origin, Source};
 use crate::web::{Shared, Web, WebError, WebResult, anyhow_bad, bad, enter, fail, ok};
+
+/// O maior `.torrent` que a rota de "torrent do site" aceita.
+const SITE_TORRENT_LIMIT: usize = 10 << 20;
 
 pub fn router(web: Arc<Web>) -> Router {
     routes().with_state(web)
@@ -50,8 +54,16 @@ pub(crate) fn routes() -> Router<Arc<Web>> {
             get(download),
         )
         .route(
+            "/ui/api/biblioteca/para-lancar/{hash}/{indexer}/mediainfo.txt",
+            get(download_mediainfo),
+        )
+        .route(
             "/ui/api/biblioteca/para-lancar/{hash}/{indexer}/enviado",
             post(sent),
+        )
+        .route(
+            "/ui/api/biblioteca/para-lancar/{hash}/{indexer}/torrent-do-site",
+            post(site_torrent).layer(DefaultBodyLimit::max(SITE_TORRENT_LIMIT)),
         )
         .route(
             "/ui/api/biblioteca/para-lancar/{hash}/{indexer}/descartar",
@@ -337,8 +349,17 @@ async fn detail(
             "estado": state_name(None), "progresso": null, "erro": null,
             "report": {}, "fields": {}, "screens": [], "tem_torrent": false,
             "criado_em": null, "atualizado_em": null, "enviado_em": null,
+            "pasta_adaptada": null, "layout_adaptado": null,
+            "status_tracker": null, "torrent_do_site": false,
         }));
     };
+    // O tracker só importa depois do envio: antes não há torrent semeando.
+    let tracker =
+        if crate::crossseed::sent_to_site(&launch) || launch.state == LaunchState::Semeando {
+            Some(super::seeded_tracker_status(&web.config(), store, &launch).await)
+        } else {
+            None
+        };
     ok(&json!({
         "hash": hash,
         "indexer": indexer,
@@ -354,6 +375,10 @@ async fn detail(
         "criado_em": launch.created_at,
         "atualizado_em": launch.updated_at,
         "enviado_em": launch.sent_at,
+        "pasta_adaptada": launch.adapted_path,
+        "layout_adaptado": super::adapted_layout(&launch),
+        "status_tracker": tracker,
+        "torrent_do_site": launch.site_hash.is_some(),
     }))
 }
 
@@ -376,6 +401,10 @@ async fn prepare(
             site.label()
         ))));
     }
+    // A posse vem antes de ler o estado: quem lê sem ela pode ver `pronto`
+    // enquanto o torrent do site o passa a `enviado`.
+    let claim = super::claim(&hash, &indexer)
+        .ok_or_else(|| conflict("o pacote já está sendo preparado ou em outra operação"))?;
     if let Some(launch) = store
         .launch(&hash, &indexer)
         .await
@@ -388,11 +417,17 @@ async fn prepare(
                     "o publicado já foi achado e está semeando: não há o que preparar",
                 ));
             }
+            // Preparar de novo refaria a pasta adaptada, de onde o publicado
+            // semeia; e o publicado é o que foi enviado, não um pacote novo.
+            _ if crate::crossseed::sent_to_site(&launch) => {
+                return Err(conflict(
+                    "o pacote já foi enviado ao site: não dá para preparar de novo (o publicado \
+                     semeia destes arquivos)",
+                ));
+            }
             _ => {}
         }
     }
-    let claim = super::claim(&hash, &indexer)
-        .ok_or_else(|| conflict("o pacote já está sendo preparado"))?;
     store
         .upsert_launch_state(
             &hash,
@@ -413,7 +448,10 @@ async fn prepare(
 /// `filename` em ASCII (o que todo navegador lê) e `filename*` em UTF-8
 /// percent-encoded (RFC 6266), para nome com acento.
 fn content_disposition(name: &str) -> String {
-    let file = format!("{name}.torrent");
+    attachment(&format!("{name}.torrent"))
+}
+
+fn attachment(file: &str) -> String {
     let ascii: String = file
         .chars()
         .map(|c| {
@@ -473,6 +511,57 @@ async fn download(
     Ok(response)
 }
 
+/// O nome do vídeo sem extensão, lido do "Complete name" do relatório (que o
+/// `MediaInfo` grava só com o nome do arquivo). Sem ele, o release.
+fn mediainfo_stem(report: &str, release: Option<&str>) -> String {
+    let from_report = report
+        .lines()
+        .find(|l| l.trim_start().starts_with("Complete name"))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, name)| name.trim())
+        .map(|name| name.rsplit(['/', '\\']).next().unwrap_or(name))
+        .map(|name| name.rsplit_once('.').map_or(name, |(stem, _)| stem))
+        .filter(|stem| !stem.is_empty());
+    from_report
+        .or(release.map(str::trim).filter(|r| !r.is_empty()))
+        .unwrap_or("mediainfo")
+        .chars()
+        .map(|c| if c.is_control() { '_' } else { c })
+        .collect()
+}
+
+async fn download_mediainfo(
+    State(web): Shared,
+    headers: HeaderMap,
+    Path((hash, indexer)): Path<(String, String)>,
+) -> WebResult {
+    let store = enter(&web, &headers, &Method::GET).await?;
+    let (hash, _) = pair(&hash, &indexer).map_err(fail)?;
+    let launch = store
+        .launch(&hash, &indexer)
+        .await
+        .map_err(|e| fail(bad(e)))?
+        .ok_or_else(|| not_found("o pacote não tem relatório do MediaInfo"))?;
+    let report = launch
+        .fields
+        .get("mediainfo")
+        .and_then(Value::as_str)
+        .filter(|r| !r.trim().is_empty())
+        .ok_or_else(|| not_found("o pacote não tem relatório do MediaInfo"))?;
+    let stem = mediainfo_stem(report, launch.fields.get("release").and_then(Value::as_str));
+    let mut response = Response::new(Body::from(format!("{}\n", report.trim_end())));
+    let headers = response.headers_mut();
+    crate::api::secure_headers(headers);
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    let disposition = HeaderValue::from_str(&attachment(&format!("{stem}.txt")))
+        .map_err(|_| fail(bad("nome do vídeo ilegível")))?;
+    headers.insert(header::CONTENT_DISPOSITION, disposition);
+    Ok(response)
+}
+
 /// O cross-seed já achou o irmão do par no destino.
 fn already_there(checks: &[CrossSeedCheck], hash: &str, indexer: &str) -> bool {
     checks
@@ -487,6 +576,7 @@ async fn sent(
 ) -> WebResult {
     let store = enter_live(&web, &headers, &Method::POST).await?;
     let (hash, _) = pair(&hash, &indexer).map_err(fail)?;
+    let _claim = own_pair(&hash, &indexer)?;
     let launch = store
         .launch(&hash, &indexer)
         .await
@@ -505,17 +595,173 @@ async fn sent(
             "o release já existe no destino: não há o que enviar",
         ));
     }
+    mark_sent(store, &hash, &indexer).await?;
+    // Semear antes da aprovação: o site só libera com seeder. Falha aqui não
+    // desfaz o envio; vira erro do pacote e aviso na tela.
+    let warning = seed_generated(&web, store, &launch).await;
+    ok(&json!({
+        "ok": true,
+        "estado": LaunchState::Enviado.as_str(),
+        "aviso": warning,
+    }))
+}
+
+/// A posse do par (hash, destino) para uma rota que muda o pacote: preparar,
+/// descartar, enviado e torrent do site disputam a mesma, e a que chega depois
+/// recebe 409 em vez de rodar por cima. É a mesma trava do job de preparo.
+fn own_pair(hash: &str, indexer: &str) -> Result<super::Claim, Response> {
+    super::claim(hash, indexer).ok_or_else(|| {
+        conflict(
+            "outra operação está em andamento neste pacote (preparo, descarte, envio ou \
+             .torrent do site): tente de novo em instantes",
+        )
+    })
+}
+
+/// Passa o pacote a `enviado`. O par volta a ser procurado primeiro, e
+/// urgente: o publicado é o próprio arquivo do disco.
+async fn mark_sent(store: &Store, hash: &str, indexer: &str) -> Result<(), Response> {
     store
-        .mark_launch_sent(&hash, &indexer, &crate::decide::now_rfc3339())
+        .mark_launch_sent(hash, indexer, &crate::decide::now_rfc3339())
         .await
         .map_err(|e| fail(bad(e)))?;
-    // O par volta a ser procurado primeiro, e urgente: o publicado é o
-    // próprio arquivo do disco.
     store
-        .reset_cross_seed_pair(&hash, &indexer)
+        .reset_cross_seed_pair(hash, indexer)
         .await
         .map_err(|e| fail(bad(e)))?;
-    ok(&json!({ "ok": true, "estado": LaunchState::Enviado.as_str() }))
+    Ok(())
+}
+
+/// Adiciona o `.torrent` gerado do pacote ao cliente, parado. Devolve o aviso
+/// da tela quando não deu, depois de gravar o motivo em `error`.
+async fn seed_generated(web: &Web, store: &Store, launch: &Launch) -> Option<String> {
+    let bytes = match store.launch_torrent(&launch.hash, &launch.indexer).await {
+        Ok(Some(bytes)) => Ok(bytes),
+        Ok(None) => Err(anyhow::anyhow!("o pacote não tem .torrent para semear")),
+        Err(error) => Err(error.into()),
+    };
+    seed_or_warn(web, store, launch, bytes).await.1
+}
+
+/// Semeia o `.torrent` (ou o erro de obtê-lo) e fecha o resultado: sucesso
+/// limpa o erro antigo do pacote; falha o grava e vira o aviso da tela. O
+/// estado do pacote já foi gravado antes, e a falha nunca o desfaz.
+async fn seed_or_warn(
+    web: &Web,
+    store: &Store,
+    launch: &Launch,
+    bytes: anyhow::Result<Vec<u8>>,
+) -> (Option<super::Seeded>, Option<String>) {
+    let seeded = async { super::seed_package(&web.config(), launch, bytes?).await }.await;
+    let message = match seeded {
+        Ok(seeded) => {
+            if launch.error.is_some()
+                && let Err(error) = store
+                    .set_launch_error(&launch.hash, &launch.indexer, None)
+                    .await
+            {
+                tracing::warn!(indexer = launch.indexer, "erro antigo não limpo: {error}");
+            }
+            return (Some(seeded), None);
+        }
+        Err(error) => format!(
+            "marcado como enviado, mas o .torrent não entrou no cliente para semear: {error:#}"
+        ),
+    };
+    tracing::warn!(indexer = launch.indexer, "{message}");
+    if let Err(error) = store
+        .set_launch_error(&launch.hash, &launch.indexer, Some(&message))
+        .await
+    {
+        tracing::warn!(
+            indexer = launch.indexer,
+            "erro do pacote não gravado: {error}"
+        );
+    }
+    (None, Some(message))
+}
+
+/// Recebe o `.torrent` que o site entregou (ele pode trocar o hash do gerado)
+/// e o semeia no lugar. O corpo é segredo (leva o announce): nada dele é logado
+/// nem devolvido.
+async fn site_torrent(
+    State(web): Shared,
+    headers: HeaderMap,
+    Path((hash, indexer)): Path<(String, String)>,
+    body: Result<Bytes, BytesRejection>,
+) -> WebResult {
+    let store = enter_live(&web, &headers, &Method::POST).await?;
+    let (hash, _) = pair(&hash, &indexer).map_err(fail)?;
+    let _claim = own_pair(&hash, &indexer)?;
+    let bytes = body.map_err(|rejection| {
+        let status = rejection.status();
+        let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
+            "o .torrent passa de 10 MiB"
+        } else {
+            "não consegui ler o corpo da requisição"
+        };
+        fail(WebError(status, message.into()))
+    })?;
+    let launch = store
+        .launch(&hash, &indexer)
+        .await
+        .map_err(|e| fail(bad(e)))?
+        .ok_or_else(|| not_found("prepare o pacote antes de enviar o .torrent do site"))?;
+    if !matches!(launch.state, LaunchState::Pronto | LaunchState::Enviado) {
+        return Err(conflict(
+            "o pacote não está pronto nem enviado: não há o que semear",
+        ));
+    }
+    if launch.sent_at.is_none() {
+        let checks = store.cross_seed_checks().await.map_err(|e| fail(bad(e)))?;
+        if already_there(&checks, &hash, &indexer) {
+            return Err(conflict(
+                "o release já existe no destino: não há o que enviar",
+            ));
+        }
+    }
+    let Some(site_layout) = acervo_clients::layout(&bytes) else {
+        return Err(fail(WebError(
+            StatusCode::BAD_REQUEST,
+            "o corpo não é um .torrent válido".into(),
+        )));
+    };
+    let site_hash = acervo_clients::info_hash(&bytes).ok_or_else(|| {
+        fail(WebError(
+            StatusCode::BAD_REQUEST,
+            "o corpo não é um .torrent válido".into(),
+        ))
+    })?;
+    let expected = super::package_layout(&web.config(), &launch)
+        .await
+        .map_err(|e| fail(anyhow_bad(&e)))?;
+    if !crate::crossseed::same_layout(&expected, &site_layout) {
+        return Err(fail(WebError(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "o .torrent do site não tem os arquivos do pacote: {}",
+                super::layout_diff(&expected, &site_layout)
+            ),
+        )));
+    }
+    // O estado que impede a limpeza da pasta (enviado, com o hash do site) vai
+    // ao banco antes de qualquer coisa no cliente: uma queda entre os dois
+    // deixa o pacote protegido, nunca um torrent semeando de pasta descartável.
+    store
+        .save_launch_site_hash(&hash, &indexer, &site_hash)
+        .await
+        .map_err(|e| fail(bad(e)))?;
+    if launch.sent_at.is_none() {
+        mark_sent(store, &hash, &indexer).await?;
+    }
+    // Falha ao adicionar não desfaz o envio: vira erro do pacote e aviso.
+    let (seeded, warning) = seed_or_warn(&web, store, &launch, Ok(bytes.to_vec())).await;
+    ok(&json!({
+        "ok": true,
+        "estado": LaunchState::Enviado.as_str(),
+        "adicionado": seeded == Some(super::Seeded::Added),
+        "aviso": warning,
+    }))
 }
 
 async fn discard(
@@ -525,6 +771,7 @@ async fn discard(
 ) -> WebResult {
     let store = enter_live(&web, &headers, &Method::POST).await?;
     let (hash, _) = pair(&hash, &indexer).map_err(fail)?;
+    let _claim = own_pair(&hash, &indexer)?;
     let launch = store
         .launch(&hash, &indexer)
         .await
@@ -541,6 +788,12 @@ async fn discard(
                 "o pacote já foi enviado ao site: não dá para descartar",
             ));
         }
+        // O irmão semeia da pasta do pacote: descartar a deixaria órfã.
+        Some(LaunchState::Semeando) => {
+            return Err(conflict(
+                "o pacote está semeando no site: não dá para descartar",
+            ));
+        }
         Some(_) => {
             store
                 .set_launch_state(&hash, &indexer, LaunchState::Descartado)
@@ -555,7 +808,18 @@ async fn discard(
                 .map_err(|e| fail(bad(e)))?;
         }
     }
-    ok(&json!({ "ok": true, "estado": LaunchState::Descartado.as_str() }))
+    // A pasta adaptada sai junto, pela limpeza segura; o que ficar vira aviso.
+    let warning = match &launch {
+        Some(launch) if launch.adapted_path.is_some() => {
+            super::discard_folder(&web.config(), store, launch).await
+        }
+        _ => None,
+    };
+    ok(&json!({
+        "ok": true,
+        "estado": LaunchState::Descartado.as_str(),
+        "aviso": warning,
+    }))
 }
 
 #[cfg(test)]
@@ -597,6 +861,9 @@ mod tests {
             created_at: "2026-10-01T00:00:00Z".into(),
             updated_at: "2026-10-01T00:00:00Z".into(),
             sent_at: None,
+            adapted_path: None,
+            adapted_layout: None,
+            site_hash: None,
         }
     }
 
@@ -743,6 +1010,30 @@ mod tests {
         );
         assert!(header.ends_with("filename*=UTF-8''Cora%C3%A7%C3%A3o%20%22x%22.torrent"));
         assert!(HeaderValue::from_str(&header).is_ok());
+    }
+
+    #[test]
+    fn nome_do_txt_sai_do_complete_name_sem_extensao() {
+        let relatorio = "General\nUnique ID : 1\nComplete name                            : Filme.2024.1080p.WEB-DL.mkv\nFormat : Matroska\n";
+        assert_eq!(
+            mediainfo_stem(relatorio, Some("Outro")),
+            "Filme.2024.1080p.WEB-DL"
+        );
+        // Sem "Complete name": o release; sem nenhum dos dois, um nome fixo.
+        assert_eq!(
+            mediainfo_stem("General\n", Some(" Release.X ")),
+            "Release.X"
+        );
+        assert_eq!(mediainfo_stem("General\n", None), "mediainfo");
+        // Caminho que escapasse do relatório não vira diretório no nome.
+        assert_eq!(
+            mediainfo_stem("Complete name : /srv/x/Filme.mkv\n", None),
+            "Filme"
+        );
+        assert_eq!(
+            attachment("Coração.txt"),
+            "attachment; filename=\"Cora__o.txt\"; filename*=UTF-8''Cora%C3%A7%C3%A3o.txt"
+        );
     }
 
     const KEY: &str = "chave-de-teste-0123456789";
@@ -968,6 +1259,45 @@ mod tests {
         assert_eq!(headers["x-content-type-options"], "nosniff");
         assert_eq!(headers["cache-control"], "no-store");
         assert_eq!(response.bytes().await.unwrap().as_ref(), bytes.as_slice());
+        // O relatório do MediaInfo: `.txt` com nome do vídeo, mesma auth e
+        // cabeçalhos; sem relatório, 404.
+        let (status, _) = call(&http, get.clone(), &url(&pronto, "/mediainfo.txt")).await;
+        assert_eq!(status, 404);
+        let relatorio =
+            "General\nComplete name                : Filme Çá.2024.mkv\nFormat : Matroska";
+        store
+            .save_launch_fields(
+                &pronto,
+                BJ,
+                &json!({ "release": "Filme.2024.1080p", "mediainfo": relatorio }),
+            )
+            .await
+            .unwrap();
+        let sem_chave = http
+            .get(url(&pronto, "/mediainfo.txt"))
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(sem_chave.status().as_u16(), 200);
+        let response = http
+            .get(url(&pronto, "/mediainfo.txt"))
+            .header("X-Api-Key", KEY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let headers = response.headers().clone();
+        assert_eq!(headers["content-type"], "text/plain; charset=utf-8");
+        let disposition = headers["content-disposition"].to_str().unwrap();
+        assert!(
+            disposition.starts_with("attachment; filename=\"Filme __.2024.txt\""),
+            "{disposition}"
+        );
+        assert!(disposition.ends_with("filename*=UTF-8''Filme%20%C3%87%C3%A1.2024.txt"));
+        assert!(headers.contains_key("content-security-policy"));
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(response.text().await.unwrap(), format!("{relatorio}\n"));
         // O pacote que falhou não entrega o `.torrent`.
         let (status, _) = call(&http, get.clone(), &url(&novo, "/torrent")).await;
         assert_eq!(status, 404);
@@ -1011,6 +1341,60 @@ mod tests {
             LaunchState::Enviado
         );
 
+        // Enviado não se prepara de novo: o publicado semeia destes arquivos (e
+        // da pasta adaptada, que preparar apagaria).
+        let (status, body) = call(&http, post.clone(), &url(&pronto, "/preparar")).await;
+        assert_eq!(status, 409, "{body}");
+        assert!(body["erro"].as_str().unwrap().contains("enviado"), "{body}");
+
+        // Descartar um pacote com pasta adaptada sem a origem para conferir:
+        // descarta, a pasta fica e a resposta avisa.
+        let adaptado = "9".repeat(40);
+        let pasta = std::env::temp_dir().join(format!("acervo-descarte-{}", std::process::id()));
+        let pasta_texto = pasta.to_str().unwrap().to_owned();
+        std::fs::create_dir_all(&pasta).unwrap();
+        store
+            .upsert_launch_state(&adaptado, BJ, LaunchState::Pronto, None, None)
+            .await
+            .unwrap();
+        store
+            .save_launch_adaptation(&adaptado, BJ, Some(&pasta_texto), None)
+            .await
+            .unwrap();
+        let (status, body) = call(&http, post.clone(), &url(&adaptado, "/descartar")).await;
+        let _ = std::fs::remove_dir_all(&pasta);
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            body["aviso"].as_str().unwrap().contains(&pasta_texto),
+            "{body}"
+        );
+        let launch = store.launch(&adaptado, BJ).await.unwrap().unwrap();
+        assert_eq!(launch.state, LaunchState::Descartado);
+        assert_eq!(launch.adapted_path.as_deref(), Some(pasta_texto.as_str()));
+        let (_, detail) = call(&http, get.clone(), &url(&adaptado, "")).await;
+        assert_eq!(detail["pasta_adaptada"], pasta_texto.as_str());
+
+        // Pasta adaptada que já não existe: não há aviso falso de "ficou no
+        // disco" (nem o cliente é consultado) e a coluna é zerada.
+        let sumido = "8".repeat(40);
+        store
+            .upsert_launch_state(&sumido, BJ, LaunchState::Pronto, None, None)
+            .await
+            .unwrap();
+        store
+            .save_launch_adaptation(&sumido, BJ, Some("/media/lancamentos/bj/Filme"), None)
+            .await
+            .unwrap();
+        let (status, body) = call(&http, post.clone(), &url(&sumido, "/descartar")).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            body.get("aviso").is_none_or(serde_json::Value::is_null),
+            "{body}"
+        );
+        let launch = store.launch(&sumido, BJ).await.unwrap().unwrap();
+        assert_eq!(launch.state, LaunchState::Descartado);
+        assert_eq!(launch.adapted_path, None);
+
         // Semeando não se prepara de novo.
         store
             .set_launch_state(&pronto, BJ, LaunchState::Semeando)
@@ -1018,6 +1402,500 @@ mod tests {
             .unwrap();
         let (status, _) = call(&http, post.clone(), &url(&pronto, "/preparar")).await;
         assert_eq!(status, 409);
+        db.drop().await;
+    }
+
+    /// O `.torrent` de `root` com os `files`; `salt` muda o hash sem mudar os
+    /// arquivos. O announce leva a passkey, que nada pode devolver.
+    fn torrent(root: &str, files: &[(&str, u64)], salt: &str) -> Vec<u8> {
+        let announce = "https://t.exemplo/announce?passkey=PASSKEY123";
+        let mut out = format!("d8:announce{}:{announce}4:infod5:filesl", announce.len());
+        for (path, size) in files {
+            let _ = write!(out, "d6:lengthi{size}e4:pathl{}:{path}ee", path.len());
+        }
+        let _ = write!(
+            out,
+            "e4:name{}:{root}6:pieces{}:{salt}ee",
+            root.len(),
+            salt.len()
+        );
+        out.into_bytes()
+    }
+
+    /// Um qBittorrent de mentira: login, o que há no cliente, os arquivos da
+    /// origem e os trackers de cada hash.
+    async fn qbit(
+        origin: &str,
+        present: &[&str],
+        adds: u64,
+        add_status: u16,
+    ) -> wiremock::MockServer {
+        qbit_slow(origin, present, adds, add_status, std::time::Duration::ZERO).await
+    }
+
+    /// O mesmo, com o `add` demorando `delay` para responder.
+    async fn qbit_slow(
+        origin: &str,
+        present: &[&str],
+        adds: u64,
+        add_status: u16,
+        delay: std::time::Duration,
+    ) -> wiremock::MockServer {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let mut torrents = vec![json!({
+            "hash": origin, "name": "Raiz", "state": "stalledUP",
+            "save_path": "/downloads/filmes", "category": "acervo", "progress": 1.0,
+        })];
+        torrents.extend(present.iter().map(|hash| {
+            json!({
+                "hash": hash, "name": "Raiz", "state": "stoppedUP",
+                "save_path": "/downloads/filmes", "category": "acervo", "progress": 1.0,
+            })
+        }));
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(torrents))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "index": 0, "name": "Raiz/Filme.mkv", "size": 100, "progress": 1.0, "priority": 1 },
+                { "index": 1, "name": "Raiz/Filme.srt", "size": 5, "progress": 1.0, "priority": 1 },
+            ])))
+            .mount(&server)
+            .await;
+        // Parado, na categoria do acervo, na pasta da origem e com as duas
+        // tags: a da conferência e a de semear do destino.
+        Mock::given(method("POST"))
+            .and(path("/api/v2/torrents/add"))
+            .and(body_string_contains("name=\"stopped\"\r\n\r\ntrue"))
+            .and(body_string_contains("name=\"category\"\r\n\r\nacervo"))
+            .and(body_string_contains(
+                "name=\"savepath\"\r\n\r\n/downloads/filmes",
+            ))
+            .and(body_string_contains(format!(
+                "name=\"tags\"\r\n\r\nacervo:cross-seed,acervo:semear:{BJ}"
+            )))
+            .respond_with(
+                ResponseTemplate::new(add_status)
+                    .set_body_string("Ok.")
+                    .set_delay(delay),
+            )
+            .expect(adds)
+            .mount(&server)
+            .await;
+        // O torrent que já está no cliente é adotado (tag, parar e conferir): o
+        // resto dos POSTs o cliente aceita, e o tracker é o do destino.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .with_priority(10)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/trackers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "url": "https://t.exemplo/announce?passkey=PASSKEY123", "status": 2, "msg": "" },
+            ])))
+            .with_priority(10)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn serve(db: &acervo_store::testing::TestDb) -> (Arc<Web>, String) {
+        let settings = Arc::new(
+            crate::settings::Settings::load(db.store.clone())
+                .await
+                .unwrap(),
+        );
+        settings
+            .save_section(crate::config::SERVIDOR, json!({ "api_key": KEY }))
+            .await
+            .unwrap();
+        let web = Arc::new(Web {
+            settings,
+            database: crate::serve::Database::connected(db.store.clone()),
+            catalog: crate::api::Catalog::default(),
+            searches: tokio::sync::Mutex::default(),
+            series_searches: tokio::sync::Mutex::default(),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!(
+            "http://{}/ui/api/biblioteca/para-lancar",
+            listener.local_addr().unwrap()
+        );
+        let app = router(Arc::clone(&web));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (web, base)
+    }
+
+    async fn point_to(web: &Web, server: &wiremock::MockServer) {
+        web.settings
+            .save_section(
+                crate::config::QBITTORRENT,
+                json!({ "url": server.uri(), "username": "u", "password": "s" }),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn send_torrent(http: &reqwest::Client, url: &str, body: Vec<u8>) -> (u16, String) {
+        let response = http
+            .post(url)
+            .header("X-Api-Key", KEY)
+            .header("X-Acervo", "1")
+            .header("Content-Type", "application/x-bittorrent")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        (response.status().as_u16(), response.text().await.unwrap())
+    }
+
+    async fn insert_bj(store: &Store) {
+        store
+            .insert_indexer(&acervo_store::IndexerRecord {
+                name: BJ.into(),
+                kind: "cardigann".into(),
+                definition: None,
+                url: None,
+                settings: std::collections::BTreeMap::new(),
+                enabled: true,
+                priority: acervo_store::DEFAULT_INDEXER_PRIORITY,
+                ratio_mode: false,
+                added_at: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn ready(store: &Store, hash: &str, generated: &[u8]) {
+        store
+            .upsert_launch_state(hash, BJ, LaunchState::Pronto, None, None)
+            .await
+            .unwrap();
+        store
+            .save_launch_torrent(hash, BJ, generated)
+            .await
+            .unwrap();
+    }
+
+    const FILES: [(&str, u64); 2] = [("Filme.mkv", 100), ("Filme.srt", 5)];
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Um cenário de ponta a ponta, pela API.
+    async fn enviado_semeia_o_torrent_gerado_parado_sem_duplicar_e_avisa_se_falhar() {
+        let Some(db) = acervo_store::testing::TestDb::new("para_lancar_semear").await else {
+            return;
+        };
+        let store = &db.store;
+        let (web, base) = serve(&db).await;
+        insert_bj(store).await;
+        let http = reqwest::Client::new();
+        let post = reqwest::Method::POST;
+        let generated = torrent("Raiz", &FILES, "");
+        let generated_hash = acervo_clients::info_hash(&generated).unwrap();
+        let origin = "5".repeat(40);
+        let url = |hash: &str, action: &str| format!("{base}/{hash}/{BJ}{action}");
+
+        // O cliente não tem o gerado: entra uma vez, parado e com as tags.
+        let server = qbit(&origin, &[], 1, 200).await;
+        point_to(&web, &server).await;
+        ready(store, &origin, &generated).await;
+        let (status, body) = call(&http, post.clone(), &url(&origin, "/enviado")).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["aviso"], Value::Null, "{body}");
+        let launch = store.launch(&origin, BJ).await.unwrap().unwrap();
+        assert_eq!(launch.state, LaunchState::Enviado);
+        assert_eq!(launch.error, None);
+        assert!(!body.to_string().contains("PASSKEY123"));
+        drop(server);
+
+        // O gerado já está no cliente (mesmo hash): não adiciona de novo,
+        // nem em um segundo "enviado" do mesmo pacote.
+        let server = qbit(&origin, &[&generated_hash], 0, 200).await;
+        point_to(&web, &server).await;
+        let (status, body) = call(&http, post.clone(), &url(&origin, "/enviado")).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["aviso"], Value::Null, "{body}");
+        drop(server);
+
+        // O cliente recusa: o pacote continua enviado, com o erro gravado e o
+        // aviso na resposta (e no detalhe).
+        let other = "6".repeat(40);
+        let server = qbit(&other, &[], 1, 500).await;
+        point_to(&web, &server).await;
+        ready(store, &other, &generated).await;
+        let (status, body) = call(&http, post.clone(), &url(&other, "/enviado")).await;
+        assert_eq!(status, 200, "{body}");
+        let aviso = body["aviso"].as_str().unwrap();
+        assert!(aviso.contains("não entrou no cliente"), "{body}");
+        assert!(!body.to_string().contains("PASSKEY123"));
+        let launch = store.launch(&other, BJ).await.unwrap().unwrap();
+        assert_eq!(launch.state, LaunchState::Enviado);
+        assert!(launch.sent_at.is_some());
+        assert_eq!(launch.error.as_deref(), Some(aviso));
+        drop(server);
+
+        // Sem cliente configurado também é aviso, não falha do envio.
+        let none = "7".repeat(40);
+        web.settings
+            .save_section(crate::config::QBITTORRENT, json!({}))
+            .await
+            .unwrap();
+        ready(store, &none, &generated).await;
+        let (status, body) = call(&http, post.clone(), &url(&none, "/enviado")).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            body["aviso"].as_str().unwrap().contains("cliente"),
+            "{body}"
+        );
+        assert_eq!(
+            store.launch(&none, BJ).await.unwrap().unwrap().state,
+            LaunchState::Enviado
+        );
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Um cenário de ponta a ponta, pela API.
+    async fn torrent_do_site_confere_o_layout_o_limite_e_mostra_o_tracker_sem_url() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(db) = acervo_store::testing::TestDb::new("para_lancar_torrent_do_site").await
+        else {
+            return;
+        };
+        let store = &db.store;
+        let (web, base) = serve(&db).await;
+        insert_bj(store).await;
+        let http = reqwest::Client::new();
+        let origin = "1".repeat(40);
+        let url = |action: &str| format!("{base}/{origin}/{BJ}{action}");
+        let generated = torrent("Raiz", &FILES, "");
+        ready(store, &origin, &generated).await;
+        let route = url("/torrent-do-site");
+
+        // Sem chave e sem o cabeçalho da tela, nada.
+        assert_eq!(
+            http.post(&route)
+                .body("x")
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            401
+        );
+        let sem_cabecalho = http
+            .post(&route)
+            .header("X-Api-Key", KEY)
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sem_cabecalho.status().as_u16(), 403);
+
+        let server = qbit(&origin, &[], 1, 200).await;
+        point_to(&web, &server).await;
+
+        // Lixo, e layout diferente: 400 dizendo o que difere, sem passkey, e
+        // nada muda no pacote.
+        let (status, body) = send_torrent(&http, &route, b"nao e torrent".to_vec()).await;
+        assert_eq!(status, 400, "{body}");
+        let diferente = torrent("Raiz", &[("Filme.mkv", 99), ("Extra.nfo", 1)], "x");
+        let (status, body) = send_torrent(&http, &route, diferente).await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("Raiz/Filme.srt"), "{body}");
+        assert!(body.contains("Raiz/Extra.nfo"), "{body}");
+        assert!(
+            body.contains("Raiz/Filme.mkv (pacote 100 B, torrent 99 B)"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("PASSKEY123") && !body.contains("t.exemplo"),
+            "{body}"
+        );
+        let launch = store.launch(&origin, BJ).await.unwrap().unwrap();
+        assert_eq!(launch.state, LaunchState::Pronto);
+        assert_eq!(launch.sent_at, None);
+        assert_eq!(launch.site_hash, None);
+
+        // Acima de 10 MiB, 413 com a mensagem; o limite não vale só para o
+        // corpo inteiro lido.
+        let (status, body) = send_torrent(&http, &route, vec![b'd'; (10 << 20) + 1]).await;
+        assert_eq!(status, 413, "{body}");
+        assert!(body.contains("10 MiB"), "{body}");
+
+        // Layout igual (o hash muda): entra parado, o pacote passa a enviado
+        // e o hash do site fica guardado; o announce não volta.
+        let do_site = torrent("Raiz", &FILES, "site");
+        let site_hash = acervo_clients::info_hash(&do_site).unwrap();
+        assert_ne!(site_hash, acervo_clients::info_hash(&generated).unwrap());
+        let (status, body) = send_torrent(&http, &route, do_site).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["estado"], "enviado");
+        assert_eq!(value["adicionado"], true);
+        assert!(
+            !body.contains("PASSKEY123") && !body.contains("t.exemplo"),
+            "{body}"
+        );
+        let launch = store.launch(&origin, BJ).await.unwrap().unwrap();
+        assert_eq!(launch.state, LaunchState::Enviado);
+        assert!(launch.sent_at.is_some());
+        assert_eq!(launch.site_hash.as_deref(), Some(site_hash.as_str()));
+        drop(server);
+
+        // Status do tracker no detalhe: do torrent do site quando ele está no
+        // cliente; texto, sem URL nem passkey.
+        let server = qbit(&origin, &[&site_hash], 0, 200).await;
+        point_to(&web, &server).await;
+        let trackers = |status: i64, msg: &str| {
+            ResponseTemplate::new(200).set_body_json(json!([
+                { "url": "** [DHT] **", "status": 0, "msg": "" },
+                { "url": "https://t.exemplo/announce?passkey=PASSKEY123", "status": status, "msg": msg },
+            ]))
+        };
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/trackers"))
+            .and(query_param("hash", site_hash.as_str()))
+            .respond_with(trackers(4, "Torrent not registered with this tracker"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/trackers"))
+            .and(query_param("hash", site_hash.as_str()))
+            .respond_with(trackers(2, ""))
+            .mount(&server)
+            .await;
+        let (status, detail) = call(&http, reqwest::Method::GET, &url("")).await;
+        assert_eq!(status, 200, "{detail}");
+        assert_eq!(detail["status_tracker"], "não registrado");
+        assert_eq!(detail["torrent_do_site"], true);
+        assert!(!detail.to_string().contains("PASSKEY123"));
+        assert!(!detail.to_string().contains("t.exemplo"));
+        let (_, detail) = call(&http, reqwest::Method::GET, &url("")).await;
+        assert_eq!(detail["status_tracker"], "funcionando");
+        drop(server);
+
+        // O mesmo `.torrent` do site, de novo: já está no cliente, não duplica.
+        let server = qbit(&origin, &[&site_hash], 0, 200).await;
+        point_to(&web, &server).await;
+        let (status, body) = send_torrent(&http, &route, torrent("Raiz", &FILES, "site")).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["adicionado"], false);
+
+        // Pacote que ainda não está pronto nem enviado não recebe `.torrent`.
+        let falhou = "2".repeat(40);
+        store
+            .upsert_launch_state(&falhou, BJ, LaunchState::Falhou, None, Some("x"))
+            .await
+            .unwrap();
+        let (status, _) = send_torrent(
+            &http,
+            &format!("{base}/{falhou}/{BJ}/torrent-do-site"),
+            torrent("Raiz", &FILES, ""),
+        )
+        .await;
+        assert_eq!(status, 409);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn torrent_do_site_grava_o_estado_antes_de_adicionar_e_serializa_o_par() {
+        use std::time::Duration;
+
+        let Some(db) = acervo_store::testing::TestDb::new("para_lancar_serializa").await else {
+            return;
+        };
+        let store = &db.store;
+        let (web, base) = serve(&db).await;
+        insert_bj(store).await;
+        let http = reqwest::Client::new();
+        let origin = "3".repeat(40);
+        let url = |action: &str| format!("{base}/{origin}/{BJ}{action}");
+        let generated = torrent("Raiz", &FILES, "");
+        ready(store, &origin, &generated).await;
+        let route = url("/torrent-do-site");
+
+        // O cliente demora a aceitar o `.torrent`: na janela, o banco já diz
+        // `enviado` com o hash do site, e preparar, descartar e enviado do mesmo
+        // par levam 409 sem mexer em nada.
+        let do_site = torrent("Raiz", &FILES, "site");
+        let site_hash = acervo_clients::info_hash(&do_site).unwrap();
+        let server = qbit_slow(&origin, &[], 1, 200, Duration::from_millis(900)).await;
+        point_to(&web, &server).await;
+        let upload = tokio::spawn({
+            let (http, route) = (http.clone(), route.clone());
+            async move { send_torrent(&http, &route, do_site).await }
+        });
+        let mut persisted = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let launch = store.launch(&origin, BJ).await.unwrap().unwrap();
+            if launch.state == LaunchState::Enviado {
+                assert_eq!(launch.site_hash.as_deref(), Some(site_hash.as_str()));
+                assert!(launch.sent_at.is_some());
+                persisted = true;
+                break;
+            }
+        }
+        assert!(
+            persisted,
+            "o estado devia estar gravado antes de o add voltar"
+        );
+        assert!(
+            !upload.is_finished(),
+            "o add ainda devia estar em andamento"
+        );
+        for action in ["/preparar", "/descartar", "/enviado", "/torrent-do-site"] {
+            let (status, body) = if action == "/torrent-do-site" {
+                send_torrent(&http, &url(action), torrent("Raiz", &FILES, "site")).await
+            } else {
+                let (status, body) = call(&http, reqwest::Method::POST, &url(action)).await;
+                (status, body.to_string())
+            };
+            assert_eq!(status, 409, "{action}: {body}");
+        }
+        let (status, body) = upload.await.unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"adicionado\":true"), "{body}");
+        // Sem a posse do par solta, as rotas voltam a responder.
+        let (status, _) = call(&http, reqwest::Method::POST, &url("/descartar")).await;
+        assert_eq!(status, 409, "enviado ao site não se descarta");
+        drop(server);
+
+        // O cliente recusa o `.torrent`: o estado gravado fica (enviado, com o
+        // hash do site), o erro vai ao pacote e à resposta, sem a passkey.
+        let other = "4".repeat(40);
+        ready(store, &other, &generated).await;
+        let server = qbit(&other, &[], 1, 500).await;
+        point_to(&web, &server).await;
+        let route = format!("{base}/{other}/{BJ}/torrent-do-site");
+        let (status, body) = send_torrent(&http, &route, torrent("Raiz", &FILES, "site")).await;
+        assert_eq!(status, 200, "{body}");
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["adicionado"], false);
+        let aviso = value["aviso"].as_str().unwrap();
+        assert!(aviso.contains("não entrou no cliente"), "{body}");
+        assert!(!body.contains("PASSKEY123") && !body.contains("t.exemplo"));
+        let launch = store.launch(&other, BJ).await.unwrap().unwrap();
+        assert_eq!(launch.state, LaunchState::Enviado);
+        assert_eq!(launch.site_hash.as_deref(), Some(site_hash.as_str()));
+        assert_eq!(launch.error.as_deref(), Some(aviso));
         db.drop().await;
     }
 }
