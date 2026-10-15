@@ -7,6 +7,7 @@ mod config;
 mod crossseed;
 mod definitions;
 mod discover;
+mod launches;
 mod manage;
 mod marks;
 mod series;
@@ -21,9 +22,10 @@ use tokio_postgres::{NoTls, Row};
 
 pub use accounts::SESSION_DAYS;
 pub use config::{DEFAULT_INDEXER_PRIORITY, INDEXER_PRIORITIES, IndexerRecord};
-pub use crossseed::CrossSeedCheck;
+pub use crossseed::{CrossSeedCheck, CrossSeedOutcome};
 pub use definitions::DefinitionRow;
 pub use discover::{DiscoverKind, HiddenTitle};
+pub use launches::{Launch, LaunchState};
 pub use manage::{Blocked, FailReason, HistoryEvent, HistoryPage, NewHistory};
 pub use marks::{DeletionMark, MarkTarget};
 pub use series::{
@@ -263,6 +265,32 @@ const MIGRATIONS: &[&str] = &[
         checked_at TEXT NOT NULL,
         attempts INTEGER NOT NULL DEFAULT 1,
         found TEXT,
+        PRIMARY KEY (hash, indexer)
+    );",
+    // 38: desfecho de cada consulta de cross-seed e os pacotes de "Para lançar".
+    // Antes dela `found` nulo valia para busca que falhou, pacote parcial e
+    // "não existe lá" sem distinção, e o padrão 'not_found' faria de todos
+    // candidatos falsos (os de 3 tentativas nunca seriam reconsultados). As
+    // com irmão viram 'found'; as sem são apagadas e voltam a ser procuradas,
+    // já com o desfecho de verdade.
+    r"ALTER TABLE cross_seed_checks ADD COLUMN outcome TEXT NOT NULL DEFAULT 'not_found'
+        CHECK (outcome IN ('found','not_found','layout_differs','error','skipped'));
+    UPDATE cross_seed_checks SET outcome = 'found' WHERE found IS NOT NULL;
+    DELETE FROM cross_seed_checks WHERE found IS NULL;
+    CREATE TABLE launches (
+        hash TEXT NOT NULL,
+        indexer TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN
+            ('preparando','inelegivel','pronto','falhou','enviado','semeando','descartado')),
+        progress TEXT,
+        report JSONB NOT NULL DEFAULT '{}'::jsonb,
+        fields JSONB NOT NULL DEFAULT '{}'::jsonb,
+        screens JSONB NOT NULL DEFAULT '[]'::jsonb,
+        torrent BYTEA,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        sent_at TEXT,
         PRIMARY KEY (hash, indexer)
     );",
 ];
@@ -2206,16 +2234,34 @@ mod tests {
         };
         let store = &db.store;
         store
-            .record_cross_seed_check("ABCD", "amigos", "2026-10-14T00:00:00Z", None)
+            .record_cross_seed_check(
+                "ABCD",
+                "amigos",
+                "2026-10-14T00:00:00Z",
+                None,
+                CrossSeedOutcome::NotFound,
+            )
             .await
             .unwrap();
         store
-            .record_cross_seed_check("abcd", "amigos", "2026-10-15T00:00:00Z", Some("ef01"))
+            .record_cross_seed_check(
+                "abcd",
+                "amigos",
+                "2026-10-15T00:00:00Z",
+                Some("ef01"),
+                CrossSeedOutcome::Found,
+            )
             .await
             .unwrap();
         // Uma volta sem achar não apaga o irmão já achado.
         store
-            .record_cross_seed_check("abcd", "amigos", "2026-10-16T00:00:00Z", None)
+            .record_cross_seed_check(
+                "abcd",
+                "amigos",
+                "2026-10-16T00:00:00Z",
+                None,
+                CrossSeedOutcome::LayoutDiffers,
+            )
             .await
             .unwrap();
         let checks = store.cross_seed_checks().await.unwrap();
@@ -2227,11 +2273,18 @@ mod tests {
                 checked_at: "2026-10-16T00:00:00Z".into(),
                 attempts: 3,
                 found: Some("ef01".into()),
+                outcome: CrossSeedOutcome::LayoutDiffers,
             }]
         );
+        // Par com irmão não é apagado; sem irmão, volta do zero.
+        assert!(!store.reset_cross_seed_pair("ABCD", "amigos").await.unwrap());
+        assert_eq!(store.cross_seed_checks().await.unwrap().len(), 1);
         // Irmão recusado na conferência: o par volta a ser procurado.
         store.forget_cross_seed("EF01").await.unwrap();
         assert_eq!(store.cross_seed_checks().await.unwrap()[0].found, None);
+        assert!(store.reset_cross_seed_pair("ABCD", "amigos").await.unwrap());
+        assert!(!store.reset_cross_seed_pair("abcd", "amigos").await.unwrap());
+        assert!(store.cross_seed_checks().await.unwrap().is_empty());
         db.drop().await;
     }
 
@@ -2245,6 +2298,7 @@ mod tests {
             client
                 .batch_execute(
                     "ALTER TABLE indexers DROP COLUMN priority, DROP COLUMN ratio_mode;
+                     DROP TABLE launches;
                      DROP TABLE cross_seed_checks;
                      UPDATE schema_version SET version = 35;
                      INSERT INTO indexers (name, kind) VALUES ('antigo', 'cardigann')",
@@ -2259,7 +2313,28 @@ mod tests {
             .await
             .unwrap()
             .get(0);
-        assert_eq!(version, 37);
+        assert_eq!(version, 38);
+        // A 38 cria o desfecho e a tabela.
+        client
+            .batch_execute(
+                "INSERT INTO cross_seed_checks (hash, indexer, checked_at) VALUES ('a', 'b', 't');
+                 INSERT INTO launches (hash, indexer, state, created_at, updated_at)
+                 VALUES ('a', 'b', 'pronto', 't', 't')",
+            )
+            .await
+            .unwrap();
+        let outcome: String = client
+            .query_one("SELECT outcome FROM cross_seed_checks", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(outcome, "not_found");
+        assert!(
+            client
+                .batch_execute("UPDATE cross_seed_checks SET outcome = 'talvez'")
+                .await
+                .is_err()
+        );
         let indexers = db.store.indexers().await.unwrap();
         assert_eq!(indexers.len(), 1);
         assert_eq!(indexers[0].name, "antigo");
@@ -2272,6 +2347,38 @@ mod tests {
                 .is_err()
         );
         drop(client);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn migracao_38_nao_inventa_candidato_com_as_consultas_antigas() {
+        let Some(db) = TestDb::new("migracao_38").await else {
+            return;
+        };
+        {
+            // Volta ao banco da 37: sem `outcome`, com consultas de antes.
+            let client = db.store.pool.get().await.unwrap();
+            client
+                .batch_execute(
+                    "DROP TABLE launches;
+                     ALTER TABLE cross_seed_checks DROP COLUMN outcome;
+                     UPDATE schema_version SET version = 37;
+                     INSERT INTO cross_seed_checks (hash, indexer, checked_at, attempts, found)
+                     VALUES ('com-irmao', 'amigos', 't', 1, 'ef01'),
+                            ('sem-irmao', 'amigos', 't', 3, NULL),
+                            ('falhou', 'bj', 't', 1, NULL)",
+                )
+                .await
+                .unwrap();
+        }
+        db.store.migrate().await.unwrap();
+        // Quem tinha irmão é 'found'; o `found` nulo não diz se a busca falhou,
+        // se o pacote era parcial ou se não existe lá: some, e é procurado de
+        // novo em vez de virar candidato de mentira.
+        let checks = db.store.cross_seed_checks().await.unwrap();
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0].hash, "com-irmao");
+        assert_eq!(checks[0].outcome, CrossSeedOutcome::Found);
         db.drop().await;
     }
 }

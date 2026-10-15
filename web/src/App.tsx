@@ -12,6 +12,7 @@ import {
   Monitor,
   MonitorPlay,
   Moon,
+  Rocket,
   Server,
   SlidersHorizontal,
   Sun,
@@ -36,8 +37,9 @@ import { SeriesPage } from '@/pages/Series'
 import { SettingsPage } from '@/pages/Settings'
 import { TasksPage } from '@/pages/Tasks'
 import { ToDeletePage } from '@/pages/ToDelete'
+import { ToLaunchPage } from '@/pages/ToLaunch'
 
-type MainView = 'filmes' | 'series' | 'descobrir' | 'faltando' | 'apagar' | 'calendario' | 'atividade'
+type MainView = 'filmes' | 'series' | 'descobrir' | 'faltando' | 'apagar' | 'lancar' | 'calendario' | 'atividade'
 type ConfigView = 'indexadores' | 'tarefas' | 'configuracoes'
 type View = MainView | ConfigView
 
@@ -50,6 +52,7 @@ const MAIN: NavItem<MainView>[] = [
   { view: 'series', label: 'Séries', icon: MonitorPlay },
   { view: 'faltando', label: 'Faltando', icon: CircleDashed },
   { view: 'apagar', label: 'Para apagar', icon: Trash2 },
+  { view: 'lancar', label: 'Para lançar', icon: Rocket },
   { view: 'calendario', label: 'Calendário', icon: CalendarDays },
   { view: 'atividade', label: 'Atividade', icon: Activity },
 ]
@@ -68,7 +71,7 @@ function viewFromHash(): View {
   // A query depois de `?` é da tela (ex.: `#filmes?ordem=ano`), não faz parte do nome.
   const hash = window.location.hash.slice(1).split('?')[0] ?? ''
   // Endereço salvo da antiga página única de configurações.
-  if (['servidor', 'cliente-download', 'jellyfin', 'biblioteca', 'regras', 'notificacoes', 'tmdb'].includes(hash)) return 'configuracoes'
+  if (['servidor', 'cliente-download', 'jellyfin', 'biblioteca', 'regras', 'notificacoes', 'tmdb', 'imagens'].includes(hash)) return 'configuracoes'
   return VIEWS.includes(hash as View) ? (hash as View) : 'descobrir'
 }
 
@@ -284,6 +287,8 @@ export function App() {
             <MissingPage />
           ) : view === 'apagar' ? (
             <ToDeletePage />
+          ) : view === 'lancar' ? (
+            <ToLaunchPage />
           ) : view === 'calendario' ? (
             <CalendarPage />
           ) : view === 'atividade' ? (

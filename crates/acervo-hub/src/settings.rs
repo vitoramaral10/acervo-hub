@@ -219,5 +219,7 @@ mod tests {
         assert_eq!(view["url"], "http://j");
         let view = mask("servidor", json!({ "api_key": "" }));
         assert_eq!(view["api_key"], json!({ "definida": false }));
+        let view = mask("imagens", json!({ "imgbb_api_key": "segredo" }));
+        assert_eq!(view["imgbb_api_key"], json!({ "definida": true }));
     }
 }

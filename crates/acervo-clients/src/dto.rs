@@ -138,6 +138,71 @@ impl Tracker {
     }
 }
 
+/// Em que pé está uma tarefa de criação de torrent (`torrentcreator/status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum TorrentTaskState {
+    Queued,
+    Running,
+    Finished,
+    Failed,
+    /// Estado que uma versão futura do cliente inventar: quem chama trata
+    /// como "ainda não acabou".
+    #[serde(other)]
+    Unknown,
+}
+
+/// Estado de uma tarefa de criação de torrent.
+///
+/// O status do cliente também ecoa os `trackers` da tarefa (o announce com
+/// passkey); de propósito, nada disso é lido aqui.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TorrentTaskStatus {
+    pub state: TorrentTaskState,
+    /// De 0 a 100; o cliente só informa com a tarefa rodando.
+    pub progress: u8,
+    /// Só em tarefa que falhou.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawTaskStatus {
+    pub status: TorrentTaskState,
+    #[serde(default)]
+    pub progress: i64,
+    #[serde(default, rename = "errorMessage")]
+    pub error_message: Option<String>,
+}
+
+impl From<RawTaskStatus> for TorrentTaskStatus {
+    fn from(raw: RawTaskStatus) -> Self {
+        Self {
+            state: raw.status,
+            progress: u8::try_from(raw.progress.clamp(0, 100)).unwrap_or(0),
+            error: raw.error_message.filter(|m| !m.is_empty()),
+        }
+    }
+}
+
+/// Uma tarefa de criação na lista do cliente (`torrentcreator/status` sem
+/// `taskID`): o bastante para achar e apagar a que ficou órfã. Como em
+/// [`TorrentTaskStatus`], os `trackers` (com a passkey) não são lidos.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TorrentTaskEntry {
+    #[serde(rename = "taskID")]
+    pub task_id: String,
+    /// O que a tarefa empacota.
+    #[serde(default, rename = "sourcePath")]
+    pub source_path: String,
+    #[serde(rename = "status")]
+    pub state: TorrentTaskState,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct CreatedTask {
+    #[serde(rename = "taskID")]
+    pub task_id: String,
+}
+
 fn normal_priority() -> u8 {
     1
 }
@@ -172,9 +237,83 @@ pub(crate) struct Preferences {
     pub max_active_torrents: i64,
 }
 
+/// O announce que funciona: a primeira URL real (http, https ou udp; não
+/// DHT, `PeX` nem LSD) com status 2. É a URL com passkey do tracker, por isso
+/// quem chama a trata como segredo.
+#[must_use]
+pub fn working_announce(trackers: &[Tracker]) -> Option<String> {
+    trackers
+        .iter()
+        .find(|t| t.status == 2 && t.is_real() && has_announce_scheme(&t.url))
+        .map(|t| t.url.clone())
+}
+
+fn has_announce_scheme(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    ["http://", "https://", "udp://"]
+        .iter()
+        .any(|scheme| lower.starts_with(scheme))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tracker(url: &str, status: i64) -> Tracker {
+        Tracker {
+            url: url.into(),
+            status,
+            msg: String::new(),
+        }
+    }
+
+    #[test]
+    fn announce_e_a_primeira_url_real_funcionando() {
+        let trackers = [
+            tracker("** [DHT] **", 2),
+            tracker("https://morto.exemplo/announce?passkey=a", 4),
+            tracker("https://espera.exemplo/announce?passkey=b", 1),
+            tracker("HTTPS://bom.exemplo/announce?passkey=c", 2),
+            tracker("udp://outro.exemplo:80/announce", 2),
+        ];
+        assert_eq!(
+            working_announce(&trackers).as_deref(),
+            Some("HTTPS://bom.exemplo/announce?passkey=c")
+        );
+    }
+
+    #[test]
+    fn announce_ignora_esquema_que_nao_e_de_tracker() {
+        let trackers = [
+            tracker("ws://x.exemplo/a", 2),
+            tracker("udp://u.exemplo/a", 2),
+        ];
+        assert_eq!(
+            working_announce(&trackers).as_deref(),
+            Some("udp://u.exemplo/a")
+        );
+    }
+
+    #[test]
+    fn sem_tracker_funcionando_nao_ha_announce() {
+        assert_eq!(working_announce(&[]), None);
+        let trackers = [
+            tracker("** [PeX] **", 2),
+            tracker("** [LSD] **", 2),
+            tracker("https://x.exemplo/a", 3),
+        ];
+        assert_eq!(working_announce(&trackers), None);
+    }
+
+    #[test]
+    fn status_de_tarefa_desconhecido_nao_quebra_e_progresso_e_limitado() {
+        let raw: RawTaskStatus =
+            serde_json::from_str(r#"{"status":"Novo","progress":250,"trackers":["x"]}"#).unwrap();
+        let status = TorrentTaskStatus::from(raw);
+        assert_eq!(status.state, TorrentTaskState::Unknown);
+        assert_eq!(status.progress, 100);
+        assert_eq!(status.error, None);
+    }
 
     #[test]
     fn espaco_livre_menos_um_desserializa() {

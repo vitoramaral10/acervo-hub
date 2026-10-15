@@ -7,6 +7,7 @@ import { NotificationsSection } from '@/pages/settings/Notifications'
 import { RulesSection, RulesSkeleton, useRules } from '@/pages/settings/Rules'
 import {
   DownloadClientSettings,
+  ImagesSettings,
   JellyfinSettings,
   LibrarySettings,
   ServerSettings,
@@ -139,7 +140,7 @@ function TmdbSettings() {
 }
 
 /** Seções editáveis reunidas na mesma tela. */
-type Section = 'servidor' | 'cliente-download' | 'jellyfin' | 'biblioteca' | 'regras' | 'notificacoes' | 'tmdb'
+type Section = 'servidor' | 'cliente-download' | 'jellyfin' | 'biblioteca' | 'regras' | 'notificacoes' | 'tmdb' | 'imagens'
 
 const PAGES: Record<Section, { title: string; description: string; body: () => ReactNode }> = {
   servidor: {
@@ -176,6 +177,11 @@ const PAGES: Record<Section, { title: string; description: string; body: () => R
     title: 'TMDB',
     description: 'A fonte dos metadados de filmes e séries.',
     body: () => <TmdbSettings />,
+  },
+  imagens: {
+    title: 'Imagens',
+    description: 'A chave do ImgBB, que hospeda as capturas de “Para lançar”.',
+    body: () => <ImagesSettings />,
   },
 }
 

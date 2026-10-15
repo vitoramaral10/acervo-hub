@@ -96,6 +96,14 @@ const ORIGIN: &str = "cadastro";
 /// Configuração ilegível no banco ou endereço ocupado.
 pub async fn run(store: Store, bind: &str) -> Result<()> {
     let settings = Arc::new(Settings::load(store.clone()).await?);
+    // Pacote de "Para lançar" que o desligamento cortou no meio não volta
+    // sozinho: vira `falhou`, e o botão de preparar vale de novo.
+    match crate::launch::recover(&store).await {
+        Ok(0) => {}
+        Ok(count) => tracing::warn!(pacotes = count, "preparo de lançamento interrompido"),
+        Err(error) => tracing::warn!("lançamentos interrompidos não conferidos: {error:#}"),
+    }
+    crate::launch::spawn_clear_stale_tasks(settings.get(), store.clone());
     let records = store.indexers().await.context("lendo os indexadores")?;
     let rows = store
         .definitions()
@@ -159,6 +167,7 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
             .merge(crate::agenda::router(Arc::clone(&web)))
             .merge(crate::marks::router(Arc::clone(&web)))
             .merge(crate::discover::router(Arc::clone(&web)))
+            .merge(crate::launch::web::router(Arc::clone(&web)))
             .merge(crate::series::web::router(web))
             .merge(crate::health::router(readiness)),
     )
@@ -168,6 +177,8 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
             shutdown().await;
             // Para de agendar já; quem está rodando termina em `drain`.
             tasks.stop();
+            // O preparo de lançamento apaga a tarefa que deixou no qBittorrent.
+            crate::launch::stop();
         }
     })
     .await
@@ -177,6 +188,14 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         tracing::warn!(
             tarefas = running,
             "tarefas ainda rodando após {} s; saindo assim mesmo",
+            SHUTDOWN_GRACE.as_secs()
+        );
+    }
+    let preparing = crate::launch::drain(SHUTDOWN_GRACE).await;
+    if preparing > 0 {
+        tracing::warn!(
+            pacotes = preparing,
+            "preparos de lançamento ainda rodando após {} s; saindo assim mesmo",
             SHUTDOWN_GRACE.as_secs()
         );
     }
@@ -1077,6 +1096,30 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body["url"], "http://qbit:8080");
         assert!(!body.to_string().contains("senha-qbit"));
+
+        // A chave do ImgBB também é segredo; vazia no PUT, fica a guardada.
+        let imgbb = "0123456789abcdef0123456789abcdef";
+        let (status, body) = call(
+            &client,
+            reqwest::Method::PUT,
+            &url("imagens"),
+            first,
+            Some(json!({ "imgbb_api_key": imgbb })),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["imgbb_api_key"], json!({ "definida": true }));
+        let (status, body) = call(
+            &client,
+            reqwest::Method::PUT,
+            &url("imagens"),
+            first,
+            Some(json!({ "imgbb_api_key": "" })),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert!(!body.to_string().contains(imgbb));
+        assert_eq!(settings.get().imgbb_key(), Some(imgbb));
 
         // Jellyfin sem chave é recusado; seção que não existe mais, 404.
         let (status, _) = call(

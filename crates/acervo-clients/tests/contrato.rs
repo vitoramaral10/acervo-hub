@@ -13,7 +13,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use acervo_clients::{QbitClient, QbitError, client_path, state_from_qbit};
+use acervo_clients::{
+    CreateTorrentOptions, QbitClient, QbitError, TorrentTaskState, client_path, state_from_qbit,
+};
 use acervo_core::{DownloadHash, DownloadState};
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, header, method, path, query_param};
@@ -738,4 +740,261 @@ async fn trackers_trazem_estado_e_mensagem() {
     assert!(trackers[2].is_real());
     assert_eq!(trackers[2].status, 4);
     assert_eq!(trackers[2].msg, "Unregistered torrent");
+}
+
+const ANNOUNCE: &str = "https://tracker.exemplo/announce?passkey=segredo123";
+
+#[tokio::test]
+async fn criar_torrent_manda_os_parametros_do_5_0_e_devolve_o_id() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrentcreator/addTask"))
+        .and(header("referer", server.uri() + "/"))
+        .and(body_string_contains(
+            "sourcePath=%2Fmedia%2FFilme.2024.1080p",
+        ))
+        .and(body_string_contains("format=v1"))
+        .and(body_string_contains("pieceSize=0"))
+        .and(body_string_contains("optimizeAlignment=false"))
+        .and(body_string_contains("private=true"))
+        .and(body_string_contains("startSeeding=false"))
+        .and(body_string_contains(
+            "trackers=https%3A%2F%2Ftracker.exemplo",
+        ))
+        .and(body_string_contains("comment=acervo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"taskID": "task-1"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut options = CreateTorrentOptions::new("/media/Filme.2024.1080p", vec![ANNOUNCE.into()]);
+    options.comment = Some("acervo".into());
+    let id = cliente.create_torrent_task(&options).await.expect("tarefa");
+
+    assert_eq!(id, "task-1");
+    drop(server);
+}
+
+#[tokio::test]
+async fn criar_torrent_com_tarefas_demais_e_recusa_sem_vazar_o_announce() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrentcreator/addTask"))
+        .respond_with(ResponseTemplate::new(409).set_body_string("Too many active tasks"))
+        .mount(&server)
+        .await;
+
+    let options = CreateTorrentOptions::new("/media/F", vec![ANNOUNCE.into()]);
+    let erro = cliente.create_torrent_task(&options).await.unwrap_err();
+    assert!(matches!(erro, QbitError::CreateRefused));
+    assert!(!format!("{erro} {erro:?} {options:?}").contains("segredo123"));
+}
+
+#[tokio::test]
+async fn criar_torrent_com_erro_de_status_nao_inclui_o_announce() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrentcreator/addTask"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let options = CreateTorrentOptions::new("/media/F", vec![ANNOUNCE.into()]);
+    let erro = cliente.create_torrent_task(&options).await.unwrap_err();
+    assert!(matches!(erro, QbitError::Status { .. }));
+    assert!(!format!("{erro} {erro:?}").contains("segredo123"));
+}
+
+#[tokio::test]
+async fn announce_com_barra_vertical_nao_chega_ao_cliente() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+
+    // Sem mock para `addTask`: qualquer requisição falharia o teste.
+    let options = CreateTorrentOptions::new("/media/F", vec!["https://t.exemplo/a|b".into()]);
+    let erro = cliente.create_torrent_task(&options).await.unwrap_err();
+    assert!(matches!(erro, QbitError::InvalidAnnounce));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| !r.url.path().contains("torrentcreator"))
+    );
+}
+
+#[tokio::test]
+async fn status_da_tarefa_le_estado_progresso_e_erro_e_ignora_os_trackers() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrentcreator/status"))
+        .and(query_param("taskID", "rodando"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "taskID": "rodando", "sourcePath": "/media/F", "pieceSize": 0,
+            "private": true, "format": "v1", "status": "Running", "progress": 42,
+            "trackers": [ANNOUNCE], "timeAdded": "2026-10-14T10:00:00",
+        }])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrentcreator/status"))
+        .and(query_param("taskID", "falhou"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "taskID": "falhou", "status": "Failed", "errorMessage": "disco cheio",
+        }])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrentcreator/status"))
+        .and(query_param("taskID", "pronta"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "taskID": "pronta", "status": "Finished", "pieceSize": 4_194_304,
+        }])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrentcreator/status"))
+        .and(query_param("taskID", "fila"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "taskID": "fila", "status": "Queued",
+        }])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrentcreator/status"))
+        .and(query_param("taskID", "sumiu"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let rodando = cliente
+        .torrent_task_status("rodando")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rodando.state, TorrentTaskState::Running);
+    assert_eq!(rodando.progress, 42);
+    assert_eq!(rodando.error, None);
+    assert!(!format!("{rodando:?}").contains("segredo123"));
+
+    let falhou = cliente
+        .torrent_task_status("falhou")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(falhou.state, TorrentTaskState::Failed);
+    assert_eq!(falhou.error.as_deref(), Some("disco cheio"));
+
+    let pronta = cliente
+        .torrent_task_status("pronta")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pronta.state, TorrentTaskState::Finished);
+
+    let fila = cliente.torrent_task_status("fila").await.unwrap().unwrap();
+    assert_eq!(fila.state, TorrentTaskState::Queued);
+    assert_eq!(fila.progress, 0);
+
+    assert_eq!(cliente.torrent_task_status("sumiu").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn lista_de_tarefas_traz_id_e_caminho_e_ignora_os_trackers() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrentcreator/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"taskID": "a", "sourcePath": "/media/F", "status": "Running", "progress": 3,
+             "trackers": [ANNOUNCE]},
+            {"taskID": "b", "status": "Finished"},
+        ])))
+        .mount(&server)
+        .await;
+
+    let tarefas = cliente.torrent_tasks().await.unwrap();
+    assert_eq!(tarefas.len(), 2);
+    assert_eq!(tarefas[0].task_id, "a");
+    assert_eq!(tarefas[0].source_path, "/media/F");
+    assert_eq!(tarefas[0].state, TorrentTaskState::Running);
+    assert_eq!(tarefas[1].source_path, "");
+    assert!(!format!("{tarefas:?}").contains("segredo123"));
+}
+
+#[tokio::test]
+async fn arquivo_da_tarefa_vem_em_bytes_e_tarefa_nao_pronta_e_erro_claro() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrentcreator/torrentFile"))
+        .and(query_param("taskID", "pronta"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/x-bittorrent")
+                .set_body_bytes(b"d4:infod4:name1:xee".to_vec()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrentcreator/torrentFile"))
+        .and(query_param("taskID", "rodando"))
+        .respond_with(
+            ResponseTemplate::new(409).set_body_string("Torrent creation is still unfinished."),
+        )
+        .mount(&server)
+        .await;
+
+    let bytes = cliente.torrent_task_file("pronta").await.unwrap();
+    assert_eq!(bytes, b"d4:infod4:name1:xee");
+    let erro = cliente.torrent_task_file("rodando").await.unwrap_err();
+    assert!(matches!(erro, QbitError::TorrentFileUnavailable));
+}
+
+#[tokio::test]
+async fn apagar_tarefa_manda_o_id_e_tarefa_inexistente_nao_e_erro() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrentcreator/deleteTask"))
+        .and(header("referer", server.uri() + "/"))
+        .and(body_string_contains("taskID=t1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrentcreator/deleteTask"))
+        .and(body_string_contains("taskID=velha"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrentcreator/deleteTask"))
+        .and(body_string_contains("taskID=quebra"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    cliente.delete_torrent_task("t1").await.expect("apagada");
+    cliente
+        .delete_torrent_task("velha")
+        .await
+        .expect("idempotente");
+    let erro = cliente.delete_torrent_task("quebra").await.unwrap_err();
+    assert!(matches!(erro, QbitError::Status { .. }));
+    drop(server);
 }

@@ -27,7 +27,9 @@ use axum::routing::get;
 pub use catalog::{ALL, Catalog, Entry, IndexerView};
 #[cfg(test)]
 pub use catalog::{CatalogError, Health};
-pub use ui::{DefinitionCatalog, DefinitionView, SettingView, authorize_ui, ui_json};
+pub use ui::{
+    DefinitionCatalog, DefinitionView, SettingView, authorize_ui, secure_headers, ui_json,
+};
 
 /// A chave da interface, lida a cada requisição: trocada pela tela, a nova
 /// vale na hora, sem reiniciar.

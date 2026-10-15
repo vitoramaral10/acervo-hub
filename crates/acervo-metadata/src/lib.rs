@@ -14,9 +14,10 @@ mod discover;
 mod tv;
 pub use discover::{
     DiscoverCast, DiscoverDetails, DiscoverItem, DiscoverKind, DiscoverList, DiscoverPage, Genre,
+    country_name_pt,
 };
 
-pub use tv::{EpisodeMetadata, SeriesMetadata, SeriesSummary};
+pub use tv::{EpisodeMetadata, EpisodeText, SeasonText, SeriesMetadata, SeriesSummary};
 
 const BASE: &str = "https://api.themoviedb.org/3/";
 const IMAGES: &str = "https://image.tmdb.org/t/p/original";
@@ -39,10 +40,18 @@ pub enum MetadataError {
     Status(reqwest::StatusCode),
 
     #[error("falha ao falar com o TMDB: {0}")]
-    Transport(#[from] reqwest::Error),
+    Transport(reqwest::Error),
 
     #[error("url inválida: {0}")]
     Url(#[from] url::ParseError),
+}
+
+/// O erro do reqwest traz a URL da requisição, e a do TMDB leva `api_key` na
+/// query: a URL sai aqui, antes de o erro chegar a log, banco ou API.
+impl From<reqwest::Error> for MetadataError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Transport(error.without_url())
+    }
 }
 
 /// Um filme, com o que o catálogo guarda.
@@ -438,6 +447,23 @@ mod tests {
 
     fn raw(json: &serde_json::Value) -> RawMovie {
         serde_json::from_value(json.clone()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn falha_de_transporte_nao_leva_a_chave_na_mensagem() {
+        const KEY: &str = "chave-secreta-do-tmdb";
+        // Porta fechada: o erro do reqwest traria a URL com `api_key`.
+        let tmdb = Tmdb::with_base(
+            "http://127.0.0.1:9/3/",
+            KEY,
+            "pt-BR",
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let error = tmdb.validate().await.unwrap_err();
+        assert!(matches!(error, MetadataError::Transport(_)));
+        assert!(!error.to_string().contains(KEY), "{error}");
+        assert!(!format!("{error:?}").contains(KEY), "{error:?}");
     }
 
     #[test]

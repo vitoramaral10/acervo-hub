@@ -12,7 +12,10 @@ mod dto;
 pub mod jellyfin;
 mod torrent;
 
-pub use dto::{TorrentFile, TorrentInfo, Tracker};
+pub use dto::{
+    TorrentFile, TorrentInfo, TorrentTaskEntry, TorrentTaskState, TorrentTaskStatus, Tracker,
+    working_announce,
+};
 pub use torrent::{info_hash, layout, magnet_hash};
 
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +37,15 @@ pub enum QbitError {
 
     #[error("o qBittorrent recusou o torrent (já existe ou arquivo inválido)")]
     AddRefused,
+
+    #[error("o announce tem `|`, que o qBittorrent usaria para separar trackers")]
+    InvalidAnnounce,
+
+    #[error("o qBittorrent não aceitou criar o torrent (tarefas demais ativas)")]
+    CreateRefused,
+
+    #[error("o qBittorrent respondeu sem o `.torrent` da tarefa (não terminou ou falhou)")]
+    TorrentFileUnavailable,
 
     #[error("o qBittorrent não sabe o espaço livre: a pasta de download existe?")]
     FreeSpaceUnknown,
@@ -65,6 +77,85 @@ pub struct AddOptions {
     /// antes de baixar qualquer um. Ignorado com `stopped`.
     pub stop_after_metadata: bool,
     pub tags: Vec<String>,
+}
+
+/// Formato do `.torrent` criado (`format`; só vale em build com libtorrent 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TorrentFormat {
+    V1,
+    V2,
+    Hybrid,
+}
+
+impl TorrentFormat {
+    fn as_param(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
+/// O que pedir à criação de torrent (`torrentcreator/addTask`, qBittorrent 5).
+///
+/// Os padrões de [`CreateTorrentOptions::new`] são os do lançamento: v1,
+/// peça automática, sem otimizar alinhamento (o layout não pode mudar),
+/// privado e sem semear (o torrent novo não entra no cliente).
+#[derive(Clone)]
+pub struct CreateTorrentOptions {
+    /// Arquivo ou pasta, como o **cliente** o vê.
+    pub source_path: String,
+    pub format: TorrentFormat,
+    /// Em bytes; `0` é automático.
+    pub piece_size: u32,
+    pub optimize_alignment: bool,
+    pub private: bool,
+    pub start_seeding: bool,
+    /// URLs de announce. **Segredo** (passkey): nunca vai a log nem a erro.
+    pub trackers: Vec<String>,
+    pub comment: Option<String>,
+    /// Campo `source` do torrent. O qBittorrent 5.0.0 ignora o parâmetro
+    /// `source` e copia o `comment` para ele; só versões que o leem usam
+    /// este valor.
+    pub source: Option<String>,
+}
+
+impl CreateTorrentOptions {
+    #[must_use]
+    pub fn new(source_path: impl Into<String>, trackers: Vec<String>) -> Self {
+        Self {
+            source_path: source_path.into(),
+            format: TorrentFormat::V1,
+            piece_size: 0,
+            optimize_alignment: false,
+            private: true,
+            start_seeding: false,
+            trackers,
+            comment: None,
+            source: None,
+        }
+    }
+}
+
+// À mão: o derive imprimiria o announce com a passkey.
+impl std::fmt::Debug for CreateTorrentOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateTorrentOptions")
+            .field("source_path", &self.source_path)
+            .field("format", &self.format)
+            .field("piece_size", &self.piece_size)
+            .field("optimize_alignment", &self.optimize_alignment)
+            .field("private", &self.private)
+            .field("start_seeding", &self.start_seeding)
+            .field(
+                "trackers",
+                &format_args!("<{} redigido(s)>", self.trackers.len()),
+            )
+            .field("comment", &self.comment)
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 /// Sessão autenticada no qBittorrent.
@@ -430,6 +521,151 @@ impl QbitClient {
             .await
     }
 
+    /// Cria uma tarefa de criação de `.torrent` no cliente e devolve o id.
+    ///
+    /// O cliente calcula os hashes (ele já vê os arquivos); quem chama
+    /// acompanha com [`Self::torrent_task_status`], baixa com
+    /// [`Self::torrent_task_file`] e apaga com [`Self::delete_torrent_task`].
+    ///
+    /// # Errors
+    ///
+    /// Announce com `|`; falha de transporte; 409 (tarefas demais) ou outro
+    /// status não-2xx. Nenhum erro carrega o announce.
+    pub async fn create_torrent_task(
+        &self,
+        options: &CreateTorrentOptions,
+    ) -> Result<String, QbitError> {
+        if options.trackers.iter().any(|t| t.contains('|')) {
+            return Err(QbitError::InvalidAnnounce);
+        }
+        let path = "api/v2/torrentcreator/addTask";
+        let mut form: Vec<(&str, String)> = vec![
+            ("sourcePath", options.source_path.clone()),
+            ("format", options.format.as_param().into()),
+            ("pieceSize", options.piece_size.to_string()),
+            ("optimizeAlignment", options.optimize_alignment.to_string()),
+            ("private", options.private.to_string()),
+            ("startSeeding", options.start_seeding.to_string()),
+            ("trackers", options.trackers.join("|")),
+        ];
+        if let Some(comment) = &options.comment {
+            form.push(("comment", comment.clone()));
+        }
+        if let Some(source) = &options.source {
+            form.push(("source", source.clone()));
+        }
+        let response = self
+            .http
+            .post(self.base.join(path)?)
+            .header(reqwest::header::REFERER, self.base.as_str())
+            .form(&form)
+            .send()
+            .await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::CONFLICT {
+            return Err(QbitError::CreateRefused);
+        }
+        if !status.is_success() {
+            return Err(QbitError::Status {
+                status,
+                path: path.into(),
+            });
+        }
+        let created: dto::CreatedTask = response.json().await?;
+        Ok(created.task_id)
+    }
+
+    /// Estado de uma tarefa de criação; `None` se o cliente não a conhece
+    /// (404: apagada, ou o cliente reiniciou).
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status inesperado.
+    pub async fn torrent_task_status(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TorrentTaskStatus>, QbitError> {
+        let path = "api/v2/torrentcreator/status";
+        let response = self
+            .http
+            .get(self.base.join(path)?)
+            .query(&[("taskID", task_id)])
+            .send()
+            .await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(QbitError::Status {
+                status,
+                path: path.into(),
+            });
+        }
+        let tasks: Vec<dto::RawTaskStatus> = response.json().await?;
+        Ok(tasks.into_iter().next().map(TorrentTaskStatus::from))
+    }
+
+    /// Todas as tarefas de criação que o cliente tem, para achar a que ficou
+    /// órfã (o acervo caiu no meio e nunca a apagou).
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status não-2xx.
+    pub async fn torrent_tasks(&self) -> Result<Vec<TorrentTaskEntry>, QbitError> {
+        self.get("api/v2/torrentcreator/status", &[]).await
+    }
+
+    /// Os bytes do `.torrent` de uma tarefa terminada.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte; 404 ou 409 (tarefa desconhecida, não terminada
+    /// ou falha) viram [`QbitError::TorrentFileUnavailable`]; outro status
+    /// não-2xx.
+    pub async fn torrent_task_file(&self, task_id: &str) -> Result<Vec<u8>, QbitError> {
+        let path = "api/v2/torrentcreator/torrentFile";
+        let response = self
+            .http
+            .get(self.base.join(path)?)
+            .query(&[("taskID", task_id)])
+            .send()
+            .await?;
+        let status = response.status();
+        if matches!(
+            status,
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::CONFLICT
+        ) {
+            return Err(QbitError::TorrentFileUnavailable);
+        }
+        if !status.is_success() {
+            return Err(QbitError::Status {
+                status,
+                path: path.into(),
+            });
+        }
+        Ok(response.bytes().await?.to_vec())
+    }
+
+    /// Apaga a tarefa de criação (e libera a vaga dela no cliente). Tarefa
+    /// que já não existe (404) não é erro: a limpeza roda em qualquer
+    /// desfecho e precisa ser repetível.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status inesperado.
+    pub async fn delete_torrent_task(&self, task_id: &str) -> Result<(), QbitError> {
+        let path = "api/v2/torrentcreator/deleteTask";
+        match self.post_status(path, &[("taskID", task_id)]).await? {
+            status if status.is_success() => Ok(()),
+            reqwest::StatusCode::NOT_FOUND => Ok(()),
+            status => Err(QbitError::Status {
+                status,
+                path: path.into(),
+            }),
+        }
+    }
+
     /// Apaga torrents, opcionalmente com os arquivos.
     ///
     /// Com os arquivos, o torrent cujo conteúdo outro torrent do cliente
@@ -645,6 +881,26 @@ pub fn client_path(torrent: &TorrentInfo, file: &TorrentFile) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_das_opcoes_de_criacao_nao_mostra_o_announce() {
+        let options = CreateTorrentOptions::new(
+            "/media/Filme",
+            vec!["https://tracker.exemplo/announce?passkey=segredo123".into()],
+        );
+        let texto = format!("{options:?}");
+        assert!(!texto.contains("segredo123"));
+        assert!(!texto.contains("tracker.exemplo"));
+        assert!(texto.contains("/media/Filme"));
+    }
+
+    #[test]
+    fn opcoes_de_criacao_seguem_o_padrao_do_lancamento() {
+        let o = CreateTorrentOptions::new("/m/F", vec![]);
+        assert_eq!(o.format, TorrentFormat::V1);
+        assert_eq!(o.piece_size, 0);
+        assert!(!o.optimize_alignment && o.private && !o.start_seeding);
+    }
 
     #[test]
     fn completo_mas_parado_nao_e_seeding() {
