@@ -22,8 +22,9 @@ use crate::mediainfo::{SubtitleFacts, SubtitleKind};
 
 use super::rules::{
     ProbedVideo, Site, SourceFile, file_name, is_portuguese_subtitle, parent, stem,
-    videos_without_portuguese,
+    videos_needing_extraction, videos_without_portuguese,
 };
+use super::subtitle_sniff::Sniffs;
 
 /// Pasta, dentro de `<raiz>`, onde ficam as pastas adaptadas.
 pub(crate) const ADAPTED_DIR: &str = "lancamentos";
@@ -197,13 +198,17 @@ pub fn folder_name(files: &[SourceFile]) -> Option<String> {
 /// legenda não dá para extrair fica de fora (é o [`Obstacle`] que a regra
 /// reporta). Vazio sem pasta raiz identificável.
 #[must_use]
-pub fn extractions(files: &[SourceFile], videos: &[ProbedVideo]) -> Vec<Extraction> {
+pub fn extractions(
+    files: &[SourceFile],
+    videos: &[ProbedVideo],
+    sniffs: &Sniffs,
+) -> Vec<Extraction> {
     let Some(name) = folder_name(files) else {
         return Vec::new();
     };
     let single = !files[0].path.contains('/');
     let mut out = Vec::new();
-    for video in videos_without_portuguese(files, videos, Site::Bj) {
+    for video in videos_needing_extraction(files, videos, sniffs) {
         let Ok(picked) = pick(&video.media.subtitles) else {
             continue;
         };
@@ -213,22 +218,59 @@ pub fn extractions(files: &[SourceFile], videos: &[ProbedVideo]) -> Vec<Extracti
             video.path.clone()
         };
         let base = format!("{}/{}", parent(&place), stem(file_name(&place)));
+        let full = free_output(files, &out, &name, single, &base, "pt-BR", "srt");
         out.push(Extraction {
             video: video.path.clone(),
             stream: picked.full.index,
-            output: format!("{base}.pt-BR.srt"),
+            output: full,
             forced: false,
         });
         if let Some(forced) = picked.forced {
+            let output = free_output(files, &out, &name, single, &base, "pt-BR.forced", "srt");
             out.push(Extraction {
                 video: video.path.clone(),
                 stream: forced.index,
-                output: format!("{base}.pt-BR.forced.srt"),
+                output,
                 forced: true,
             });
         }
     }
     out
+}
+
+/// `<base>.<tag>.<ext>`, ou, se o nome já existe na origem (ou já foi
+/// reservado para outra extração), `<base>.2.<tag>.<ext>`, `.3`...: a
+/// extração nunca sobrescreve um arquivo. O sufixo de idioma continua no
+/// fim do nome, então a legenda segue sendo reconhecida como PT.
+fn free_output(
+    files: &[SourceFile],
+    taken: &[Extraction],
+    name: &str,
+    single: bool,
+    base: &str,
+    tag: &str,
+    ext: &str,
+) -> String {
+    let used = |candidate: &str| {
+        let candidate = candidate.to_lowercase();
+        taken.iter().any(|e| e.output.to_lowercase() == candidate)
+            || files.iter().any(|f| {
+                let path = if single {
+                    format!("{name}/{}", f.path)
+                } else {
+                    f.path.clone()
+                };
+                path.to_lowercase() == candidate
+            })
+    };
+    let first = format!("{base}.{tag}.{ext}");
+    if !used(&first) {
+        return first;
+    }
+    (2..=u32::MAX)
+        .map(|n| format!("{base}.{n}.{tag}.{ext}"))
+        .find(|candidate| !used(candidate))
+        .unwrap_or(first)
 }
 
 /// O plano da pasta adaptada, ou `None` se não há o que adaptar: outro site
@@ -247,6 +289,7 @@ pub fn extractions(files: &[SourceFile], videos: &[ProbedVideo]) -> Vec<Extracti
 pub fn plan(
     source_files: &[SourceFile],
     videos: &[ProbedVideo],
+    sniffs: &Sniffs,
     content_path: &Path,
     save_path: &Path,
     site: Site,
@@ -265,9 +308,9 @@ pub fn plan(
     if content_path.file_name()?.to_str()? != expected {
         return None;
     }
-    let extractions = extractions(source_files, videos);
+    let extractions = extractions(source_files, videos, sniffs);
     // Todo vídeo sem português precisa ter virado extração.
-    let missing = videos_without_portuguese(source_files, videos, Site::Bj);
+    let missing = videos_without_portuguese(source_files, videos, sniffs, Site::Bj);
     if extractions.is_empty()
         || missing
             .iter()
@@ -307,6 +350,7 @@ mod tests {
     use acervo_parser::Language;
 
     use super::*;
+    use crate::launch::subtitle_sniff::{Sniff, SniffLanguage};
     use crate::mediainfo::{AudioFacts, MediaFacts};
 
     const GB: u64 = 1_000_000_000;
@@ -369,6 +413,7 @@ mod tests {
         plan(
             files,
             videos,
+            &Sniffs::new(),
             Path::new(content),
             Path::new("/media/downloads"),
             Site::Bj,
@@ -601,6 +646,7 @@ mod tests {
             plan(
                 &files,
                 &videos,
+                &Sniffs::new(),
                 Path::new("/media/downloads/Filme"),
                 Path::new("/media/downloads"),
                 Site::Amigos,
@@ -635,5 +681,86 @@ mod tests {
                 ("Filme/Filme.pt-BR.srt".to_owned(), 70_000),
             ])
         );
+    }
+
+    fn sniffed(language: SniffLanguage, cues: usize) -> Sniff {
+        Sniff {
+            language,
+            cues,
+            covered_secs: f64::from(u32::try_from(cues).unwrap()) * 2.0,
+            video_secs: Some(6000.0),
+        }
+    }
+
+    fn plan_with_sniff(
+        files: &[SourceFile],
+        videos: &[ProbedVideo],
+        sniff: Sniff,
+    ) -> Option<AdaptationPlan> {
+        let sniffs: Sniffs = [("Filme/Filme.srt".to_owned(), sniff)].into();
+        plan(
+            files,
+            videos,
+            &sniffs,
+            Path::new("/media/downloads/Filme"),
+            Path::new("/media/downloads"),
+            Site::Bj,
+        )
+    }
+
+    #[test]
+    fn so_srt_pt_br_completo_confirmado_dispensa_a_extracao() {
+        let files = [file("Filme/Filme.mkv", GB), file("Filme/Filme.srt", 90_000)];
+        let videos = [probed("Filme/Filme.mkv", vec![text(3, "por")])];
+        // PT-BR completo: nada a extrair.
+        let confirmed = sniffed(SniffLanguage::PtBr, 995);
+        assert!(plan_with_sniff(&files, &videos, confirmed).is_none());
+        // Qualquer outro caso extrai a faixa embutida normalmente.
+        for other in [
+            sniffed(SniffLanguage::Pt, 995),
+            sniffed(SniffLanguage::PtPt, 995),
+            sniffed(SniffLanguage::PtBr, 28),
+            sniffed(SniffLanguage::PtBr, 300),
+            sniffed(SniffLanguage::English, 995),
+        ] {
+            let plan = plan_with_sniff(&files, &videos, other).expect("extrai");
+            assert_eq!(plan.extractions.len(), 1, "{other:?}");
+            assert_eq!(plan.extractions[0].output, "Filme/Filme.pt-BR.srt");
+            assert_eq!(plan.extractions[0].stream, 3);
+        }
+    }
+
+    #[test]
+    fn nome_ja_existente_na_origem_nao_e_sobrescrito() {
+        // A forçada já existe na origem (o BJ não a conta como a completa).
+        let files = [
+            file("Filme/Filme.mkv", GB),
+            file("Filme/Filme.pt-BR.forced.srt", 500),
+        ];
+        let videos = [probed(
+            "Filme/Filme.mkv",
+            vec![text(3, "por"), sub(5, "por", "subrip", true, None)],
+        )];
+        let plan = plan_bj(&files, &videos, "/media/downloads/Filme").expect("plano");
+        let saidas: Vec<(&str, bool)> = plan
+            .extractions
+            .iter()
+            .map(|e| (e.output.as_str(), e.forced))
+            .collect();
+        assert_eq!(
+            saidas,
+            [
+                ("Filme/Filme.pt-BR.srt", false),
+                ("Filme/Filme.2.pt-BR.forced.srt", true),
+            ]
+        );
+        // Ocupado também fora de caixa, e o novo nome segue sendo PT pelo sufixo.
+        let files = [
+            file("Filme/Filme.mkv", GB),
+            file("Filme/FILME.PT-BR.FORCED.SRT", 500),
+            file("Filme/Filme.2.pt-BR.forced.srt", 500),
+        ];
+        let plan = plan_bj(&files, &videos, "/media/downloads/Filme").expect("plano");
+        assert_eq!(plan.extractions[1].output, "Filme/Filme.3.pt-BR.forced.srt");
     }
 }

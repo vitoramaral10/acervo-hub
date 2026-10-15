@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::mediainfo::{AudioFacts, Hdr, MediaFacts, VideoFacts};
 
 use super::adapt::{self, Extraction, Obstacle};
+use super::subtitle_sniff::{Completeness, Sniff, SniffLanguage, Sniffs};
 
 /// Diferença de tamanho (relativa ao release do destino) abaixo da qual dois
 /// releases de mesma resolução, fonte e áudio contam como o mesmo arquivo.
@@ -268,6 +269,9 @@ pub struct Facts {
     /// futura ou ausente). Com algum, a temporada ainda está em exibição.
     pub season_pending: u32,
     pub destination: Vec<DestinationRelease>,
+    /// Conteúdo das legendas em arquivo sem idioma no nome (o mesmo nome-base
+    /// do vídeo), lido do disco pelo preparo.
+    pub sniffs: Sniffs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -439,7 +443,7 @@ impl<'a> Context<'a> {
             // Obra nacional dispensa a legenda: nada a extrair.
             adaptations: if site == Site::Bj && !facts.original_language.is_some_and(is_portuguese)
             {
-                adapt::extractions(&facts.files, &facts.videos)
+                adapt::extractions(&facts.files, &facts.videos, &facts.sniffs)
             } else {
                 Vec::new()
             },
@@ -501,26 +505,50 @@ fn portuguese_available(ctx: &Context<'_>) -> Check {
         );
     }
     // Cada vídeo precisa do seu: legenda de outro episódio não vale.
-    let missing = videos_without_portuguese(&facts.files, &facts.videos, Site::Amigos);
+    let missing =
+        videos_without_portuguese(&facts.files, &facts.videos, &facts.sniffs, Site::Amigos);
     if missing.is_empty() {
         let audio = facts
             .videos
             .iter()
             .all(|v| v.media.audio.iter().any(is_portuguese_audio));
         if audio {
-            Check::ok(RULE, "tem áudio em português")
-        } else {
-            Check::ok(RULE, "sem áudio PT, mas tem legenda em português")
+            return Check::ok(RULE, "tem áudio em português");
+        }
+        let relied = sibling_reliance(&facts.files, &facts.videos, &facts.sniffs, Site::Amigos);
+        if let Some(doubt) = relied.iter().find(|r| r.standing != Standing::Confirmed) {
+            let note = describe_sibling(doubt.path, doubt.sniff, Site::Amigos);
+            return Check::warn(
+                RULE,
+                if doubt.standing == Standing::European {
+                    format!(
+                        "a legenda em português é pt-PT, e a regra pede português brasileiro e/ou áudio dublado em português: {note}"
+                    )
+                } else {
+                    note
+                },
+            );
+        }
+        match relied.first() {
+            Some(found) => Check::ok(
+                RULE,
+                format!(
+                    "sem áudio PT, mas tem legenda em português: {}",
+                    describe_sibling(found.path, found.sniff, Site::Amigos)
+                ),
+            ),
+            None => Check::ok(RULE, "sem áudio PT, mas tem legenda em português"),
         }
     } else {
         Check::fail(
             RULE,
             format!(
-                "obra em {} com {} de {} vídeos sem áudio nem legenda em português: o Amigos exige um dos dois em cada vídeo ({})",
+                "obra em {} com {} de {} vídeos sem áudio nem legenda em português: o Amigos exige um dos dois em cada vídeo ({}){}",
                 language_pt(original),
                 missing.len(),
                 facts.videos.len(),
                 list_names(&missing),
+                sibling_hint(&facts.files, &facts.sniffs, &missing, Site::Amigos),
             ),
         )
     }
@@ -539,10 +567,13 @@ fn list_names(videos: &[&ProbedVideo]) -> String {
 
 /// Os vídeos sem português: sem faixa de áudio PT e sem legenda PT (embutida,
 /// só no Amigos; ou em arquivo ao lado, associada ao vídeo pelo nome-base e,
-/// no BJ, na mesma pasta).
+/// no BJ, na mesma pasta). A legenda em arquivo sem idioma no nome vale pelo
+/// que o conteúdo diz (`sniffs`): PT-BR completo, português não confirmado ou
+/// inconclusivo (com aviso) e, no Amigos, o pt-PT completo (com aviso).
 pub(super) fn videos_without_portuguese<'a>(
     files: &[SourceFile],
     videos: &'a [ProbedVideo],
+    sniffs: &Sniffs,
     site: Site,
 ) -> Vec<&'a ProbedVideo> {
     videos
@@ -555,17 +586,281 @@ pub(super) fn videos_without_portuguese<'a>(
                     .subtitles
                     .iter()
                     .any(|s| is_portuguese_subtitle(s.language, s.raw_language.as_deref()));
-            !(audio
-                || embedded
-                || has_external_portuguese(files, &video.path, site == Site::Bj, site == Site::Bj))
+            !(audio || embedded || has_external_portuguese(files, sniffs, &video.path, site))
         })
         .collect()
 }
 
-/// Há legenda PT em arquivo associada ao vídeo: mesmo nome-base, com sufixos
-/// de idioma (`.pt-BR`, `.por`, `.forced`), e na mesma pasta se `same_folder`.
-/// Com `full_only` (BJ), a forçada não conta: ela não é a legenda exigida.
-fn has_external_portuguese(
+/// Há legenda PT em arquivo associada ao vídeo: pelo sufixo de idioma do
+/// nome (`.pt-BR`, `.por`, `.forced`) ou, sem sufixo, pelo conteúdo.
+fn has_external_portuguese(files: &[SourceFile], sniffs: &Sniffs, video: &str, site: Site) -> bool {
+    has_external_by_name(files, video, site == Site::Bj, site == Site::Bj)
+        || siblings(files, sniffs, video, site == Site::Bj)
+            .iter()
+            .any(|(_, s)| standing(s).counts(site))
+}
+
+/// O quanto o conteúdo de um `.srt` sem idioma no nome confirma a legenda PT
+/// completa que a regra pede. Do melhor ao pior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Standing {
+    /// PT-BR e completa.
+    Confirmed,
+    /// Português completo, mas a variante não foi confirmada.
+    Unconfirmed,
+    /// Português (BR ou sem variante), sem dar para dizer se é completa.
+    Doubtful,
+    /// pt-PT completo.
+    European,
+    /// Forçada, de outro idioma ou pt-PT sem confirmação de completude.
+    Rejected,
+}
+
+impl Standing {
+    /// Conta como legenda PT presente (com aviso, salvo `Confirmed`). O pt-PT
+    /// completo só no Amigos; no BJ a regra exige PT-BR.
+    fn counts(self, site: Site) -> bool {
+        match self {
+            Self::Confirmed | Self::Unconfirmed | Self::Doubtful => true,
+            Self::European => site == Site::Amigos,
+            Self::Rejected => false,
+        }
+    }
+}
+
+fn standing(sniff: &Sniff) -> Standing {
+    let portuguese = matches!(sniff.language, SniffLanguage::PtBr | SniffLanguage::Pt);
+    match sniff.completeness() {
+        Completeness::Complete => match sniff.language {
+            SniffLanguage::PtBr => Standing::Confirmed,
+            SniffLanguage::Pt => Standing::Unconfirmed,
+            SniffLanguage::PtPt => Standing::European,
+            _ => Standing::Rejected,
+        },
+        Completeness::Inconclusive if portuguese => Standing::Doubtful,
+        Completeness::Forced | Completeness::Inconclusive => Standing::Rejected,
+    }
+}
+
+/// Um vídeo cuja legenda PT é só um `.srt` sem idioma no nome.
+struct Reliance<'a> {
+    video: &'a ProbedVideo,
+    path: &'a str,
+    sniff: &'a Sniff,
+    standing: Standing,
+}
+
+/// Os vídeos que dependem do `.srt` sem idioma no nome para ter português:
+/// sem áudio PT, sem legenda PT embutida (no Amigos) e sem arquivo PT pelo
+/// sufixo do nome. Com a melhor legenda lida de cada um que conta no site.
+fn sibling_reliance<'a>(
+    files: &'a [SourceFile],
+    videos: &'a [ProbedVideo],
+    sniffs: &'a Sniffs,
+    site: Site,
+) -> Vec<Reliance<'a>> {
+    videos
+        .iter()
+        .filter(|v| {
+            let audio = v.media.audio.iter().any(is_portuguese_audio);
+            let embedded = site == Site::Amigos
+                && v.media
+                    .subtitles
+                    .iter()
+                    .any(|s| is_portuguese_subtitle(s.language, s.raw_language.as_deref()));
+            !(audio
+                || embedded
+                || has_external_by_name(files, &v.path, site == Site::Bj, site == Site::Bj))
+        })
+        .filter_map(|video| {
+            siblings(files, sniffs, &video.path, site == Site::Bj)
+                .into_iter()
+                .map(|(path, sniff)| Reliance {
+                    video,
+                    path,
+                    sniff,
+                    standing: standing(sniff),
+                })
+                .filter(|r| r.standing.counts(site))
+                .min_by_key(|r| r.standing)
+        })
+        .collect()
+}
+
+/// Os vídeos que ainda precisam da faixa PT embutida extraída para `.srt`:
+/// sem áudio PT, sem arquivo PT pelo nome e sem `.srt` ao lado que seja
+/// PT-BR completo confirmado. Só o PT-BR confirmado dispensa a extração.
+pub(super) fn videos_needing_extraction<'a>(
+    files: &[SourceFile],
+    videos: &'a [ProbedVideo],
+    sniffs: &Sniffs,
+) -> Vec<&'a ProbedVideo> {
+    videos
+        .iter()
+        .filter(|video| {
+            let audio = video.media.audio.iter().any(is_portuguese_audio);
+            !(audio
+                || has_external_by_name(files, &video.path, true, true)
+                || siblings(files, sniffs, &video.path, true)
+                    .iter()
+                    .any(|(_, s)| standing(s) == Standing::Confirmed))
+        })
+        .collect()
+}
+
+/// As legendas em arquivo sem idioma no nome (`<nome do vídeo>.srt`) que o
+/// preparo leu, com o que se achou nelas; na mesma pasta se `same_folder`.
+fn siblings<'a>(
+    files: &'a [SourceFile],
+    sniffs: &'a Sniffs,
+    video: &str,
+    same_folder: bool,
+) -> Vec<(&'a str, &'a Sniff)> {
+    let video_stem = stem(file_name(video)).to_lowercase();
+    files
+        .iter()
+        .filter(|f| {
+            is_subtitle_file(&f.path)
+                && stem(file_name(&f.path)).to_lowercase() == video_stem
+                && (!same_folder || parent(&f.path) == parent(video))
+        })
+        .filter_map(|f| sniffs.get(&f.path).map(|s| (f.path.as_str(), s)))
+        .collect()
+}
+
+/// Os arquivos de legenda que o preparo precisa ler: os `.srt`/`.ass`/`.ssa`
+/// com o mesmo nome-base de um vídeo (sem sufixo de idioma), e o vídeo
+/// de cada um.
+pub(super) fn sniff_targets<'a>(
+    files: &'a [SourceFile],
+    videos: &'a [ProbedVideo],
+) -> Vec<(&'a str, &'a ProbedVideo)> {
+    files
+        .iter()
+        .filter(|f| has_extension(&f.path, &["srt", "ass", "ssa"]))
+        .filter_map(|f| {
+            let name = stem(file_name(&f.path)).to_lowercase();
+            videos
+                .iter()
+                .find(|v| stem(file_name(&v.path)).to_lowercase() == name)
+                .map(|v| (f.path.as_str(), v))
+        })
+        .collect()
+}
+
+/// A primeira legenda sem idioma no nome ao lado do vídeo que foi lida.
+fn sibling_sniff<'a>(
+    files: &'a [SourceFile],
+    sniffs: &'a Sniffs,
+    video: &str,
+    site: Site,
+) -> Option<(&'a str, &'a Sniff)> {
+    siblings(files, sniffs, video, site == Site::Bj)
+        .into_iter()
+        .next()
+}
+
+/// Complemento da mensagem de reprovação: o que o `.srt` ao lado, sem
+/// idioma no nome, se revelou ser. Vazio se nenhum foi lido.
+fn sibling_hint(
+    files: &[SourceFile],
+    sniffs: &Sniffs,
+    missing: &[&ProbedVideo],
+    site: Site,
+) -> String {
+    let notes: Vec<String> = missing
+        .iter()
+        .filter_map(|v| {
+            sibling_sniff(files, sniffs, &v.path, site).map(|(path, sniff)| {
+                let note = describe_sibling(path, sniff, site);
+                if missing.len() > 1 {
+                    format!("{}: {note}", file_name(&v.path))
+                } else {
+                    note
+                }
+            })
+        })
+        .take(3)
+        .collect();
+    if notes.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", notes.join("; "))
+    }
+}
+
+/// `o .srt ao lado é forçado (28 falas em 1 h 43 min) e em pt-PT`,
+/// `o .srt ao lado é PT-BR completo (995 falas)`.
+fn describe_sibling(path: &str, sniff: &Sniff, site: Site) -> String {
+    let ext = extension(path).unwrap_or_else(|| "srt".to_owned());
+    let lead = format!("o .{ext} ao lado");
+    let cues = sniff.cues;
+    let language = match sniff.language {
+        SniffLanguage::PtBr => "em PT-BR",
+        SniffLanguage::PtPt => "em pt-PT",
+        SniffLanguage::Pt => "em português",
+        SniffLanguage::English => "em inglês",
+        SniffLanguage::Spanish => "em espanhol",
+        SniffLanguage::Unknown => "de idioma não identificado",
+    };
+    let completeness = sniff.completeness();
+    if completeness == Completeness::Forced {
+        let span = sniff
+            .video_secs
+            .filter(|s| *s > 0.0)
+            .map_or_else(String::new, |s| format!(" em {}", duration_label(s)));
+        return format!("{lead} é forçado ({cues} falas{span}) e {language}");
+    }
+    let rule = match site {
+        Site::Amigos => "a regra pede PT-BR",
+        Site::Bj => "o BJ exige PT-BR",
+    };
+    match (sniff.language, completeness) {
+        (SniffLanguage::English, _) => {
+            format!("{lead} é em inglês ({cues} falas), não em português")
+        }
+        (SniffLanguage::Spanish, _) => {
+            format!("{lead} é em espanhol ({cues} falas), não em português")
+        }
+        (SniffLanguage::Unknown, _) => {
+            format!("{lead} não teve o idioma identificado ({cues} falas)")
+        }
+        (_, Completeness::Inconclusive) => {
+            let share = sniff.coverage().map_or_else(String::new, |c| {
+                format!(", {}% do filme", (c * 100.0).round())
+            });
+            let european = if sniff.language == SniffLanguage::PtPt {
+                " (parece pt-PT)"
+            } else {
+                ""
+            };
+            format!(
+                "não deu para confirmar se o .{ext} ao lado é completo ou forçado ({cues} falas{share}){european}: confira"
+            )
+        }
+        (SniffLanguage::PtBr, _) => format!("{lead} é PT-BR completo ({cues} falas)"),
+        (SniffLanguage::Pt, _) => format!(
+            "{lead} parece português completo, mas a variante não foi confirmada: {rule}, confira"
+        ),
+        (_, _) => format!("{lead} é pt-PT completo ({cues} falas): {rule}"),
+    }
+}
+
+/// `1 h 43 min`, `52 min`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn duration_label(secs: f64) -> String {
+    let minutes = (secs / 60.0).round() as u64;
+    if minutes >= 60 {
+        format!("{} h {:02} min", minutes / 60, minutes % 60)
+    } else {
+        format!("{minutes} min")
+    }
+}
+
+/// Há legenda PT em arquivo pelo sufixo de idioma do nome, mesmo nome-base
+/// do vídeo, e na mesma pasta se `same_folder`. Com `full_only` (BJ), a
+/// forçada não conta: ela não é a legenda exigida.
+fn has_external_by_name(
     files: &[SourceFile],
     video: &str,
     same_folder: bool,
@@ -907,12 +1202,9 @@ fn portuguese_subtitle_file(ctx: &Context<'_>) -> Vec<Check> {
     }
     // Cada vídeo precisa de áudio PT ou de legenda PT em arquivo próprio, na
     // mesma pasta e com o mesmo nome-base.
-    let missing = videos_without_portuguese(&facts.files, &facts.videos, Site::Bj);
+    let missing = videos_without_portuguese(&facts.files, &facts.videos, &facts.sniffs, Site::Bj);
     if missing.is_empty() {
-        return vec![Check::ok(
-            RULE,
-            "áudio PT ou legenda PT em arquivo separado",
-        )];
+        return vec![bj_sibling_check(RULE, facts)];
     }
     let unfixable: Vec<&ProbedVideo> = missing
         .iter()
@@ -979,12 +1271,36 @@ fn portuguese_subtitle_file(ctx: &Context<'_>) -> Vec<Check> {
     vec![Check::fail(
         RULE,
         format!(
-            "{} de {} vídeos sem áudio PT e sem legenda PT em arquivo separado, na mesma pasta e com o mesmo nome do vídeo: {}{hint}",
+            "{} de {} vídeos sem áudio PT e sem legenda PT em arquivo separado, na mesma pasta e com o mesmo nome do vídeo: {}{hint}{}",
             unfixable.len(),
             facts.videos.len(),
             list_names(&unfixable),
+            sibling_hint(&facts.files, &facts.sniffs, &unfixable, Site::Bj),
         ),
     )]
+}
+
+/// 4.2.1.5 quando todo vídeo tem português: `Ok`, ou `Warn` se algum depende
+/// de um `.srt` ao lado que o conteúdo não confirma como PT-BR completo.
+fn bj_sibling_check(rule: &'static str, facts: &Facts) -> Check {
+    let relied = sibling_reliance(&facts.files, &facts.videos, &facts.sniffs, Site::Bj);
+    if let Some(doubt) = relied.iter().find(|r| r.standing != Standing::Confirmed) {
+        let mut note = describe_sibling(doubt.path, doubt.sniff, Site::Bj);
+        if adapt::pick(&doubt.video.media.subtitles).is_ok() {
+            note.push_str("; a legenda PT embutida será extraída para arquivo separado também");
+        }
+        return Check::warn(rule, note);
+    }
+    match relied.first() {
+        Some(found) => Check::ok(
+            rule,
+            format!(
+                "áudio PT ou legenda PT em arquivo separado: {}",
+                describe_sibling(found.path, found.sniff, Site::Bj)
+            ),
+        ),
+        None => Check::ok(rule, "áudio PT ou legenda PT em arquivo separado"),
+    }
 }
 
 /// 4.2.1.10: filme com um só vídeo e no máximo quatro legendas.
@@ -1841,6 +2157,7 @@ mod tests {
             season_episodes: None,
             season_pending: 0,
             destination: Vec::new(),
+            sniffs: Sniffs::new(),
         }
     }
 
@@ -2531,10 +2848,13 @@ mod tests {
             .files
             .push(file(&format!("{folder}/{stem}.pt-BR.forced.srt"), 1000));
         assert_eq!(
-            videos_without_portuguese(&facts.files, &facts.videos, Site::Bj).len(),
+            videos_without_portuguese(&facts.files, &facts.videos, &facts.sniffs, Site::Bj).len(),
             1
         );
-        assert!(videos_without_portuguese(&facts.files, &facts.videos, Site::Amigos).is_empty());
+        assert!(
+            videos_without_portuguese(&facts.files, &facts.videos, &facts.sniffs, Site::Amigos)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2966,5 +3286,190 @@ mod tests {
             c.message
                 .starts_with("Serie.S01E02.1080p.WEB-DL.mkv: áudio em")
         }));
+    }
+
+    /// Filme estrangeiro sem áudio PT, com um `.srt` sem sufixo de idioma ao
+    /// lado do vídeo, que o preparo leu como `sniff`.
+    fn srt_sem_sufixo(language: SniffLanguage, cues: usize) -> Facts {
+        let mut facts = movie();
+        set_video(&mut facts, |m| {
+            m.audio = vec![eng()];
+            m.subtitles = Vec::new();
+        });
+        let srt = format!(
+            "{}.srt",
+            &facts.videos[0].path[..facts.videos[0].path.len() - 4]
+        );
+        facts.files.push(file(&srt, 90_000));
+        facts.sniffs.insert(
+            srt,
+            Sniff {
+                language,
+                cues,
+                covered_secs: f64::from(u32::try_from(cues).unwrap()) * 2.0,
+                video_secs: Some(6180.0),
+            },
+        );
+        facts
+    }
+
+    fn message(site: Site, facts: &Facts, rule: &str) -> String {
+        check(site, facts)
+            .checks
+            .iter()
+            .find(|c| c.rule == rule)
+            .map(|c| c.message.clone())
+            .unwrap_or_default()
+    }
+
+    const BJ_SUB: &str = "4.2.1.5 / 4.2.1.4";
+
+    #[test]
+    fn srt_sem_sufixo_pt_br_completo_vale_nos_dois_sites() {
+        let facts = srt_sem_sufixo(SniffLanguage::PtBr, 995);
+        assert_eq!(status(Site::Amigos, &facts, "3.3"), Some(Status::Ok));
+        assert_eq!(status(Site::Bj, &facts, BJ_SUB), Some(Status::Ok));
+        assert!(
+            message(Site::Amigos, &facts, "3.3")
+                .contains("o .srt ao lado é PT-BR completo (995 falas)")
+        );
+        assert!(
+            message(Site::Bj, &facts, BJ_SUB)
+                .contains("o .srt ao lado é PT-BR completo (995 falas)")
+        );
+    }
+
+    #[test]
+    fn srt_sem_sufixo_pt_sem_variante_confirmada_e_aviso_que_conta_como_presente() {
+        let facts = srt_sem_sufixo(SniffLanguage::Pt, 995);
+        let esperado =
+            "o .srt ao lado parece português completo, mas a variante não foi confirmada";
+        assert_eq!(status(Site::Amigos, &facts, "3.3"), Some(Status::Warn));
+        assert_eq!(status(Site::Bj, &facts, BJ_SUB), Some(Status::Warn));
+        let bj = message(Site::Bj, &facts, BJ_SUB);
+        assert!(
+            bj.contains(esperado) && bj.contains("o BJ exige PT-BR, confira"),
+            "{bj}"
+        );
+        assert!(message(Site::Amigos, &facts, "3.3").contains(esperado));
+    }
+
+    #[test]
+    fn srt_sem_sufixo_inconclusivo_avisa_e_conta_so_em_pt_ou_pt_br() {
+        // 300 falas / 600 s em 6180 s: 10% de cobertura, nem completa nem forçada.
+        for language in [SniffLanguage::PtBr, SniffLanguage::Pt] {
+            let facts = srt_sem_sufixo(language, 300);
+            for (site, rule) in [(Site::Amigos, "3.3"), (Site::Bj, BJ_SUB)] {
+                assert_eq!(status(site, &facts, rule), Some(Status::Warn));
+                let text = message(site, &facts, rule);
+                assert!(
+                    text.contains(
+                        "não deu para confirmar se o .srt ao lado é completo ou forçado (300 falas, 10% do filme): confira"
+                    ),
+                    "{text}"
+                );
+            }
+        }
+        // pt-PT inconclusivo não conta, nos dois sites.
+        let facts = srt_sem_sufixo(SniffLanguage::PtPt, 300);
+        assert_eq!(status(Site::Amigos, &facts, "3.3"), Some(Status::Fail));
+        assert_eq!(status(Site::Bj, &facts, BJ_SUB), Some(Status::Fail));
+    }
+
+    #[test]
+    fn srt_sem_sufixo_forcado_nunca_conta_em_pt_br() {
+        let facts = srt_sem_sufixo(SniffLanguage::PtBr, 160);
+        // 160 falas de 2 s em 6180 s: 5% de cobertura.
+        assert_eq!(status(Site::Amigos, &facts, "3.3"), Some(Status::Fail));
+        assert_eq!(status(Site::Bj, &facts, BJ_SUB), Some(Status::Fail));
+        assert!(message(Site::Bj, &facts, BJ_SUB).contains("é forçado (160 falas em 1 h 43 min)"));
+    }
+
+    #[test]
+    fn srt_nao_confirmado_com_faixa_embutida_avisa_que_extrai() {
+        let mut facts = srt_sem_sufixo(SniffLanguage::Pt, 995);
+        set_video(&mut facts, |m| {
+            m.subtitles = vec![embedded_pt()];
+        });
+        let bj = message(Site::Bj, &facts, BJ_SUB);
+        assert!(bj.contains("a legenda PT embutida será extraída"), "{bj}");
+        assert_eq!(check(Site::Bj, &facts).adaptations.len(), 1);
+        // Com o PT-BR confirmado, o .srt basta e não há o que extrair.
+        let mut facts = srt_sem_sufixo(SniffLanguage::PtBr, 995);
+        set_video(&mut facts, |m| {
+            m.subtitles = vec![embedded_pt()];
+        });
+        assert!(check(Site::Bj, &facts).adaptations.is_empty());
+    }
+
+    #[test]
+    fn srt_sem_sufixo_forcado_pt_pt_reprova_com_a_explicacao() {
+        let facts = srt_sem_sufixo(SniffLanguage::PtPt, 28);
+        let esperado = "o .srt ao lado é forçado (28 falas em 1 h 43 min) e em pt-PT";
+        assert_eq!(status(Site::Amigos, &facts, "3.3"), Some(Status::Fail));
+        assert_eq!(status(Site::Bj, &facts, BJ_SUB), Some(Status::Fail));
+        assert!(message(Site::Amigos, &facts, "3.3").contains(esperado));
+        assert!(message(Site::Bj, &facts, BJ_SUB).contains(esperado));
+    }
+
+    #[test]
+    fn srt_sem_sufixo_pt_pt_completo_e_aviso_no_amigos_e_falha_no_bj() {
+        let facts = srt_sem_sufixo(SniffLanguage::PtPt, 900);
+        assert_eq!(status(Site::Amigos, &facts, "3.3"), Some(Status::Warn));
+        let amigos = message(Site::Amigos, &facts, "3.3");
+        assert!(
+            amigos.contains("pt-PT") && amigos.contains("pede português brasileiro"),
+            "{amigos}"
+        );
+        assert!(
+            amigos.contains("o .srt ao lado é pt-PT completo (900 falas)"),
+            "{amigos}"
+        );
+        assert_eq!(status(Site::Bj, &facts, BJ_SUB), Some(Status::Fail));
+        assert!(
+            message(Site::Bj, &facts, BJ_SUB)
+                .contains("pt-PT completo (900 falas): o BJ exige PT-BR")
+        );
+    }
+
+    #[test]
+    fn srt_sem_sufixo_em_outro_idioma_ou_sem_leitura_nao_vale() {
+        let facts = srt_sem_sufixo(SniffLanguage::English, 900);
+        assert_eq!(status(Site::Amigos, &facts, "3.3"), Some(Status::Fail));
+        assert_eq!(status(Site::Bj, &facts, BJ_SUB), Some(Status::Fail));
+        assert!(message(Site::Bj, &facts, BJ_SUB).contains("é em inglês (900 falas)"));
+        // Sem leitura (arquivo grande ou ilegível), nada a dizer sobre o conteúdo.
+        let mut facts = srt_sem_sufixo(SniffLanguage::PtBr, 900);
+        facts.sniffs.clear();
+        assert_eq!(status(Site::Amigos, &facts, "3.3"), Some(Status::Fail));
+        assert_eq!(status(Site::Bj, &facts, BJ_SUB), Some(Status::Fail));
+    }
+
+    #[test]
+    fn srt_sem_sufixo_em_outra_pasta_nao_vale_no_bj() {
+        let mut facts = srt_sem_sufixo(SniffLanguage::PtBr, 995);
+        let from = facts.files.pop().unwrap();
+        let sniff = facts.sniffs.remove(&from.path).unwrap();
+        let moved = format!("Outra/{}", file_name(&from.path));
+        facts.files.push(file(&moved, from.size));
+        facts.sniffs.insert(moved, sniff);
+        assert_eq!(status(Site::Amigos, &facts, "3.3"), Some(Status::Ok));
+        assert_eq!(status(Site::Bj, &facts, BJ_SUB), Some(Status::Fail));
+    }
+
+    #[test]
+    fn so_o_srt_de_mesmo_nome_do_video_e_lido() {
+        let mut facts = srt_sem_sufixo(SniffLanguage::PtBr, 10);
+        let folder = parent(&facts.videos[0].path).to_owned();
+        facts
+            .files
+            .push(file(&format!("{folder}/Outro.nome.srt"), 10));
+        facts.files.push(file(
+            &format!("{folder}/Filme.2024.1080p.WEB-DL.DUAL.x264-GRP.por.srt"),
+            10,
+        ));
+        let targets = sniff_targets(&facts.files, &facts.videos);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, facts.files[1].path);
     }
 }

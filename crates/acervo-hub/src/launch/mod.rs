@@ -18,6 +18,7 @@ pub(crate) mod adapt;
 pub(crate) mod folder;
 pub(crate) mod imgbb;
 pub(crate) mod rules;
+pub(crate) mod subtitle_sniff;
 pub(crate) mod text;
 pub(crate) mod web;
 
@@ -48,6 +49,7 @@ use folder::Cleanup;
 use rules::{
     DestinationRelease, Facts, Kind, ProbedVideo, Report, SeriesStatus, Site, SourceFile, Verdict,
 };
+use subtitle_sniff::Sniffs;
 use text::{Credits, Input, Work};
 
 /// O andamento de quem espera o pacote da frente.
@@ -1053,6 +1055,7 @@ async fn adapt_folder(
     torrent: &TorrentInfo,
     files: &[SourceFile],
     videos: &[ProbedVideo],
+    sniffs: &Sniffs,
     report: &Report,
     site: Site,
 ) -> Result<Option<Adapted>> {
@@ -1063,7 +1066,7 @@ async fn adapt_folder(
     } else {
         let content = PathBuf::from(source_path(torrent, files));
         Some(
-            adapt::plan(files, videos, &content, &save_path, site).context(
+            adapt::plan(files, videos, sniffs, &content, &save_path, site).context(
                 "a legenda PT precisa ir para arquivo separado, mas a origem não deixa montar \
                  a pasta adaptada",
             )?,
@@ -1274,6 +1277,55 @@ async fn remove_folder(
     let origin = files.iter().map(|f| save_path.join(&f.path)).collect();
     let generated = generated_subtitles(&files, Some(launch), target);
     clean(target.to_path_buf(), root, origin, generated).await
+}
+
+/// Lê do disco as legendas em arquivo sem idioma no nome (`<vídeo>.srt`) e
+/// as classifica pelo conteúdo. Só leitura. Arquivo ilegível ou maior que
+/// [`subtitle_sniff::MAX_BYTES`] fica de fora: sem leitura a legenda não vale
+/// como PT, e a regra reprova dizendo que falta.
+async fn sniff_subtitles(save_path: &str, files: &[SourceFile], videos: &[ProbedVideo]) -> Sniffs {
+    let targets: Vec<(String, PathBuf, Option<f64>)> = rules::sniff_targets(files, videos)
+        .into_iter()
+        .map(|(path, video)| {
+            (
+                path.to_owned(),
+                Path::new(save_path).join(path),
+                video.media.duration_seconds,
+            )
+        })
+        .collect();
+    let read = tokio::task::spawn_blocking(move || {
+        let mut found = Sniffs::new();
+        for (relative, disk, duration) in targets {
+            match read_limited(&disk, subtitle_sniff::MAX_BYTES) {
+                Ok(bytes) => {
+                    found.insert(relative, subtitle_sniff::sniff(&bytes, duration));
+                }
+                Err(error) => {
+                    tracing::warn!("legenda `{relative}` não lida para classificar: {error}");
+                }
+            }
+        }
+        found
+    })
+    .await;
+    read.unwrap_or_else(|error| {
+        tracing::warn!("leitura das legendas interrompida: {error}");
+        Sniffs::new()
+    })
+}
+
+/// O conteúdo do arquivo, ou erro se passar de `limit` bytes.
+fn read_limited(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::other(format!("passa de {limit} bytes")));
+    }
+    Ok(bytes)
 }
 
 // ---------------------------------------------------------------- semear
@@ -1697,6 +1749,7 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
 
     // 4. Checagem.
     job.step("conferindo as regras").await;
+    let sniffs = sniff_subtitles(&torrent.save_path, &files, &videos).await;
     let release = release_name(&files);
     let facts = Facts {
         kind,
@@ -1708,6 +1761,7 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
         season_episodes: work.season_episodes.clone(),
         season_pending: work.season_pending,
         destination,
+        sniffs,
     };
     let mut report = rules::check(site, &facts);
     store
@@ -1792,7 +1846,16 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
         .await?;
 
     // 7. Pasta adaptada: a legenda PT só embutida vira `.srt` ao lado do vídeo.
-    let adapted = adapt_folder(job, torrent, &files, &facts.videos, &report, site).await?;
+    let adapted = adapt_folder(
+        job,
+        torrent,
+        &files,
+        &facts.videos,
+        &facts.sniffs,
+        &report,
+        site,
+    )
+    .await?;
 
     // 8. `.torrent`, com o announce do destino, conferido contra a origem (ou
     // contra a pasta adaptada, que é o que ele empacota).
@@ -2447,7 +2510,7 @@ mod tests {
             checks: Vec::new(),
             destination: Vec::new(),
             verdict: Verdict::Elegivel,
-            adaptations: adapt::extractions(&files, &videos),
+            adaptations: adapt::extractions(&files, &videos, &Sniffs::new()),
         };
         assert_eq!(report.adaptations.len(), 1, "a faixa PT vira um .srt");
         // O nome da faixa vai junto ao laudo, para a tela.
@@ -2480,6 +2543,7 @@ mod tests {
             &origin_torrent,
             &files,
             &videos,
+            &Sniffs::new(),
             &report,
             Site::Bj,
         )
@@ -2522,6 +2586,7 @@ mod tests {
             &origin_torrent,
             &files,
             &videos,
+            &Sniffs::new(),
             &report,
             Site::Bj,
         )
@@ -2537,6 +2602,7 @@ mod tests {
             &origin_torrent,
             &files,
             &videos,
+            &Sniffs::new(),
             &report,
             Site::Bj,
         )
@@ -2556,9 +2622,17 @@ mod tests {
             adaptations: Vec::new(),
             ..report.clone()
         };
-        let none = adapt_folder(&mut job, &origin_torrent, &files, &videos, &plain, Site::Bj)
-            .await
-            .unwrap();
+        let none = adapt_folder(
+            &mut job,
+            &origin_torrent,
+            &files,
+            &videos,
+            &Sniffs::new(),
+            &plain,
+            Site::Bj,
+        )
+        .await
+        .unwrap();
         assert!(none.is_none());
         assert!(!target.exists());
         assert!(video.is_file(), "a origem nunca é tocada");
@@ -2572,6 +2646,7 @@ mod tests {
             &origin_torrent,
             &files,
             &videos,
+            &Sniffs::new(),
             &report,
             Site::Bj,
         )
@@ -2586,6 +2661,7 @@ mod tests {
             &origin_torrent,
             &files,
             &videos,
+            &Sniffs::new(),
             &report,
             Site::Bj,
         )
@@ -2994,5 +3070,16 @@ mod tests {
         );
         assert_eq!(tracker_status_of(&[dht], None), "sem resposta");
         assert_eq!(tracker_status_of(&[], None), "sem resposta");
+    }
+    #[test]
+    fn leitura_de_legenda_para_no_limite() {
+        let dir = std::env::temp_dir().join(format!("acervo-sniff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.srt");
+        std::fs::write(&path, vec![b'a'; 10]).unwrap();
+        assert_eq!(read_limited(&path, 10).unwrap().len(), 10);
+        assert!(read_limited(&path, 9).is_err());
+        assert!(read_limited(&dir.join("falta.srt"), 10).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
