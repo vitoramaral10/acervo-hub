@@ -742,6 +742,46 @@ async fn trackers_trazem_estado_e_mensagem() {
     assert_eq!(trackers[2].msg, "Unregistered torrent");
 }
 
+#[tokio::test]
+async fn adicionar_trackers_manda_o_hash_e_as_urls_e_o_erro_nao_as_carrega() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/addTrackers"))
+        .and(body_string_contains("hash=a1b2"))
+        .and(body_string_contains("passkey%3Dsegredo123"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    cliente
+        .add_trackers("a1b2", &[ANNOUNCE.to_owned()])
+        .await
+        .unwrap();
+    // Lista vazia não chama o cliente (o `expect(1)` acima não se mexe).
+    cliente.add_trackers("a1b2", &[]).await.unwrap();
+    // Quebra de linha no meio da URL separaria URLs: recusa antes de enviar.
+    assert!(
+        cliente
+            .add_trackers("a1b2", &["http://x/\nhttp://y/".to_owned()])
+            .await
+            .is_err()
+    );
+
+    let recusa = MockServer::start().await;
+    let cliente = sessao(&recusa).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/addTrackers"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&recusa)
+        .await;
+    let erro = cliente
+        .add_trackers("a1b2", &[ANNOUNCE.to_owned()])
+        .await
+        .unwrap_err();
+    assert!(!format!("{erro:?} {erro}").contains("segredo123"));
+}
+
 const ANNOUNCE: &str = "https://tracker.exemplo/announce?passkey=segredo123";
 
 #[tokio::test]

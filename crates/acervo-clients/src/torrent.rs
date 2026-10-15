@@ -140,6 +140,16 @@ pub fn layout(torrent: &[u8]) -> Option<Vec<(String, u64)>> {
     Some(out)
 }
 
+/// A URL de `announce` do `.torrent`. É segredo (leva a passkey): quem a usa
+/// não a loga nem a devolve.
+#[must_use]
+pub fn announce(torrent: &[u8]) -> Option<String> {
+    let top = entries(torrent, 0)?;
+    let at = top.iter().find(|(k, _)| *k == b"announce")?.1;
+    let url = String::from_utf8(string(torrent, at)?.0.to_vec()).ok()?;
+    (!url.is_empty()).then_some(url)
+}
+
 /// Infohash v1 (hex minúsculo) de um arquivo `.torrent`.
 #[must_use]
 pub fn info_hash(torrent: &[u8]) -> Option<String> {
@@ -209,6 +219,20 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn announce_sai_do_nivel_de_cima_e_vazio_ou_ausente_e_none() {
+        let info = b"4:infod6:lengthi1e4:name1:aee";
+        let mut torrent = b"d8:announce22:http://t.x/a?k=SEGREDO".to_vec();
+        torrent.extend_from_slice(info);
+        assert_eq!(
+            announce(&torrent).as_deref(),
+            Some("http://t.x/a?k=SEGREDO")
+        );
+        assert_eq!(announce(b"d4:infod4:name1:aee"), None);
+        assert_eq!(announce(b"d8:announce0:4:infod4:name1:aee"), None);
+        assert_eq!(announce(b"lixo"), None);
+    }
 
     #[test]
     fn hash_e_o_sha1_dos_bytes_do_info() {

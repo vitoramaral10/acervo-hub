@@ -1,6 +1,18 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Ban, CircleAlert, CircleCheck, CircleX, Download, PackageOpen, Rocket, Send } from 'lucide-react'
-import { type ReactNode, useEffect, useMemo, useState } from 'react'
+import {
+  Ban,
+  Captions,
+  CircleAlert,
+  CircleCheck,
+  CircleX,
+  Download,
+  FolderOpen,
+  PackageOpen,
+  Rocket,
+  Send,
+  Upload,
+} from 'lucide-react'
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { CopyButton } from '@/components/CopyButton'
 import { PageHeader } from '@/components/PageHeader'
@@ -10,6 +22,7 @@ import { Input } from '@/components/ui/input'
 import { Badge, Skeleton } from '@/components/ui/misc'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
+  type LaunchAdaptation,
   type LaunchCheck,
   type LaunchCheckStatus,
   type LaunchDetail,
@@ -17,6 +30,7 @@ import {
   type LaunchItem,
   type LaunchSite,
   type LaunchState,
+  type LaunchTrackerStatus,
   launchApi,
 } from '@/lib/api'
 import { formatAgo, formatCount, formatSize, safeHref } from '@/lib/format'
@@ -126,7 +140,9 @@ function usePrepare() {
 function LaunchRow({ item, onOpen }: { item: LaunchItem; onOpen: () => void }) {
   const prepare = usePrepare()
   const busy = item.estado === 'preparando' || prepare.isPending
-  const locked = busy || item.estado === 'semeando' || !item.no_cliente
+  // Já foi ao site: o publicado semeia destes arquivos (e da pasta adaptada), e o backend recusa preparar de novo.
+  const sentToSite = item.estado === 'enviado' || item.estado === 'semeando' || Boolean(item.enviado_em)
+  const locked = busy || sentToSite || !item.no_cliente
   const label = item.estado === 'a_preparar' || item.estado === 'descartado' ? 'Preparar' : 'Preparar de novo'
   const hasPackage = item.estado !== 'a_preparar'
   const title = itemTitle(item)
@@ -179,7 +195,13 @@ function LaunchRow({ item, onOpen }: { item: LaunchItem; onOpen: () => void }) {
           variant={item.estado === 'a_preparar' ? 'primary' : 'secondary'}
           disabled={locked}
           loading={busy}
-          title={item.no_cliente ? undefined : 'O torrent de origem não está mais no cliente de download'}
+          title={
+            sentToSite
+              ? 'Já enviado ao site: o publicado semeia destes arquivos'
+              : item.no_cliente
+                ? undefined
+                : 'O torrent de origem não está mais no cliente de download'
+          }
           aria-label={`${label}: ${title}`}
           onClick={() => prepare.mutate(item)}
         >
@@ -265,21 +287,194 @@ function FieldRow({ id, label, value, long }: { id: string; label: string; value
   )
 }
 
+/** O relatório do MediaInfo: o formulário do Amigos o pede, para colar ou para "Abrir arquivo .txt". */
+function MediaInfoField({ detail, value }: { detail: LaunchDetail; value: string }) {
+  return (
+    <div className="grid gap-1.5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span id="lancar-campo-mediainfo-rotulo" className="text-sm font-medium">
+          MediaInfo
+        </span>
+        <div className="flex items-center gap-1">
+          {value && (
+            <Button variant="ghost" size="sm" asChild>
+              <a href={launchApi.mediainfoUrl(detail.hash, detail.indexer)} download>
+                <Download aria-hidden="true" />
+                Baixar .txt
+              </a>
+            </Button>
+          )}
+          <CopyButton text={value} label="mediainfo" />
+        </div>
+      </div>
+      <pre
+        id="lancar-campo-mediainfo"
+        aria-labelledby="lancar-campo-mediainfo-rotulo"
+        tabIndex={0}
+        className="max-h-80 overflow-auto rounded-md border border-border-strong bg-surface px-3 py-2 font-mono text-xs whitespace-pre text-content shadow-sm focus-visible:border-accent focus-visible:ring-3 focus-visible:ring-ring/25 focus-visible:outline-none"
+      >
+        {value || 'Vazio: o MediaInfo não gerou o relatório'}
+      </pre>
+    </div>
+  )
+}
+
+/** O nome do arquivo, sem as pastas. */
+const baseName = (path: string) => path.slice(path.lastIndexOf('/') + 1)
+
+function adaptationSource(adaptation: LaunchAdaptation) {
+  const track = adaptation.faixa ? ` (${adaptation.faixa})` : ''
+  return `faixa ${adaptation.stream}${track}${adaptation.forced ? ', forçada' : ''}`
+}
+
+/**
+ * A pasta adaptada do BJ: o que o laudo manda extrair e, montada, onde ela está e o que tem. O vídeo não muda; a pasta
+ * nova tem hardlinks da origem e o `.srt` ao lado.
+ */
+function AdaptedFolder({ detail }: { detail: LaunchDetail }) {
+  const adaptations = detail.report.adaptations ?? []
+  const folder = detail.pasta_adaptada
+  const layout = detail.layout_adaptado ?? []
+  const built = folder !== null && ['pronto', 'enviado', 'semeando'].includes(detail.estado)
+  if (adaptations.length === 0 && !built) return null
+  return (
+    <section aria-labelledby="lancar-pasta" className="grid gap-3">
+      <h3 id="lancar-pasta" className="flex items-center gap-1.5 text-sm font-semibold">
+        <Captions className="size-4" aria-hidden="true" />
+        Legenda em arquivo separado
+      </h3>
+      <p className="text-sm text-content-muted">
+        O {detail.destino} exige a legenda PT ao lado do vídeo. O vídeo não muda: o acervo monta uma pasta nova com
+        hardlinks dos arquivos da origem e a legenda extraída, e o .torrent é dessa pasta.
+      </p>
+      {adaptations.length > 0 && (
+        <ul className="grid gap-1.5 text-sm">
+          {adaptations.map((adaptation) => (
+            <li key={adaptation.output} className="flex flex-wrap gap-x-1.5 break-words">
+              <span className="text-content-muted">{built ? 'criou:' : 'vai criar:'}</span>
+              <span className="font-mono text-xs leading-5">{baseName(adaptation.output)}</span>
+              <span className="text-content-muted">a partir da {adaptationSource(adaptation)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {built && folder && (
+        <div className="grid gap-2 rounded-md border border-border bg-surface-raised p-3">
+          <div className="flex items-center justify-between gap-2">
+            <p className="flex min-w-0 items-center gap-1.5 text-sm font-medium">
+              <FolderOpen className="size-4 shrink-0" aria-hidden="true" />
+              <span>Pasta adaptada</span>
+            </p>
+            <CopyButton text={folder} label="caminho da pasta adaptada" />
+          </div>
+          <p className="font-mono text-xs break-all">{folder}</p>
+          {layout.length > 0 && (
+            <ul className="grid gap-1 text-xs" aria-label="Arquivos da pasta adaptada">
+              {layout.map(([path, size]) => (
+                <li key={path} className="flex flex-wrap justify-between gap-x-3">
+                  <span className="min-w-0 break-all font-mono">{path}</span>
+                  <span className="shrink-0 text-content-muted tabular-nums">{formatSize(size)}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </section>
+  )
+}
+
+const TRACKER_TONES: Record<LaunchTrackerStatus, 'success' | 'warning' | 'danger' | 'neutral'> = {
+  funcionando: 'success',
+  'não registrado': 'warning',
+  erro: 'danger',
+  'sem resposta': 'neutral',
+}
+
+/**
+ * O pacote enviado semeia parado-e-conferido antes da aprovação (os sites só liberam com seeder). Mostra o status do
+ * tracker do destino e deixa mandar o `.torrent` que o site entregou, para quando ele troca o hash.
+ */
+function SeedSection({ detail }: { detail: LaunchDetail }) {
+  const refresh = useRefreshLaunch()
+  const input = useRef<HTMLInputElement>(null)
+  const upload = useMutation({
+    mutationFn: (file: File) => launchApi.siteTorrent(detail.hash, detail.indexer, file),
+    onSuccess: (data) => {
+      if (data.aviso) {
+        toast.warning(data.aviso)
+      } else {
+        toast.success(
+          data.adicionado ? 'Torrent do site no cliente: confere os arquivos e semeia com 100%' : 'Esse torrent já está no cliente',
+        )
+      }
+      refresh(detail)
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+  const status = detail.status_tracker
+  return (
+    <section aria-labelledby="lancar-semear" className="grid gap-3">
+      <h3 id="lancar-semear" className="text-sm font-semibold">
+        Semear antes da aprovação
+      </h3>
+      <p className="text-sm text-content-muted">
+        O site só libera o envio com seeder. O acervo adiciona o .torrent do pacote ao cliente, parado, confere os
+        arquivos e só inicia com 100%.
+      </p>
+      {status && (
+        <p className="flex flex-wrap items-center gap-2 text-sm">
+          <span className="text-content-muted">Tracker do {detail.destino}:</span>
+          <Badge tone={TRACKER_TONES[status]}>{status}</Badge>
+          {detail.torrent_do_site && <span className="text-xs text-content-subtle">(torrent do site)</span>}
+        </p>
+      )}
+      {status === 'não registrado' && (
+        <p role="status" className="text-sm text-content-muted">
+          Logo depois do envio isso é esperado: o site ainda processa ou espera aprovar. Se continuar assim, baixe o
+          .torrent no site e envie aqui, porque o hash pode ter mudado.
+        </p>
+      )}
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          ref={input}
+          type="file"
+          accept=".torrent,application/x-bittorrent"
+          className="sr-only"
+          aria-label="Arquivo .torrent do site"
+          tabIndex={-1}
+          onChange={(event) => {
+            const file = event.target.files?.[0]
+            event.target.value = ''
+            if (file) upload.mutate(file)
+          }}
+        />
+        <Button variant="secondary" loading={upload.isPending} onClick={() => input.current?.click()}>
+          <Upload aria-hidden="true" />
+          Enviar o .torrent do site
+        </Button>
+      </div>
+    </section>
+  )
+}
+
 function Package({ detail, item }: { detail: LaunchDetail; item: LaunchItem }) {
   const refresh = useRefreshLaunch()
   const prepare = usePrepare()
   const sent = useMutation({
     mutationFn: () => launchApi.sent(detail.hash, detail.indexer),
-    onSuccess: () => {
-      toast.success('Marcado como enviado: o acervo procura o publicado e semeia sozinho')
+    onSuccess: (data) => {
+      if (data.aviso) toast.warning(data.aviso)
+      else toast.success('Marcado como enviado: o .torrent entrou no cliente, parado, e o acervo semeia sozinho')
       refresh(detail)
     },
     onError: (error: Error) => toast.error(error.message),
   })
   const discard = useMutation({
     mutationFn: () => launchApi.discard(detail.hash, detail.indexer),
-    onSuccess: () => {
-      toast.success('Pacote descartado')
+    onSuccess: (data) => {
+      if (data.aviso) toast.warning(`Pacote descartado, mas ${data.aviso}`)
+      else toast.success('Pacote descartado')
       refresh(detail)
     },
     onError: (error: Error) => toast.error(error.message),
@@ -315,7 +510,17 @@ function Package({ detail, item }: { detail: LaunchDetail; item: LaunchItem }) {
         </p>
       )}
 
+      {detail.estado === 'enviado' && detail.erro && (
+        <p role="alert" className="rounded-md border border-border bg-warning-bg p-3 text-sm text-warning break-words">
+          {detail.erro}
+        </p>
+      )}
+
+      {(detail.estado === 'enviado' || detail.estado === 'semeando') && <SeedSection detail={detail} />}
+
       {checks.length > 0 && <Checks checks={checks} />}
+
+      <AdaptedFolder detail={detail} />
 
       {destination.length > 0 && (
         <section aria-labelledby="lancar-destino" className="grid gap-2">
@@ -344,6 +549,7 @@ function Package({ detail, item }: { detail: LaunchDetail; item: LaunchItem }) {
           {FIELD_LABELS.map(({ key, label, long }) => (
             <FieldRow key={key} id={`lancar-campo-${key}`} label={label} value={fields[key] ?? ''} long={long} />
           ))}
+          <MediaInfoField detail={detail} value={fields.mediainfo ?? ''} />
         </section>
       )}
 
@@ -390,7 +596,7 @@ function Package({ detail, item }: { detail: LaunchDetail; item: LaunchItem }) {
             Marquei como enviado
           </Button>
         )}
-        {!preparing && !done && (
+        {!preparing && !done && !detail.enviado_em && (
           <Button
             variant="ghost"
             loading={prepare.isPending}

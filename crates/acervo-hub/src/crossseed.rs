@@ -16,7 +16,9 @@
 //! Par lançado pela tela "Para lançar" (o usuário enviou o pacote ao site) é
 //! urgente na semana do envio: o torrent publicado é o próprio arquivo do
 //! disco, e quem envia semeia (Amigos 4.7, H&R do uploader). Achado, o irmão
-//! leva a tag de semear do indexador mesmo sem o modo ratio.
+//! leva a tag de semear do indexador mesmo sem o modo ratio. Se o pacote foi
+//! de uma pasta adaptada (legenda separada para o BJ), o publicado é dela: os
+//! candidatos são comparados com o layout dela e o irmão semeia de lá.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex, PoisonError};
@@ -183,6 +185,43 @@ fn launched_pair_of(
         })
         .map(|c| (c.hash.to_ascii_lowercase(), c.indexer.clone()))
         .find(|pair| launched.contains(pair))
+}
+
+/// O que o publicado de um par lançado tem no disco: o layout e a pasta onde o
+/// irmão é adicionado (`save_path`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Published {
+    layout: Vec<(String, u64)>,
+    save_path: String,
+}
+
+/// Os pares lançados de uma pasta adaptada: o publicado é ela, não a origem.
+/// O irmão vai para o pai da pasta, onde o nome dela é a raiz do torrent.
+fn adapted_published(launches: &[Launch]) -> HashMap<(String, String), Published> {
+    launches
+        .iter()
+        .filter(|l| sent_to_site(l))
+        .filter_map(|l| {
+            let layout = crate::launch::adapted_layout(l)?;
+            let parent = std::path::Path::new(l.adapted_path.as_deref()?).parent()?;
+            Some((
+                (l.hash.to_ascii_lowercase(), l.indexer.clone()),
+                Published {
+                    layout,
+                    save_path: parent.to_string_lossy().into_owned(),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// O que comparar com os candidatos e onde pôr o irmão: a pasta adaptada do
+/// par lançado, se houver, senão os arquivos e a pasta da origem.
+fn published(source: &Source, files: Vec<(String, u64)>, adapted: Option<&Published>) -> Published {
+    adapted.cloned().unwrap_or_else(|| Published {
+        layout: files,
+        save_path: source.save_path.clone(),
+    })
 }
 
 /// Releases do destino cujo `.torrent` já foi baixado e tem layout diferente
@@ -476,7 +515,7 @@ pub(crate) async fn query(store: &Store, source: &Source) -> Result<Option<Searc
 ///
 /// `launched`: o par foi enviado pelo usuário, que tem de semear o que
 /// publicou; o irmão leva a tag de semear do indexador mesmo com o modo
-/// ratio desligado.
+/// ratio desligado. `adapted`: o publicado é a pasta adaptada do par.
 #[allow(clippy::too_many_arguments)]
 async fn find(
     config: &Config,
@@ -487,6 +526,7 @@ async fn find(
     source: &Source,
     indexer: &str,
     launched: bool,
+    adapted: Option<&Published>,
 ) -> Result<(CrossSeedOutcome, Option<String>, bool)> {
     let Some(query) = query(store, source).await? else {
         return Ok((CrossSeedOutcome::Skipped, None, false));
@@ -500,6 +540,16 @@ async fn find(
         return Ok((CrossSeedOutcome::Skipped, None, false));
     }
     let files: Vec<(String, u64)> = files.into_iter().map(|f| (f.name, f.size)).collect();
+    let target = published(source, files, adapted);
+    let files = &target.layout;
+    // A memória de "layout diferente" é por layout comparado: o veredito
+    // contra a origem não vale para a pasta adaptada (o publicado dela teria
+    // sido lembrado como diferente antes de o usuário marcar o envio).
+    let memory = if adapted.is_some() {
+        format!("{}#adaptada", source.hash)
+    } else {
+        source.hash.clone()
+    };
     let total: u64 = files.iter().map(|(_, size)| size).sum();
     let mut releases: Vec<acervo_indexers::Release> = catalog
         .search(indexer, &query)
@@ -514,7 +564,7 @@ async fn find(
     // (provável duplicado); download que falhou deixa a dúvida.
     let (mut layout_differs, mut failed) = (false, false);
     for release in releases.into_iter().take(CANDIDATES) {
-        if DIFFERING.knows(&source.hash, indexer, &release.guid) {
+        if DIFFERING.knows(&memory, indexer, &release.guid) {
             layout_differs = true;
             continue;
         }
@@ -529,9 +579,9 @@ async fn find(
         let NewTorrent::File(bytes) = &torrent else {
             continue;
         };
-        if !layout(bytes).is_some_and(|other| same_layout(&files, &other)) {
+        if !layout(bytes).is_some_and(|other| same_layout(files, &other)) {
             layout_differs = true;
-            DIFFERING.remember(&source.hash, indexer, &release.guid);
+            DIFFERING.remember(&memory, indexer, &release.guid);
             continue;
         }
         if let Some(existing) = present.get(&hash) {
@@ -547,7 +597,7 @@ async fn find(
         }
         let options = AddOptions {
             category: config.library.category.clone(),
-            save_path: Some(source.save_path.clone()),
+            save_path: Some(target.save_path.clone()),
             stopped: true,
             stop_after_metadata: false,
             tags,
@@ -654,6 +704,7 @@ pub(crate) async fn run(config: &Config, store: &Store, catalog: &Catalog) -> Re
     let checks = store.cross_seed_checks().await?;
     let now = OffsetDateTime::now_utc();
     let urgent = urgent(&launches, now);
+    let adapted = adapted_published(&launches);
     let present: HashMap<String, TorrentInfo> = torrents
         .iter()
         .map(|t| (t.hash.to_ascii_lowercase(), t.clone()))
@@ -675,6 +726,7 @@ pub(crate) async fn run(config: &Config, store: &Store, catalog: &Catalog) -> Re
             source,
             indexer,
             is_launched,
+            adapted.get(&pair),
         )
         .await
         {
@@ -707,6 +759,18 @@ pub(crate) async fn run(config: &Config, store: &Store, catalog: &Catalog) -> Re
                     indexer,
                     "cross-seed: o release já existe no destino; pacote descartado"
                 );
+                // A pasta adaptada não serve mais a ninguém: o hardlink dela
+                // seguraria o vídeo no disco depois que a origem sair.
+                if launch.adapted_path.is_some()
+                    && let Some(warning) =
+                        crate::launch::discard_folder(config, store, launch).await
+                {
+                    tracing::warn!(
+                        torrent = source.name,
+                        indexer,
+                        "cross-seed: pasta adaptada fica: {warning}"
+                    );
+                }
             }
         }
         // Irmão recém-adicionado espera a conferência (`verify`); só o que já
@@ -1063,6 +1127,9 @@ mod tests {
             created_at: "2026-10-01T00:00:00Z".into(),
             updated_at: "2026-10-01T00:00:00Z".into(),
             sent_at: sent_at.map(str::to_owned),
+            adapted_path: None,
+            adapted_layout: None,
+            site_hash: None,
         }
     }
 
@@ -1183,6 +1250,45 @@ mod tests {
             .collect();
         assert_eq!(launched(&launches), esperado);
         assert_eq!(urgent(&launches, now), esperado);
+    }
+
+    #[test]
+    fn par_lancado_de_pasta_adaptada_compara_com_ela_e_semeia_do_pai_dela() {
+        let enviado = Some("2026-10-14T10:00:00Z");
+        let adaptado = |mut launch: Launch| {
+            launch.adapted_path = Some("/media/lancamentos/bj/Filme".into());
+            launch.adapted_layout = Some(serde_json::json!([
+                ["Filme/Filme.mkv", 4000],
+                ["Filme/Filme.pt-BR.srt", 70]
+            ]));
+            launch
+        };
+        let launches = [
+            adaptado(launch("a", "bj", LaunchState::Enviado, enviado)),
+            // Pronto e não enviado: ainda não há publicado.
+            adaptado(launch("b", "bj", LaunchState::Pronto, None)),
+            // Enviado sem pasta adaptada: o publicado é a origem.
+            launch("c", "bj", LaunchState::Enviado, enviado),
+        ];
+        let adapted = adapted_published(&launches);
+        assert_eq!(adapted.len(), 1);
+        let pasta = &adapted[&("a".to_owned(), "bj".to_owned())];
+        assert_eq!(pasta.save_path, "/media/lancamentos/bj");
+
+        let origem = vec![("Filme/Filme.mkv".to_owned(), 4000)];
+        // O publicado tem o .srt extraído: bate com a pasta, não com a origem.
+        let publicado = vec![
+            ("Filme/Filme.pt-BR.srt".to_owned(), 70),
+            ("Filme/Filme.mkv".to_owned(), 4000),
+        ];
+        let alvo = published(&fonte("a", "amigos"), origem.clone(), Some(pasta));
+        assert!(same_layout(&alvo.layout, &publicado));
+        assert!(!same_layout(&origem, &publicado));
+        assert_eq!(alvo.save_path, "/media/lancamentos/bj");
+        // Sem pasta adaptada, tudo como antes: a origem e a pasta dela.
+        let alvo = published(&fonte("c", "amigos"), origem.clone(), None);
+        assert_eq!(alvo.layout, origem);
+        assert_eq!(alvo.save_path, "/d");
     }
 
     #[test]

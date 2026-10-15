@@ -293,6 +293,12 @@ const MIGRATIONS: &[&str] = &[
         sent_at TEXT,
         PRIMARY KEY (hash, indexer)
     );",
+    // 39: pasta adaptada do pacote (legenda separada para o BJ): onde ela está
+    // e a lista `[[caminho, tamanho]]` relativa ao pai dela.
+    r"ALTER TABLE launches ADD COLUMN adapted_path TEXT, ADD COLUMN adapted_layout JSONB;",
+    // 40: infohash do `.torrent` que o usuário baixou do site depois do envio
+    // (o site pode trocar o hash do gerado); o status do tracker é lido dele.
+    r"ALTER TABLE launches ADD COLUMN site_hash TEXT;",
 ];
 
 /// Quanto uma consulta pode levar. A maior consulta real (o catálogo de
@@ -2313,7 +2319,7 @@ mod tests {
             .await
             .unwrap()
             .get(0);
-        assert_eq!(version, 38);
+        assert_eq!(version, 40);
         // A 38 cria o desfecho e a tabela.
         client
             .batch_execute(
@@ -2379,6 +2385,58 @@ mod tests {
         assert_eq!(checks.len(), 1, "{checks:?}");
         assert_eq!(checks[0].hash, "com-irmao");
         assert_eq!(checks[0].outcome, CrossSeedOutcome::Found);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn migracao_39_acrescenta_a_pasta_adaptada_sem_perder_o_pacote() {
+        let Some(db) = TestDb::new("migracao_39").await else {
+            return;
+        };
+        {
+            // Volta ao banco da 38: pacote sem as colunas da pasta adaptada.
+            let client = db.store.pool.get().await.unwrap();
+            client
+                .batch_execute(
+                    "ALTER TABLE launches DROP COLUMN adapted_path, DROP COLUMN adapted_layout,
+                       DROP COLUMN site_hash;
+                     UPDATE schema_version SET version = 38;
+                     INSERT INTO launches (hash, indexer, state, created_at, updated_at)
+                     VALUES ('a', 'bj', 'pronto', 't', 't')",
+                )
+                .await
+                .unwrap();
+        }
+        db.store.migrate().await.unwrap();
+        let launch = db.store.launch("a", "bj").await.unwrap().unwrap();
+        assert_eq!(launch.state, LaunchState::Pronto);
+        assert_eq!(launch.adapted_path, None);
+        assert_eq!(launch.adapted_layout, None);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn migracao_40_acrescenta_o_hash_do_site_sem_perder_o_pacote() {
+        let Some(db) = TestDb::new("migracao_40").await else {
+            return;
+        };
+        {
+            // Volta ao banco da 39: pacote sem a coluna do hash do site.
+            let client = db.store.pool.get().await.unwrap();
+            client
+                .batch_execute(
+                    "ALTER TABLE launches DROP COLUMN site_hash;
+                     UPDATE schema_version SET version = 39;
+                     INSERT INTO launches (hash, indexer, state, created_at, updated_at)
+                     VALUES ('a', 'bj', 'enviado', 't', 't')",
+                )
+                .await
+                .unwrap();
+        }
+        db.store.migrate().await.unwrap();
+        let launch = db.store.launch("a", "bj").await.unwrap().unwrap();
+        assert_eq!(launch.state, LaunchState::Enviado);
+        assert_eq!(launch.site_hash, None);
         db.drop().await;
     }
 }

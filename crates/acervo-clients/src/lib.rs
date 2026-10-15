@@ -16,7 +16,7 @@ pub use dto::{
     TorrentFile, TorrentInfo, TorrentTaskEntry, TorrentTaskState, TorrentTaskStatus, Tracker,
     working_announce,
 };
-pub use torrent::{info_hash, layout, magnet_hash};
+pub use torrent::{announce, info_hash, layout, magnet_hash};
 
 #[derive(Debug, thiserror::Error)]
 pub enum QbitError {
@@ -519,6 +519,28 @@ impl QbitClient {
     pub async fn trackers(&self, hash: &str) -> Result<Vec<Tracker>, QbitError> {
         self.get("api/v2/torrents/trackers", &[("hash", hash)])
             .await
+    }
+
+    /// Acrescenta trackers a um torrent já no cliente (`torrents/addTrackers`).
+    /// As URLs são segredo (levam a passkey): nenhum erro as carrega. Lista
+    /// vazia não chama o cliente.
+    ///
+    /// # Errors
+    ///
+    /// URL com quebra de linha (separa as URLs no corpo), falha de transporte ou
+    /// status não-2xx.
+    pub async fn add_trackers(&self, hash: &str, urls: &[String]) -> Result<(), QbitError> {
+        if urls.is_empty() {
+            return Ok(());
+        }
+        if urls.iter().any(|u| u.contains(['\n', '\r'])) {
+            return Err(QbitError::InvalidAnnounce);
+        }
+        self.post(
+            "api/v2/torrents/addTrackers",
+            &[("hash", hash), ("urls", &urls.join("\n"))],
+        )
+        .await
     }
 
     /// Cria uma tarefa de criação de `.torrent` no cliente e devolve o id.
