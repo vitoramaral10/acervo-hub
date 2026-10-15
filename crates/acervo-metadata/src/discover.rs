@@ -41,6 +41,10 @@ pub struct DiscoverDetails {
     pub cast: Vec<DiscoverCast>,
     pub directors: Vec<String>,
     pub creators: Vec<String>,
+    /// Códigos ISO 3166-1 dos países de produção (`production_countries`; na
+    /// série, `origin_country` quando o TMDB não preenche aquele). Nomes em
+    /// português saem de [`country_name_pt`].
+    pub countries: Vec<String>,
     pub trailer: Option<String>,
     pub recommendations: Vec<DiscoverItem>,
 }
@@ -94,6 +98,10 @@ struct RawCreator {
     name: String,
 }
 #[derive(Deserialize)]
+struct RawCountry {
+    iso_3166_1: String,
+}
+#[derive(Deserialize)]
 struct RawDetails {
     #[serde(flatten)]
     item: RawItem,
@@ -108,6 +116,11 @@ struct RawDetails {
     status: Option<String>,
     #[serde(default)]
     created_by: Vec<RawCreator>,
+    #[serde(default)]
+    production_countries: Vec<RawCountry>,
+    /// Só a série traz; serve de reserva quando `production_countries` vem vazio.
+    #[serde(default)]
+    origin_country: Vec<String>,
     #[serde(default)]
     credits: RawCredits,
     #[serde(default)]
@@ -142,6 +155,18 @@ impl RawDetails {
                 directors.push(person.name);
             }
         }
+        let mut countries: Vec<String> = Vec::new();
+        let codes = self
+            .production_countries
+            .into_iter()
+            .map(|country| country.iso_3166_1)
+            .chain(self.origin_country);
+        for code in codes {
+            let code = code.trim().to_ascii_uppercase();
+            if !code.is_empty() && !countries.contains(&code) {
+                countries.push(code);
+            }
+        }
         DiscoverDetails {
             item: self.item.into_item(kind),
             tagline: self.tagline.unwrap_or_default(),
@@ -164,6 +189,7 @@ impl RawDetails {
                 .into_iter()
                 .map(|person| person.name)
                 .collect(),
+            countries,
             cast: self
                 .credits
                 .cast
@@ -310,6 +336,63 @@ impl RawItem {
             genre_ids: self.genre_ids,
         }
     }
+}
+
+/// Nome do país em português a partir do código ISO 3166-1. O TMDB devolve
+/// `production_countries[].name` em inglês mesmo com `language=pt-BR`, então o
+/// nome vem desta tabela; código fora dela volta como veio (maiúsculo).
+#[must_use]
+pub fn country_name_pt(code: &str) -> String {
+    let code = code.trim().to_ascii_uppercase();
+    let name = match code.as_str() {
+        "AR" => "Argentina",
+        "AT" => "Áustria",
+        "AU" => "Austrália",
+        "BE" => "Bélgica",
+        "BR" => "Brasil",
+        "CA" => "Canadá",
+        "CH" => "Suíça",
+        "CL" => "Chile",
+        "CN" => "China",
+        "CO" => "Colômbia",
+        "CZ" => "República Tcheca",
+        "DE" => "Alemanha",
+        "DK" => "Dinamarca",
+        "ES" => "Espanha",
+        "FI" => "Finlândia",
+        "FR" => "França",
+        "GB" => "Reino Unido",
+        "GR" => "Grécia",
+        "HK" => "Hong Kong",
+        "HU" => "Hungria",
+        "IE" => "Irlanda",
+        "IL" => "Israel",
+        "IN" => "Índia",
+        "IS" => "Islândia",
+        "IT" => "Itália",
+        "JP" => "Japão",
+        "KR" => "Coreia do Sul",
+        "LU" => "Luxemburgo",
+        "MX" => "México",
+        "NL" => "Países Baixos",
+        "NO" => "Noruega",
+        "NZ" => "Nova Zelândia",
+        "PE" => "Peru",
+        "PL" => "Polônia",
+        "PT" => "Portugal",
+        "RO" => "Romênia",
+        "RU" => "Rússia",
+        "SE" => "Suécia",
+        "TH" => "Tailândia",
+        "TR" => "Turquia",
+        "TW" => "Taiwan",
+        "UA" => "Ucrânia",
+        "US" => "Estados Unidos",
+        "UY" => "Uruguai",
+        "ZA" => "África do Sul",
+        _ => return code,
+    };
+    name.to_owned()
 }
 
 impl Tmdb {
@@ -631,6 +714,48 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn pais_vem_da_producao_ou_da_origem_da_serie() {
+        let server = MockServer::start().await;
+        Mock::given(path("/movie/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 10, "title": "Filme",
+                "production_countries": [
+                    {"iso_3166_1": "BR", "name": "Brazil"},
+                    {"iso_3166_1": "pt", "name": "Portugal"},
+                    {"iso_3166_1": "BR", "name": "Brazil"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(path("/tv/20"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 20, "name": "Série", "production_countries": [], "origin_country": ["JP", "XX"]
+            })))
+            .mount(&server)
+            .await;
+        let tmdb = Tmdb::with_base(
+            &format!("{}/", server.uri()),
+            "key",
+            "pt-BR",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let filme = tmdb
+            .discover_details(DiscoverKind::Movie, 10)
+            .await
+            .unwrap();
+        assert_eq!(filme.countries, ["BR", "PT"]);
+        let serie = tmdb
+            .discover_details(DiscoverKind::Series, 20)
+            .await
+            .unwrap();
+        assert_eq!(serie.countries, ["JP", "XX"]);
+        assert_eq!(country_name_pt("br"), "Brasil");
+        assert_eq!(country_name_pt("us"), "Estados Unidos");
+        assert_eq!(country_name_pt("xx"), "XX");
     }
 
     #[tokio::test]

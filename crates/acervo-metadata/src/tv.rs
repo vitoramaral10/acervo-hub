@@ -32,6 +32,22 @@ pub struct SeriesMetadata {
     pub seasons: Vec<u16>,
 }
 
+/// Título e sinopse de um episódio na língua do cliente (ver [`Tmdb::season_text`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpisodeText {
+    pub number: u16,
+    pub title: Option<String>,
+    pub overview: Option<String>,
+}
+
+/// Sinopse da temporada e textos dos episódios na língua do cliente.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeasonText {
+    pub season: u16,
+    pub overview: Option<String>,
+    pub episodes: Vec<EpisodeText>,
+}
+
 /// Um episódio; título e sinopse em inglês, como o da série.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpisodeMetadata {
@@ -221,6 +237,8 @@ impl RawSeries {
 #[derive(Deserialize)]
 struct RawSeasonDetail {
     #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
     episodes: Vec<RawEpisode>,
 }
 
@@ -326,6 +344,41 @@ impl Tmdb {
         }
         episodes.sort_by_key(|e| (e.season, e.number));
         Ok(episodes)
+    }
+
+    /// Sinopse da temporada e título/sinopse dos episódios na língua do
+    /// cliente. É chamada à parte de [`Tmdb::series_episodes`], que grava o
+    /// catálogo em inglês: aqui o texto serve à ficha de lançamento. Sem
+    /// tradução, o TMDB devolve texto vazio e o campo fica `None`; temporada
+    /// inexistente é `None`.
+    ///
+    /// # Errors
+    ///
+    /// Chave recusada ou TMDB inalcançável.
+    pub async fn season_text(
+        &self,
+        tmdb_id: u32,
+        season: u16,
+    ) -> Result<Option<SeasonText>, MetadataError> {
+        let detail: Option<RawSeasonDetail> = self
+            .get(
+                &format!("tv/{tmdb_id}/season/{season}"),
+                &[("language", self.language.as_str())],
+            )
+            .await?;
+        Ok(detail.map(|d| SeasonText {
+            season,
+            overview: non_empty(d.overview),
+            episodes: d
+                .episodes
+                .into_iter()
+                .map(|e| EpisodeText {
+                    number: e.episode_number,
+                    title: non_empty(e.name),
+                    overview: non_empty(e.overview),
+                })
+                .collect(),
+        }))
     }
 
     /// Busca séries por título, na língua do cliente.
@@ -565,6 +618,37 @@ mod tests {
         assert_eq!(episodes[1].overview, None);
         assert_eq!(episodes[1].runtime, 0);
         assert_eq!(episodes[2].tmdb_id, 22);
+    }
+
+    #[tokio::test]
+    async fn texto_da_temporada_vem_na_lingua_do_cliente() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/3/tv/1396/season/1"))
+            .and(query_param("language", "pt-BR"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "overview": "A primeira temporada.",
+                "episodes": [
+                    { "id": 11, "season_number": 1, "episode_number": 1,
+                      "name": "Piloto", "overview": "O começo." },
+                    { "id": 12, "season_number": 1, "episode_number": 2,
+                      "name": "", "overview": "  " }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount(&server, "/3/tv/1396/season/9", 404, serde_json::json!({})).await;
+        let tmdb = client(&server);
+        let season = tmdb.season_text(1396, 1).await.unwrap().unwrap();
+        assert_eq!(season.season, 1);
+        assert_eq!(season.overview.as_deref(), Some("A primeira temporada."));
+        assert_eq!(season.episodes.len(), 2);
+        assert_eq!(season.episodes[0].title.as_deref(), Some("Piloto"));
+        assert_eq!(season.episodes[0].overview.as_deref(), Some("O começo."));
+        assert_eq!(season.episodes[1].title, None);
+        assert_eq!(season.episodes[1].overview, None);
+        assert_eq!(tmdb.season_text(1396, 9).await.unwrap(), None);
     }
 
     #[tokio::test]

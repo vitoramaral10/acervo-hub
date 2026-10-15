@@ -11,6 +11,7 @@ import { Input } from '@/components/ui/input'
 import { Badge, Skeleton } from '@/components/ui/misc'
 import {
   type DownloadClientSection,
+  type ImagesSection,
   type JellyfinSection,
   type LibrarySection,
   type SectionInput,
@@ -463,6 +464,51 @@ export function JellyfinSettings() {
       description="Diz o que já foi assistido. Com ele, a tela “Para apagar” sugere o filme ou a temporada vista há mais que a carência; nada sai sem você marcar e confirmar."
       status={(data: JellyfinSection) => data.url !== ''}
       Form={JellyfinForm}
+    />
+  )
+}
+
+// ---------------------------------------------------------------- imagens
+
+function ImagesForm({ data, save, saving }: FormProps<'imagens'>) {
+  const [key, setKey] = useState('')
+  return (
+    <form
+      noValidate
+      className="mt-6 grid gap-4"
+      onSubmit={(event) => {
+        event.preventDefault()
+        const value: SectionInput<'imagens'> = {}
+        if (key.trim()) value.imgbb_api_key = key.trim()
+        save(value)
+      }}
+    >
+      <Field
+        id="imagens-chave"
+        label="Chave do ImgBB"
+        help="Gratuita, em api.imgbb.com. Hospeda as capturas de tela dos pacotes de “Para lançar”; a chave nunca volta para a tela."
+      >
+        <SecretInput
+          id="imagens-chave"
+          defined={data.imgbb_api_key.definida}
+          value={key}
+          onChange={setKey}
+          describedBy="imagens-chave-ajuda"
+        />
+      </Field>
+      <SaveRow saving={saving} />
+    </form>
+  )
+}
+
+export function ImagesSettings() {
+  return (
+    <SectionCard
+      name="imagens"
+      title="Imagens"
+      description="Onde o acervo hospeda as capturas de tela que vão na descrição do lançamento. Sem a chave, o pacote não é preparado."
+      status={(data: ImagesSection) => data.imgbb_api_key.definida}
+      Form={ImagesForm}
     />
   )
 }

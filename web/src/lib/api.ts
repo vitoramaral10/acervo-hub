@@ -236,6 +236,10 @@ export interface JellyfinSection {
   api_key: Secret
 }
 
+export interface ImagesSection {
+  imgbb_api_key: Secret
+}
+
 export interface LibrarySection {
   roots: string[]
   root_folders: string[]
@@ -249,6 +253,7 @@ export interface Sections {
   qbittorrent: DownloadClientSection
   jellyfin: JellyfinSection
   biblioteca: LibrarySection
+  imagens: ImagesSection
 }
 
 export type SectionName = keyof Sections
@@ -980,4 +985,135 @@ export const discover = {
     request<{ ok: boolean }>('POST', `${DISCOVER}/ocultos/titulos`, title),
   showTitle: (tipo: MediaKind, tmdb: number) =>
     request<{ ok: boolean; removido: boolean }>('DELETE', `${DISCOVER}/ocultos/titulos/${tipo}/${tmdb}`),
+}
+
+// ---------------------------------------------------------------- para lançar
+
+const LAUNCH = `${LIB}/para-lancar`
+
+/** Sem pacote o par é `a_preparar`; os demais são o estado de `launches`. */
+export type LaunchState =
+  | 'a_preparar'
+  | 'preparando'
+  | 'inelegivel'
+  | 'pronto'
+  | 'falhou'
+  | 'enviado'
+  | 'semeando'
+  | 'descartado'
+
+export type LaunchSite = 'bj' | 'amigos'
+
+export type LaunchOutcome = 'found' | 'not_found' | 'layout_differs' | 'error' | 'skipped'
+
+/** Uma linha da lista: o par (torrent de origem, destino) e o estado do pacote. */
+export interface LaunchItem {
+  hash: string
+  indexer: string
+  destino: string | null
+  site: LaunchSite | null
+  origem: string | null
+  no_cliente: boolean
+  tipo: 'filme' | 'serie' | null
+  titulo: string | null
+  release: string | null
+  tamanho: number | null
+  estado: LaunchState
+  desfecho: LaunchOutcome | null
+  parecido_no_destino: boolean
+  progresso: string | null
+  erro: string | null
+  tem_torrent: boolean
+  atualizado_em: string | null
+  enviado_em: string | null
+}
+
+export interface LaunchList {
+  itens: LaunchItem[]
+  /** Cliente de download fora do ar: a lista sai só com os pacotes já feitos. */
+  aviso: string | null
+}
+
+/** Andamento dos pares em preparo: a consulta leve que a tela repete enquanto espera. */
+export interface LaunchProgress {
+  itens: { hash: string; indexer: string; progresso: string | null }[]
+}
+
+export type LaunchCheckStatus = 'ok' | 'warn' | 'fail'
+
+export interface LaunchCheck {
+  /** Número da regra no site (`4.2.1.14.1`). */
+  rule: string
+  status: LaunchCheckStatus
+  message: string
+}
+
+/** Release que o destino já tem para a mesma obra. */
+export interface LaunchDestinationRelease {
+  title: string
+  size: number
+  quality: string
+  audio: 'dual' | 'dublado' | 'nacional' | 'legendado'
+  codec: 'h264' | 'h265' | 'av1' | null
+}
+
+/** Vazio (`{}`) enquanto o pacote não passou da checagem. */
+export interface LaunchReport {
+  checks: LaunchCheck[]
+  destination: LaunchDestinationRelease[]
+  verdict: 'elegivel' | 'inelegivel'
+}
+
+/** O texto gerado; cada campo vira um botão de copiar. */
+export interface LaunchFields {
+  titulo: string
+  release: string
+  ano: string
+  imdb: string
+  tmdb: string
+  duracao: string
+  tamanho: string
+  sinopse: string
+  ficha: string
+  tecnico: string
+  descricao: string
+}
+
+export interface LaunchScreen {
+  url: string
+  thumb: string
+}
+
+export interface LaunchDetail {
+  hash: string
+  indexer: string
+  destino: string
+  site: LaunchSite
+  estado: LaunchState
+  progresso: string | null
+  erro: string | null
+  report: Partial<LaunchReport>
+  fields: Partial<LaunchFields>
+  screens: LaunchScreen[]
+  tem_torrent: boolean
+  criado_em: string | null
+  atualizado_em: string | null
+  enviado_em: string | null
+}
+
+const launchPair = (hash: string, indexer: string) =>
+  `${LAUNCH}/${encodeURIComponent(hash)}/${encodeURIComponent(indexer)}`
+
+export const launchApi = {
+  list: () => request<LaunchList>('GET', LAUNCH),
+  progress: () => request<LaunchProgress>('GET', `${LAUNCH}/andamento`),
+  detail: (hash: string, indexer: string) => request<LaunchDetail>('GET', launchPair(hash, indexer)),
+  prepare: (hash: string, indexer: string) =>
+    request<{ ok: boolean; estado: LaunchState }>('POST', `${launchPair(hash, indexer)}/preparar`),
+  sent: (hash: string, indexer: string) =>
+    request<{ ok: boolean; estado: LaunchState }>('POST', `${launchPair(hash, indexer)}/enviado`),
+  discard: (hash: string, indexer: string) =>
+    request<{ ok: boolean; estado: LaunchState }>('POST', `${launchPair(hash, indexer)}/descartar`),
+  /** O download não passa por `request` (que só lê JSON): é um `<a href download>` com a sessão. */
+  torrentUrl: (hash: string, indexer: string) => `${launchPair(hash, indexer)}/torrent`,
 }

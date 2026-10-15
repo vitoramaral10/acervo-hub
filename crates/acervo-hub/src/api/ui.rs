@@ -178,12 +178,13 @@ fn immutable(body: &'static str, media_type: &'static str) -> Response {
 /// Cabeçalhos de toda resposta da interface. A CSP só aceita script servido
 /// daqui — nada inline, nada de terceiros. Estilo inline é permitido porque
 /// os componentes (Radix, sonner) o injetam em tempo de execução; estilo não
-/// executa código. Pôster vem direto do TMDB.
-fn secure_headers(headers: &mut HeaderMap) {
+/// executa código. Pôster vem direto do TMDB; as miniaturas das capturas de
+/// "Para lançar", do `ImgBB` (`i.ibb.co`).
+pub fn secure_headers(headers: &mut HeaderMap) {
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://image.tmdb.org; \
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://image.tmdb.org https://i.ibb.co; \
              connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         ),
     );

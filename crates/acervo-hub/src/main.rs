@@ -30,6 +30,7 @@ mod fs;
 mod grab;
 mod heal;
 mod health;
+mod launch;
 mod ledger;
 mod library;
 mod marks;

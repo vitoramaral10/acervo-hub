@@ -1,0 +1,264 @@
+# Para lançar
+
+Tela que transforma "existe num tracker e não no outro" em um envio pronto para
+o usuário fazer à mão. O acervo prepara o pacote (checagem de regras, título,
+descrição, capturas e `.torrent`), o usuário revisa e envia pelo site, e a
+tarefa `cross-seed` acha o torrent publicado e semeia sozinha.
+
+Nada aqui envia ao site. O BJ proíbe navegação automatizada (regra 1.12) e as
+duas moderações reprovam envio fora do padrão: o envio é sempre do usuário.
+
+## Princípios
+
+1. **Os arquivos nunca mudam.** O pacote usa os arquivos do torrent de origem
+   como estão: mesma pasta raiz, mesmos nomes, mesmos tamanhos. Release que
+   precisaria de mudança para passar nas regras (legenda a separar, faixa a
+   tirar, nome com referência a site) é **não elegível**, com o motivo. Isso
+   respeita "não alterar o release original" (Amigos 4.0.1, BJ 4.1.1) e mantém
+   o layout que `crossseed::same_layout` exige para achar o publicado.
+2. **Checagem pelo arquivo, não pelo nome.** Codec, resolução, HDR, faixas de
+   áudio e legendas vêm do `ffprobe`; o nome do release só completa (fonte
+   WEB-DL/BluRay, grupo).
+3. **Segredo não sai.** Announce com passkey, chave do ImgBB e links de
+   download nunca vão a JSON, log ou mensagem de erro. O `.torrent` gerado
+   leva o announce (é o propósito dele) e só sai pela rota de download.
+4. **Pouca carga.** Um pacote é preparado por vez. O hash do `.torrent` é do
+   qBittorrent (API `torrentcreator`, qBittorrent 5), que já vê `/media`; o
+   acervo só roda `ffprobe` e `ffmpeg` (um quadro por vez).
+5. **Busca no tracker é rara.** A checagem de duplicidade reaproveita a
+   consulta do cross-seed (mesmo `SearchQuery`, cache de 30 min do `Catalog`).
+
+## Sites
+
+`Site` é chaveado pelo nome do indexador (`IndexerRecord.name`):
+`bjsharecustom` → `Site::Bj`, `amigosshare` → `Site::Amigos`. Outro nome não é
+destino de lançamento.
+
+## Dados
+
+### Migração 38
+
+```sql
+ALTER TABLE cross_seed_checks ADD COLUMN outcome TEXT NOT NULL DEFAULT 'not_found'
+  CHECK (outcome IN ('found','not_found','layout_differs','error','skipped'));
+CREATE TABLE launches (
+  hash TEXT NOT NULL,              -- torrent de origem, minúsculas
+  indexer TEXT NOT NULL,           -- destino (IndexerRecord.name)
+  state TEXT NOT NULL CHECK (state IN
+    ('preparando','inelegivel','pronto','falhou','enviado','semeando','descartado')),
+  progress TEXT,                   -- andamento legível enquanto 'preparando'
+  report JSONB NOT NULL DEFAULT '{}'::jsonb,   -- Report (checagens + releases do destino)
+  fields JSONB NOT NULL DEFAULT '{}'::jsonb,   -- Fields (texto gerado)
+  screens JSONB NOT NULL DEFAULT '[]'::jsonb,  -- [{url, thumb}]
+  torrent BYTEA,                   -- .torrent gerado (tem passkey: só a rota de download lê)
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  sent_at TEXT,
+  PRIMARY KEY (hash, indexer)
+);
+```
+
+Na migração, a consulta antiga com irmão vira `found`; a sem irmão é apagada
+(o `found` nulo de antes não distingue busca que falhou, pacote parcial e "não
+existe lá") e o par volta a ser procurado, já com o desfecho de verdade.
+
+`outcome` da consulta do cross-seed:
+- `found`: achou e adicionou (ou já estava no cliente) o irmão;
+- `not_found`: buscou e nenhum release de tamanho parecido existe → **candidato**;
+- `layout_differs`: há release de tamanho parecido com arquivos diferentes →
+  candidato marcado "parecido no destino" (provável duplicado);
+- `error`: busca ou download do `.torrent` falhou (429, prisão, fora do ar);
+- `skipped`: sem consulta possível (pacote parcial, filme fora do catálogo,
+  nome de série que não parseia).
+
+### Candidatos
+
+Fonte (a mesma de `crossseed::sources`): torrent da categoria do acervo,
+completo, com grab não falho, todos os arquivos com prioridade > 0 e
+`progress` 1. Destino: indexador habilitado com `Site`, diferente do de origem.
+É candidato o par (fonte, destino) cuja última consulta tem `outcome` em
+`not_found` ou `layout_differs`, ou que tem linha em `launches`. Par com
+`found` preenchido não é candidato (já existe no destino).
+
+## Fluxo de um pacote
+
+`POST /ui/api/biblioteca/para-lancar/{hash}/{indexer}/preparar` grava
+`launches.state = 'preparando'` e dispara um job em fundo (um por vez,
+`tokio::sync::Semaphore(1)`; o segundo espera com `progress = 'na fila'`).
+Cada passo atualiza `progress`. Falha técnica → `falhou` com `error`. Par `preparando` sem job (handler ou
+gravação do desfecho que falhou) é resgatado para `falhou` pelas rotas.
+
+1. **Origem.** Lê o torrent no cliente (`torrents/info`, `torrents/files`):
+   completo, arquivos inteiros, `content_path`. Exige pasta raiz (vários
+   arquivos sem raiz comum, ou `content_path` que não termina nela, é `falhou`:
+   o `addTask` empacotaria a pasta de download inteira). Vídeos = arquivos `.mkv`,
+   `.mp4`, `.avi`, `.m2ts`, `.ts`; o principal é o maior.
+2. **Sonda.** `ffprobe -show_streams -show_format` no vídeo principal (e em
+   todos os vídeos de um pacote, para a checagem; os textos usam o principal).
+3. **Destino.** `Catalog::search(indexer, crossseed::query(fonte))`: os
+   releases que já existem lá para o mesmo filme ou episódio, com qualidade
+   parseada (`acervo_parser`). Falha de busca → `falhou` (sem checar dupe não
+   há pacote).
+4. **Checagem** (`launch::rules`, função pura) → `Report`. Alguma `Fail` →
+   `inelegivel` e para aqui.
+5. **Texto** (`launch::text`, função pura sobre TMDB pt-BR + sonda) → `Fields`.
+6. **Capturas.** 4 quadros a 15%, 35%, 55% e 75% da duração:
+   `ffmpeg -ss T -i VIDEO -frames:v 1 -threads 2 -f image2pipe -c:v png -`
+   (sem escala: as regras pedem a resolução real), cada um enviado ao ImgBB
+   (`POST https://api.imgbb.com/1/upload`, multipart `key` + `image`). Sem
+   chave configurada → `falhou` com "configure a chave do ImgBB em
+   Configurações → Imagens". Guarda `{url, thumb}`.
+7. **`.torrent`.** Announce do destino: de um torrent do cliente cujo grab é do
+   indexador destino, `QbitClient::trackers`, a primeira URL real com status
+   2 (funcionando); sem nenhum → `falhou` "nenhum torrent do <site> no cliente
+   para ler o announce". Cria pelo qBittorrent:
+   `torrentcreator/addTask` com `sourcePath = content_path`, `format = v1`,
+   `pieceSize = 0` (automático), `optimizeAlignment = false`, `private = true`,
+   `startSeeding = false`, `trackers = announce`; acompanha
+   `torrentcreator/status` a cada 5 s (teto 2 h); baixa
+   `torrentcreator/torrentFile`; apaga a tarefa (`deleteTask`, com repetição) em qualquer
+   desfecho, e antes de criar apaga tarefas do mesmo `sourcePath` que uma queda
+   anterior deixou. Confere `acervo_clients::layout(bytes)` == arquivos da origem;
+   diferente → `falhou`.
+8. `pronto`.
+
+### Ações
+
+- `GET  /ui/api/biblioteca/para-lancar` → lista de candidatos (com estado do
+  pacote, sem `torrent`, sem segredo).
+- `GET  /ui/api/biblioteca/para-lancar/{hash}/{indexer}` → detalhe (report,
+  fields, screens, estado, `tem_torrent`).
+- `POST .../preparar` → (re)prepara; permitido em qualquer estado menos
+  `preparando` e `semeando`.
+- `GET  .../torrent` → `application/x-bittorrent`, `Content-Disposition:
+  attachment; filename="<pasta raiz>.torrent"`.
+- `POST .../enviado` → `state = 'enviado'`, `sent_at = agora`; apaga a linha
+  do par em `cross_seed_checks` se `found` é nulo (o par volta a ser
+  procurado primeiro).
+- `POST .../descartar` → `descartado` (some da lista padrão; filtro "todos"
+  mostra).
+
+### Cross-seed depois do envio
+
+- Par com `launches.state = 'enviado'` e `sent_at` há menos de 7 dias é
+  **urgente**: entra antes dos outros em `due`, ignora `MAX_ATTEMPTS` e
+  `RETRY_DAYS` e espera só 1 h entre consultas.
+- Achado o irmão de um par lançado: o irmão recebe a tag de semear do
+  indexador **sempre** (quem envia semeia 7 dias: Amigos 4.7, H&R do
+  uploader). `launches.state` passa a `semeando` só com o irmão conferido
+  (100%, iniciado); irmão recém-adicionado espera a conferência, e se ela
+  recusa o par segue `enviado` e urgente.
+- `run` grava o `outcome` de cada consulta.
+
+## Regras
+
+Cada checagem é `Check { rule: "4.1.10.2", status: Ok|Warn|Fail, message }`
+em português, com o número da regra do site. `Warn` não bloqueia: aparece para
+o usuário julgar (principalmente duplicidade).
+
+Entradas (`Facts`): sonda de cada vídeo (container, codec de vídeo, largura,
+altura, HDR10/HLG/Dolby Vision, duração, faixas de áudio com idioma/codec/
+canais, faixas de legenda embutidas com idioma/forçada), arquivos do torrent
+(caminho, tamanho; legendas externas `.srt/.ass/.ssa/.sub/.idx` com idioma
+pelo nome), release parseado (fonte, resolução, grupo), tipo (filme, episódio,
+temporada), idioma original da obra (`Language::from_name` do banco), status
+da série (`ended`/`continuing`) e episódios da temporada no catálogo, e os
+releases do destino (título, tamanho, qualidade parseada).
+
+"PT" = faixa ou legenda em português (`por`/`pt`/`pob`/`pt-BR`; o ffprobe não
+distingue pt-BR de pt-PT: aceitar os dois). "Dual" = áudio PT + original.
+
+### Amigos (`Site::Amigos`)
+- **3.2** arquivo compactado (`.rar`, `.zip`, `.7z`, `.r00`...) → Fail.
+- **3.3** obra não falada em português sem áudio PT e sem legenda PT
+  (embutida ou arquivo) → Fail.
+- **5.6** nome de arquivo/pasta com referência a site (lista: `bj-share`,
+  `bjshare`, `amigos-share`, `amigosshare`, e `www.`/`.com`/`.net`/`.org`
+  dentro do nome) → Fail.
+- **3.11 / 4.15** série em andamento (`continuing`): só episódio avulso;
+  temporada completa → Fail. Série encerrada (`ended`): só temporada
+  completa; episódio avulso → Fail. Temporada que não cobre todos os
+  episódios exibidos da temporada no catálogo → Fail.
+- **4.2.1** duplicidade contra os releases do destino:
+  - mesma resolução, mesma fonte e mesmo tipo de áudio (dual/dublado/
+    legendado) e tamanho a menos de 10% → Fail "duplicado provável";
+  - destino tem Dual e este é só dublado ou só legendado → Fail;
+  - mesma resolução e fonte, mas outro codec ou tamanho → Warn "avaliar
+    duplicidade";
+  - nada parecido → Ok.
+- **4.14** fonte inferior a WEB-DL (WEBRip, HDTV, CAM, TS...) com WEB-DL Dual
+  no destino → Fail.
+
+### BJ (`Site::Bj`)
+- **4.1.10.2** vídeo que não é MKV → Fail. Até 1080p SDR em H.265 → Warn
+  ("só se a fonte não tem x264; proibido se há x264 no BJ" — e Fail se o
+  destino já tem um x264 na mesma resolução). 4K em H.264 → Warn.
+- **4.2.1.14** fonte fora de WEB/WEB-DL/Blu-ray/Remux → Fail. Resolução
+  abaixo de 1080p com release ≥ 1080p no destino → Fail.
+- **4.2.1.9** HDR/DV numa resolução menor que a maior do destino → Fail.
+- **4.2.1.14.1** áudio além do original + PT → Fail (MULTi só com duas
+  dublagens oficiais: o usuário confirma, então Warn quando há duas faixas
+  PT ou duas no idioma original).
+- **4.2.1.5 / 4.2.1.4** (obra nacional dispensa; áudio sem tag de idioma numa
+  obra nacional conta como original, não como legendado) sem áudio PT: precisa de legenda PT **em arquivo
+  separado** na mesma pasta → Fail se só embutida ou ausente.
+- **4.2.1.10** filme com mais de um vídeo, ou mais de 4 legendas → Fail.
+- **4.1.2 / 4.1.3** referência a site no nome (mesma lista do Amigos) → Fail.
+- **4.2.1.13** temporada incompleta ou pacote com mais de uma temporada →
+  Fail.
+- **4.2.1.13 (episódio avulso)** destino com o pacote da mesma temporada na
+  mesma resolução, fonte e áudio → Warn (o preparo faz uma segunda busca, pela
+  temporada, só para episódio).
+- **4.1.20** destino tem Dual e este não é Dual → Fail (obra nacional: Ok).
+- **4.2.1.2** duplicidade: mesma resolução, fonte e áudio, tamanho a menos de
+  10% → Fail; mesma resolução e fonte com diferença pequena → Warn.
+- **4.1.7** compactado → Fail.
+
+## Texto (`Fields`)
+
+Tudo em português; cada campo tem botão de copiar na tela.
+
+- `titulo`: "Título em português (Título original)" — sem o original se for
+  igual ou se a obra é nacional; sem ano (Amigos 4.5). Série: `" - S01E02"`
+  (episódio) ou `" - S01"` (temporada).
+- `release`: nome da pasta raiz ou do arquivo, intacto.
+- `ano`, `imdb` (URL), `tmdb` (URL), `duracao` ("1 h 52 min"), `tamanho`.
+- `sinopse`: overview pt-BR do TMDB (filme, ou episódio/temporada da série
+  quando houver; senão a da série). Sem pt-BR → vazio e Warn no report
+  ("sinopse em PT não encontrada: escreva à mão; tradutor automático não é
+  aceito no BJ, 4.1.6").
+- `ficha`: direção (ou criação), elenco (até 8), gêneros, país, título
+  original, ano.
+- `tecnico`: formato, resolução (`1920x1080`), qualidade (WEB-DL…), vídeo
+  (codec, HDR/DV, bit depth), áudio (cada faixa: idioma, codec, canais),
+  legendas (embutidas e arquivos, idiomas), duração.
+- `descricao`: BBCode juntando sinopse, ficha, técnico e as capturas
+  (`[img]url[/img]`), sem citar nenhum outro site (Amigos 1.16).
+
+## Configuração
+
+Seção nova `imagens` com `imgbb_api_key` (segredo: entra em
+`config::secrets`, Debug redigido, nunca devolvida pela API). Campo na tela de
+Configurações. URL com a chave nunca vai a log: o erro do reqwest é trocado por
+mensagem própria.
+
+## Deploy
+
+- Dockerfile: copiar também `/ffmpeg` do estágio `mwader/static-ffmpeg`
+  (binário `ACERVO_FFMPEG`, padrão `ffmpeg`).
+- Compose de produção: limites que caibam um quadro 4K HEVC (conferir no
+  deploy).
+
+## Tela
+
+Página "Para lançar" (`#lancar`), entre as principais.
+- Abas por destino (BJ, Amigos) e filtro de estado (a preparar, prontos,
+  enviados, não elegíveis, todos).
+- Linha: título, release, tamanho, origem → destino, selo de estado
+  ("parecido no destino" quando `layout_differs`), botão Preparar.
+- Diálogo do pacote: checagens agrupadas por status com o número da regra;
+  releases do destino; campos com botão copiar; capturas (miniaturas com link);
+  "Baixar .torrent"; "Marquei como enviado"; "Descartar"; enquanto
+  `preparando`, o andamento com polling de 3 s.
+- Configurações → Imagens: chave do ImgBB.

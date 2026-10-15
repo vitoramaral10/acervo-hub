@@ -19,6 +19,7 @@ pub const SERVIDOR: &str = "servidor";
 pub const QBITTORRENT: &str = "qbittorrent";
 pub const JELLYFIN: &str = "jellyfin";
 pub const BIBLIOTECA: &str = "biblioteca";
+pub const IMAGENS: &str = "imagens";
 
 /// Campos secretos de cada seção: nunca voltam pela API, e vazio ao salvar
 /// mantém o valor guardado.
@@ -28,6 +29,7 @@ pub fn secrets(section: &str) -> &'static [&'static str] {
         SERVIDOR => &["api_key", "proxy_password"],
         JELLYFIN => &["api_key"],
         QBITTORRENT => &["password"],
+        IMAGENS => &["imgbb_api_key"],
         _ => &[],
     }
 }
@@ -43,6 +45,9 @@ pub struct Config {
     /// "Para apagar" não sugere assistidos.
     pub jellyfin: JellyfinConfig,
     pub library: LibraryConfig,
+    /// Hospedagem das capturas de "Para lançar". Sem chave, o pacote não sai
+    /// das capturas.
+    pub images: ImagesConfig,
 }
 
 /// Onde o XEM responde, se a seção não disser outro.
@@ -166,6 +171,25 @@ impl std::fmt::Debug for JellyfinConfig {
     }
 }
 
+/// Onde as capturas do pacote de lançamento são hospedadas: o `ImgBB`, que os
+/// dois sites aceitam no `[img]` da descrição.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImagesConfig {
+    /// Chave da API do `ImgBB`. Vazia, o preparo para nas capturas.
+    pub imgbb_api_key: String,
+}
+
+impl std::fmt::Debug for ImagesConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Com a chave, qualquer um sobe imagem na conta do usuário.
+        formatter
+            .debug_struct("ImagesConfig")
+            .field("imgbb_api_key_definida", &!self.imgbb_api_key.is_empty())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LibraryConfig {
@@ -209,6 +233,13 @@ pub const SEARCH_LIMIT: usize = 10;
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 pub const SUGGESTION_GRACE_MINUTES: u64 = 60;
 
+/// A chave do `ImgBB` é hexadecimal (32 caracteres hoje). A conferência é
+/// frouxa de propósito: pega espaço e quebra de linha coladas junto, sem
+/// recusar um formato novo do serviço.
+fn plausible_imgbb_key(key: &str) -> bool {
+    (16..=128).contains(&key.len()) && key.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
 /// Uma URL HTTP(S) sem credencial nem query, ou a mensagem do porquê não.
 fn check_url(field: &str, value: &str) -> Result<(), String> {
     let parsed = url::Url::parse(value).map_err(|_| format!("{field}: URL inválida"))?;
@@ -251,6 +282,7 @@ impl Config {
             QBITTORRENT => serde_json::to_value(&self.qbittorrent),
             JELLYFIN => serde_json::to_value(&self.jellyfin),
             BIBLIOTECA => serde_json::to_value(&self.library),
+            IMAGENS => serde_json::to_value(&self.images),
             other => return Err(format!("seção desconhecida: {other}")),
         };
         value.map_err(|e| e.to_string())
@@ -271,6 +303,7 @@ impl Config {
             QBITTORRENT => config.qbittorrent = parse(value)?,
             JELLYFIN => config.jellyfin = parse(value)?,
             BIBLIOTECA => config.library = parse(value)?,
+            IMAGENS => config.images = parse(value)?,
             other => return Err(format!("seção desconhecida: {other}")),
         }
         Ok(config)
@@ -309,7 +342,22 @@ impl Config {
         if library.category.trim().is_empty() {
             return Err("biblioteca: informe a categoria do cliente de download".into());
         }
+        // Só quando preenchida: a seção vazia vale para quem não lança nada,
+        // e a validação roda a cada seção salva.
+        let key = &self.images.imgbb_api_key;
+        if !key.is_empty() && !plausible_imgbb_key(key) {
+            return Err(
+                "imagens: a chave do ImgBB tem só letras e números (copie-a de api.imgbb.com)"
+                    .into(),
+            );
+        }
         Ok(())
+    }
+
+    /// A chave do `ImgBB`, se configurada.
+    #[must_use]
+    pub fn imgbb_key(&self) -> Option<&str> {
+        Some(self.images.imgbb_api_key.as_str()).filter(|key| !key.is_empty())
     }
 
     /// O cliente de download, se configurado.
@@ -383,7 +431,7 @@ mod tests {
         ] {
             assert!(config.with_section(section, value).is_err());
         }
-        for section in [SERVIDOR, QBITTORRENT, JELLYFIN, BIBLIOTECA] {
+        for section in [SERVIDOR, QBITTORRENT, JELLYFIN, BIBLIOTECA, IMAGENS] {
             assert_eq!(
                 config
                     .with_section(section, config.section(section).unwrap())
@@ -391,5 +439,35 @@ mod tests {
                 config
             );
         }
+    }
+
+    #[test]
+    fn chave_do_imgbb_e_segredo_e_so_e_validada_quando_preenchida() {
+        assert_eq!(secrets(IMAGENS), ["imgbb_api_key"]);
+        let config = Config::from_sections([]).unwrap();
+        assert_eq!(config.imgbb_key(), None);
+        assert!(config.validate().is_ok());
+
+        let key = "0123456789abcdef0123456789abcdef";
+        let config = config
+            .with_section(IMAGENS, json!({ "imgbb_api_key": key }))
+            .unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.imgbb_key(), Some(key));
+        let shown = format!("{config:?}");
+        assert!(!shown.contains(key), "{shown}");
+        assert!(shown.contains("imgbb_api_key_definida: true"));
+
+        let colada = config
+            .with_section(IMAGENS, json!({ "imgbb_api_key": format!("{key}\n") }))
+            .unwrap();
+        let erro = colada.validate().unwrap_err();
+        assert!(erro.starts_with("imagens:"), "{erro}");
+        assert!(!erro.contains(key));
+        assert!(
+            config
+                .with_section(IMAGENS, json!({ "chave": key }))
+                .is_err()
+        );
     }
 }

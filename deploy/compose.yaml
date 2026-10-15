@@ -22,7 +22,9 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
 
-    mem_limit: 128m
+    # Cobre o acervo-hub e o ffmpeg das capturas juntos: um quadro 4K HEVC
+    # 10 bits pede ~435 MiB só no ffmpeg (medido com `-threads 1`).
+    mem_limit: 768m
     pids_limit: 64
     cpus: "0.50"
 
