@@ -2295,6 +2295,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consulta_com_erro_nao_gasta_tentativa() {
+        let Some(db) = TestDb::new("cross_seed_erro").await else {
+            return;
+        };
+        let store = &db.store;
+        for (at, outcome) in [
+            ("2026-10-14T00:00:00Z", CrossSeedOutcome::Error),
+            ("2026-10-14T12:00:00Z", CrossSeedOutcome::Error),
+            ("2026-10-15T00:00:00Z", CrossSeedOutcome::NotFound),
+            ("2026-10-15T12:00:00Z", CrossSeedOutcome::Error),
+        ] {
+            store
+                .record_cross_seed_check("abcd", "amigos", at, None, outcome)
+                .await
+                .unwrap();
+        }
+        let checks = store.cross_seed_checks().await.unwrap();
+        // Só a busca que respondeu conta; o desfecho é o da última volta.
+        assert_eq!(checks[0].attempts, 1);
+        assert_eq!(checks[0].outcome, CrossSeedOutcome::Error);
+        db.drop().await;
+    }
+
+    #[tokio::test]
     async fn migracao_36_da_prioridade_e_modo_ratio_aos_indexadores() {
         let Some(db) = TestDb::new("migracao_36").await else {
             return;
