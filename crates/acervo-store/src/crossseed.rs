@@ -99,7 +99,9 @@ impl Store {
     }
 
     /// Grava uma consulta: soma uma tentativa, guarda o irmão, se achou, e o
-    /// desfecho da volta (que sempre substitui o anterior).
+    /// desfecho da volta (que sempre substitui o anterior). Consulta que deu
+    /// erro (busca falhou, `.torrent` recusado, conta presa no tracker) não
+    /// gasta tentativa: não diz nada sobre existir ou não no destino.
     ///
     /// # Errors
     ///
@@ -116,10 +118,10 @@ impl Store {
         client
             .execute(
                 "INSERT INTO cross_seed_checks (hash, indexer, checked_at, attempts, found, outcome)
-                 VALUES ($1, $2, $3, 1, $4, $5)
+                 VALUES ($1, $2, $3, CASE WHEN $5 = 'error' THEN 0 ELSE 1 END, $4, $5)
                  ON CONFLICT (hash, indexer) DO UPDATE
                  SET checked_at = EXCLUDED.checked_at,
-                     attempts = cross_seed_checks.attempts + 1,
+                     attempts = cross_seed_checks.attempts + EXCLUDED.attempts,
                      found = COALESCE(EXCLUDED.found, cross_seed_checks.found),
                      outcome = EXCLUDED.outcome",
                 &[

@@ -48,6 +48,10 @@ const CANDIDATES: usize = 3;
 const MAX_ATTEMPTS: i32 = 3;
 /// Dias entre consultas sem achar, multiplicado pela tentativa: 2, 4.
 const RETRY_DAYS: i64 = 2;
+/// Horas até reconsultar um par cuja última consulta deu erro. O erro não
+/// gasta tentativa (ver `record_cross_seed_check`): volta logo, sem a
+/// espera crescente de quem buscou e não achou.
+const ERROR_RETRY_HOURS: i64 = 12;
 /// Tempo que o irmão recém-adicionado tem para aparecer e começar a
 /// conferência antes de o resultado contar.
 const SETTLE_SECS: i64 = 10 * 60;
@@ -392,7 +396,8 @@ fn due<'a>(
                 pairs.push((hurry, None, source, indexer));
                 continue;
             };
-            if check.found.is_some() || (!sent && check.attempts >= MAX_ATTEMPTS) {
+            let failed = check.outcome == CrossSeedOutcome::Error;
+            if check.found.is_some() || (!sent && !failed && check.attempts >= MAX_ATTEMPTS) {
                 continue;
             }
             let Ok(at) = OffsetDateTime::parse(&check.checked_at, &Rfc3339) else {
@@ -400,6 +405,8 @@ fn due<'a>(
             };
             let wait = if hurry {
                 time::Duration::minutes(URGENT_WAIT_MINUTES)
+            } else if failed {
+                time::Duration::hours(ERROR_RETRY_HOURS)
             } else if sent {
                 time::Duration::days(RETRY_DAYS)
             } else {
@@ -1069,6 +1076,30 @@ mod tests {
                 CrossSeedOutcome::NotFound
             },
         }
+    }
+
+    #[test]
+    fn consulta_que_deu_erro_volta_em_12_horas_sem_limite_de_tentativas() {
+        // A conta presa no Amigos recusa o .torrent: o erro não diz se o
+        // release existe lá, e o par não pode se esgotar antes de a prisão
+        // acabar.
+        let now = OffsetDateTime::parse("2026-10-15T12:00:00Z", &Rfc3339).unwrap();
+        let sources = [fonte("a", "bj"), fonte("b", "bj")];
+        let indexers = ["bj".to_owned(), "amigos".to_owned()];
+        let erro = |hash: &str, at: &str| CrossSeedCheck {
+            outcome: CrossSeedOutcome::Error,
+            ..check(hash, "amigos", at, MAX_ATTEMPTS, None)
+        };
+        let checks = [
+            erro("a", "2026-10-14T23:00:00Z"), // 13 h atrás: volta
+            erro("b", "2026-10-15T01:00:00Z"), // 11 h atrás: espera
+        ];
+        let none = Pairs::new();
+        let pairs: Vec<&str> = due(&sources, &indexers, &checks, &none, &none, now)
+            .into_iter()
+            .map(|(s, _)| s.hash.as_str())
+            .collect();
+        assert_eq!(pairs, ["a"]);
     }
 
     #[test]
