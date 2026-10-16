@@ -376,6 +376,102 @@ async fn release_reservation(client: &QbitClient, torrent: &acervo_clients::Torr
     }
 }
 
+/// Onde um grab de série cai na ordem de download da série dele
+/// ([`crate::series::grab::order_key`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Place {
+    pub series_id: i64,
+    pub key: crate::series::grab::OrderKey,
+    /// Ainda esperando na fila do acervo: tag `acervo:fila`, nunca iniciado.
+    pub queued: bool,
+}
+
+/// Se um grab de série ainda espera a vez: algum grab anterior da mesma
+/// série (chave menor) continua na fila do acervo. Anterior iniciado,
+/// terminado, falho ou descartado não está em `places` como `queued`, e não
+/// segura nada. Grab fora de `places` não é de série e nunca espera.
+fn held_back(hash: &str, places: &HashMap<String, Place>) -> bool {
+    places.get(hash).is_some_and(|place| {
+        places.values().any(|other| {
+            other.queued && other.series_id == place.series_id && other.key < place.key
+        })
+    })
+}
+
+/// A mensagem de um grab que espera na fila do acervo: segurado por grab
+/// anterior da mesma série (o de menor chave entre os que seguram), diz quem
+/// ("esperando S02 da mesma série"); senão, a genérica de espaço. A chave não
+/// distingue pacote de temporada de episódio avulso: número 0 ou 1 lê-se como
+/// a temporada inteira, acima disso como episódio (S02E03).
+pub(crate) fn queue_message(hash: &str, places: &HashMap<String, Place>) -> String {
+    let Some(place) = places.get(hash).filter(|p| p.queued) else {
+        return QUEUED.into();
+    };
+    let holder = places
+        .values()
+        .filter(|o| o.queued && o.series_id == place.series_id && o.key < place.key)
+        .map(|o| o.key)
+        .min();
+    match holder {
+        None => QUEUED.into(),
+        Some((true, ..)) => "na fila: esperando os especiais da mesma série".into(),
+        Some((false, season, number)) if number > 1 => {
+            format!("na fila: esperando S{season:02}E{number:02} da mesma série")
+        }
+        Some((false, season, _)) => format!("na fila: esperando S{season:02} da mesma série"),
+    }
+}
+
+/// Reordena `items`, já na ordem "menor primeiro" (e prioritários antes):
+/// a série entra no lugar do seu grab mais anterior (menor chave) e os
+/// demais grabs dela vêm em seguida, em ordem de chave. O que não é de série
+/// fica onde está.
+fn series_first<T>(
+    items: Vec<T>,
+    hash: impl Fn(&T) -> &str,
+    places: &HashMap<String, Place>,
+) -> Vec<T> {
+    let place = |item: &T| places.get(hash(item));
+    // Posição, em `items`, do grab mais anterior de cada série.
+    let mut head: HashMap<i64, (&crate::series::grab::OrderKey, usize)> = HashMap::new();
+    for (position, item) in items.iter().enumerate() {
+        if let Some(p) = place(item) {
+            let best = head.entry(p.series_id).or_insert((&p.key, position));
+            if p.key < *best.0 {
+                *best = (&p.key, position);
+            }
+        }
+    }
+    let mut ordered = Vec::with_capacity(items.len());
+    let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
+    for position in 0..slots.len() {
+        let Some(series_id) = slots[position]
+            .as_ref()
+            .and_then(place)
+            .map(|p| p.series_id)
+        else {
+            ordered.extend(slots[position].take());
+            continue;
+        };
+        if head[&series_id].1 != position {
+            continue;
+        }
+        let mut members: Vec<(usize, T)> = Vec::new();
+        for (i, slot) in slots.iter_mut().enumerate() {
+            if slot
+                .as_ref()
+                .and_then(place)
+                .is_some_and(|p| p.series_id == series_id)
+            {
+                members.extend(slot.take().map(|item| (i, item)));
+            }
+        }
+        members.sort_by_key(|(i, item)| (place(item).map(|p| p.key), *i));
+        ordered.extend(members.into_iter().map(|(_, item)| item));
+    }
+    ordered
+}
+
 /// Quem sai da fila agora: do menor para o maior, pulando quem não cabe, e
 /// no máximo até o limite de downloads ativos.
 ///
@@ -385,8 +481,13 @@ async fn release_reservation(client: &QbitClient, torrent: &acervo_clients::Torr
 /// espaço aos poucos depois de iniciar, então o livre lido logo em seguida
 /// ainda sobra; quem já pré-alocou é descontado duas vezes, de propósito:
 /// errar para menos nunca enche o disco.
+///
+/// Série baixa em ordem ([`Place`]): grab de série com algum anterior ainda
+/// na fila nem é candidato, e a ordem entre os candidatos põe a série no
+/// lugar do seu grab mais anterior ([`series_first`]).
 fn pick_starts(
     candidates: &[(String, u64)],
+    places: &HashMap<String, Place>,
     active_left: &[u64],
     free: u64,
     reserve: u64,
@@ -396,10 +497,13 @@ fn pick_starts(
         .saturating_sub(active_left.iter().sum())
         .saturating_sub(reserve);
     let mut slots = limit.saturating_sub(active_left.len());
-    let mut sorted: Vec<&(String, u64)> = candidates.iter().collect();
+    let mut sorted: Vec<&(String, u64)> = candidates
+        .iter()
+        .filter(|(hash, _)| !held_back(hash, places))
+        .collect();
     sorted.sort_by_key(|(_, need)| *need);
     let mut picked = Vec::new();
-    for (hash, need) in sorted {
+    for (hash, need) in series_first(sorted, |(hash, _)| hash, places) {
         if slots == 0 {
             break;
         }
@@ -421,8 +525,10 @@ fn pick_starts(
 /// prioritário não espera vaga, só espaço: o cliente segura o excesso na fila
 /// dele, e ele vai para o topo dela ([`client_queue_moves`]). Sem isso, a vaga
 /// do acervo é a única trava, e vale para todos.
+#[allow(clippy::too_many_arguments)] // A fila, a ordem, o orçamento e as vagas.
 fn pick_starts_prioritized(
     candidates: &[(String, u64)],
+    places: &HashMap<String, Place>,
     priority: &HashSet<String>,
     active_left: &[u64],
     free: u64,
@@ -439,7 +545,7 @@ fn pick_starts_prioritized(
     };
     let (first, rest) = (group(true), group(false));
     let first_limit = if client_queues { usize::MAX } else { limit };
-    let mut picked = pick_starts(&first, active_left, free, reserve, first_limit);
+    let mut picked = pick_starts(&first, places, active_left, free, reserve, first_limit);
     // O que saiu agora passa a contar como ativo: desconta espaço e vaga.
     let mut busy = active_left.to_vec();
     busy.extend(
@@ -448,12 +554,13 @@ fn pick_starts_prioritized(
             .filter(|(hash, _)| picked.contains(hash))
             .map(|(_, need)| *need),
     );
-    picked.extend(pick_starts(&rest, &busy, free, reserve, limit));
+    picked.extend(pick_starts(&rest, places, &busy, free, reserve, limit));
     picked
 }
 
 /// Os `topPrio` que deixam a fila de downloads do cliente na ordem do
-/// acervo: prioritários primeiro, depois do menor para o maior. Vale para
+/// acervo: prioritários primeiro, depois do menor para o maior, com cada
+/// série no lugar do seu grab mais anterior ([`series_first`]). Vale para
 /// todo torrent que está nela, do acervo ou não.
 ///
 /// O tamanho é o total, não o que falta: o que falta muda a cada volta e
@@ -463,6 +570,7 @@ fn pick_starts_prioritized(
 /// resto da ordem desejada. Fila já em ordem não gera chamada nenhuma.
 fn client_queue_moves(
     torrents: &[acervo_clients::TorrentInfo],
+    places: &HashMap<String, Place>,
     priority: &HashSet<String>,
     size: impl Fn(&acervo_clients::TorrentInfo) -> u64,
 ) -> Vec<String> {
@@ -471,6 +579,7 @@ fn client_queue_moves(
     current.sort_by_key(|t| t.priority);
     let mut wanted = current.clone();
     wanted.sort_by_key(|t| (!priority.contains(&t.hash), size(t), t.priority));
+    let wanted = series_first(wanted, |t| t.hash.as_str(), places);
     let wanted: Vec<&str> = wanted.iter().map(|t| t.hash.as_str()).collect();
     let current: Vec<&str> = current.iter().map(|t| t.hash.as_str()).collect();
     let moves = (0..=wanted.len())
@@ -505,10 +614,11 @@ async fn client_holds_excess(client: &QbitClient, limit: usize) -> Result<bool> 
 async fn order_client_queue(
     client: &QbitClient,
     torrents: &[acervo_clients::TorrentInfo],
+    places: &HashMap<String, Place>,
     priority: &HashSet<String>,
     size: impl Fn(&acervo_clients::TorrentInfo) -> u64,
 ) {
-    for hash in client_queue_moves(torrents, priority, size) {
+    for hash in client_queue_moves(torrents, places, priority, size) {
         if let Err(error) = client.top_priority(&[&hash]).await {
             tracing::warn!("ordem da fila do cliente: {error}");
             return;
@@ -567,7 +677,8 @@ pub(crate) async fn start_queued(
     // O que foi apagado, ou ficou por ter link, não entra na conta.
     torrents.retain(|t| !t.has_tag(QUEUE_TAG) || known.contains_key(&t.hash));
     let priority = store.priority_hashes().await?;
-    order_client_queue(client, &torrents, &priority, size).await;
+    let places = series_places(store, &series, &torrents).await;
+    order_client_queue(client, &torrents, &places, &priority, size).await;
     // Só os do acervo: grab em andamento, filme ou série. Sem `amount_left`
     // (cliente antigo), cai na conta pelo tamanho.
     let active_left: Vec<u64> = torrents
@@ -625,6 +736,7 @@ pub(crate) async fn start_queued(
     }
     let picked = pick_starts_prioritized(
         &queue,
+        &places,
         &priority,
         &active_left,
         free,
@@ -637,15 +749,56 @@ pub(crate) async fn start_queued(
             release_reservation(client, torrent).await;
         }
     }
-    start_picked(client, &torrents, &priority, picked).await
+    start_picked(client, &torrents, &priority, &places, picked).await
+}
+
+/// Onde cada grab de série em andamento cai na ordem da série dele; quem
+/// está aqui é grab de série. Série que o catálogo não lê fica de fora (os
+/// grabs dela não seguram nem são segurados): um registro ruim não para a
+/// fila inteira.
+pub(crate) async fn series_places(
+    store: &Store,
+    grabs: &[acervo_store::SeriesGrab],
+    torrents: &[acervo_clients::TorrentInfo],
+) -> HashMap<String, Place> {
+    let mut by_series: HashMap<i64, Vec<&acervo_store::SeriesGrab>> = HashMap::new();
+    for grab in grabs {
+        by_series.entry(grab.series_id).or_default().push(grab);
+    }
+    let mut places = HashMap::new();
+    for (series_id, grabs) in by_series {
+        let entry = match store.series(series_id).await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(series_id, "ordem da série: {error}");
+                continue;
+            }
+        };
+        let numbers = crate::series::grab::numbers(&entry);
+        for grab in grabs {
+            places.insert(
+                grab.hash.clone(),
+                Place {
+                    series_id,
+                    key: crate::series::grab::order_key(&grab.episode_ids, &numbers),
+                    queued: torrents
+                        .iter()
+                        .any(|t| t.hash == grab.hash && is_waiting(t)),
+                },
+            );
+        }
+    }
+    places
 }
 
 /// Inicia os escolhidos da fila e os tira dela; o prioritário vai ao topo da
-/// fila do cliente.
+/// fila do cliente, e o de série começa com download sequencial.
 async fn start_picked(
     client: &QbitClient,
     torrents: &[acervo_clients::TorrentInfo],
     priority: &HashSet<String>,
+    places: &HashMap<String, Place>,
     picked: Vec<String>,
 ) -> Result<Vec<String>> {
     let mut started = Vec::new();
@@ -653,6 +806,9 @@ async fn start_picked(
         let Some(torrent) = torrents.iter().find(|t| t.hash == hash) else {
             continue;
         };
+        if places.contains_key(&hash) {
+            crate::series::grab::ensure_sequential(client, torrent).await;
+        }
         client.start(&[&hash]).await?;
         client.remove_tag(&[&hash], QUEUE_TAG).await?;
         if priority.contains(&hash)
@@ -2537,20 +2693,32 @@ mod tests {
     #[test]
     fn limite_segura_a_fila_mesmo_com_espaco_sobrando() {
         // Dois ativos de limite 3: só uma vaga, apesar do disco enorme.
-        let picked = pick_starts(&queue(&[10, 20, 30]), &[1, 1], 1_000_000, 0, 3);
+        let picked = pick_starts(
+            &queue(&[10, 20, 30]),
+            &HashMap::new(),
+            &[1, 1],
+            1_000_000,
+            0,
+            3,
+        );
         assert_eq!(picked, ["h10"]);
         // Limite já atingido: nada inicia.
-        assert!(pick_starts(&queue(&[10]), &[1, 1, 1], 1_000_000, 0, 3).is_empty());
+        assert!(
+            pick_starts(&queue(&[10]), &HashMap::new(), &[1, 1, 1], 1_000_000, 0, 3).is_empty()
+        );
     }
 
     #[test]
     fn conta_desconta_o_que_falta_dos_ativos() {
         // 100 livres, 30 faltam nos ativos, folga 10: sobram 60.
-        let picked = pick_starts(&queue(&[50, 70]), &[10, 20], 100, 10, 10);
+        let picked = pick_starts(&queue(&[50, 70]), &HashMap::new(), &[10, 20], 100, 10, 10);
         assert_eq!(picked, ["h50"]);
         // Sem ativos, o orçamento é 90: o de 50 cabe e o de 70 não, depois dele.
-        assert_eq!(pick_starts(&queue(&[50, 70]), &[], 100, 10, 10), ["h50"]);
-        assert!(pick_starts(&queue(&[50]), &[60], 100, 10, 10).is_empty());
+        assert_eq!(
+            pick_starts(&queue(&[50, 70]), &HashMap::new(), &[], 100, 10, 10),
+            ["h50"]
+        );
+        assert!(pick_starts(&queue(&[50]), &HashMap::new(), &[60], 100, 10, 10).is_empty());
     }
 
     #[test]
@@ -2560,6 +2728,7 @@ mod tests {
         // dos outros, menor primeiro, com os 50 que sobram: 5 e 30.
         let picked = pick_starts_prioritized(
             &queue(&[80, 5, 40, 30, 95]),
+            &HashMap::new(),
             &priority,
             &[],
             100,
@@ -2569,11 +2738,21 @@ mod tests {
         );
         assert_eq!(picked, ["h40", "h5", "h30"]);
         // A vaga também: com uma só, é do prioritário, mesmo sendo maior.
-        let picked = pick_starts_prioritized(&queue(&[5, 40]), &priority, &[], 100, 10, 1, true);
+        let picked = pick_starts_prioritized(
+            &queue(&[5, 40]),
+            &HashMap::new(),
+            &priority,
+            &[],
+            100,
+            10,
+            1,
+            true,
+        );
         assert_eq!(picked, ["h40"]);
         // Sem prioritário, é a regra de sempre.
         let picked = pick_starts_prioritized(
             &queue(&[80, 5, 40, 30]),
+            &HashMap::new(),
             &HashSet::new(),
             &[],
             100,
@@ -2583,16 +2762,16 @@ mod tests {
         );
         assert_eq!(
             picked,
-            pick_starts(&queue(&[80, 5, 40, 30]), &[], 100, 10, 10)
+            pick_starts(&queue(&[80, 5, 40, 30]), &HashMap::new(), &[], 100, 10, 10)
         );
     }
 
     #[test]
     fn menor_primeiro_pulando_quem_nao_cabe() {
-        let picked = pick_starts(&queue(&[80, 5, 40, 30]), &[], 100, 10, 10);
+        let picked = pick_starts(&queue(&[80, 5, 40, 30]), &HashMap::new(), &[], 100, 10, 10);
         // Orçamento 90: 5, 30, 40 (soma 75); o de 80 não cabe mais.
         assert_eq!(picked, ["h5", "h30", "h40"]);
-        let picked = pick_starts(&queue(&[95, 20]), &[], 100, 10, 10);
+        let picked = pick_starts(&queue(&[95, 20]), &HashMap::new(), &[], 100, 10, 10);
         assert_eq!(picked, ["h20"]);
     }
 
@@ -2611,15 +2790,18 @@ mod tests {
     #[test]
     fn fila_travada_por_pre_alocacao_volta_a_andar() {
         // Disco com 5 livres e folga 1: quem precisa de 20 nunca cabe...
-        let travada = pick_starts(&queue(&[20, 30]), &[], 5, 1, 5);
+        let travada = pick_starts(&queue(&[20, 30]), &HashMap::new(), &[], 5, 1, 5);
         assert!(travada.is_empty());
         // ...mas quem já tem os 20 e os 30 reservados cabe, no limite de vagas.
         let net = [
             ("h20".to_owned(), unreserved(20, 20, 0)),
             ("h30".to_owned(), unreserved(30, 30, 0)),
         ];
-        assert_eq!(pick_starts(&net, &[], 5, 1, 5), ["h20", "h30"]);
-        assert_eq!(pick_starts(&net, &[], 5, 1, 1), ["h20"]);
+        assert_eq!(
+            pick_starts(&net, &HashMap::new(), &[], 5, 1, 5),
+            ["h20", "h30"]
+        );
+        assert_eq!(pick_starts(&net, &HashMap::new(), &[], 5, 1, 1), ["h20"]);
     }
 
     #[test]
@@ -2642,12 +2824,28 @@ mod tests {
         let priority = HashSet::from(["h40".to_owned(), "h95".to_owned()]);
         // Limite 1 já ocupado: o prioritário de 40 sai mesmo assim; o de 95
         // não cabe no orçamento, e os outros esperam vaga.
-        let picked =
-            pick_starts_prioritized(&queue(&[5, 40, 95]), &priority, &[1], 100, 10, 1, true);
+        let picked = pick_starts_prioritized(
+            &queue(&[5, 40, 95]),
+            &HashMap::new(),
+            &priority,
+            &[1],
+            100,
+            10,
+            1,
+            true,
+        );
         assert_eq!(picked, ["h40"]);
         // Sem a fila do cliente para segurar o excesso, a vaga vale para todos.
-        let picked =
-            pick_starts_prioritized(&queue(&[5, 40, 95]), &priority, &[1], 100, 10, 1, false);
+        let picked = pick_starts_prioritized(
+            &queue(&[5, 40, 95]),
+            &HashMap::new(),
+            &priority,
+            &[1],
+            100,
+            10,
+            1,
+            false,
+        );
         assert!(picked.is_empty());
     }
 
@@ -2662,7 +2860,7 @@ mod tests {
 
     fn moves(torrents: &[acervo_clients::TorrentInfo], priority: &[&str]) -> Vec<String> {
         let priority = priority.iter().map(|h| (*h).to_owned()).collect();
-        client_queue_moves(torrents, &priority, |t| t.size)
+        client_queue_moves(torrents, &HashMap::new(), &priority, |t| t.size)
     }
 
     /// A fila depois de aplicar os `topPrio`, como o cliente faria.
@@ -2724,6 +2922,119 @@ mod tests {
         ];
         let top = moves(&fila, &["d"]);
         assert_eq!(aplicar(&fila, &top), ["d", "a", "b", "c", "e"]);
+    }
+
+    /// Grab de série na ordem da série: (hash, série, (temporada, episódio),
+    /// ainda na fila do acervo).
+    fn places(items: &[(&str, i64, (u16, u16), bool)]) -> HashMap<String, Place> {
+        items
+            .iter()
+            .map(|(hash, series_id, (season, number), queued)| {
+                (
+                    (*hash).to_owned(),
+                    Place {
+                        series_id: *series_id,
+                        key: (*season == 0, *season, *number),
+                        queued: *queued,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn named(items: &[(&str, u64)]) -> Vec<(String, u64)> {
+        items.iter().map(|(h, n)| ((*h).to_owned(), *n)).collect()
+    }
+
+    #[test]
+    fn temporada_posterior_menor_espera_a_anterior_na_fila() {
+        // Blindspot: o S05 é o menor, mas o S02 vem antes.
+        let queue = named(&[("s05", 10), ("s02", 50)]);
+        let both = places(&[("s02", 1, (2, 1), true), ("s05", 1, (5, 1), true)]);
+        assert_eq!(
+            pick_starts(&queue, &both, &[], 1000, 0, 10),
+            ["s02"],
+            "o S05 espera enquanto o S02 está na fila"
+        );
+        // O S02 não cabe: o S05, que caberia, continua esperando.
+        assert!(pick_starts(&queue, &both, &[], 40, 0, 10).is_empty());
+    }
+
+    #[test]
+    fn anterior_iniciado_falho_ou_descartado_nao_segura() {
+        let queue = named(&[("s05", 10)]);
+        // Iniciado: sem a tag da fila.
+        let started = places(&[("s02", 1, (2, 1), false), ("s05", 1, (5, 1), true)]);
+        assert_eq!(pick_starts(&queue, &started, &[], 1000, 0, 10), ["s05"]);
+        // Falho, descartado ou terminado: nem entra nos lugares.
+        let gone = places(&[("s05", 1, (5, 1), true)]);
+        assert_eq!(pick_starts(&queue, &gone, &[], 1000, 0, 10), ["s05"]);
+        // Anterior na fila de outra série não segura.
+        let other = places(&[("s02", 2, (2, 1), true), ("s05", 1, (5, 1), true)]);
+        assert_eq!(pick_starts(&queue, &other, &[], 1000, 0, 10), ["s05"]);
+    }
+
+    #[test]
+    fn episodios_avulsos_saem_em_ordem() {
+        let queue = named(&[("e03", 5), ("e01", 20)]);
+        let both = places(&[("e03", 1, (1, 3), true), ("e01", 1, (1, 1), true)]);
+        assert_eq!(pick_starts(&queue, &both, &[], 1000, 0, 10), ["e01"]);
+        // Especial (temporada 0) fica depois da última temporada.
+        let queue = named(&[("sp", 5), ("s09", 20)]);
+        let both = places(&[("sp", 1, (0, 1), true), ("s09", 1, (9, 1), true)]);
+        assert_eq!(pick_starts(&queue, &both, &[], 1000, 0, 10), ["s09"]);
+    }
+
+    #[test]
+    fn series_e_filme_misturados_seguem_menor_primeiro_entre_grupos() {
+        let queue = named(&[("a1", 30), ("b1", 10), ("filme", 20)]);
+        let lugares = places(&[("a1", 1, (1, 1), true), ("b1", 2, (1, 1), true)]);
+        assert_eq!(
+            pick_starts(&queue, &lugares, &[], 1000, 0, 10),
+            ["b1", "filme", "a1"]
+        );
+        // Limite de uma vaga: sai o menor dos grupos.
+        assert_eq!(pick_starts(&queue, &lugares, &[], 1000, 0, 1), ["b1"]);
+    }
+
+    #[test]
+    fn prioritario_de_serie_continua_primeiro() {
+        let queue = named(&[("s02", 50), ("s05", 10), ("filme", 5)]);
+        let lugares = places(&[("s02", 1, (2, 1), true), ("s05", 1, (5, 1), true)]);
+        let priority = HashSet::from(["s02".to_owned(), "s05".to_owned()]);
+        let picked = pick_starts_prioritized(&queue, &lugares, &priority, &[], 1000, 0, 10, true);
+        assert_eq!(picked, ["s02", "filme"]);
+    }
+
+    #[test]
+    fn serie_entra_no_lugar_do_grab_mais_anterior() {
+        let fila = [
+            na_fila("a5", 10, 1),
+            na_fila("filme", 15, 2),
+            na_fila("b1", 20, 3),
+            na_fila("a2", 50, 4),
+        ];
+        let lugares = places(&[
+            ("a5", 1, (5, 1), true),
+            ("a2", 1, (2, 1), true),
+            ("b1", 2, (1, 1), true),
+        ]);
+        let top = client_queue_moves(&fila, &lugares, &HashSet::new(), |t| t.size);
+        // Menor primeiro daria a5, filme, b1, a2; a série A vai para o lugar
+        // do a2 (o mais anterior), com o a5 logo depois.
+        assert_eq!(aplicar(&fila, &top), ["filme", "b1", "a2", "a5"]);
+        // Fila já nessa ordem não gera chamada.
+        let ordenada = [
+            na_fila("filme", 15, 1),
+            na_fila("b1", 20, 2),
+            na_fila("a2", 50, 3),
+            na_fila("a5", 10, 4),
+        ];
+        assert!(client_queue_moves(&ordenada, &lugares, &HashSet::new(), |t| t.size).is_empty());
+        // Prioritário primeiro, a série inteira junta.
+        let priority = HashSet::from(["a2".to_owned(), "a5".to_owned()]);
+        let top = client_queue_moves(&fila, &lugares, &priority, |t| t.size);
+        assert_eq!(aplicar(&fila, &top), ["a2", "a5", "filme", "b1"]);
     }
 
     fn at(text: &str) -> time::OffsetDateTime {
@@ -2788,6 +3099,151 @@ mod tests {
         let mut t = travado(now);
         t.last_activity = now.unix_timestamp() - 1799;
         assert!(!stalled(&t, now));
+    }
+
+    fn grab_of(series_id: i64, hash: &str, episode_ids: Vec<i64>) -> acervo_store::SeriesGrab {
+        acervo_store::SeriesGrab {
+            id: 0,
+            series_id,
+            episode_ids,
+            hash: hash.into(),
+            title: "t".into(),
+            indexer: "i".into(),
+            quality: acervo_parser::Quality::WebDl1080p,
+            size: 1,
+            grabbed_at: "2026-10-01T00:00:00Z".into(),
+            state: GrabState::Downloading,
+            message: None,
+            finished_at: None,
+        }
+    }
+
+    fn queued_at(hash: &str, progress: f64) -> acervo_clients::TorrentInfo {
+        serde_json::from_value(serde_json::json!({
+            "hash": hash, "name": hash, "state": "pausedDL", "save_path": "/",
+            "tags": QUEUE_TAG, "progress": progress,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn anterior_que_ja_iniciou_e_voltou_a_fila_nao_segura_o_posterior() {
+        let Some(db) = acervo_store::testing::TestDb::new("lugares_fila").await else {
+            return;
+        };
+        let sample =
+            crate::series::watched::tests::sample(1, &[(1, 2, 1, None), (2, 3, 1, None)], &[]);
+        let id = db
+            .store
+            .add_series(&sample.series, &[episode(2, 1), episode(3, 1)])
+            .await
+            .unwrap();
+        let entry = db.store.series(id).await.unwrap().unwrap();
+        let ids: Vec<i64> = entry.episodes.iter().map(|e| e.id).collect();
+        let grabs = [
+            grab_of(id, "s02", vec![ids[0]]),
+            grab_of(id, "s03", vec![ids[1]]),
+        ];
+        // S02 devolvido à fila com 40% (disco cheio): não segura o S03.
+        let torrents = [queued_at("s02", 0.4), queued_at("s03", 0.0)];
+        let places = series_places(&db.store, &grabs, &torrents).await;
+        assert!(!places["s02"].queued);
+        assert!(places["s03"].queued);
+        assert!(!held_back("s03", &places));
+        // Nunca iniciado: segura.
+        let torrents = [queued_at("s02", 0.0), queued_at("s03", 0.0)];
+        let places = series_places(&db.store, &grabs, &torrents).await;
+        assert!(held_back("s03", &places));
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn serie_ilegivel_no_catalogo_nao_derruba_os_lugares() {
+        let Some(db) = acervo_store::testing::TestDb::new("lugares_ilegivel").await else {
+            return;
+        };
+        let store = db.store.clone();
+        // Com o schema apagado, toda leitura da série falha.
+        db.drop().await;
+        let grabs = [grab_of(1, "s02", vec![1])];
+        let places = series_places(&store, &grabs, &[queued_at("s02", 0.0)]).await;
+        assert!(places.is_empty());
+    }
+
+    fn place_of(series_id: i64, key: crate::series::grab::OrderKey, queued: bool) -> Place {
+        Place {
+            series_id,
+            key,
+            queued,
+        }
+    }
+
+    fn places_of(items: &[(&str, Place)]) -> HashMap<String, Place> {
+        items
+            .iter()
+            .map(|(hash, place)| ((*hash).to_owned(), place.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn mensagem_da_fila_por_temporada() {
+        let places = places_of(&[
+            ("s02", place_of(1, (false, 2, 1), true)),
+            ("s03", place_of(1, (false, 3, 1), true)),
+            ("s05", place_of(1, (false, 5, 1), true)),
+            ("outra", place_of(2, (false, 1, 1), true)),
+            ("iniciado", place_of(1, (false, 1, 1), false)),
+        ]);
+        // Segurado: diz o menor entre os que seguram (o iniciado não segura).
+        assert_eq!(
+            queue_message("s05", &places),
+            "na fila: esperando S02 da mesma série"
+        );
+        assert_eq!(
+            queue_message("s03", &places),
+            "na fila: esperando S02 da mesma série"
+        );
+        // Não segurado: a genérica.
+        assert_eq!(queue_message("s02", &places), QUEUED);
+        assert_eq!(queue_message("outra", &places), QUEUED);
+        assert_eq!(queue_message("desconhecido", &places), QUEUED);
+    }
+
+    #[test]
+    fn mensagem_da_fila_por_episodio_avulso() {
+        let places = places_of(&[
+            ("s02e03", place_of(1, (false, 2, 3), true)),
+            ("s04", place_of(1, (false, 4, 1), true)),
+        ]);
+        assert_eq!(
+            queue_message("s04", &places),
+            "na fila: esperando S02E03 da mesma série"
+        );
+    }
+
+    #[test]
+    fn mensagem_da_fila_por_especiais() {
+        let places = places_of(&[
+            ("esp", place_of(1, (true, 0, 1), true)),
+            ("esp2", place_of(1, (true, 0, 4), true)),
+        ]);
+        assert_eq!(
+            queue_message("esp2", &places),
+            "na fila: esperando os especiais da mesma série"
+        );
+        assert_eq!(queue_message("esp", &places), QUEUED);
+    }
+
+    fn episode(season: u16, number: u16) -> acervo_store::Episode {
+        acervo_store::Episode {
+            season,
+            number,
+            tmdb_id: None,
+            title: None,
+            air_date: Some("2026-01-01".into()),
+            overview: None,
+            runtime: 0,
+        }
     }
 
     fn torrent(state: &str) -> acervo_clients::TorrentInfo {

@@ -3,7 +3,7 @@
 //! falta. A escolha é pura ([`choose_files`]) e idempotente: roda ao
 //! adicionar, antes de o torrent sair da fila e a cada volta da importação.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -38,6 +38,11 @@ const EXTRAS: &[&str] = &[
 
 /// Prioridade normal no qBittorrent; zero não baixa.
 const NORMAL: u8 = 1;
+
+/// Prioridade alta e máxima de arquivo no qBittorrent: o segundo e o primeiro
+/// episódio que faltam.
+const HIGH: u8 = 6;
+const MAXIMUM: u8 = 7;
 
 /// O destino de um arquivo do torrent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,12 +232,121 @@ pub(crate) fn numbers(entry: &CatalogSeries) -> Vec<(i64, u16, u16)> {
         .collect()
 }
 
+/// Chave de ordem de episódios na série: `(especial, temporada, episódio)`.
+/// Temporada 0 (especiais) vai para o fim; o menor vem primeiro.
+pub(crate) type OrderKey = (bool, u16, u16);
+
+/// A chave de ordem de um grab (ou arquivo): o menor `(temporada, episódio)`
+/// entre os episódios `wanted` dele, na numeração da biblioteca. `episodes`
+/// são `(id, temporada, número)` da série. Sem nenhum episódio conhecido,
+/// vai para o fim de tudo.
+#[must_use]
+pub(crate) fn order_key(wanted: &[i64], episodes: &[(i64, u16, u16)]) -> OrderKey {
+    episodes
+        .iter()
+        .filter(|(id, _, _)| wanted.contains(id))
+        .map(|(_, season, number)| (*season == 0, *season, *number))
+        .min()
+        .unwrap_or((true, u16::MAX, u16::MAX))
+}
+
+/// A prioridade que cada arquivo escolhido deve ter para baixar em ordem de
+/// episódio, por `index`: o primeiro episódio que falta em prioridade máxima,
+/// o seguinte em alta, os demais em normal. Arquivos do mesmo episódio (vídeo
+/// e legendas) andam juntos. Episódio com todos os arquivos prontos não
+/// conta e fica de fora do mapa: o que já tem, fica.
+fn rank_files(
+    files: &[TorrentFile],
+    choices: &[Choice],
+    episodes: &[(i64, u16, u16)],
+) -> BTreeMap<usize, u8> {
+    let mut groups: BTreeMap<OrderKey, Vec<(usize, bool)>> = BTreeMap::new();
+    for choice in choices.iter().filter(|c| c.priority > 0) {
+        let done = files
+            .iter()
+            .find(|f| f.index == choice.index)
+            .is_none_or(|f| f.progress >= 1.0);
+        groups
+            .entry(order_key(&choice.episodes, episodes))
+            .or_default()
+            .push((choice.index, done));
+    }
+    let mut ranks = BTreeMap::new();
+    let mut pending = 0;
+    for members in groups.values() {
+        if members.iter().all(|(_, done)| *done) {
+            continue;
+        }
+        let priority = match pending {
+            0 => MAXIMUM,
+            1 => HIGH,
+            _ => NORMAL,
+        };
+        pending += 1;
+        ranks.extend(members.iter().map(|(index, _)| (*index, priority)));
+    }
+    ranks
+}
+
+/// Serializa a leitura e o toggle do download sequencial: a fila e a volta
+/// da importação podem pegar o mesmo torrent juntas, e dois toggles a partir
+/// do mesmo `seq_dl = false` ligariam e desligariam o modo.
+static SEQUENTIAL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Liga o download sequencial do torrent se estiver desligado: o
+/// `toggleSequentialDownload` só alterna, então o estado é relido do cliente
+/// dentro da trava antes de alternar (o `torrent` recebido pode estar velho).
+/// Falha só avisa: a ordem é ajuste, não condição para baixar.
+pub(crate) async fn ensure_sequential(client: &QbitClient, torrent: &TorrentInfo) {
+    if torrent.seq_dl {
+        return;
+    }
+    let _guard = SEQUENTIAL_LOCK.lock().await;
+    let current = match client.torrent(&torrent.hash).await {
+        Ok(Some(current)) => current,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(torrent = %torrent.name, "download sequencial: {error}");
+            return;
+        }
+    };
+    if current.seq_dl {
+        return;
+    }
+    if let Err(error) = client.toggle_sequential(&torrent.hash).await {
+        tracing::warn!(torrent = %torrent.name, "download sequencial: {error}");
+    }
+}
+
+/// O torrent reaproveitado baixa em ordem de episódio, esteja parado ou não:
+/// semeando, o arquivo novo volta a baixar sozinho, sem passar pela fila (que
+/// é quem liga o modo nos grabs novos). Com `need == Some(0)` nada falta.
+async fn sequential_on_reuse(
+    client: &QbitClient,
+    existing: Option<&TorrentInfo>,
+    need: Option<u64>,
+) {
+    if let Some(existing) = existing.filter(|_| need != Some(0)) {
+        ensure_sequential(client, existing).await;
+    }
+}
+
+/// A volta da importação religa o modo num grab que ainda baixa: o que saiu
+/// da fila antes de o modo existir, ou foi reaproveitado sem passar por aqui,
+/// também baixa em ordem. Terminado, não há o que ordenar.
+pub(crate) async fn sequential_while_downloading(client: &QbitClient, torrent: &TorrentInfo) {
+    if torrent.progress < 1.0 {
+        ensure_sequential(client, torrent).await;
+    }
+}
+
 /// Uma escolha aplicada no cliente.
 #[derive(Debug)]
 pub(crate) struct Selection {
     pub files: Vec<TorrentFile>,
     pub choices: Vec<Choice>,
-    /// Alguma prioridade mudou agora: o progresso do cliente ainda não conta.
+    /// Algum arquivo entrou ou saiu do download agora: o progresso do cliente
+    /// ainda não conta. Mudar a ordem entre os escolhidos não conta.
     pub changed: bool,
 }
 
@@ -268,8 +382,10 @@ impl Selection {
 }
 
 /// Lê os arquivos do torrent e acerta as prioridades (só com `write`; sem,
-/// só diz o que faria). `None` quando o cliente ainda não tem a lista
-/// (magnet sem metadados). Prioridade acima da normal, posta à mão, fica.
+/// só diz o que faria): zero no que não se quer e, nos escolhidos, a ordem de
+/// episódio ([`rank_files`]), refeita a cada chamada e só mandada ao cliente
+/// quando muda. `None` quando o cliente ainda não tem a lista (magnet sem
+/// metadados).
 ///
 /// # Errors
 ///
@@ -291,49 +407,60 @@ pub(crate) async fn apply_selection(
         return Ok(None);
     }
     let wanted: HashSet<i64> = wanted.iter().copied().collect();
-    let choices = choose_files(
-        &files,
-        &numbers(entry),
-        &wanted,
-        release,
-        &super::scene(entry),
-    );
+    let episodes = numbers(entry);
+    let choices = choose_files(&files, &episodes, &wanted, release, &super::scene(entry));
+    let ranks = rank_files(&files, &choices, &episodes);
     let current = |index: usize| files.iter().find(|f| f.index == index).map(|f| f.priority);
-    let off: Vec<usize> = choices
+    // O destino de cada arquivo: zero fora da escolha; o lugar na ordem; e,
+    // se o episódio já está pronto, o que o cliente já tem.
+    let target = |choice: &Choice| {
+        if choice.priority == 0 {
+            return 0;
+        }
+        ranks
+            .get(&choice.index)
+            .copied()
+            .unwrap_or_else(|| current(choice.index).filter(|p| *p > 0).unwrap_or(NORMAL))
+    };
+    let moves: Vec<(usize, u8)> = choices
         .iter()
-        .filter(|c| c.priority == 0 && current(c.index) != Some(0))
-        .map(|c| c.index)
+        .map(|c| (c.index, target(c)))
+        .filter(|(index, priority)| current(*index) != Some(*priority))
         .collect();
-    let on: Vec<usize> = choices
-        .iter()
-        .filter(|c| c.priority > 0 && current(c.index) == Some(0))
-        .map(|c| c.index)
-        .collect();
+    let to = |priority: u8| -> Vec<usize> {
+        moves
+            .iter()
+            .filter(|(_, p)| *p == priority)
+            .map(|(index, _)| *index)
+            .collect()
+    };
     if write {
         client
-            .set_file_priority(&hash, &off, 0)
+            .set_file_priority(&hash, &to(0), 0)
             .await
             .context("tirando arquivos do download")?;
-        client
-            .set_file_priority(&hash, &on, NORMAL)
-            .await
-            .context("escolhendo arquivos do download")?;
+        for priority in [MAXIMUM, HIGH, NORMAL] {
+            client
+                .set_file_priority(&hash, &to(priority), priority)
+                .await
+                .context("escolhendo arquivos do download")?;
+        }
     }
-    let changed = !off.is_empty() || !on.is_empty();
-    let files = if changed {
+    let changed = moves
+        .iter()
+        .any(|(index, priority)| *priority == 0 || current(*index) == Some(0));
+    let files = if moves.is_empty() {
+        files
+    } else {
         files
             .into_iter()
             .map(|mut f| {
-                if off.contains(&f.index) {
-                    f.priority = 0;
-                } else if on.contains(&f.index) {
-                    f.priority = NORMAL;
+                if let Some((_, priority)) = moves.iter().find(|(index, _)| *index == f.index) {
+                    f.priority = *priority;
                 }
                 f
             })
             .collect()
-    } else {
-        files
     };
     Ok(Some(Selection {
         files,
@@ -523,6 +650,7 @@ pub async fn send(
         .context("registrando o grab")?;
     // Sem a tag da fila: com ela, se o grab falhasse, o torrent viraria
     // órfão da fila e sairia do cliente com os arquivos.
+    sequential_on_reuse(&client, existing.as_ref(), need).await;
     if stopped
         && need != Some(0)
         && let Err(error) = client.start(&[&hash]).await
@@ -857,6 +985,114 @@ pub async fn remove_download(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Request, Respond};
+
+    /// `torrents/info` de um qBittorrent falso com estado: devolve o
+    /// `seq_dl` atual do torrent "h".
+    struct Info(Arc<AtomicBool>);
+
+    impl Respond for Info {
+        fn respond(&self, _: &Request) -> ResponseTemplate {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "hash": "h", "name": "n", "state": "downloading", "save_path": "/",
+                "seq_dl": self.0.load(Ordering::SeqCst),
+            }]))
+        }
+    }
+
+    /// `toggleSequentialDownload` que alterna de verdade e conta as chamadas.
+    struct Toggle(Arc<AtomicBool>, Arc<AtomicUsize>);
+
+    impl Respond for Toggle {
+        fn respond(&self, _: &Request) -> ResponseTemplate {
+            self.0.fetch_xor(true, Ordering::SeqCst);
+            self.1.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200)
+        }
+    }
+
+    /// Cliente logado num qBittorrent falso cujo torrent "h" começa com
+    /// `seq_dl` desligado. Devolve o servidor, o estado e o contador de toggles.
+    async fn sequential_fake() -> (MockServer, QbitClient, Arc<AtomicBool>, Arc<AtomicUsize>) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+            .mount(&server)
+            .await;
+        let on = Arc::new(AtomicBool::new(false));
+        let toggles = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/info"))
+            .respond_with(Info(Arc::clone(&on)))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/torrents/toggleSequentialDownload"))
+            .and(body_string_contains("hashes=h"))
+            .respond_with(Toggle(Arc::clone(&on), Arc::clone(&toggles)))
+            .mount(&server)
+            .await;
+        let client = QbitClient::login(&server.uri(), "u", "p", Duration::from_secs(5))
+            .await
+            .unwrap();
+        (server, client, on, toggles)
+    }
+
+    #[tokio::test]
+    async fn ligar_o_sequencial_em_paralelo_nao_desliga_o_que_o_outro_ligou() {
+        // A fila e a importação pegam o mesmo torrent com o mesmo retrato
+        // velho (`seq_dl = false`): dois toggles desligariam o modo.
+        let (_server, client, on, toggles) = sequential_fake().await;
+        let stale: TorrentInfo = serde_json::from_value(serde_json::json!({
+            "hash": "h", "name": "n", "state": "downloading", "save_path": "/", "seq_dl": false,
+        }))
+        .unwrap();
+        futures::future::join_all((0..8).map(|_| ensure_sequential(&client, &stale))).await;
+        assert!(on.load(Ordering::SeqCst));
+        assert_eq!(toggles.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reaproveitado_que_semeia_tambem_baixa_em_sequencia() {
+        let (_server, client, _on, toggles) = sequential_fake().await;
+        let info = |state: &str, seq_dl: bool| -> TorrentInfo {
+            serde_json::from_value(serde_json::json!({
+                "hash": "h", "name": "n", "state": state, "save_path": "/", "seq_dl": seq_dl,
+            }))
+            .unwrap()
+        };
+        // Semeando, sem o modo: liga (a única chamada esperada).
+        sequential_on_reuse(&client, Some(&info("stalledUP", false)), Some(3)).await;
+        // Já sequencial, nada a ligar; sem torrent, nem chama.
+        sequential_on_reuse(&client, Some(&info("stalledUP", true)), Some(3)).await;
+        sequential_on_reuse(&client, None, None).await;
+        // Nada falta baixar: não mexe.
+        sequential_on_reuse(&client, Some(&info("stalledUP", false)), Some(0)).await;
+        assert_eq!(toggles.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn importacao_liga_o_modo_so_no_grab_que_ainda_baixa() {
+        let (_server, client, _on, toggles) = sequential_fake().await;
+        let info = |progress: f64, seq_dl: bool| -> TorrentInfo {
+            serde_json::from_value(serde_json::json!({
+                "hash": "h", "name": "n", "state": "downloading", "save_path": "/",
+                "progress": progress, "seq_dl": seq_dl,
+            }))
+            .unwrap()
+        };
+        // Baixando sem o modo: liga (a única chamada esperada).
+        sequential_while_downloading(&client, &info(0.4, false)).await;
+        // Já ligado, ou terminado: não mexe.
+        sequential_while_downloading(&client, &info(0.4, true)).await;
+        sequential_while_downloading(&client, &info(1.0, false)).await;
+        assert_eq!(toggles.load(Ordering::SeqCst), 1);
+    }
 
     fn file(index: usize, name: &str, size: u64) -> TorrentFile {
         serde_json::from_value(serde_json::json!({
@@ -867,6 +1103,69 @@ mod tests {
 
     fn season_one() -> Vec<(i64, u16, u16)> {
         (1..=10).map(|n| (100 + i64::from(n), 1, n)).collect()
+    }
+
+    #[test]
+    fn chave_de_ordem_e_o_menor_episodio_com_especiais_no_fim() {
+        let episodes = [(1, 0, 1), (2, 1, 3), (3, 1, 1), (4, 2, 1), (5, 5, 1)];
+        assert_eq!(order_key(&[2, 3], &episodes), (false, 1, 1));
+        assert_eq!(order_key(&[5, 4], &episodes), (false, 2, 1));
+        assert!(order_key(&[5], &episodes) > order_key(&[4], &episodes));
+        // Especial depois de qualquer temporada.
+        assert!(order_key(&[1], &episodes) > order_key(&[5], &episodes));
+        assert_eq!(order_key(&[1, 5], &episodes), (false, 5, 1));
+        // Sem episódio conhecido, no fim de tudo.
+        assert!(order_key(&[99], &episodes) > order_key(&[1], &episodes));
+    }
+
+    fn choice(index: usize, episodes: &[i64]) -> Choice {
+        Choice {
+            index,
+            priority: NORMAL,
+            episodes: episodes.to_vec(),
+            subtitle: false,
+        }
+    }
+
+    #[test]
+    fn arquivos_baixam_por_prioridade_decrescente_do_primeiro_que_falta() {
+        let episodes = [(1, 1, 1), (2, 1, 2), (3, 1, 3), (4, 1, 4)];
+        // Fora de ordem no torrent: o E03 é o arquivo 0.
+        let mut files = vec![
+            file(0, "E03.mkv", 10),
+            file(1, "E01.mkv", 10),
+            file(2, "E04.mkv", 10),
+            file(3, "E02.mkv", 10),
+            file(4, "E01.srt", 1),
+        ];
+        let mut choices = vec![
+            choice(0, &[3]),
+            choice(1, &[1]),
+            choice(2, &[4]),
+            choice(3, &[2]),
+            Choice {
+                subtitle: true,
+                ..choice(4, &[1])
+            },
+        ];
+        let ranks = rank_files(&files, &choices, &episodes);
+        assert_eq!(ranks[&1], MAXIMUM);
+        assert_eq!(ranks[&4], MAXIMUM, "a legenda anda com o vídeo");
+        assert_eq!(ranks[&3], HIGH);
+        assert_eq!(ranks[&0], NORMAL);
+        assert_eq!(ranks[&2], NORMAL);
+        // O E01 terminou: o E02 passa a máxima, o E03 a alta, e o E01 fica.
+        for index in [1, 4] {
+            files[index].progress = 1.0;
+        }
+        let ranks = rank_files(&files, &choices, &episodes);
+        assert!(!ranks.contains_key(&1) && !ranks.contains_key(&4));
+        assert_eq!(ranks[&3], MAXIMUM);
+        assert_eq!(ranks[&0], HIGH);
+        assert_eq!(ranks[&2], NORMAL);
+        // Arquivo fora da escolha (prioridade zero) não entra.
+        choices[2].priority = 0;
+        assert!(!rank_files(&files, &choices, &episodes).contains_key(&2));
     }
 
     #[test]

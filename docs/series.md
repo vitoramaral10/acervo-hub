@@ -109,6 +109,40 @@ Torrent sem metadados ainda (magnet) fica parado até tê-los; a importação re
 a cada volta, e ela é idempotente. A fila por espaço usa o que falta baixar, que no
 qBittorrent já conta só os arquivos escolhidos.
 
+## Ordem de download
+
+Série se assiste em ordem: o acervo baixa na ordem também.
+
+- **Chave de ordem** de um grab de série: o menor `(temporada, episódio)`
+  entre os episódios `wanted` dele (números da biblioteca, não de cena).
+  Temporada 0 (especiais) vai para o fim da série.
+- **Entre grabs da mesma série**: um grab na fila do acervo só pode sair
+  dela se nenhum grab **anterior** da mesma série (chave menor) ainda está na
+  fila esperando (tag `acervo:fila`, nunca iniciado). Anterior que já iniciou,
+  terminou, falhou ou foi descartado não segura nada — falha ou dispensa não
+  podem travar a série. Assim, mesmo que o S05 caiba e o S02 não, o S05 espera
+  o S02 começar.
+- **Na tela Fila**: grab segurado pela ordem aparece na fila como
+  "esperando S02 da mesma série": a série espera a temporada anterior, mesmo
+  que ela nunca caiba no disco — a ordem vem antes do espaço.
+- **Ordem da fila**: dentro do grupo de prioridade, a série entra no lugar do
+  seu grab mais anterior; os demais grabs dela vêm em seguida, em ordem de
+  chave. Entre séries diferentes e filmes, continua "menor primeiro". A fila
+  do qBittorrent (`client_queue_moves`) usa a mesma ordem.
+- **Dentro do torrent**: todo grab de série baixa com download sequencial
+  (`seq_dl`) ligado: a fila liga ao iniciar, o reaproveitamento e a volta da
+  importação religam num grab que ainda baixa (grab anterior à mudança,
+  torrent semeando). Cada arquivo escolhido recebe prioridade decrescente pela
+  ordem dos episódios (o primeiro episódio que falta em prioridade máxima, o
+  seguinte em alta, os demais em normal), refeita a cada volta da importação.
+  Com `seq_dl`, o libtorrent só distingue a prioridade máxima (7): ela vai
+  primeiro e o resto segue a ordem dos pedaços do torrent, sem separar alta
+  de normal. Num pacote cujos arquivos estão na ordem dos episódios isso basta;
+  fora de ordem, o segundo episódio pode perder a vez até a próxima volta
+  refazer o ranking. A alta só pesa com o modo desligado.
+  `seq_dl` é idempotente: lê o estado (`torrents/info`) e só alterna
+  (`toggleSequentialDownload`) se estiver desligado.
+
 ## Importação
 
 Tarefa `importacao`. Para cada grab de série em andamento cujo torrent terminou os

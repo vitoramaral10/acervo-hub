@@ -61,6 +61,9 @@ pub struct TorrentInfo {
     /// Dois torrents com o mesmo caminho semeiam dos mesmos arquivos.
     #[serde(default)]
     pub content_path: String,
+    /// Download sequencial ligado: os pedaços vêm em ordem.
+    #[serde(default)]
+    pub seq_dl: bool,
 }
 
 impl TorrentInfo {

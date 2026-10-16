@@ -511,6 +511,21 @@ impl QbitClient {
         }
     }
 
+    /// Alterna o download sequencial do torrent: é um toggle, não um
+    /// "ligar". Quem chama lê `seq_dl` ([`TorrentInfo`]) antes e só alterna
+    /// se estiver desligado.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status não-2xx.
+    pub async fn toggle_sequential(&self, hash: &str) -> Result<(), QbitError> {
+        self.post(
+            "api/v2/torrents/toggleSequentialDownload",
+            &[("hashes", hash)],
+        )
+        .await
+    }
+
     /// Os trackers de um torrent, com o estado e a última mensagem de cada.
     ///
     /// # Errors

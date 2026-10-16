@@ -12,7 +12,7 @@
 //! A volta liga os arquivos no disco primeiro e grava tudo de uma vez no
 //! fim ([`Store::import_series_files`]): arquivos, legendas e o grab.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::api::Catalog;
@@ -26,7 +26,7 @@ use anyhow::Result;
 use serde::Serialize;
 use time::{Duration, OffsetDateTime};
 
-use super::grab::{Choice, apply_selection, give_up};
+use super::grab::{Choice, apply_selection, give_up, sequential_while_downloading};
 use super::naming::{TBA, episode_path};
 use crate::config::Config;
 use crate::decide::now_rfc3339;
@@ -34,7 +34,7 @@ use crate::events::{self, Event, Kind};
 use crate::grab::{
     CHECKING, Condition, Failure, NO_SEEDS, QUEUE_TAG, QUEUED, UNREGISTERED, absent, checking,
     client_trouble, ensure_client_listed, install, left, no_seeds, present, progress, qbit,
-    recheck_once, watch,
+    queue_message, recheck_once, series_places, watch,
 };
 
 /// Quanto se espera pelo título do episódio depois da exibição.
@@ -140,6 +140,8 @@ struct Importer<'a> {
     store: &'a Store,
     client: QbitClient,
     free_space: Option<u64>,
+    /// Lugar de cada grab na ordem da série, lido uma vez por volta.
+    places: HashMap<String, crate::grab::Place>,
 }
 
 impl Importer<'_> {
@@ -260,6 +262,7 @@ impl Importer<'_> {
                 .await?;
             return Err(Failure::Download(FailReason::NoSeeds, NO_SEEDS.into()));
         }
+        sequential_while_downloading(&self.client, &torrent).await;
         let Some(selection) = apply_selection(
             &self.client,
             &grab.hash,
@@ -319,6 +322,9 @@ impl Importer<'_> {
             return Ok(Step::waiting(CHECKING));
         }
         if selection.changed || torrent.progress < 1.0 || torrent.state == "moving" {
+            if torrent.has_tag(QUEUE_TAG) && torrent.progress <= 0.0 {
+                return Ok(Step::waiting(queue_message(&grab.hash, &self.places)));
+            }
             return Ok(Step::waiting(progress(&torrent)));
         }
 
@@ -685,9 +691,14 @@ pub async fn import_downloads(
     if !ensure_client_listed(config, &client, pending.len()).await? {
         return Ok(Vec::new());
     }
+    let places = match client.torrents().await {
+        Ok(torrents) => series_places(store, &pending, &torrents).await,
+        Err(_) => HashMap::new(),
+    };
     let importer = Importer {
         store,
         free_space: client.free_space().await.ok(),
+        places,
         client,
     };
     let mut lines = Vec::new();
