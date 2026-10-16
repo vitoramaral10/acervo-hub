@@ -447,7 +447,7 @@ fn series_first<T>(
     for position in 0..slots.len() {
         let Some(series_id) = slots[position]
             .as_ref()
-            .and_then(&place)
+            .and_then(place)
             .map(|p| p.series_id)
         else {
             ordered.extend(slots[position].take());
@@ -460,7 +460,7 @@ fn series_first<T>(
         for (i, slot) in slots.iter_mut().enumerate() {
             if slot
                 .as_ref()
-                .and_then(&place)
+                .and_then(place)
                 .is_some_and(|p| p.series_id == series_id)
             {
                 members.extend(slot.take().map(|item| (i, item)));
