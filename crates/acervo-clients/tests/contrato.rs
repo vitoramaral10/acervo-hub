@@ -676,6 +676,44 @@ async fn arquivos_trazem_indice_e_prioridade_e_a_prioridade_se_muda() {
 }
 
 #[tokio::test]
+async fn download_sequencial_vem_no_info_e_alterna_pelo_hash() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+    let mut sequencial = torrent("aa", "downloading", "/d");
+    sequencial["seq_dl"] = json!(true);
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrents/info"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([torrent("bb", "stoppedDL", "/d"), sequencial])),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/toggleSequentialDownload"))
+        .and(header("referer", server.uri() + "/"))
+        .and(body_string_contains("hashes=bb"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let torrents = cliente.torrents().await.unwrap();
+    assert!(!torrents[0].seq_dl);
+    assert!(torrents[1].seq_dl);
+    cliente.toggle_sequential("bb").await.expect("alternado");
+
+    let quebrado = MockServer::start().await;
+    let cliente = sessao(&quebrado).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/torrents/toggleSequentialDownload"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&quebrado)
+        .await;
+    assert!(cliente.toggle_sequential("bb").await.is_err());
+}
+
+#[tokio::test]
 async fn topo_da_fila_manda_os_hashes_juntos_e_fila_desligada_nao_e_erro() {
     let server = MockServer::start().await;
     let cliente = sessao(&server).await;
