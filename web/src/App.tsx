@@ -18,12 +18,13 @@ import {
   Sun,
   Trash2,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useSyncExternalStore } from 'react'
 import { GlobalSearch } from '@/components/GlobalSearch'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Tooltip } from '@/components/ui/misc'
-import { api, isUnauthorized } from '@/lib/api'
+import { api, isUnauthorized, sessionExpiredStore } from '@/lib/api'
+import { type LiveStatus, useLive } from '@/lib/live'
 import { type Theme, saveTheme, storedTheme } from '@/lib/theme'
 import { cn } from '@/lib/utils'
 import { ActivityPage } from '@/pages/Activity'
@@ -199,6 +200,19 @@ export function App() {
     [queryClient],
   )
 
+  const live = useLive(Boolean(session.data))
+  const expired = useSyncExternalStore(sessionExpiredStore.subscribe, sessionExpiredStore.get)
+
+  if (expired) {
+    return (
+      <div className="grid min-h-dvh place-items-center px-4">
+        <div role="alert" className="grid max-w-sm gap-3 text-center">
+          <p className="text-sm text-content">Sua sessão expirou — recarregue a página.</p>
+          <Button onClick={() => window.location.reload()}>Recarregar</Button>
+        </div>
+      </div>
+    )
+  }
   if (session.isPending) {
     return (
       <div className="grid min-h-dvh place-items-center" aria-busy="true">
@@ -260,6 +274,7 @@ export function App() {
           <ConfigGroup current={view} />
         </nav>
         <div className="flex shrink-0 items-center gap-1 md:mt-auto md:flex-col md:items-stretch">
+          <LiveBadge status={live} />
           <div className="hidden md:block">
             <ThemeSwitcher />
           </div>
@@ -303,6 +318,18 @@ export function App() {
         </div>
       </main>
     </div>
+  )
+}
+
+/** Ponto verde "ao vivo" / cinza "reconectando": o canal de eventos está de pé ou não. */
+function LiveBadge({ status }: { status: LiveStatus }) {
+  const on = status === 'live'
+  const label = on ? 'ao vivo' : 'reconectando'
+  return (
+    <p role="status" title={label} className="flex items-center gap-1.5 px-2 text-xs text-content-subtle md:px-3">
+      <span aria-hidden="true" className={cn('size-2 rounded-full', on ? 'bg-success' : 'bg-border-strong')} />
+      <span className="sr-only md:not-sr-only">{label}</span>
+    </p>
   )
 }
 

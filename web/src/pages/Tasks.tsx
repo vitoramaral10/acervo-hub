@@ -17,21 +17,21 @@ import { formatAgo, formatDuration, formatInterval } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
 // Enquanto alguma tarefa roda, a tela acompanha de perto; parada, só confere de vez em quando.
-const FAST = 3_000
-const SLOW = 15_000
+/** Execução em curso: só o andamento volta por polling; início e fim chegam por evento. */
+const FAST = 5_000
 
 export function TasksPage() {
   const queryClient = useQueryClient()
   const tasks = useQuery({
     queryKey: ['tarefas'],
     queryFn: api.tasks,
-    refetchInterval: (query) => (query.state.data?.tarefas.some((task) => task.rodando) ? FAST : SLOW),
+    refetchInterval: (query) => (query.state.data?.tarefas.some((task) => task.rodando) ? FAST : false),
   })
   const anyRunning = tasks.data?.tarefas.some((task) => task.rodando) ?? false
   const history = useQuery({
     queryKey: ['tarefas-historico'],
     queryFn: api.taskHistory,
-    refetchInterval: anyRunning ? FAST : SLOW,
+    refetchInterval: anyRunning ? FAST : false,
   })
 
   const run = useMutation({

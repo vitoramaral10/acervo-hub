@@ -43,6 +43,7 @@ use tokio::sync::Semaphore;
 use crate::api::Catalog;
 use crate::config::Config;
 use crate::crossseed::{Origin, Source};
+use crate::live::{self, Bus};
 use crate::tasks::Cancel;
 use crate::web::Web;
 use adapt::{AdaptationPlan, Extraction};
@@ -159,6 +160,8 @@ struct Job<'a> {
     secrets: Vec<String>,
     /// O último andamento gravado, para não regravar o mesmo.
     shown: String,
+    /// Cada mudança de estado ou de andamento avisa a tela (`lancar`).
+    events: Bus,
 }
 
 impl Job<'_> {
@@ -182,6 +185,7 @@ impl Job<'_> {
         {
             tracing::warn!(indexer = self.indexer, "andamento do lançamento: {error}");
         }
+        self.events.emit(&[live::LAUNCH]);
     }
 }
 
@@ -222,6 +226,7 @@ pub(crate) async fn run(web: Arc<Web>, hash: String, indexer: String, claim: Cla
             if let Err(error) = error {
                 tracing::warn!(indexer, "pacote da fila não marcado como interrompido: {error}");
             }
+            web.events.emit(&[live::LAUNCH]);
             return;
         }
     };
@@ -235,6 +240,7 @@ pub(crate) async fn run(web: Arc<Web>, hash: String, indexer: String, claim: Cla
         indexer,
         secrets: Vec::new(),
         shown: QUEUED.to_owned(),
+        events: web.events.clone(),
     };
     let outcome = prepare(&config, &web.catalog, &mut job).await;
     let (state, error) = match outcome {
@@ -273,7 +279,10 @@ async fn save_outcome(
             .upsert_launch_state(&job.hash, &job.indexer, state, None, error)
             .await
         {
-            Ok(()) => return,
+            Ok(()) => {
+                job.events.emit(&[live::LAUNCH]);
+                return;
+            }
             Err(failure) => {
                 let Some(wait) = waits.next() else {
                     tracing::error!(
@@ -2332,6 +2341,7 @@ mod tests {
             indexer: "bjsharecustom".into(),
             secrets: Vec::new(),
             shown: QUEUED.to_owned(),
+            events: Bus::default(),
         };
         let cancel = Cancel::default();
         let stopper = cancel.clone();
@@ -2416,6 +2426,7 @@ mod tests {
             indexer: "bjsharecustom".into(),
             secrets: Vec::new(),
             shown: QUEUED.to_owned(),
+            events: Bus::default(),
         };
         let cancel = Cancel::default();
         let stopper = cancel.clone();
@@ -2492,6 +2503,7 @@ mod tests {
             indexer: "bjsharecustom".into(),
             secrets: Vec::new(),
             shown: QUEUED.to_owned(),
+            events: Bus::default(),
         };
         let result = create_torrent(
             &client,
@@ -2717,6 +2729,7 @@ mod tests {
             indexer: "bjsharecustom".into(),
             secrets: Vec::new(),
             shown: QUEUED.to_owned(),
+            events: Bus::default(),
         };
         let target = root.join("lancamentos/bj/Filme");
 

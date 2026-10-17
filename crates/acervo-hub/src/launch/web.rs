@@ -311,8 +311,10 @@ async fn enter_live<'a>(
     method: &Method,
 ) -> Result<&'a Store, Response> {
     let store = enter(web, headers, method).await?;
-    if let Err(error) = super::heal(store).await {
-        tracing::warn!("pacote sem job não resgatado: {error:#}");
+    match super::heal(store).await {
+        Ok(0) => {}
+        Ok(_) => web.events.emit(&[crate::live::LAUNCH]),
+        Err(error) => tracing::warn!("pacote sem job não resgatado: {error:#}"),
     }
     Ok(store)
 }
@@ -1206,6 +1208,7 @@ mod tests {
             catalog: crate::api::Catalog::default(),
             searches: tokio::sync::Mutex::default(),
             series_searches: tokio::sync::Mutex::default(),
+            events: crate::live::Bus::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!(
@@ -1661,6 +1664,7 @@ mod tests {
             catalog: crate::api::Catalog::default(),
             searches: tokio::sync::Mutex::default(),
             series_searches: tokio::sync::Mutex::default(),
+            events: crate::live::Bus::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!(

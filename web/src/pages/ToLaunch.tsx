@@ -41,7 +41,7 @@ const PROGRESS_KEY = ['para-lancar', 'andamento'] as const
 const detailKey = (hash: string, indexer: string) => ['para-lancar', hash, indexer] as const
 
 /** O pacote em preparo muda de passo sozinho: a tela pergunta o andamento de novo a cada 3 s. */
-const POLL_MS = 3000
+const POLL_MS = 5000
 
 type Filter = 'preparar' | 'prontos' | 'enviados' | 'inelegiveis' | 'todos'
 

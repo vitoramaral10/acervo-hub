@@ -894,6 +894,7 @@ mod tests {
             catalog: crate::api::Catalog::default(),
             searches: tokio::sync::Mutex::default(),
             series_searches: tokio::sync::Mutex::default(),
+            events: crate::live::Bus::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!(
@@ -1133,6 +1134,7 @@ mod tests {
             catalog: crate::api::Catalog::default(),
             searches: tokio::sync::Mutex::default(),
             series_searches: tokio::sync::Mutex::default(),
+            events: crate::live::Bus::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!(
