@@ -343,6 +343,11 @@ const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 /// escolher `rgb48be` (16 bits), um PNG 4K de ~40 MB que passa do limite do
 /// `ImgBB` e ocupa dezenas de MiB a mais na memória do hub.
 pub async fn screenshot(path: &Path, at_seconds: f64) -> anyhow::Result<Vec<u8>> {
+    // Um ffmpeg por vez, no preparo e na rota de download: um quadro 4K ocupa
+    // dezenas de MiB e o hub divide a máquina com o resto. Quem chega depois
+    // espera a vez.
+    static ONE_AT_A_TIME: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    let _turn = ONE_AT_A_TIME.acquire().await?;
     let output = tokio::time::timeout(
         Duration::from_secs(120),
         tokio::process::Command::new(ffmpeg_binary())

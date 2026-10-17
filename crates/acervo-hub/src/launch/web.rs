@@ -15,6 +15,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use acervo_clients::TorrentInfo;
+use acervo_core::DownloadHash;
 use acervo_store::{CrossSeedCheck, CrossSeedOutcome, Launch, LaunchState, Store};
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -25,7 +26,7 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use serde_json::{Value, json};
 
-use super::rules::Site;
+use super::rules::{Site, SourceFile};
 use crate::crossseed::{Origin, Source};
 use crate::web::{Shared, Web, WebError, WebResult, anyhow_bad, bad, enter, fail, ok};
 
@@ -56,6 +57,10 @@ pub(crate) fn routes() -> Router<Arc<Web>> {
         .route(
             "/ui/api/biblioteca/para-lancar/{hash}/{indexer}/mediainfo.txt",
             get(download_mediainfo),
+        )
+        .route(
+            "/ui/api/biblioteca/para-lancar/{hash}/{indexer}/capturas/{file}",
+            get(download_capture),
         )
         .route(
             "/ui/api/biblioteca/para-lancar/{hash}/{indexer}/enviado",
@@ -557,6 +562,122 @@ async fn download_mediainfo(
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     let disposition = HeaderValue::from_str(&attachment(&format!("{stem}.txt")))
+        .map_err(|_| fail(bad("nome do vídeo ilegível")))?;
+    headers.insert(header::CONTENT_DISPOSITION, disposition);
+    Ok(response)
+}
+
+/// `1.png` a `4.png` do fim da rota das capturas.
+fn capture_number(file: &str) -> Option<usize> {
+    let number: usize = file.strip_suffix(".png")?.parse().ok()?;
+    // `+1` e `01` também passam por `parse`: só a forma canônica vale.
+    (file == format!("{number}.png") && (1..=super::SCREEN_COUNT).contains(&number))
+        .then_some(number)
+}
+
+/// O nome do vídeo sem extensão, sem nada que vire caminho ou controle.
+fn capture_stem(video: &str) -> String {
+    let name = video.rsplit(['/', '\\']).next().unwrap_or(video);
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    let stem: String = stem
+        .chars()
+        .map(|c| if c.is_control() { '_' } else { c })
+        .collect();
+    if stem.trim().is_empty() {
+        "captura".to_owned()
+    } else {
+        stem
+    }
+}
+
+/// O vídeo principal da origem no disco: o torrent no cliente e o maior vídeo
+/// dele, como no preparo.
+async fn source_video(web: &Web, hash: &str) -> Result<(String, std::path::PathBuf), Response> {
+    let client = crate::grab::qbit(&web.config())
+        .await
+        .map_err(|e| fail(WebError(StatusCode::BAD_GATEWAY, format!("{e:#}"))))?;
+    let torrents = client
+        .torrents()
+        .await
+        .map_err(|e| fail(WebError(StatusCode::BAD_GATEWAY, e.to_string())))?;
+    let torrent = torrents
+        .iter()
+        .find(|t| t.hash.eq_ignore_ascii_case(hash))
+        .ok_or_else(|| not_found("o torrent de origem não está mais no cliente"))?;
+    let files = client
+        .files(&DownloadHash::new(torrent.hash.clone()))
+        .await
+        .map_err(|e| fail(WebError(StatusCode::BAD_GATEWAY, e.to_string())))?;
+    let files: Vec<SourceFile> = files
+        .iter()
+        .map(|f| SourceFile {
+            path: f.name.clone(),
+            size: f.size,
+        })
+        .collect();
+    let main = super::main_video(&files).ok_or_else(|| not_found("o pacote não tem vídeo"))?;
+    Ok((
+        main.path.clone(),
+        std::path::Path::new(&torrent.save_path).join(&main.path),
+    ))
+}
+
+/// Uma das 4 capturas do pacote, tirada na hora do vídeo principal da origem,
+/// na resolução real e sem escala. Nada vai a disco: o PNG sai do ffmpeg
+/// direto para a resposta. É o que se anexa no formulário do site, no lugar
+/// da miniatura ou da cópia reduzida do `ImgBB`.
+async fn download_capture(
+    State(web): Shared,
+    headers: HeaderMap,
+    Path((hash, indexer, file)): Path<(String, String, String)>,
+) -> WebResult {
+    let store = enter(&web, &headers, &Method::GET).await?;
+    let (hash, _) = pair(&hash, &indexer).map_err(fail)?;
+    let number = capture_number(&file).ok_or_else(|| {
+        not_found(format!(
+            "capturas vão de 1.png a {}.png",
+            super::SCREEN_COUNT
+        ))
+    })?;
+    let launch = store
+        .launch(&hash, &indexer)
+        .await
+        .map_err(|e| fail(bad(e)))?
+        .ok_or_else(|| not_found("o pacote não existe"))?;
+    let (relative, video) = source_video(&web, &hash).await?;
+    if !std::fs::metadata(&video).is_ok_and(|m| m.is_file()) {
+        return Err(not_found("o vídeo de origem não está no disco"));
+    }
+    // A duração do preparo; pacote de antes dela (ou sem ela) relê o vídeo.
+    let recorded = launch
+        .report
+        .pointer("/capturas/duracao")
+        .and_then(Value::as_f64);
+    let duration = match recorded {
+        Some(duration) => Some(duration),
+        None => crate::mediainfo::probe_full(&video)
+            .await
+            .and_then(|media| media.duration_seconds),
+    };
+    let at = duration
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .and_then(|d| super::screen_time(d, number))
+        .ok_or_else(|| fail(bad("o ffprobe não disse a duração do vídeo")))?;
+    let png = crate::mediainfo::screenshot(&video, at)
+        .await
+        .map_err(|error| {
+            tracing::warn!(indexer, number, "captura para baixar: {error:#}");
+            fail(WebError(
+                StatusCode::BAD_GATEWAY,
+                "não deu para tirar a captura (detalhe no log do hub)".into(),
+            ))
+        })?;
+    let mut response = Response::new(Body::from(png));
+    let headers = response.headers_mut();
+    crate::api::secure_headers(headers);
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    let name = format!("{}.captura-{number}.png", capture_stem(&relative));
+    let disposition = HeaderValue::from_str(&attachment(&name))
         .map_err(|_| fail(bad("nome do vídeo ilegível")))?;
     headers.insert(header::CONTENT_DISPOSITION, disposition);
     Ok(response)
@@ -1896,6 +2017,193 @@ mod tests {
         assert_eq!(launch.state, LaunchState::Enviado);
         assert_eq!(launch.site_hash.as_deref(), Some(site_hash.as_str()));
         assert_eq!(launch.error.as_deref(), Some(aviso));
+        db.drop().await;
+    }
+
+    #[test]
+    fn numero_da_captura_so_aceita_1_a_4_em_forma_canonica() {
+        for (file, want) in [
+            ("1.png", Some(1)),
+            ("4.png", Some(4)),
+            ("0.png", None),
+            ("5.png", None),
+            ("01.png", None),
+            ("+1.png", None),
+            ("1.jpg", None),
+            ("1", None),
+            ("../1.png", None),
+            ("", None),
+        ] {
+            assert_eq!(capture_number(file), want, "{file}");
+        }
+        assert_eq!(capture_stem("Raiz/Sub/Filme Çá.2024.mkv"), "Filme Çá.2024");
+        assert_eq!(capture_stem("Raiz\\a\nb.mkv"), "a_b");
+        assert_eq!(capture_stem(".mkv"), "captura");
+    }
+
+    /// Um qBittorrent de mentira com um torrent em `save_path` e estes arquivos.
+    async fn qbit_with_files(hash: &str, save_path: &str, files: &[&str]) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "hash": hash, "name": "Raiz", "state": "stalledUP",
+                "save_path": save_path, "category": "acervo", "progress": 1.0,
+            }])))
+            .mount(&server)
+            .await;
+        let list: Vec<Value> = files
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                json!({ "index": index, "name": name, "size": 100, "progress": 1.0, "priority": 1 })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(list))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Um `.mkv` de 4 s e 320x240, ou `None` sem ffmpeg na máquina.
+    fn small_video(path: &std::path::Path) -> Option<()> {
+        let ffmpeg = std::env::var("ACERVO_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
+        std::process::Command::new(ffmpeg)
+            .args(["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=duration=4:size=320x240:rate=10")
+            .args(["-c:v", "mpeg4"])
+            .arg(path)
+            .status()
+            .is_ok_and(|s| s.success())
+            .then_some(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Um cenário de ponta a ponta, pela API.
+    async fn captura_para_baixar_sai_na_hora_em_resolucao_original_sem_gravar_nada() {
+        let Some(db) = acervo_store::testing::TestDb::new("para_lancar_capturas").await else {
+            return;
+        };
+        let store = &db.store;
+        let (web, base) = serve(&db).await;
+        let http = reqwest::Client::new();
+        let hash = "c".repeat(40);
+        let url = |n: &str| format!("{base}/{hash}/{BJ}/capturas/{n}");
+        let get = |n: &str| http.get(url(n)).header("X-Api-Key", KEY);
+
+        // Auth: sem a chave, nada.
+        assert_eq!(
+            http.get(url("1.png"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            401
+        );
+        // Sem pacote, 404; número fora de 1 a 4, 404.
+        let (status, _) = call(&http, reqwest::Method::GET, &url("1.png")).await;
+        assert_eq!(status, 404);
+        store
+            .upsert_launch_state(&hash, BJ, LaunchState::Pronto, None, None)
+            .await
+            .unwrap();
+        for n in ["0.png", "5.png", "01.png", "1.jpg", "x.png"] {
+            let (status, _) = call(&http, reqwest::Method::GET, &url(n)).await;
+            assert_eq!(status, 404, "{n}");
+        }
+        // Cliente de download fora do ar: 502, não 500.
+        let (status, _) = call(&http, reqwest::Method::GET, &url("1.png")).await;
+        assert_eq!(status, 502);
+
+        // Torrent que saiu do cliente; torrent sem vídeo: 404.
+        let server = qbit_with_files(&"9".repeat(40), "/nada", &["Raiz/Filme.mkv"]).await;
+        point_to(&web, &server).await;
+        let (status, _) = call(&http, reqwest::Method::GET, &url("1.png")).await;
+        assert_eq!(status, 404);
+        let server = qbit_with_files(&hash, "/nada", &["Raiz/Filme.nfo", "Raiz/Filme.srt"]).await;
+        point_to(&web, &server).await;
+        let (status, body) = call(&http, reqwest::Method::GET, &url("1.png")).await;
+        assert_eq!(status, 404);
+        assert!(body.to_string().contains("não tem vídeo"), "{body}");
+        // Vídeo que não está no disco: 404.
+        let server = qbit_with_files(&hash, "/nada", &["Raiz/Filme.mkv"]).await;
+        point_to(&web, &server).await;
+        let (status, _) = call(&http, reqwest::Method::GET, &url("1.png")).await;
+        assert_eq!(status, 404);
+
+        // Com ffmpeg na máquina: o quadro de verdade.
+        let dir = std::env::temp_dir().join(format!("acervo-capturas-{}", std::process::id()));
+        let content = dir.join("Raiz");
+        std::fs::create_dir_all(&content).unwrap();
+        let video = content.join("Filme Çá.mkv");
+        if small_video(&video).is_some() {
+            let server = qbit_with_files(
+                &hash,
+                dir.to_str().unwrap(),
+                &["Raiz/Filme Çá.mkv", "Raiz/Sample/amostra.mkv"],
+            )
+            .await;
+            point_to(&web, &server).await;
+            let before: Vec<_> = std::fs::read_dir(&content).unwrap().flatten().collect();
+            // Os 100 bytes de cada arquivo empatam o "maior": vale o primeiro
+            // pelo caminho, `Raiz/Filme Çá.mkv`.
+            let duration = crate::mediainfo::probe_full(&video)
+                .await
+                .and_then(|m| m.duration_seconds)
+                .expect("ffprobe");
+            for number in 1..=super::super::SCREEN_COUNT {
+                let response = get(&format!("{number}.png")).send().await.unwrap();
+                assert_eq!(response.status().as_u16(), 200, "captura {number}");
+                let headers = response.headers().clone();
+                assert_eq!(headers["content-type"], "image/png");
+                let disposition = headers["content-disposition"].to_str().unwrap();
+                assert!(
+                    disposition.starts_with(&format!(
+                        "attachment; filename=\"Filme __.captura-{number}.png\""
+                    )),
+                    "{disposition}"
+                );
+                assert!(disposition.ends_with(&format!(
+                    "filename*=UTF-8''Filme%20%C3%87%C3%A1.captura-{number}.png"
+                )));
+                assert!(headers.contains_key("content-security-policy"));
+                assert_eq!(headers["x-content-type-options"], "nosniff");
+                assert_eq!(headers["cache-control"], "no-store");
+                let png = response.bytes().await.unwrap();
+                assert!(png.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]));
+                // IHDR: a largura e a altura reais, sem escala.
+                assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 320);
+                assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 240);
+                // Mesmo instante do preparo: o mesmo quadro, byte a byte.
+                let at = super::super::screen_time(duration, number).unwrap();
+                let expected = crate::mediainfo::screenshot(&video, at).await.unwrap();
+                assert_eq!(png.as_ref(), expected.as_slice(), "captura {number}");
+            }
+            // A duração gravada no laudo manda: 400 s de duração levam ao fim
+            // do vídeo de 4 s, que não tem quadro, e a rota diz que falhou.
+            store
+                .save_launch_report(&hash, BJ, &json!({ "capturas": { "duracao": 4000.0 } }))
+                .await
+                .unwrap();
+            let (status, body) = call(&http, reqwest::Method::GET, &url("1.png")).await;
+            assert_eq!(status, 502, "{body}");
+            assert!(!body.to_string().contains(dir.to_str().unwrap()), "{body}");
+            // Nada foi gravado ao lado do vídeo.
+            let after: Vec<_> = std::fs::read_dir(&content).unwrap().flatten().collect();
+            assert_eq!(before.len(), after.len());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
         db.drop().await;
     }
 }

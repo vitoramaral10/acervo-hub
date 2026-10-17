@@ -1081,6 +1081,8 @@ export interface LaunchReport {
   verdict: 'elegivel' | 'inelegivel'
   /** Ausente em laudos anteriores à pasta adaptada. */
   adaptations?: LaunchAdaptation[]
+  /** O vídeo principal, de onde saem as capturas; ausente em pacote anterior às capturas para baixar. */
+  capturas?: { arquivo: string; largura: number; altura: number; duracao: number | null }
 }
 
 /** O texto gerado; cada campo vira um botão de copiar. */
@@ -1161,4 +1163,6 @@ export const launchApi = {
   /** O download não passa por `request` (que só lê JSON): é um `<a href download>` com a sessão. */
   torrentUrl: (hash: string, indexer: string) => `${launchPair(hash, indexer)}/torrent`,
   mediainfoUrl: (hash: string, indexer: string) => `${launchPair(hash, indexer)}/mediainfo.txt`,
+  /** O PNG `number` (1 a 4), tirado na hora em resolução original. */
+  captureUrl: (hash: string, indexer: string, number: number) => `${launchPair(hash, indexer)}/capturas/${number}.png`,
 }
