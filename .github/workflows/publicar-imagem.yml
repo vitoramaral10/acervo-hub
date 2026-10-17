@@ -9,6 +9,13 @@ permissions:
   contents: read
   packages: write
 
+# Dois pushes seguidos na main corriam juntos e a tag `main` ficava com o
+# build que terminasse por último, não com o commit mais novo. Um por ref: o
+# push novo cancela o build em andamento do anterior.
+concurrency:
+  group: publicar-imagem-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   publicar:
     runs-on: ubuntu-latest
