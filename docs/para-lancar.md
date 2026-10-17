@@ -175,6 +175,19 @@ distingue pt-BR de pt-PT: aceitar os dois). "Dual" = áudio PT + original.
   lido pelo ffprobe → Fail, citando o arquivo quando o pacote tem mais de um
   vídeo. O site valida o nome contra o MediaInfo e renomear é proibido, então
   o pacote fica inelegível antes do envio. Ver "Nome contra o arquivo" abaixo.
+- **4.0.1 (padrão de nome)** o nome de cada vídeo precisa trazer um codec de
+  áudio e um de vídeo na grafia de release padrão, ou o formulário o recusa
+  ("Nome fora do padrão") e renomear é proibido → Fail, só no Amigos (o BJ não
+  muda). Áudio (sem diferenciar maiúsculas; canais colados ou após ponto):
+  `DDP5.1`/`DDP.5.1`/`DD5.1`/`DD.5.1`/`DD+5.1`/`AAC2.0`/`AAC`/`AC3`/`EAC3`/
+  `DTS`/`DTS-HD.MA.5.1`/`DTS-HD`/`DTS-X`/`TrueHD`/`FLAC`/`Opus`/`LPCM`/`PCM`;
+  Atmos sozinho não conta. Vídeo (grafia exata): `H.264`, `H.265`, `H264`,
+  `H265`, `x264`, `x265`, `AVC`, `HEVC`, `AV1`, `VC-1`, `MPEG-2`; `h264`/`h265`
+  minúsculos também passam (comuns em WEB-DL), mas `X264`/`X265` com X
+  maiúsculo falham ("o nome usa 'X265' em maiúsculas; o padrão é 'x265'"),
+  como no Toy Story ...X265-IAMABLE, recusado pelo site. Parser puro em
+  `name_check::standard_name_gaps`; é uma segunda linha 4.0.1, independente da
+  conferência contra o arquivo.
 - **3.3** obra não falada em português sem áudio PT e sem legenda PT
   (embutida ou arquivo) → Fail.
 - **5.6** nome de arquivo/pasta com referência a site (lista: `bj-share`,
