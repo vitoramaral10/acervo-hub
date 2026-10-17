@@ -140,6 +140,21 @@ pub fn layout(torrent: &[u8]) -> Option<Vec<(String, u64)>> {
     Some(out)
 }
 
+/// O que prova que dois `.torrent` carregam o mesmo conteúdo: o tamanho da
+/// peça e os hashes das peças (`pieces`), exatamente como vieram. Campos
+/// soltos do `info` (como `source`, que muda o infohash) não entram.
+#[must_use]
+pub fn piece_digest(torrent: &[u8]) -> Option<(u64, Vec<u8>)> {
+    let top = entries(torrent, 0)?;
+    let info = top.iter().find(|(k, _)| *k == b"info")?.1;
+    let info = entries(torrent, info)?;
+    let length = info.iter().find(|(k, _)| *k == b"piece length")?.1;
+    let (length, _) = integer(torrent, length)?;
+    let pieces = info.iter().find(|(k, _)| *k == b"pieces")?.1;
+    let (pieces, _) = string(torrent, pieces)?;
+    Some((u64::try_from(length).ok()?, pieces.to_vec()))
+}
+
 /// A URL de `announce` do `.torrent`. É segredo (leva a passkey): quem a usa
 /// não a loga nem a devolve.
 #[must_use]
@@ -232,6 +247,25 @@ mod tests {
         assert_eq!(announce(b"d4:infod4:name1:aee"), None);
         assert_eq!(announce(b"d8:announce0:4:infod4:name1:aee"), None);
         assert_eq!(announce(b"lixo"), None);
+    }
+
+    #[test]
+    fn piece_digest_ignora_o_resto_do_info_e_exige_os_dois_campos() {
+        let a = b"d4:infod6:lengthi10e4:name1:a12:piece lengthi16384e6:pieces3:abc6:source1:xee";
+        let b = b"d4:infod6:lengthi10e4:name1:a12:piece lengthi16384e6:pieces3:abc6:source1:yee";
+        assert_eq!(piece_digest(a), Some((16384, b"abc".to_vec())));
+        assert_eq!(piece_digest(a), piece_digest(b));
+        assert_ne!(info_hash(a), info_hash(b));
+        let other = b"d4:infod6:lengthi10e4:name1:a12:piece lengthi16384e6:pieces3:abdee";
+        assert_ne!(piece_digest(a), piece_digest(other));
+        let bigger = b"d4:infod6:lengthi10e4:name1:a12:piece lengthi32768e6:pieces3:abcee";
+        assert_ne!(piece_digest(a), piece_digest(bigger));
+        assert_eq!(
+            piece_digest(b"d4:infod6:lengthi1e4:name1:a6:pieces1:xee"),
+            None
+        );
+        assert_eq!(piece_digest(b"d4:infod12:piece lengthi1ee"), None);
+        assert_eq!(piece_digest(b"lixo"), None);
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub use dto::{
     TorrentFile, TorrentInfo, TorrentTaskEntry, TorrentTaskState, TorrentTaskStatus, Tracker,
     working_announce,
 };
-pub use torrent::{announce, info_hash, layout, magnet_hash};
+pub use torrent::{announce, info_hash, layout, magnet_hash, piece_digest};
 
 #[derive(Debug, thiserror::Error)]
 pub enum QbitError {
@@ -243,6 +243,31 @@ impl QbitClient {
             .get("api/v2/torrents/info", &[("hashes", hash)])
             .await?;
         Ok(found.into_iter().next())
+    }
+
+    /// O `.torrent` de um torrent do cliente (`torrents/export`, qBittorrent
+    /// 4.5+). Leva o announce com a passkey: quem o usa não o loga.
+    ///
+    /// # Errors
+    ///
+    /// Falha de transporte ou status não-2xx (404: torrent desconhecido ou
+    /// cliente sem a rota; 409: sem metadados).
+    pub async fn export_torrent(&self, hash: &str) -> Result<Vec<u8>, QbitError> {
+        let path = "api/v2/torrents/export";
+        let response = self
+            .http
+            .get(self.base.join(path)?)
+            .query(&[("hash", hash)])
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(QbitError::Status {
+                status,
+                path: path.into(),
+            });
+        }
+        Ok(response.bytes().await?.to_vec())
     }
 
     /// Espaço livre, em bytes, no disco da pasta de download padrão.

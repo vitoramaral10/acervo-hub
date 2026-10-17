@@ -22,8 +22,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex, PoisonError};
+use std::time::Duration;
 
-use acervo_clients::{AddOptions, NewTorrent, QbitClient, TorrentInfo, layout};
+use acervo_clients::{
+    AddOptions, NewTorrent, QbitClient, QbitError, TorrentInfo, announce, layout, piece_digest,
+};
 use acervo_core::DownloadHash;
 use acervo_indexers::SearchQuery;
 use acervo_store::{CrossSeedCheck, CrossSeedOutcome, GrabState, Launch, LaunchState, Store};
@@ -333,6 +336,155 @@ async fn adopt(client: &QbitClient, torrent: &TorrentInfo, seed: &str) -> Result
     }
 }
 
+/// Tentativas de achar o irmão recém-adicionado para mandar conferir: o
+/// qBittorrent 5 responde ao `add` antes de listar o torrent.
+const RECHECK_TRIES: usize = 5;
+/// Espera entre elas.
+const RECHECK_WAIT: Duration = Duration::from_secs(1);
+
+/// Adiciona o irmão e já manda conferir, em vez de esperar a próxima volta do
+/// `verify`: o torrent entra parado e a conferência é o que decide se ele
+/// semeia. Se o cliente ainda não o lista depois das tentativas, fica para o
+/// `verify` (sem a tag de conferência, ele pede o recheck).
+///
+/// # Errors
+///
+/// A adição falhou. Falha do recheck não é erro: o irmão já está no cliente.
+pub(crate) async fn add_sibling(
+    client: &QbitClient,
+    torrent: NewTorrent,
+    options: &AddOptions,
+    hash: &str,
+) -> Result<(), QbitError> {
+    client.add(torrent, options).await?;
+    if !recheck_now(client, hash, RECHECK_TRIES, RECHECK_WAIT).await {
+        tracing::info!(
+            "cross-seed: irmão ainda fora da lista do cliente; a conferência fica para o verify"
+        );
+    }
+    Ok(())
+}
+
+/// Manda conferir `hash` assim que o cliente o lista e marca [`CHECKING_TAG`].
+/// Devolve se conseguiu (ou se o `verify` já o tinha mandado).
+///
+/// Sob o mesmo [`VERIFY_LOCK`] do `verify`, com a tag antes do recheck e o
+/// torrent relido já dentro da trava: um `verify` concorrente que o viu sem a
+/// tag já mandou conferir, e um que vem depois já a encontra. Nenhum chamador
+/// segura a trava aqui (só `verify` a toma, e ele não adiciona irmãos).
+async fn recheck_now(client: &QbitClient, hash: &str, tries: usize, wait: Duration) -> bool {
+    for attempt in 0..tries {
+        if attempt > 0 {
+            tokio::time::sleep(wait).await;
+        }
+        let _turn = VERIFY_LOCK.lock().await;
+        match client.torrent(hash).await {
+            Ok(Some(found)) => {
+                if found.has_tag(CHECKING_TAG) {
+                    return true;
+                }
+                let sent = async {
+                    client.add_tag(&[hash], CHECKING_TAG).await?;
+                    if let Err(error) = client.recheck(&[hash]).await {
+                        // Sem recheck a tag mentiria: o `verify` esperaria um
+                        // resultado que não vem e recusaria o irmão.
+                        let _ = client.remove_tag(&[hash], CHECKING_TAG).await;
+                        return Err(error);
+                    }
+                    Ok::<(), QbitError>(())
+                }
+                .await;
+                return match sent {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!("cross-seed: conferência imediata falhou: {error}");
+                        false
+                    }
+                };
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!("cross-seed: procurando o irmão adicionado: {error}"),
+        }
+    }
+    false
+}
+
+/// Caminho com `/` como separador e sem barra no fim.
+fn normalized_path(path: &str) -> String {
+    path.replace('\\', "/").trim_end_matches('/').to_owned()
+}
+
+/// Um torrent do cliente que já semeia o conteúdo de `candidate` (um
+/// `.torrent` de outro hash) **para o mesmo tracker**: duplicá-lo no mesmo
+/// tracker nunca registraria. Vale o que tem o mesmo `content_path` do
+/// pacote (`save_path` + raiz do layout, o atalho barato), um tracker real
+/// com o mesmo host, porta e primeiro segmento do announce do candidato
+/// ([`crate::launch::tracker_key`]), os mesmos arquivos **e** a mesma prova de
+/// conteúdo: o `.torrent` exportado pelo cliente tem o mesmo tamanho de peça
+/// e os mesmos hashes de peça (só `source` e afins podem diferir). Só esses
+/// pedem trackers, arquivos e export ao cliente. Sem a prova (export
+/// recusado, cliente antigo, peças diferentes) não adota. Nada do announce
+/// (passkey) é logado.
+///
+/// # Errors
+///
+/// O cliente falhou ao listar trackers ou arquivos: na dúvida não adiciona.
+pub(crate) async fn same_tracker_sibling<'a>(
+    client: &QbitClient,
+    torrents: impl IntoIterator<Item = &'a TorrentInfo>,
+    save_path: &str,
+    candidate: &[u8],
+) -> Result<Option<TorrentInfo>> {
+    let (Some(key), Some(files), Some(digest)) = (
+        announce(candidate).and_then(|url| crate::launch::tracker_key(&url)),
+        layout(candidate),
+        piece_digest(candidate),
+    ) else {
+        return Ok(None);
+    };
+    let Some(root) = files.first().and_then(|(path, _)| path.split('/').next()) else {
+        return Ok(None);
+    };
+    let content = normalized_path(&format!("{}/{root}", save_path.trim_end_matches('/')));
+    let own = acervo_clients::info_hash(candidate);
+    for existing in torrents {
+        if existing.content_path.is_empty()
+            || normalized_path(&existing.content_path) != content
+            || own
+                .as_deref()
+                .is_some_and(|hash| hash.eq_ignore_ascii_case(&existing.hash))
+        {
+            continue;
+        }
+        let trackers = client.trackers(&existing.hash).await?;
+        if !trackers
+            .iter()
+            .filter(|t| t.is_real())
+            .any(|t| crate::launch::tracker_key(&t.url).as_deref() == Some(key.as_str()))
+        {
+            continue;
+        }
+        let there = client
+            .files(&DownloadHash::new(existing.hash.clone()))
+            .await?;
+        let there: Vec<(String, u64)> = there.into_iter().map(|f| (f.name, f.size)).collect();
+        if !same_layout(&files, &there) {
+            continue;
+        }
+        // Mesmos arquivos não provam o mesmo conteúdo: só as peças provam.
+        match client.export_torrent(&existing.hash).await {
+            Ok(exported) if piece_digest(&exported).as_ref() == Some(&digest) => {
+                return Ok(Some(existing.clone()));
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                "cross-seed: sem o .torrent do irmão para provar o conteúdo; não adota: {error}"
+            ),
+        }
+    }
+    Ok(None)
+}
+
 /// O pacote do par que ainda não foi ao site (pronto, falhou ou inelegível):
 /// o que perde o sentido quando o release aparece no destino.
 fn unsent_package<'a>(launches: &'a [Launch], hash: &str, indexer: &str) -> Option<&'a Launch> {
@@ -516,6 +668,72 @@ pub(crate) async fn query(store: &Store, source: &Source) -> Result<Option<Searc
     }
 }
 
+/// Põe o irmão achado no cliente. Devolve o hash a gravar como achado e se
+/// já semeia.
+///
+/// Mesmo hash já no cliente, ou outro hash **do mesmo tracker** com os mesmos
+/// arquivos (o `.torrent` que o usuário baixou do site e adicionou à mão):
+/// não adiciona, porque um irmão a mais seria duplicata que o tracker não
+/// registra. Adota o que existe e grava o hash dele. Senão adiciona parado e
+/// já manda conferir ([`add_sibling`]).
+#[allow(clippy::too_many_arguments)]
+async fn place(
+    config: &Config,
+    store: &Store,
+    client: &QbitClient,
+    present: &HashMap<String, TorrentInfo>,
+    source: &Source,
+    indexer: &str,
+    launched: bool,
+    target: &Published,
+    bytes: Vec<u8>,
+    hash: String,
+) -> Result<(String, bool)> {
+    if let Some(existing) = present.get(&hash) {
+        let seeding = launched && adopt(client, existing, &acervo_core::seed_tag(indexer)).await?;
+        return Ok((hash, seeding));
+    }
+    if let Some(existing) =
+        same_tracker_sibling(client, present.values(), &target.save_path, &bytes).await?
+    {
+        let seed = if launched {
+            Some(acervo_core::seed_tag(indexer))
+        } else {
+            crate::grab::seed_tag(store, indexer).await
+        };
+        let seeding = match seed {
+            Some(seed) => adopt(client, &existing, &seed).await? && launched,
+            None => false,
+        };
+        tracing::info!(
+            torrent = source.name,
+            indexer,
+            "cross-seed: o tracker já tem torrent com estes arquivos no cliente; adotado"
+        );
+        return Ok((existing.hash.to_ascii_lowercase(), seeding));
+    }
+    let mut tags = vec![PENDING_TAG.to_owned()];
+    tags.extend(crate::grab::seed_tag(store, indexer).await);
+    let seed = acervo_core::seed_tag(indexer);
+    if launched && !tags.contains(&seed) {
+        tags.push(seed);
+    }
+    let options = AddOptions {
+        category: config.library.category.clone(),
+        save_path: Some(target.save_path.clone()),
+        stopped: true,
+        stop_after_metadata: false,
+        tags,
+    };
+    add_sibling(client, NewTorrent::File(bytes), &options, &hash).await?;
+    tracing::info!(
+        torrent = source.name,
+        indexer,
+        "cross-seed: irmão adicionado, conferindo"
+    );
+    Ok((hash, false))
+}
+
 /// Procura o irmão de `source` em `indexer` e, achando, o adiciona parado
 /// para conferir. Devolve o desfecho da consulta e, achando, o infohash do
 /// irmão.
@@ -591,31 +809,14 @@ async fn find(
             DIFFERING.remember(&memory, indexer, &release.guid);
             continue;
         }
-        if let Some(existing) = present.get(&hash) {
-            let seeding =
-                launched && adopt(client, existing, &acervo_core::seed_tag(indexer)).await?;
-            return Ok((CrossSeedOutcome::Found, Some(hash), seeding));
-        }
-        let mut tags = vec![PENDING_TAG.to_owned()];
-        tags.extend(crate::grab::seed_tag(store, indexer).await);
-        let seed = acervo_core::seed_tag(indexer);
-        if launched && !tags.contains(&seed) {
-            tags.push(seed);
-        }
-        let options = AddOptions {
-            category: config.library.category.clone(),
-            save_path: Some(target.save_path.clone()),
-            stopped: true,
-            stop_after_metadata: false,
-            tags,
+        let NewTorrent::File(bytes) = torrent else {
+            continue;
         };
-        client.add(torrent, &options).await?;
-        tracing::info!(
-            torrent = source.name,
-            indexer,
-            "cross-seed: irmão adicionado, conferindo"
-        );
-        return Ok((CrossSeedOutcome::Found, Some(hash), false));
+        let (hash, seeding) = place(
+            config, store, client, present, source, indexer, launched, &target, bytes, hash,
+        )
+        .await?;
+        return Ok((CrossSeedOutcome::Found, Some(hash), seeding));
     }
     let outcome = if layout_differs {
         CrossSeedOutcome::LayoutDiffers
@@ -627,15 +828,17 @@ async fn find(
     Ok((outcome, None, false))
 }
 
+static VERIFY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Confere os irmãos pendentes: manda conferir, inicia o que deu 100% e
 /// tira do cliente, sem os arquivos, o que não deu. Devolve (iniciados,
 /// recusados).
-async fn verify(
-    store: &Store,
-    client: &QbitClient,
-    torrents: &[TorrentInfo],
-    launched: &Pairs,
-) -> Result<(usize, usize)> {
+///
+/// Lê o cliente sob uma trava: a volta do cross-seed e a importação o chamam
+/// ao mesmo tempo, e cada uma agiria sobre uma lista já velha da outra.
+async fn verify(store: &Store, client: &QbitClient, launched: &Pairs) -> Result<(usize, usize)> {
+    let _turn = VERIFY_LOCK.lock().await;
+    let torrents = client.torrents().await?;
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let (mut started, mut rejected) = (0, 0);
     for torrent in torrents.iter().filter(|t| t.has_tag(PENDING_TAG)) {
@@ -686,6 +889,19 @@ async fn verify(
     Ok((started, rejected))
 }
 
+/// Só a parte de conferir e iniciar os irmãos pendentes, sem buscas: roda
+/// também na importação, para o irmão adicionado não esperar a próxima volta
+/// do cross-seed. Devolve (iniciados, recusados).
+///
+/// # Errors
+///
+/// Cliente ou banco inalcançável.
+pub(crate) async fn verify_pending(config: &Config, store: &Store) -> Result<(usize, usize)> {
+    let client = crate::grab::qbit(config).await?;
+    let launches = store.launches().await?;
+    verify(store, &client, &launched(&launches)).await
+}
+
 /// Uma volta: confere os pendentes e consulta os próximos pares.
 ///
 /// # Errors
@@ -694,10 +910,11 @@ async fn verify(
 /// consulta sem achar.
 pub(crate) async fn run(config: &Config, store: &Store, catalog: &Catalog) -> Result<String> {
     let client = crate::grab::qbit(config).await?;
-    let torrents = client.torrents().await?;
     let launches = store.launches().await?;
     let sent = launched(&launches);
-    let (started, rejected) = verify(store, &client, &torrents, &sent).await?;
+    let (started, rejected) = verify(store, &client, &sent).await?;
+    // Depois do verify: a lista já reflete o que ele iniciou ou removeu.
+    let torrents = client.torrents().await?;
 
     let indexers: Vec<String> = store
         .indexers()
@@ -1339,5 +1556,505 @@ mod tests {
             .collect();
         assert_eq!(achados, ["a", "b", "c"]);
         assert!(unsent_package(&launches, "a", "amigos").is_none());
+    }
+
+    // ---- mesmo tracker no cliente e conferência imediata
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use wiremock::matchers::{body_string_contains, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// O `.torrent` de um arquivo (`Filme.mkv`, 10 bytes) com o announce dado.
+    fn site_torrent(announce: &str) -> Vec<u8> {
+        site_torrent_with(announce, "x", None)
+    }
+
+    /// Como [`site_torrent`], com as peças dadas e, se houver, um `source` no
+    /// `info` (muda o infohash sem mudar o conteúdo).
+    fn site_torrent_with(announce: &str, pieces: &str, source: Option<&str>) -> Vec<u8> {
+        let source = source.map_or_else(String::new, |s| format!("6:source{}:{s}", s.len()));
+        format!(
+            "d8:announce{}:{announce}4:infod6:lengthi10e4:name9:Filme.mkv12:piece lengthi16384e6:pieces{}:{pieces}{source}ee",
+            announce.len(),
+            pieces.len()
+        )
+        .into_bytes()
+    }
+
+    /// O irmão `hash` no cliente: tracker do destino (outra passkey) e os
+    /// mesmos arquivos; o export devolve `exported` (`None`: 404).
+    async fn mount_sibling(server: &MockServer, hash: &str, exported: Option<Vec<u8>>) {
+        mount_sibling_at(
+            server,
+            hash,
+            "https://AMIGOS.exemplo/announce?passkey=OUTRA",
+            exported,
+        )
+        .await;
+    }
+
+    async fn mount_sibling_at(
+        server: &MockServer,
+        hash: &str,
+        tracker: &str,
+        exported: Option<Vec<u8>>,
+    ) {
+        mount_get(
+            server,
+            "trackers",
+            hash,
+            serde_json::json!([{ "url": tracker, "status": 2 }]),
+        )
+        .await;
+        mount_get(
+            server,
+            "files",
+            hash,
+            serde_json::json!([{ "name": "Filme.mkv", "size": 10 }]),
+        )
+        .await;
+        mount_export(server, hash, exported).await;
+    }
+
+    async fn mount_export(server: &MockServer, hash: &str, exported: Option<Vec<u8>>) {
+        let response = exported.map_or_else(
+            || ResponseTemplate::new(404),
+            |bytes| ResponseTemplate::new(200).set_body_bytes(bytes),
+        );
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/export"))
+            .and(query_param("hash", hash))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+
+    const AMIGOS: &str = "https://amigos.exemplo/announce?passkey=SEGREDO";
+
+    fn in_client(hash: &str, state: &str, tags: &str, content: &str) -> TorrentInfo {
+        serde_json::from_value(serde_json::json!({
+            "hash": hash, "name": "Filme", "state": state, "save_path": "/d",
+            "progress": 1.0, "tags": tags, "category": "acervo",
+            "content_path": content,
+        }))
+        .unwrap()
+    }
+
+    async fn qbit_mock() -> (MockServer, QbitClient) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = QbitClient::login(&server.uri(), "u", "s", Duration::from_secs(5))
+            .await
+            .unwrap();
+        (server, client)
+    }
+
+    async fn mount_get(server: &MockServer, route: &str, hash: &str, body: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v2/torrents/{route}")))
+            .and(query_param("hash", hash))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_post(server: &MockServer, route: &str, matcher: &str, times: u64) {
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v2/torrents/{route}")))
+            .and(body_string_contains(matcher))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(times)
+            .mount(server)
+            .await;
+    }
+
+    fn target() -> Published {
+        Published {
+            layout: vec![("Filme.mkv".to_owned(), 10)],
+            save_path: "/d".to_owned(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn place_in(
+        store: &Store,
+        client: &QbitClient,
+        present: &[TorrentInfo],
+        launched: bool,
+        bytes: Vec<u8>,
+    ) -> (String, bool) {
+        let present: HashMap<String, TorrentInfo> = present
+            .iter()
+            .map(|t| (t.hash.clone(), t.clone()))
+            .collect();
+        let hash = acervo_clients::info_hash(&bytes).unwrap();
+        let mut config = Config::default();
+        config.library.category = "acervo".into();
+        place(
+            &config,
+            store,
+            client,
+            &present,
+            &fonte("src", "bj"),
+            "amigos",
+            launched,
+            &target(),
+            bytes,
+            hash,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn irmao_ja_no_cliente_com_o_mesmo_tracker_e_adotado_sem_adicionar() {
+        let Some(db) = acervo_store::testing::TestDb::new("crossseed_adota").await else {
+            return;
+        };
+        let (server, client) = qbit_mock().await;
+        let mine = "8".repeat(40);
+        let origin = "1".repeat(40);
+        let other = "2".repeat(40);
+        // O .torrent do site que o usuário adicionou à mão: mesmo conteúdo,
+        // tracker do destino, hash diferente do candidato do cross-seed.
+        let present = [
+            in_client(&mine, "stalledUP", "", "/d/Filme.mkv"),
+            in_client(&origin, "stalledUP", "", "/d/Filme.mkv"),
+            in_client(&other, "stalledUP", "", "/d/Outro.mkv"),
+        ];
+        mount_get(
+            &server,
+            "trackers",
+            &mine,
+            serde_json::json!([
+                { "url": "** [DHT] **", "status": 0 },
+                { "url": "https://AMIGOS.exemplo/announce?passkey=OUTRA", "status": 2 },
+            ]),
+        )
+        .await;
+        mount_get(
+            &server,
+            "trackers",
+            &origin,
+            serde_json::json!([{ "url": "https://origem.exemplo/announce", "status": 2 }]),
+        )
+        .await;
+        // Outro caminho: nem trackers nem arquivos são pedidos.
+        Mock::given(method("GET"))
+            .and(query_param("hash", other.as_str()))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        mount_get(
+            &server,
+            "files",
+            &mine,
+            serde_json::json!([{ "name": "Filme.mkv", "size": 10 }]),
+        )
+        .await;
+        // As mesmas peças, com um `source` do site no info (outro infohash).
+        mount_export(
+            &server,
+            &mine,
+            Some(site_torrent_with(AMIGOS, "x", Some("amigos"))),
+        )
+        .await;
+        mount_post(&server, "add", "", 0).await;
+        mount_post(&server, "addTags", &format!("hashes={mine}"), 1).await;
+
+        let (hash, seeding) =
+            place_in(&db.store, &client, &present, true, site_torrent(AMIGOS)).await;
+        // Grava o hash do que já existia, não o do candidato.
+        assert_eq!(hash, mine);
+        assert!(seeding);
+        drop(server);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn existente_de_outro_tracker_com_os_mesmos_arquivos_e_cross_seed_legitimo() {
+        let Some(db) = acervo_store::testing::TestDb::new("crossseed_outro_tracker").await else {
+            return;
+        };
+        let (server, client) = qbit_mock().await;
+        let origin = "1".repeat(40);
+        let present = [in_client(&origin, "stalledUP", "", "/d/Filme.mkv")];
+        mount_get(
+            &server,
+            "trackers",
+            &origin,
+            serde_json::json!([{ "url": "https://origem.exemplo/announce", "status": 2 }]),
+        )
+        .await;
+        // Tracker diferente: os arquivos nem são comparados.
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/files"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let bytes = site_torrent(AMIGOS);
+        let candidate = acervo_clients::info_hash(&bytes).unwrap();
+        // Adiciona, acha o torrent na lista e manda conferir na hora.
+        mount_post(&server, "add", "", 1).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/info"))
+            .and(query_param("hashes", candidate.as_str()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([in_client_json(&candidate)])),
+            )
+            .mount(&server)
+            .await;
+        mount_post(&server, "recheck", &format!("hashes={candidate}"), 1).await;
+        mount_post(&server, "addTags", "cross-seed%3Aconferindo", 1).await;
+
+        let (hash, seeding) = place_in(&db.store, &client, &present, true, bytes).await;
+        assert_eq!(hash, candidate);
+        assert!(!seeding);
+        drop(server);
+        db.drop().await;
+    }
+
+    fn in_client_json(hash: &str) -> serde_json::Value {
+        serde_json::json!({
+            "hash": hash, "name": "Filme", "state": "stoppedDL", "save_path": "/d",
+        })
+    }
+
+    #[tokio::test]
+    async fn mesmo_tracker_com_arquivos_diferentes_nao_e_o_mesmo_conteudo() {
+        let (server, client) = qbit_mock().await;
+        let mine = "8".repeat(40);
+        let present = [in_client(&mine, "stalledUP", "", "/d/Filme.mkv")];
+        mount_get(
+            &server,
+            "trackers",
+            &mine,
+            serde_json::json!([{ "url": AMIGOS, "status": 2 }]),
+        )
+        .await;
+        mount_get(
+            &server,
+            "files",
+            &mine,
+            serde_json::json!([{ "name": "Filme.mkv", "size": 11 }]),
+        )
+        .await;
+        let found = same_tracker_sibling(&client, &present, "/d", &site_torrent(AMIGOS))
+            .await
+            .unwrap();
+        assert!(found.is_none());
+        // O próprio candidato no cliente não é "outro": é o caso do mesmo hash.
+        let own = acervo_clients::info_hash(&site_torrent(AMIGOS)).unwrap();
+        let present = [in_client(&own, "stalledUP", "", "/d/Filme.mkv")];
+        let found = same_tracker_sibling(&client, &present, "/d", &site_torrent(AMIGOS))
+            .await
+            .unwrap();
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn so_adota_com_as_mesmas_pecas_e_o_mesmo_caminho_de_announce() {
+        let (server, client) = qbit_mock().await;
+        let mine = "8".repeat(40);
+        let present = [in_client(&mine, "stalledUP", "", "/d/Filme.mkv")];
+        let candidate = site_torrent(AMIGOS);
+        let find = || same_tracker_sibling(&client, &present, "/d", &candidate);
+
+        // Peças diferentes: mesmo layout e tracker, outro conteúdo.
+        mount_sibling(&server, &mine, Some(site_torrent_with(AMIGOS, "y", None))).await;
+        assert!(find().await.unwrap().is_none());
+
+        // Mesmas peças com `source` diferente: adota.
+        server.reset().await;
+        mount_sibling(
+            &server,
+            &mine,
+            Some(site_torrent_with(AMIGOS, "x", Some("amigos"))),
+        )
+        .await;
+        let found = find().await.unwrap().expect("adota");
+        assert_eq!(found.hash, mine);
+
+        // Export recusado: sem prova, não adota (e não é erro).
+        server.reset().await;
+        mount_sibling(&server, &mine, None).await;
+        assert!(find().await.unwrap().is_none());
+
+        // Export que não é um .torrent: idem.
+        server.reset().await;
+        mount_sibling(&server, &mine, Some(b"<html>".to_vec())).await;
+        assert!(find().await.unwrap().is_none());
+
+        // Outro caminho de announce no mesmo host: outro tracker.
+        server.reset().await;
+        mount_sibling_at(
+            &server,
+            &mine,
+            "https://amigos.exemplo/outro/announce",
+            Some(site_torrent_with(AMIGOS, "x", None)),
+        )
+        .await;
+        assert!(find().await.unwrap().is_none());
+        // Outra porta, idem.
+        server.reset().await;
+        mount_sibling_at(
+            &server,
+            &mine,
+            "https://amigos.exemplo:8443/announce",
+            Some(site_torrent_with(AMIGOS, "x", None)),
+        )
+        .await;
+        assert!(find().await.unwrap().is_none());
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn sem_prova_de_conteudo_o_irmao_e_adicionado_e_conferido() {
+        let Some(db) = acervo_store::testing::TestDb::new("crossseed_sem_prova").await else {
+            return;
+        };
+        let (server, client) = qbit_mock().await;
+        let mine = "8".repeat(40);
+        let present = [in_client(&mine, "stalledUP", "", "/d/Filme.mkv")];
+        mount_sibling(&server, &mine, None).await;
+        let bytes = site_torrent(AMIGOS);
+        let candidate = acervo_clients::info_hash(&bytes).unwrap();
+        mount_post(&server, "add", "", 1).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/info"))
+            .and(query_param("hashes", candidate.as_str()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([in_client_json(&candidate)])),
+            )
+            .mount(&server)
+            .await;
+        mount_post(&server, "recheck", &format!("hashes={candidate}"), 1).await;
+        mount_post(&server, "addTags", "cross-seed%3Aconferindo", 1).await;
+
+        let (hash, seeding) = place_in(&db.store, &client, &present, true, bytes).await;
+        assert_eq!(hash, candidate);
+        assert!(!seeding);
+        drop(server);
+        db.drop().await;
+    }
+
+    /// Responde à lista do cliente com o irmão pendente; a tag de conferência
+    /// só aparece depois que o cliente a recebeu.
+    struct Listing {
+        hash: String,
+        tagged: Arc<AtomicBool>,
+    }
+
+    impl wiremock::Respond for Listing {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            let tags = if self.tagged.load(Ordering::SeqCst) {
+                format!("{PENDING_TAG}, {CHECKING_TAG}")
+            } else {
+                PENDING_TAG.to_owned()
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "hash": self.hash, "name": "Filme", "state": "stoppedDL",
+                "save_path": "/d", "progress": 0.0, "tags": tags,
+                "added_on": OffsetDateTime::now_utc().unix_timestamp(),
+            }]))
+        }
+    }
+
+    struct Tagging(Arc<AtomicBool>);
+
+    impl wiremock::Respond for Tagging {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            self.0.store(true, Ordering::SeqCst);
+            ResponseTemplate::new(200)
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_concorrente_nao_manda_um_segundo_recheck() {
+        let Some(db) = acervo_store::testing::TestDb::new("crossseed_recheck_unico").await else {
+            return;
+        };
+        let (server, client) = qbit_mock().await;
+        let hash = "c".repeat(40);
+        let tagged = Arc::new(AtomicBool::new(false));
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/info"))
+            .respond_with(Listing {
+                hash: hash.clone(),
+                tagged: tagged.clone(),
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/torrents/addTags"))
+            .respond_with(Tagging(tagged))
+            .mount(&server)
+            .await;
+        mount_post(&server, "recheck", &format!("hashes={hash}"), 1).await;
+        // Um recheck só: nada de iniciar nem de recusar o irmão.
+        mount_post(&server, "start", "", 0).await;
+        mount_post(&server, "delete", "", 0).await;
+
+        let launched = Pairs::new();
+        let (rechecked, verified) = tokio::join!(
+            recheck_now(&client, &hash, 3, Duration::from_millis(1)),
+            verify(&db.store, &client, &launched),
+        );
+        assert!(rechecked);
+        assert_eq!(verified.unwrap(), (0, 0));
+        drop(server);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn recheck_sem_o_torrent_na_lista_fica_para_o_verify() {
+        let (server, client) = qbit_mock().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(2)
+            .mount(&server)
+            .await;
+        mount_post(&server, "recheck", "", 0).await;
+        assert!(!recheck_now(&client, &"c".repeat(40), 2, Duration::from_millis(1)).await);
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn verify_pending_inicia_o_irmao_conferido_a_cem_por_cento() {
+        let Some(db) = acervo_store::testing::TestDb::new("crossseed_verify_pending").await else {
+            return;
+        };
+        let (server, _) = qbit_mock().await;
+        let hash = "c".repeat(40);
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/info"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "hash": hash, "name": "Filme", "state": "stoppedUP", "save_path": "/d",
+                    "progress": 1.0, "added_on": 1,
+                    "tags": format!("{PENDING_TAG}, {CHECKING_TAG}"),
+                }])),
+            )
+            .mount(&server)
+            .await;
+        mount_post(&server, "start", &format!("hashes={hash}"), 1).await;
+        mount_post(&server, "removeTags", "", 2).await;
+        let mut config = Config::default();
+        config.qbittorrent.url = server.uri();
+        let done = verify_pending(&config, &db.store).await.unwrap();
+        assert_eq!(done, (1, 0));
+        drop(server);
+        db.drop().await;
     }
 }
