@@ -382,6 +382,7 @@ mod tests {
             codec: "eac3".to_owned(),
             channels: Some(6),
             title: None,
+            profile: None,
         }
     }
 

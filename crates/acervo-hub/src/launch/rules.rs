@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::mediainfo::{AudioFacts, Hdr, MediaFacts, VideoFacts};
 
 use super::adapt::{self, Extraction, Obstacle};
+use super::name_check;
 use super::subtitle_sniff::{Completeness, Sniff, SniffLanguage, Sniffs};
 
 /// Diferença de tamanho (relativa ao release do destino) abaixo da qual dois
@@ -478,11 +479,63 @@ impl<'a> Context<'a> {
 
 fn amigos(ctx: &Context<'_>, checks: &mut Vec<Check>) {
     checks.push(archives(ctx, "3.2", "o Amigos"));
+    checks.extend(name_matches_file(ctx, "4.0.1"));
     checks.push(portuguese_available(ctx));
     checks.push(site_reference(ctx, "5.6"));
     checks.extend(amigos_series_scope(ctx));
     checks.push(duplicate(ctx, Site::Amigos, "4.2.1"));
     checks.extend(inferior_source(ctx));
+}
+
+/// Quantos arquivos divergentes a mensagem lista antes de resumir.
+const NAME_CHECK_LISTED: usize = 3;
+
+/// Amigos 4.0.1 / BJ 4.1.1: o nome de cada vídeo não pode contradizer o
+/// arquivo (codec e canais do áudio, codec, resolução e HDR do vídeo), porque
+/// o site confere o nome contra o `MediaInfo` e renomear é proibido.
+fn name_matches_file(ctx: &Context<'_>, rule: &str) -> Option<Check> {
+    if ctx.facts.videos.is_empty() {
+        return None;
+    }
+    let several = ctx.facts.videos.len() > 1;
+    let mut status = Status::Ok;
+    let mut lines: Vec<String> = Vec::new();
+    let mut files = 0;
+    for video in &ctx.facts.videos {
+        let name = file_name(&video.path);
+        let found = name_check::findings(name, &video.media);
+        let Some(worst) = found.iter().map(|f| f.0).max() else {
+            continue;
+        };
+        status = status.max(worst);
+        files += 1;
+        if lines.len() < NAME_CHECK_LISTED {
+            let text = found
+                .iter()
+                .map(|f| f.1.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            lines.push(if several {
+                format!("{name}: {text}")
+            } else {
+                text
+            });
+        }
+    }
+    if status == Status::Ok {
+        return Some(Check::ok(rule, "o nome do arquivo confere com o MediaInfo"));
+    }
+    let mut message = lines.join(" | ");
+    if files > lines.len() {
+        let more = files - lines.len();
+        message = format!("{message} (e mais {more} arquivos)");
+    }
+    let tail = if status == Status::Fail {
+        ": o site recusa o nome que diverge do MediaInfo e renomear é proibido"
+    } else {
+        ""
+    };
+    Some(Check::with(rule, status, format!("{message}{tail}")))
 }
 
 /// 3.3: obra que não é falada em português precisa de áudio ou legenda PT.
@@ -960,6 +1013,7 @@ fn inferior_source(ctx: &Context<'_>) -> Option<Check> {
 
 fn bj(ctx: &Context<'_>, checks: &mut Vec<Check>) {
     checks.extend(container(ctx));
+    checks.extend(name_matches_file(ctx, "4.1.1"));
     checks.extend(codec_choice(ctx));
     checks.push(web_or_bluray(ctx));
     checks.extend(minimum_resolution(ctx));
@@ -1947,7 +2001,7 @@ fn source_label(source: Source) -> &'static str {
     }
 }
 
-const fn hdr_label(hdr: Hdr) -> &'static str {
+pub(super) const fn hdr_label(hdr: Hdr) -> &'static str {
     match hdr {
         Hdr::Sdr => "SDR",
         Hdr::Hdr10 => "HDR10",
@@ -2107,6 +2161,7 @@ mod tests {
             codec: "eac3".to_owned(),
             channels: Some(6),
             title: None,
+            profile: None,
         }
     }
 
@@ -2550,6 +2605,7 @@ mod tests {
     #[test]
     fn bj_h265_ate_1080p_sdr_e_aviso() {
         let mut facts = movie();
+        rename_video(&mut facts, 0, "Filme.2024.1080p.WEB-DL.DUAL.x265-GRP.mkv");
         set_video(&mut facts, |m| {
             m.video = Some(video("hevc", 1920, 1080, Hdr::Sdr));
         });
@@ -3471,5 +3527,66 @@ mod tests {
         let targets = sniff_targets(&facts.files, &facts.videos);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].0, facts.files[1].path);
+    }
+
+    #[test]
+    fn nome_que_contradiz_o_arquivo_reprova_nos_dois_sites() {
+        // O fixture é H.264 1080p com E-AC-3 6 canais.
+        let mut facts = movie();
+        rename_video(
+            &mut facts,
+            0,
+            "Man.Of.War.2026.1080p.AMZN.WEB-DL.DD.5.1.H.264-playWEB.mkv",
+        );
+        for (site, rule) in [(Site::Amigos, "4.0.1"), (Site::Bj, "4.1.1")] {
+            let report = check(site, &facts);
+            assert_eq!(report.status_of(rule), Some(Status::Fail), "{site:?}");
+            assert_eq!(report.verdict, Verdict::Inelegivel);
+            let message = &report
+                .checks
+                .iter()
+                .find(|c| c.rule == rule)
+                .unwrap()
+                .message;
+            assert!(
+                message.contains("o nome diz DD (AC-3), mas o áudio é E-AC-3 (Dolby Digital Plus)"),
+                "{message}"
+            );
+        }
+        rename_video(
+            &mut facts,
+            0,
+            "Man.Of.War.2026.1080p.AMZN.WEB-DL.DDP5.1.H.264-playWEB.mkv",
+        );
+        assert_eq!(status(Site::Amigos, &facts, "4.0.1"), Some(Status::Ok));
+        assert_eq!(status(Site::Bj, &facts, "4.1.1"), Some(Status::Ok));
+    }
+
+    #[test]
+    fn nome_sem_tokens_passa_a_conferencia() {
+        let mut facts = movie();
+        rename_video(&mut facts, 0, "Filme.mkv");
+        assert_eq!(status(Site::Amigos, &facts, "4.0.1"), Some(Status::Ok));
+        assert_eq!(status(Site::Bj, &facts, "4.1.1"), Some(Status::Ok));
+    }
+
+    #[test]
+    fn pacote_com_um_video_divergente_cita_o_arquivo() {
+        let mut facts = season(2);
+        rename_video(&mut facts, 0, "Serie.S01E01.1080p.WEB-DL.DDP5.1.x264.mkv");
+        rename_video(&mut facts, 1, "Serie.S01E02.1080p.WEB-DL.DD5.1.x264.mkv");
+        let report = check(Site::Bj, &facts);
+        assert_eq!(report.status_of("4.1.1"), Some(Status::Fail));
+        let message = &report
+            .checks
+            .iter()
+            .find(|c| c.rule == "4.1.1")
+            .unwrap()
+            .message;
+        assert!(
+            message.contains("Serie.S01E02.1080p.WEB-DL.DD5.1.x264.mkv:"),
+            "{message}"
+        );
+        assert!(!message.contains("S01E01"), "{message}");
     }
 }

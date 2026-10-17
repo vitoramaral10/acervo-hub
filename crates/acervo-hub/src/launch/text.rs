@@ -568,6 +568,7 @@ mod tests {
             codec: codec.into(),
             channels: Some(channels),
             title: None,
+            profile: None,
         }
     }
 

@@ -93,6 +93,8 @@ pub struct AudioFacts {
     pub codec: String,
     pub channels: Option<u32>,
     pub title: Option<String>,
+    /// `profile` do ffprobe (`DTS-HD MA`, `LC`...), quando a faixa o traz.
+    pub profile: Option<String>,
 }
 
 /// Se a legenda é texto (dá para extrair para `.srt`) ou imagem (PGS,
@@ -283,6 +285,7 @@ pub fn facts_from_ffprobe(value: &Value) -> MediaFacts {
                 codec: s["codec_name"].as_str().unwrap_or_default().to_owned(),
                 channels: s["channels"].as_u64().and_then(|c| u32::try_from(c).ok()),
                 title: text(&s["tags"]["title"]),
+                profile: text(&s["profile"]),
             }
         })
         .collect();
