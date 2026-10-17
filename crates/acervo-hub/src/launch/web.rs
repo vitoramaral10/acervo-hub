@@ -567,12 +567,16 @@ async fn download_mediainfo(
     Ok(response)
 }
 
-/// `1.png` a `4.png` do fim da rota das capturas.
+/// `1`, `1.png` ou `1.jpg` (até 4) do fim da rota das capturas. A extensão é
+/// só um apelido: o formato devolvido é o que coube no limite do Amigos.
 fn capture_number(file: &str) -> Option<usize> {
-    let number: usize = file.strip_suffix(".png")?.parse().ok()?;
+    let digits = file
+        .strip_suffix(".png")
+        .or_else(|| file.strip_suffix(".jpg"))
+        .unwrap_or(file);
+    let number: usize = digits.parse().ok()?;
     // `+1` e `01` também passam por `parse`: só a forma canônica vale.
-    (file == format!("{number}.png") && (1..=super::SCREEN_COUNT).contains(&number))
-        .then_some(number)
+    (digits == number.to_string() && (1..=super::SCREEN_COUNT).contains(&number)).then_some(number)
 }
 
 /// O nome do vídeo sem extensão, sem nada que vire caminho ou controle.
@@ -623,9 +627,11 @@ async fn source_video(web: &Web, hash: &str) -> Result<(String, std::path::PathB
 }
 
 /// Uma das 4 capturas do pacote, tirada na hora do vídeo principal da origem,
-/// na resolução real e sem escala. Nada vai a disco: o PNG sai do ffmpeg
+/// na resolução real e sem escala. Nada vai a disco: a imagem sai do ffmpeg
 /// direto para a resposta. É o que se anexa no formulário do site, no lugar
-/// da miniatura ou da cópia reduzida do `ImgBB`.
+/// da miniatura ou da cópia reduzida do `ImgBB`. Sai PNG, ou JPEG se o PNG
+/// passar do limite de 5 MiB do Amigos; `Content-Type` e a extensão do nome
+/// dizem o que foi gerado, qualquer que seja a extensão pedida.
 async fn download_capture(
     State(web): Shared,
     headers: HeaderMap,
@@ -635,7 +641,7 @@ async fn download_capture(
     let (hash, _) = pair(&hash, &indexer).map_err(fail)?;
     let number = capture_number(&file).ok_or_else(|| {
         not_found(format!(
-            "capturas vão de 1.png a {}.png",
+            "capturas vão de 1 a {} (com .png ou .jpg opcional)",
             super::SCREEN_COUNT
         ))
     })?;
@@ -663,7 +669,7 @@ async fn download_capture(
         .filter(|d| d.is_finite() && *d > 0.0)
         .and_then(|d| super::screen_time(d, number))
         .ok_or_else(|| fail(bad("o ffprobe não disse a duração do vídeo")))?;
-    let png = crate::mediainfo::screenshot(&video, at)
+    let (image, format) = crate::mediainfo::screenshot(&video, at)
         .await
         .map_err(|error| {
             tracing::warn!(indexer, number, "captura para baixar: {error:#}");
@@ -672,11 +678,18 @@ async fn download_capture(
                 "não deu para tirar a captura (detalhe no log do hub)".into(),
             ))
         })?;
-    let mut response = Response::new(Body::from(png));
+    let mut response = Response::new(Body::from(image));
     let headers = response.headers_mut();
     crate::api::secure_headers(headers);
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
-    let name = format!("{}.captura-{number}.png", capture_stem(&relative));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(format.mime()),
+    );
+    let name = format!(
+        "{}.captura-{number}.{}",
+        capture_stem(&relative),
+        format.extension()
+    );
     let disposition = HeaderValue::from_str(&attachment(&name))
         .map_err(|_| fail(bad("nome do vídeo ilegível")))?;
     headers.insert(header::CONTENT_DISPOSITION, disposition);
@@ -2029,8 +2042,14 @@ mod tests {
             ("5.png", None),
             ("01.png", None),
             ("+1.png", None),
-            ("1.jpg", None),
-            ("1", None),
+            ("1.jpg", Some(1)),
+            ("3.jpg", Some(3)),
+            ("1", Some(1)),
+            ("4", Some(4)),
+            ("5", None),
+            ("01", None),
+            ("1.gif", None),
+            ("1.png.jpg", None),
             ("../1.png", None),
             ("", None),
         ] {
@@ -2118,7 +2137,7 @@ mod tests {
             .upsert_launch_state(&hash, BJ, LaunchState::Pronto, None, None)
             .await
             .unwrap();
-        for n in ["0.png", "5.png", "01.png", "1.jpg", "x.png"] {
+        for n in ["0.png", "5.png", "01.png", "5.jpg", "x.png", "1.gif"] {
             let (status, _) = call(&http, reqwest::Method::GET, &url(n)).await;
             assert_eq!(status, 404, "{n}");
         }
@@ -2187,8 +2206,25 @@ mod tests {
                 assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 240);
                 // Mesmo instante do preparo: o mesmo quadro, byte a byte.
                 let at = super::super::screen_time(duration, number).unwrap();
-                let expected = crate::mediainfo::screenshot(&video, at).await.unwrap();
+                let (expected, format) = crate::mediainfo::screenshot(&video, at).await.unwrap();
+                assert_eq!(format, crate::mediainfo::CaptureFormat::Png);
                 assert_eq!(png.as_ref(), expected.as_slice(), "captura {number}");
+                // Sem extensão ou com .jpg: a mesma imagem, no formato gerado.
+                for alias in [number.to_string(), format!("{number}.jpg")] {
+                    let response = get(&alias).send().await.unwrap();
+                    assert_eq!(response.status().as_u16(), 200, "{alias}");
+                    assert_eq!(response.headers()["content-type"], "image/png");
+                    assert!(
+                        response.headers()["content-disposition"]
+                            .to_str()
+                            .unwrap()
+                            .contains(&format!(".captura-{number}.png\""))
+                    );
+                    assert_eq!(
+                        response.bytes().await.unwrap().as_ref(),
+                        expected.as_slice()
+                    );
+                }
             }
             // A duração gravada no laudo manda: 400 s de duração levam ao fim
             // do vídeo de 4 s, que não tem quadro, e a rota diz que falhou.

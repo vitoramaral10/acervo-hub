@@ -1955,7 +1955,8 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
     Ok(Finish::Ready)
 }
 
-/// As 4 capturas no `ImgBB`, em resolução original. Sem chave configurada o
+/// As 4 capturas no `ImgBB`, em resolução original (PNG, ou JPEG se o PNG
+/// passar de 5 MiB). Sem chave configurada o
 /// passo é pulado e a lista sai vazia: o pacote não falha, e a tela entrega os
 /// PNG para baixar e anexar no formulário.
 ///
@@ -1982,9 +1983,11 @@ async fn host_screens(
         let number = index + 1;
         job.step(&format!("captura {number} de {}", times.len()))
             .await;
-        let png = crate::mediainfo::screenshot(video, *at).await?;
+        // PNG, ou JPEG na mesma resolução se o PNG passar do limite do Amigos.
+        let (image, format) = crate::mediainfo::screenshot(video, *at).await?;
+        let name = format!("captura-{number}.{}", format.extension());
         let screen = imgbb
-            .upload(&key, png, &format!("captura-{number}.png"))
+            .upload(&key, image, &name, format.mime())
             .await
             .with_context(|| format!("enviando a captura {number}"))?;
         screens.push(screen);

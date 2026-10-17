@@ -468,7 +468,7 @@ function Captures({ detail }: { detail: LaunchDetail }) {
         Capturas
       </h3>
       <p className="text-xs text-content-muted">
-        Tiradas na hora, do vídeo da origem, sem reduzir. Anexe estes PNG no formulário do site.
+        Tiradas na hora, do vídeo da origem, sem reduzir. Anexe estas imagens no formulário do site (PNG; JPEG na mesma resolução quando o PNG passa de 5 MB, o limite do Amigos).
       </p>
       <ul className="grid gap-2 sm:grid-cols-2">
         {[1, 2, 3, 4].map((number) => (

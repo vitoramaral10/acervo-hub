@@ -261,19 +261,30 @@ O formulário do Amigos tem upload de imagem próprio, e o ImgBB só serve a
 miniatura ou uma cópia reduzida no navegador; subir essa versão reduziu as
 capturas (1920×1012 em vez de 3840×2024) e a staff reclamou. Por isso:
 
-`GET /ui/api/biblioteca/para-lancar/{hash}/{indexer}/capturas/{n}.png`
-(`n` = 1 a 4; mesma auth e cabeçalhos de segurança do `.torrent` e do
+`GET /ui/api/biblioteca/para-lancar/{hash}/{indexer}/capturas/{n}`
+(`n` = 1 a 4, também aceito como `{n}.png` e `{n}.jpg`; mesma auth e cabeçalhos de segurança do `.torrent` e do
 `mediainfo.txt`).
 
 - Gera o quadro **na hora** com `mediainfo::screenshot`, no vídeo principal da
   origem (torrent no cliente, maior vídeo), no mesmo instante do preparo
   (15/35/55/75% da duração gravada no laudo; pacote antigo relê pelo ffprobe).
-  PNG na resolução real, sem escala. Nada vai a disco.
-- `Content-Type: image/png`; `Content-Disposition: attachment;
-  filename="<vídeo>.captura-<n>.png"` (nome sem extensão, sanitizado).
+  Resolução real, sem escala. Nada vai a disco.
+- **Limite de 5 MiB** (`mediainfo::LIMITE_CAPTURA`): o formulário do Amigos
+  só aceita imagem de até 5 MB. Regra, sempre na resolução cheia:
+  1. PNG sem perda, no máximo de compressão (`-compression_level 100`, que o
+     ffmpeg corta no 9 do zlib, e `-pred mixed`; 8 bits por canal, `rgb24`).
+  2. Passou de 5 MiB: JPEG (`mjpeg`, `-pix_fmt yuvj420p`, 8 bits mesmo para
+     fonte 10 bits/HDR, sem tonemap nem escala) em `-q:v` 2, 3, 4, 6, 9,
+     parando na primeira qualidade que couber.
+  3. Nem a 9 coube: devolve a menor e registra aviso no log do hub.
+- O formato devolvido é o realmente gerado, qualquer que seja a extensão
+  pedida: `Content-Type: image/png` ou `image/jpeg`; `Content-Disposition:
+  attachment; filename="<vídeo>.captura-<n>.png|jpg"` (nome sem extensão do
+  vídeo, sanitizado). O upload ao ImgBB usa o mesmo resultado (mesmos bytes,
+  nome e MIME do formato gerado), então também fica em até 5 MiB.
 - Um ffmpeg por vez (semáforo em `mediainfo::screenshot`, vale para o preparo
   também): quem chega depois espera a vez.
-- 404: `n` fora de 1 a 4, pacote inexistente, torrent fora do cliente, sem
+- 404: `n` fora de 1 a 4 ou extensão que não seja `.png`/`.jpg`, pacote inexistente, torrent fora do cliente, sem
   vídeo ou vídeo fora do disco. 502: cliente de download fora do ar ou ffmpeg
   falhou (detalhe só no log).
 
@@ -293,7 +304,7 @@ Página "Para lançar" (`#lancar`), entre as principais.
   ("parecido no destino" quando `layout_differs`), botão Preparar.
 - Diálogo do pacote: checagens agrupadas por status com o número da regra;
   releases do destino; campos com botão copiar; seção "Capturas" com 4 botões
-  "Baixar captura N" (resolução real ao lado, ex.: "3840×2024 — resolução
+  "Baixar captura N" (link para `/capturas/N`, sem extensão; resolução real ao lado, ex.: "3840×2024 — resolução
   original") e, havendo ImgBB, os links diretos `i.ibb.co` com botão copiar;
   "Baixar .torrent"; "Marquei como enviado"; "Descartar"; enquanto
   `preparando`, o andamento com polling de 3 s.

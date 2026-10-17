@@ -108,7 +108,8 @@ impl Imgbb {
         })
     }
 
-    /// Sobe um PNG e devolve os links.
+    /// Sobe uma imagem (`mime` é o `image/png` ou `image/jpeg` dela) e devolve
+    /// os links.
     ///
     /// # Errors
     ///
@@ -117,19 +118,20 @@ impl Imgbb {
     pub(crate) async fn upload(
         &self,
         key: &str,
-        png: Vec<u8>,
+        image: Vec<u8>,
         name: &str,
+        mime: &str,
     ) -> Result<Screen, ImgbbError> {
         // Recusa antes de subir: o serviço só diria o mesmo depois de receber
         // dezenas de MiB.
-        if png.len() > MAX_BYTES {
+        if image.len() > MAX_BYTES {
             return Err(ImgbbError::TooLarge {
-                mib: png.len() >> 20,
+                mib: image.len() >> 20,
             });
         }
-        let image = Part::bytes(png)
+        let image = Part::bytes(image)
             .file_name(name.to_owned())
-            .mime_str("image/png")
+            .mime_str(mime)
             .map_err(|_| ImgbbError::Format)?;
         let form = Form::new().text("key", key.to_owned()).part("image", image);
         let response = self
@@ -205,7 +207,7 @@ mod tests {
         // Sem mock montado: qualquer requisição seria um erro de teste.
         let imgbb = Imgbb::with_base("http://127.0.0.1:9/1/upload").unwrap();
         let error = imgbb
-            .upload(KEY, vec![0; MAX_BYTES + 1], "captura-1.png")
+            .upload(KEY, vec![0; MAX_BYTES + 1], "captura-1.png", "image/png")
             .await
             .unwrap_err();
         assert_eq!(error, ImgbbError::TooLarge { mib: 32 });
@@ -233,7 +235,7 @@ mod tests {
         let imgbb = Imgbb::with_base(&format!("{}/1/upload", server.uri())).unwrap();
         let screen = imgbb
             // Bytes em ASCII: o matcher de corpo só lê texto.
-            .upload(KEY, b"png".to_vec(), "captura-1.png")
+            .upload(KEY, b"png".to_vec(), "captura-1.png", "image/png")
             .await
             .unwrap();
         assert_eq!(screen.url, "https://i.ibb.co/abc/captura-1.png");
@@ -254,7 +256,10 @@ mod tests {
             .mount(&server)
             .await;
         let imgbb = Imgbb::with_base(&server.uri()).unwrap();
-        let error = imgbb.upload(KEY, vec![1], "c.png").await.unwrap_err();
+        let error = imgbb
+            .upload(KEY, vec![1], "c.png", "image/png")
+            .await
+            .unwrap_err();
         assert_eq!(error, ImgbbError::InvalidKey);
 
         let server = MockServer::start().await;
@@ -265,7 +270,10 @@ mod tests {
             .mount(&server)
             .await;
         let imgbb = Imgbb::with_base(&server.uri()).unwrap();
-        let error = imgbb.upload(KEY, vec![1], "c.png").await.unwrap_err();
+        let error = imgbb
+            .upload(KEY, vec![1], "c.png", "image/png")
+            .await
+            .unwrap_err();
         let text = error.to_string();
         assert!(text.contains("500"), "{text}");
         assert!(!text.contains(KEY), "{text}");
@@ -275,7 +283,10 @@ mod tests {
     async fn servico_fora_do_ar_vira_mensagem_sem_url() {
         // Porta fechada: o erro do reqwest traria a URL.
         let imgbb = Imgbb::with_base(&format!("http://127.0.0.1:9/1/upload?key={KEY}")).unwrap();
-        let error = imgbb.upload(KEY, vec![1], "c.png").await.unwrap_err();
+        let error = imgbb
+            .upload(KEY, vec![1], "c.png", "image/png")
+            .await
+            .unwrap_err();
         assert_eq!(error, ImgbbError::Unreachable);
         assert!(!error.to_string().contains(KEY));
     }
@@ -291,7 +302,10 @@ mod tests {
             .mount(&server)
             .await;
         let imgbb = Imgbb::with_base(&server.uri()).unwrap();
-        let error = imgbb.upload(KEY, vec![1], "c.png").await.unwrap_err();
+        let error = imgbb
+            .upload(KEY, vec![1], "c.png", "image/png")
+            .await
+            .unwrap_err();
         assert_eq!(error, ImgbbError::Format);
     }
 

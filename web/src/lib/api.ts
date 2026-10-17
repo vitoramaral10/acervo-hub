@@ -1163,6 +1163,6 @@ export const launchApi = {
   /** O download não passa por `request` (que só lê JSON): é um `<a href download>` com a sessão. */
   torrentUrl: (hash: string, indexer: string) => `${launchPair(hash, indexer)}/torrent`,
   mediainfoUrl: (hash: string, indexer: string) => `${launchPair(hash, indexer)}/mediainfo.txt`,
-  /** O PNG `number` (1 a 4), tirado na hora em resolução original. */
-  captureUrl: (hash: string, indexer: string, number: number) => `${launchPair(hash, indexer)}/capturas/${number}.png`,
+  /** A captura `number` (1 a 4), tirada na hora em resolução original: PNG, ou JPEG se o PNG passar de 5 MiB. */
+  captureUrl: (hash: string, indexer: string, number: number) => `${launchPair(hash, indexer)}/capturas/${number}`,
 }
