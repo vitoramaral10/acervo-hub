@@ -12,6 +12,62 @@ export class ApiError extends Error {
 
 export const isUnauthorized = (error: unknown) => error instanceof ApiError && error.status === 401
 
+/**
+ * Tópicos do canal de eventos (`/ui/api/eventos`) e as `queryKey` do react-query
+ * que cada um invalida. É o único mapa: tela nova que usa um tópico entra aqui.
+ */
+export const TOPIC_KEYS: Record<string, readonly (readonly string[])[]> = {
+  fila: [['fila'], ['bloqueados']],
+  filmes: [['filmes'], ['faltando'], ['calendario']],
+  series: [['series'], ['faltando'], ['calendario']],
+  lancar: [['para-lancar']],
+  tarefas: [['tarefas'], ['tarefas-historico'], ['filmes-busca']],
+  indexadores: [['indexadores'], ['catalogo'], ['settings']],
+  configuracoes: [['configuracoes'], ['configuracao'], ['notificacoes'], ['regras'], ['biblioteca-opcoes']],
+  apagar: [['para-apagar'], ['para-apagar-sugestoes']],
+  descobrir: [['descobrir']],
+  historico: [['historico']],
+}
+
+// Sessão do Cloudflare Access expirada: o Access responde a requisição de fetch
+// com um redirecionamento para o login. Com `redirect: 'manual'` ele chega como
+// `opaqueredirect`, e a saída é recarregar a página, para o navegador refazer o
+// login do Access. No máximo uma recarga a cada minuto, para não entrar em laço.
+const RELOAD_KEY = 'acervo.sessao.recarga'
+const RELOAD_EVERY_MS = 60_000
+
+let sessionExpired = false
+const expiredListeners = new Set<() => void>()
+
+export const sessionExpiredStore = {
+  subscribe: (listener: () => void) => {
+    expiredListeners.add(listener)
+    return () => void expiredListeners.delete(listener)
+  },
+  get: () => sessionExpired,
+}
+
+function accessExpired() {
+  let last = 0
+  try {
+    last = Number(sessionStorage.getItem(RELOAD_KEY)) || 0
+  } catch {
+    // Sem sessionStorage, só a mensagem vale (nunca recarrega sozinha).
+    last = Date.now()
+  }
+  if (Date.now() - last >= RELOAD_EVERY_MS) {
+    try {
+      sessionStorage.setItem(RELOAD_KEY, String(Date.now()))
+    } catch {
+      // Já tratado acima.
+    }
+    window.location.reload()
+    return
+  }
+  sessionExpired = true
+  for (const listener of expiredListeners) listener()
+}
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (method !== 'GET') headers['X-Acervo'] = '1'
@@ -24,10 +80,15 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
       method,
       headers,
       credentials: 'same-origin',
+      redirect: 'manual',
       body: body === undefined ? undefined : raw ? body : JSON.stringify(body),
     })
   } catch {
     throw new ApiError(0, 'Sem conexão com o acervo-hub.')
+  }
+  if (response.type === 'opaqueredirect') {
+    accessExpired()
+    throw new ApiError(0, 'Sua sessão expirou.')
   }
   const data = await response.json().catch(() => ({}))
   if (!response.ok) {

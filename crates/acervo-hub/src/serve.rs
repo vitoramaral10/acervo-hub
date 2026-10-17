@@ -17,6 +17,7 @@ use serde_json::json;
 
 use crate::config::{Config, SERVIDOR, ServerConfig};
 use crate::decide::Progress;
+use crate::live::Bus;
 use crate::registry::{
     CARDIGANN, FLARESOLVERR_OPTIONS, Registry, USE_FLARESOLVERR, USE_PROXY, build, cardigann,
     check_reserved, reserved, scan,
@@ -115,10 +116,14 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
     let database = Database::connected(store);
     // O andamento da busca dos que faltam, que a tela de filmes acompanha.
     let missing = Arc::new(Progress::default());
-    let tasks = Arc::new(Tasks::new(
-        database.clone(),
-        crate::tasks::service(&settings, &database, &catalog, &missing),
-    ));
+    let events = Bus::default();
+    let tasks = Arc::new(
+        Tasks::new(
+            database.clone(),
+            crate::tasks::service(&settings, &database, &catalog, &missing),
+        )
+        .with_events(events.clone()),
+    );
     tasks.watch_settings(settings.subscribe());
     tasks.start().await;
     // Indexador falhando e pouco espaço em disco viram aviso na mudança.
@@ -142,6 +147,7 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         catalog: catalog.clone(),
         searches: tokio::sync::Mutex::default(),
         series_searches: tokio::sync::Mutex::default(),
+        events: events.clone(),
     });
     let readiness = Arc::new(crate::health::Readiness {
         settings: Arc::clone(&settings),
@@ -162,14 +168,10 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         .with_context(|| format!("abrindo `{bind}`"))?;
     axum::serve(
         listener,
-        crate::api::router(catalog, api_key, Arc::new(admin), accounts)
-            .merge(crate::web::router(Arc::clone(&web)))
-            .merge(crate::agenda::router(Arc::clone(&web)))
-            .merge(crate::marks::router(Arc::clone(&web)))
-            .merge(crate::discover::router(Arc::clone(&web)))
-            .merge(crate::launch::web::router(Arc::clone(&web)))
-            .merge(crate::series::web::router(web))
-            .merge(crate::health::router(readiness)),
+        app(catalog, api_key, Arc::new(admin), accounts, web, readiness).layer(
+            // Depois de toda rota da interface que muda algo, avisa a tela.
+            axum::middleware::from_fn_with_state(events.clone(), crate::live::emit_after),
+        ),
     )
     .with_graceful_shutdown({
         let tasks = Arc::clone(&tasks);
@@ -177,6 +179,8 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
             shutdown().await;
             // Para de agendar já; quem está rodando termina em `drain`.
             tasks.stop();
+            // Fecha os canais de eventos: conexão aberta seguraria o desligamento.
+            events.close();
             // O preparo de lançamento apaga a tarefa que deixou no qBittorrent.
             crate::launch::stop();
         }
@@ -200,6 +204,25 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Todas as rotas do serviço, ainda sem o aviso de tempo real.
+fn app(
+    catalog: Catalog,
+    api_key: ApiKey,
+    admin: Arc<HubAdmin>,
+    accounts: Arc<Database>,
+    web: Arc<crate::web::Web>,
+    readiness: Arc<crate::health::Readiness>,
+) -> axum::Router {
+    crate::api::router(catalog, api_key, admin, accounts)
+        .merge(crate::web::router(Arc::clone(&web)))
+        .merge(crate::agenda::router(Arc::clone(&web)))
+        .merge(crate::marks::router(Arc::clone(&web)))
+        .merge(crate::discover::router(Arc::clone(&web)))
+        .merge(crate::launch::web::router(Arc::clone(&web)))
+        .merge(crate::series::web::router(web))
+        .merge(crate::health::router(readiness))
 }
 
 /// Os indexadores cadastrados: os cadastros ativos que sobem.

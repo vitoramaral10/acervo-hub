@@ -33,6 +33,7 @@ mod health;
 mod launch;
 mod ledger;
 mod library;
+mod live;
 mod marks;
 mod mediainfo;
 mod metadata;
