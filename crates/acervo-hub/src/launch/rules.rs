@@ -480,6 +480,7 @@ impl<'a> Context<'a> {
 fn amigos(ctx: &Context<'_>, checks: &mut Vec<Check>) {
     checks.push(archives(ctx, "3.2", "o Amigos"));
     checks.extend(name_matches_file(ctx, "4.0.1"));
+    checks.extend(name_standard(ctx, "4.0.1"));
     checks.push(portuguese_available(ctx));
     checks.push(site_reference(ctx, "5.6"));
     checks.extend(amigos_series_scope(ctx));
@@ -536,6 +537,45 @@ fn name_matches_file(ctx: &Context<'_>, rule: &str) -> Option<Check> {
         ""
     };
     Some(Check::with(rule, status, format!("{message}{tail}")))
+}
+
+/// Amigos 4.0.1: o formulário só aceita nome com codec de áudio e de vídeo na
+/// grafia de release padrão (`DDP5.1`, `H.264`, `x265`; `X265` não vale) e
+/// renomear é proibido, então o pacote fica inelegível antes do envio.
+fn name_standard(ctx: &Context<'_>, rule: &str) -> Option<Check> {
+    if ctx.facts.videos.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut files = 0;
+    for video in &ctx.facts.videos {
+        let name = file_name(&video.path);
+        let gaps = name_check::standard_name_gaps(name);
+        if gaps.is_empty() {
+            continue;
+        }
+        files += 1;
+        if lines.len() < NAME_CHECK_LISTED {
+            lines.push(format!(
+                "nome fora do padrão do Amigos em {name}: {}",
+                gaps.join("; ")
+            ));
+        }
+    }
+    if files == 0 {
+        return Some(Check::ok(
+            rule,
+            "o nome traz codec de áudio e de vídeo no padrão",
+        ));
+    }
+    let mut message = lines.join(" | ");
+    if files > lines.len() {
+        message = format!("{message} (e mais {} arquivos)", files - lines.len());
+    }
+    Some(Check::fail(
+        rule,
+        format!("{message} — renomear é proibido"),
+    ))
 }
 
 /// 3.3: obra que não é falada em português precisa de áudio ou legenda PT.
@@ -2193,11 +2233,10 @@ mod tests {
     /// Filme 1080p WEB-DL H.264, MKV, áudio PT + inglês, obra em inglês, 10 GB
     /// e nada no destino: passa em todas as regras dos dois sites.
     fn movie() -> Facts {
-        let path =
-            "Filme.2024.1080p.WEB-DL.DUAL.x264-GRP/Filme.2024.1080p.WEB-DL.DUAL.x264-GRP.mkv";
+        let path = "Filme.2024.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP/Filme.2024.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP.mkv";
         Facts {
             kind: Kind::Movie,
-            release_name: "Filme.2024.1080p.WEB-DL.DUAL.x264-GRP".to_owned(),
+            release_name: "Filme.2024.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP".to_owned(),
             files: vec![file(path, 10 * GB)],
             videos: vec![ProbedVideo {
                 path: path.to_owned(),
@@ -2227,12 +2266,13 @@ mod tests {
     fn season(episodes: u32) -> Facts {
         let mut facts = movie();
         facts.kind = Kind::Season;
-        facts.release_name = "Serie.S01.1080p.WEB-DL.DUAL.x264-GRP".to_owned();
+        facts.release_name = "Serie.S01.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP".to_owned();
         facts.files.clear();
         facts.videos.clear();
         for n in 1..=episodes {
-            let path =
-                format!("Serie.S01.1080p.WEB-DL.DUAL.x264-GRP/Serie.S01E{n:02}.1080p.WEB-DL.mkv");
+            let path = format!(
+                "Serie.S01.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP/Serie.S01E{n:02}.1080p.WEB-DL.mkv"
+            );
             facts.files.push(file(&path, GB));
             facts.videos.push(ProbedVideo {
                 path,
@@ -2364,7 +2404,7 @@ mod tests {
         let mut facts = movie();
         set_video(&mut facts, |m| m.audio = vec![eng()]);
         facts.files.push(file(
-            "Filme.2024.1080p.WEB-DL.DUAL.x264-GRP/Filme.2024.1080p.WEB-DL.DUAL.x264-GRP.pt-BR.srt",
+            "Filme.2024.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP/Filme.2024.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP.pt-BR.srt",
             1000,
         ));
         assert_eq!(status(Site::Amigos, &facts, "3.3"), Some(Status::Ok));
@@ -2386,7 +2426,7 @@ mod tests {
         let mut facts = movie();
         set_video(&mut facts, |m| m.audio = vec![eng()]);
         facts.files.push(file(
-            "Filme.2024.1080p.WEB-DL.DUAL.x264-GRP/Brasil.Por.Amor.eng.srt",
+            "Filme.2024.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP/Brasil.Por.Amor.eng.srt",
             1000,
         ));
         assert_eq!(
@@ -2533,7 +2573,7 @@ mod tests {
         assert_eq!(status(Site::Amigos, &facts, "4.2.1"), Some(Status::Fail));
         set_video(&mut facts, |m| m.audio = vec![eng()]);
         facts.files.push(file(
-            "Filme.2024.1080p.WEB-DL.DUAL.x264-GRP/Filme.2024.1080p.WEB-DL.DUAL.x264-GRP.pt-BR.srt",
+            "Filme.2024.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP/Filme.2024.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP.pt-BR.srt",
             1000,
         ));
         assert_eq!(status(Site::Amigos, &facts, "4.2.1"), Some(Status::Fail));
@@ -2661,7 +2701,7 @@ mod tests {
     #[test]
     fn bj_4k_em_h264_e_aviso_e_em_h265_passa() {
         let mut facts = movie();
-        rename(&mut facts, "Filme.2024.2160p.WEB-DL.DUAL.x264-GRP");
+        rename(&mut facts, "Filme.2024.2160p.WEB-DL.DUAL.DDP5.1.x264-GRP");
         set_video(&mut facts, |m| {
             m.video = Some(video("h264", 3840, 2160, Hdr::Sdr));
         });
@@ -2685,7 +2725,7 @@ mod tests {
     #[test]
     fn bj_4_2_1_14_resolucao_minima() {
         let mut facts = movie();
-        rename(&mut facts, "Filme.2024.720p.WEB-DL.DUAL.x264-GRP");
+        rename(&mut facts, "Filme.2024.720p.WEB-DL.DUAL.DDP5.1.x264-GRP");
         set_video(&mut facts, |m| {
             m.video = Some(video("h264", 1280, 720, Hdr::Sdr));
         });
@@ -2776,7 +2816,7 @@ mod tests {
         set_video(&mut facts, |m| m.subtitles = vec![embedded_pt()]);
         // Em arquivo, na mesma pasta.
         facts.files.push(file(
-            "Filme.2024.1080p.WEB-DL.DUAL.x264-GRP/Filme.2024.1080p.WEB-DL.DUAL.x264-GRP.pt-BR.srt",
+            "Filme.2024.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP/Filme.2024.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP.pt-BR.srt",
             1000,
         ));
         assert_eq!(
@@ -2832,7 +2872,7 @@ mod tests {
         // Cada um com a sua (embutida num, em arquivo no outro): passa. O
         // sufixo `.forced` e o idioma `.por` também associam.
         facts.files.push(file(
-            "Serie.S01.1080p.WEB-DL.DUAL.x264-GRP/Subs/Serie.S01E02.1080p.WEB-DL.por.forced.srt",
+            "Serie.S01.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP/Subs/Serie.S01E02.1080p.WEB-DL.por.forced.srt",
             1000,
         ));
         assert_eq!(status(Site::Amigos, &facts, "3.3"), Some(Status::Ok));
@@ -3182,7 +3222,7 @@ mod tests {
         assert_eq!(status(Site::Bj, &facts, "4.1.20"), Some(Status::Ok));
         set_video(&mut facts, |m| m.audio = vec![eng()]);
         facts.files.push(file(
-            "Filme.2024.1080p.WEB-DL.DUAL.x264-GRP/Filme.pt.srt",
+            "Filme.2024.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP/Filme.pt.srt",
             100,
         ));
         assert_eq!(status(Site::Bj, &facts, "4.1.20"), Some(Status::Fail));
@@ -3272,7 +3312,7 @@ mod tests {
     fn episode() -> Facts {
         let mut facts = movie();
         facts.kind = Kind::Episode;
-        facts.release_name = "Serie.S01E03.1080p.WEB-DL.DUAL.x264-GRP".to_owned();
+        facts.release_name = "Serie.S01E03.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP".to_owned();
         facts
     }
 
@@ -3303,7 +3343,7 @@ mod tests {
 
     #[test]
     fn release_do_destino_marca_o_pacote_de_uma_temporada() {
-        let pack = dest_ep("Serie.S01.1080p.WEB-DL.DUAL.x264-GRP", GB);
+        let pack = dest_ep("Serie.S01.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP", GB);
         assert_eq!(pack.season_pack, Some(1));
         assert_eq!(
             dest_ep("Serie.S01E01.1080p.WEB-DL.x264-GRP", GB).season_pack,
@@ -3521,7 +3561,7 @@ mod tests {
             .files
             .push(file(&format!("{folder}/Outro.nome.srt"), 10));
         facts.files.push(file(
-            &format!("{folder}/Filme.2024.1080p.WEB-DL.DUAL.x264-GRP.por.srt"),
+            &format!("{folder}/Filme.2024.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP.por.srt"),
             10,
         ));
         let targets = sniff_targets(&facts.files, &facts.videos);
@@ -3566,8 +3606,59 @@ mod tests {
     fn nome_sem_tokens_passa_a_conferencia() {
         let mut facts = movie();
         rename_video(&mut facts, 0, "Filme.mkv");
-        assert_eq!(status(Site::Amigos, &facts, "4.0.1"), Some(Status::Ok));
+        // Sem token não há o que contradizer (BJ passa); o Amigos ainda exige o
+        // padrão de nome, mas a conferência com o arquivo fica Ok.
         assert_eq!(status(Site::Bj, &facts, "4.1.1"), Some(Status::Ok));
+        let report = check(Site::Amigos, &facts);
+        assert!(report.checks.iter().any(|c| c.rule == "4.0.1"
+            && c.status == Status::Ok
+            && c.message.contains("confere com o MediaInfo")));
+    }
+
+    fn amigos_name_standard(name: &str) -> Check {
+        let mut facts = movie();
+        rename_video(&mut facts, 0, name);
+        check(Site::Amigos, &facts)
+            .checks
+            .into_iter()
+            .find(|c| c.rule == "4.0.1" && c.message.contains("padrão"))
+            .unwrap()
+    }
+
+    #[test]
+    fn amigos_recusa_nome_fora_do_padrao_e_o_bj_nao() {
+        let toy = "Toy.Story.1995.2160p.UHD.BluRay.X265-IAMABLE.DUAL-Lannister.mkv";
+        let check_toy = amigos_name_standard(toy);
+        assert_eq!(check_toy.status, Status::Fail);
+        for part in [
+            "nome fora do padrão do Amigos em Toy.Story",
+            "falta o codec de áudio",
+            "o nome usa 'X265' em maiúsculas; o padrão é 'x265'",
+            "renomear é proibido",
+        ] {
+            assert!(check_toy.message.contains(part), "{}", check_toy.message);
+        }
+        let mut facts = movie();
+        rename_video(&mut facts, 0, toy);
+        assert_eq!(check(Site::Amigos, &facts).verdict, Verdict::Inelegivel);
+        assert!(
+            check(Site::Bj, &facts)
+                .checks
+                .iter()
+                .all(|c| !c.message.contains("padrão do Amigos"))
+        );
+        let big = amigos_name_standard("Operacao.Big.Hero.2015.1080p.BluRay.x264-shaggy.mkv");
+        assert_eq!(big.status, Status::Fail);
+        assert!(big.message.contains("falta o codec de áudio"));
+        assert!(!big.message.contains("codec de vídeo"));
+        for ok in [
+            "Man.Of.War.2026.1080p.AMZN.WEB-DL.DD.5.1.H.264-playWEB.mkv",
+            "2DIE4.24.Horas.no.Limite.2026.2160p.iT.WEB-DL.DDP.5.1.Atmos.DV.HDR.H.265-GHK.mkv",
+            "Escalada.Mortal.2022.1080p.AMZN.WEB-DL.DDP5.1.H.264-DUAL-C76.mkv",
+            "The.Ark.S03E08.1080p.AMZN.WEB-DL.DD+5.1.H.264-playWEB.mkv",
+        ] {
+            assert_eq!(amigos_name_standard(ok).status, Status::Ok, "{ok}");
+        }
     }
 
     #[test]
