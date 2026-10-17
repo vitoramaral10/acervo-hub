@@ -171,6 +171,10 @@ distingue pt-BR de pt-PT: aceitar os dois). "Dual" = áudio PT + original.
 
 ### Amigos (`Site::Amigos`)
 - **3.2** arquivo compactado (`.rar`, `.zip`, `.7z`, `.r00`...) → Fail.
+- **4.0.1** o nome de cada vídeo (o arquivo, não a pasta) contradiz o arquivo
+  lido pelo ffprobe → Fail, citando o arquivo quando o pacote tem mais de um
+  vídeo. O site valida o nome contra o MediaInfo e renomear é proibido, então
+  o pacote fica inelegível antes do envio. Ver "Nome contra o arquivo" abaixo.
 - **3.3** obra não falada em português sem áudio PT e sem legenda PT
   (embutida ou arquivo) → Fail.
 - **5.6** nome de arquivo/pasta com referência a site (lista: `bj-share`,
@@ -191,6 +195,8 @@ distingue pt-BR de pt-PT: aceitar os dois). "Dual" = áudio PT + original.
   no destino → Fail.
 
 ### BJ (`Site::Bj`)
+- **4.1.1** mesma conferência de nome contra o arquivo (renomear é proibido
+  no BJ) → Fail. Ver "Nome contra o arquivo" abaixo.
 - **4.1.10.2** vídeo que não é MKV → Fail. Até 1080p SDR em H.265 → Warn
   ("só se a fonte não tem x264; proibido se há x264 no BJ" — e Fail se o
   destino já tem um x264 na mesma resolução). 4K em H.264 → Warn.
@@ -305,6 +311,33 @@ vez de recusado. O vídeo continua intacto: o que muda é a pasta.
   esse layout (não com o da origem) e adiciona o irmão com `save_path` = pai
   da pasta adaptada. O resto do fluxo (parado, conferido, 100%, tag de
   semear) é o mesmo.
+
+### Nome contra o arquivo (Amigos 4.0.1, BJ 4.1.1)
+
+`launch/name_check.rs`. O parser de tokens é puro (`NameClaims::parse`): separa
+o nome do arquivo por ponto, espaço, hífen, sublinhado, colchetes etc. (mantém
+o `+` de `DD+`), sem diferenciar maiúsculas, e lê só o que o nome afirma. Cada
+vídeo do pacote é conferido pelo seu próprio nome; nome sem token → Ok.
+
+- **Áudio:** `DD`/`AC3` → alguma faixa `ac3` (só `eac3` não vale);
+  `DDP`/`DD+`/`DDPA`/`EAC3`/`E-AC-3` → `eac3`; `AAC` → `aac`; `DTS`,
+  `DTS-HD`, `DTS-HD.MA`, `DTS-X` → `dts` (e, se o ffprobe expõe `profile`, o
+  perfil MA/HD/X precisa bater; sem perfil basta `dts`); `TrueHD`, `FLAC`,
+  `Opus` → o codec correspondente. A mensagem diz a divergência: "o nome diz DD
+  (AC-3), mas o áudio é E-AC-3 (Dolby Digital Plus)".
+- **Canais:** `5.1` → alguma faixa com 6 canais; `7.1` → 8; `2.0` → 2 (colado
+  ao codec, `DDP5.1`, ou solto, `DD.5.1`). Fail se nenhuma faixa bate; sem
+  contagem de canais lida, não há o que contradizer.
+- **Atmos:** só Warn (o ffprobe não expõe o JOC de forma confiável), salvo se o
+  título de uma faixa já diz Atmos. Nunca Fail.
+- **Vídeo:** `H.264`/`H264`/`x264`/`AVC` → `h264`; `H.265`/`H265`/`x265`/
+  `HEVC` → `hevc`; `AV1` → `av1`.
+- **Resolução:** `2160p` → largura >= 3800, altura >= 2160 ou altura >= 2000 em
+  imagem larga; `1080p` → largura 1800-2200 ou altura 1000-1100; `720p` →
+  largura 1200-1400 ou altura 680-740 (cortes widescreen passam: 3840x1600,
+  1920x800).
+- **HDR:** `DV`/`DoVi` → Dolby Vision; `HDR10` → HDR10 ou Dolby Vision; `HDR` →
+  qualquer HDR. Arquivo HDR sem token HDR no nome → Ok.
 
 ## MediaInfo
 

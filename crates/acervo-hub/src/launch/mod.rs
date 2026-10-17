@@ -17,6 +17,7 @@
 pub(crate) mod adapt;
 pub(crate) mod folder;
 pub(crate) mod imgbb;
+pub(crate) mod name_check;
 pub(crate) mod rules;
 pub(crate) mod subtitle_sniff;
 pub(crate) mod text;
