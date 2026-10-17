@@ -2152,6 +2152,7 @@ mod tests {
             indexer: "bjsharecustom".into(),
             secrets: Vec::new(),
             shown: String::new(),
+            events: Bus::default(),
         };
         // Sem chave não toca no vídeo (que nem existe) nem na duração.
         let screens = host_screens(
