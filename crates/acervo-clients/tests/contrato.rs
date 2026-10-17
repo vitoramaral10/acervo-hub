@@ -754,6 +754,33 @@ async fn topo_da_fila_manda_os_hashes_juntos_e_fila_desligada_nao_e_erro() {
 }
 
 #[tokio::test]
+async fn exportar_torrent_devolve_os_bytes_e_status_de_erro_vira_erro_com_o_caminho() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrents/export"))
+        .and(query_param("hash", "a1b2"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"d4:infodee".to_vec()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrents/export"))
+        .and(query_param("hash", "sumiu"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    assert_eq!(
+        cliente.export_torrent("a1b2").await.unwrap(),
+        b"d4:infodee".to_vec()
+    );
+    let error = cliente.export_torrent("sumiu").await.unwrap_err();
+    assert!(
+        matches!(&error, QbitError::Status { path, .. } if path == "api/v2/torrents/export"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn trackers_trazem_estado_e_mensagem() {
     let server = MockServer::start().await;
     let cliente = sessao(&server).await;

@@ -1384,19 +1384,34 @@ pub(crate) async fn package_layout(config: &Config, launch: &Launch) -> Result<V
 
 /// O host de uma URL de tracker, minúsculo. A URL leva a passkey: só o host
 /// sai daqui.
-fn tracker_host(url: &str) -> Option<String> {
+pub(crate) fn tracker_host(url: &str) -> Option<String> {
     url::Url::parse(url)
         .ok()?
         .host_str()
         .map(str::to_ascii_lowercase)
 }
 
+/// A identidade de um tracker: host, porta (a padrão do esquema, se a URL não
+/// traz) e o primeiro segmento do caminho (`host:443/announce`). Dois
+/// trackers no mesmo host com caminhos de announce diferentes não são o
+/// mesmo. A query (passkey) nunca entra: o resultado pode ser logado.
+pub(crate) fn tracker_key(url: &str) -> Option<String> {
+    let url = url::Url::parse(url).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    let port = url.port_or_known_default()?;
+    let first = url.path_segments()?.next().unwrap_or_default();
+    Some(format!("{host}:{port}/{first}"))
+}
+
 /// Adiciona o `.torrent` do pacote ao cliente **parado**, na categoria do
 /// acervo, com a tag da fila de conferência e a de semear do destino: o
 /// `verify` do cross-seed confere os arquivos e só inicia com 100%.
 ///
+/// Depois do `add` manda conferir já, sem esperar a volta do `verify`.
+///
 /// Mesmo hash já no cliente (o torrent de outro tracker, ou o gerado de um
-/// envio anterior): não adiciona de novo, mas o adota: põe a tag de semear do
+/// envio anterior), ou outro hash do mesmo tracker com os mesmos arquivos (o
+/// `.torrent` baixado do site e adicionado à mão): não adiciona de novo, mas o adota: põe a tag de semear do
 /// destino; se ele está incompleto ou parado sem estar na fila, para e
 /// encaminha à conferência (`PENDING_TAG`); e, se nenhum tracker dele é o do
 /// destino, acrescenta o announce do `.torrent` (segredo: não é logado).
@@ -1413,13 +1428,43 @@ pub(crate) async fn seed_package(
         acervo_clients::info_hash(&torrent).context("o .torrent não tem infohash legível")?;
     let client = crate::grab::qbit(config).await?;
     let torrents = client.torrents().await.context("lendo o cliente")?;
-    if let Some(existing) = torrents.iter().find(|t| t.hash.eq_ignore_ascii_case(&hash)) {
-        adopt_existing(&client, existing, launch, &torrent).await?;
+    seed_into(
+        &client,
+        &config.library.category,
+        &torrents,
+        launch,
+        torrent,
+        &hash,
+    )
+    .await
+}
+
+/// [`seed_package`] sobre um cliente já aberto e sua lista de torrents.
+async fn seed_into(
+    client: &QbitClient,
+    category: &str,
+    torrents: &[TorrentInfo],
+    launch: &Launch,
+    torrent: Vec<u8>,
+    hash: &str,
+) -> Result<Seeded> {
+    if let Some(existing) = torrents.iter().find(|t| t.hash.eq_ignore_ascii_case(hash)) {
+        adopt_existing(client, existing, launch, &torrent).await?;
+        return Ok(Seeded::AlreadyThere);
+    }
+    let save_path = seed_path(torrents, launch)?;
+    // Outro hash, mesmo tracker e mesmos arquivos já no cliente (o `.torrent`
+    // que o usuário baixou do site e adicionou à mão, com `source`): um
+    // irmão a mais seria duplicata que o tracker não registra. Adota-o.
+    if let Some(existing) =
+        crate::crossseed::same_tracker_sibling(client, torrents, &save_path, &torrent).await?
+    {
+        adopt_existing(client, &existing, launch, &torrent).await?;
         return Ok(Seeded::AlreadyThere);
     }
     let options = AddOptions {
-        category: config.library.category.clone(),
-        save_path: Some(seed_path(&torrents, launch)?),
+        category: category.to_owned(),
+        save_path: Some(save_path),
         stopped: true,
         stop_after_metadata: false,
         tags: vec![
@@ -1427,8 +1472,7 @@ pub(crate) async fn seed_package(
             acervo_core::seed_tag(&launch.indexer),
         ],
     };
-    client
-        .add(NewTorrent::File(torrent), &options)
+    crate::crossseed::add_sibling(client, NewTorrent::File(torrent), &options, hash)
         .await
         .context("adicionando o .torrent ao cliente")?;
     Ok(Seeded::Added)
@@ -2680,7 +2724,7 @@ mod tests {
 
     fn package_torrent() -> Vec<u8> {
         format!(
-            "d8:announce{}:{DEST_ANNOUNCE}4:infod6:lengthi1e4:name1:a6:pieces1:xee",
+            "d8:announce{}:{DEST_ANNOUNCE}4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces1:xee",
             DEST_ANNOUNCE.len()
         )
         .into_bytes()
@@ -3082,5 +3126,155 @@ mod tests {
         assert!(read_limited(&path, 9).is_err());
         assert!(read_limited(&dir.join("falta.srt"), 10).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pacote_com_torrent_do_mesmo_tracker_no_cliente_adota_em_vez_de_adicionar() {
+        use wiremock::matchers::{body_string_contains, method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        // O .torrent do site, baixado e adicionado à mão (hash diferente do
+        // gerado), já semeia os mesmos arquivos para o mesmo tracker.
+        let hash = "b".repeat(40);
+        let info = |hash: &str| {
+            json!({
+                "hash": hash, "name": "a", "state": "stalledUP", "save_path": "/downloads",
+                "progress": 1.0, "tags": "", "content_path": "/downloads/a",
+            })
+        };
+        let torrents: Vec<TorrentInfo> = [info(&"a".repeat(40)), info(&hash)]
+            .into_iter()
+            .map(|v| serde_json::from_value(v).unwrap())
+            .collect();
+        let (server, client, _) = adopt_with(existing("stalledUP", 1.0, ""), json!([])).await;
+        server.reset().await;
+        let mock_get = |route: &str, hash: &str, body: serde_json::Value| {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v2/torrents/{route}")))
+                .and(query_param("hash", hash.to_owned()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        };
+        mock_get(
+            "trackers",
+            &"a".repeat(40),
+            json!([{ "url": "https://origem.exemplo/announce", "status": 2 }]),
+        )
+        .mount(&server)
+        .await;
+        mock_get(
+            "trackers",
+            &hash,
+            json!([{ "url": "https://destino.exemplo/announce?passkey=OUTRA", "status": 2 }]),
+        )
+        .mount(&server)
+        .await;
+        mock_get("files", &hash, json!([{ "name": "a", "size": 1 }]))
+            .mount(&server)
+            .await;
+        // Mesmas peças, com `source`: o export prova o conteúdo.
+        let exported = "d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces1:x6:source1:zee";
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/export"))
+            .and(query_param("hash", hash.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(exported.as_bytes().to_vec()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/torrents/add"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/torrents/addTags"))
+            .and(body_string_contains(format!("hashes={hash}")))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let seeded = seed_into(
+            &client,
+            "acervo",
+            &torrents,
+            &launch_of("bjsharecustom"),
+            package_torrent(),
+            &acervo_clients::info_hash(&package_torrent()).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(seeded, Seeded::AlreadyThere);
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn sem_prova_de_conteudo_o_pacote_e_adicionado_e_conferido() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        // Mesmo tracker e mesmos arquivos, mas o cliente não exporta o
+        // .torrent do existente: sem prova, não adota.
+        let hash = "b".repeat(40);
+        let info = |hash: &str| {
+            json!({
+                "hash": hash, "name": "a", "state": "stalledUP", "save_path": "/downloads",
+                "progress": 1.0, "tags": "", "content_path": "/downloads/a",
+            })
+        };
+        let torrents: Vec<TorrentInfo> = [info(&"a".repeat(40)), info(&hash)]
+            .into_iter()
+            .map(|v| serde_json::from_value(v).unwrap())
+            .collect();
+        let (server, client, _) = adopt_with(existing("stalledUP", 1.0, ""), json!([])).await;
+        server.reset().await;
+        let own = acervo_clients::info_hash(&package_torrent()).unwrap();
+        for (route, hash, body) in [
+            (
+                "trackers",
+                "a".repeat(40),
+                json!([{ "url": "https://origem.exemplo/announce", "status": 2 }]),
+            ),
+            (
+                "trackers",
+                hash.clone(),
+                json!([{ "url": "https://destino.exemplo/announce?passkey=OUTRA", "status": 2 }]),
+            ),
+            ("files", hash.clone(), json!([{ "name": "a", "size": 1 }])),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v2/torrents/{route}")))
+                .and(query_param("hash", hash))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/export"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/info"))
+            .and(query_param("hashes", own.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "hash": own, "name": "a", "state": "stoppedDL", "save_path": "/downloads" }
+            ])))
+            .mount(&server)
+            .await;
+        accept_posts(&server).await;
+
+        let seeded = seed_into(
+            &client,
+            "acervo",
+            &torrents,
+            &launch_of("bjsharecustom"),
+            package_torrent(),
+            &own,
+        )
+        .await
+        .unwrap();
+        assert_eq!(seeded, Seeded::Added);
+        assert_eq!(posts(&server, "/api/v2/torrents/add").await.len(), 1);
+        assert_eq!(posts(&server, "/api/v2/torrents/recheck").await.len(), 1);
     }
 }

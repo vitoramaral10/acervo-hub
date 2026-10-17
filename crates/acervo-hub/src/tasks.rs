@@ -993,6 +993,15 @@ impl Job for Import {
         if let Err(error) = queue {
             tracing::warn!("fila de downloads: {error:#}");
         }
+        // Irmão de cross-seed recém-adicionado: confere e inicia já, sem
+        // esperar a volta do cross-seed. Erro aqui não derruba a importação.
+        let verified = match crate::crossseed::verify_pending(&config, store).await {
+            Ok(done) => Some(done),
+            Err(error) => {
+                tracing::warn!("conferência de irmãos do cross-seed: {error:#}");
+                None
+            }
+        };
         let (lines, series) = match (lines, series) {
             (Ok(lines), Ok(series)) => (lines, series),
             (Err(error), Ok(series)) if series.is_empty() => return Err(error),
@@ -1041,6 +1050,13 @@ impl Job for Import {
         } else {
             parts.join(", ")
         };
+        if let Some((started, rejected)) = verified
+            && started + rejected > 0
+        {
+            summary = format!(
+                "{summary}; irmãos do cross-seed: {started} semeando, {rejected} recusados"
+            );
+        }
         let found = self.check_disk(store).await;
         if found > 0 {
             summary = format!(
