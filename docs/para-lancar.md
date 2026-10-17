@@ -106,9 +106,14 @@ gravação do desfecho que falhou) é resgatado para `falhou` pelas rotas.
 6. **Capturas.** 4 quadros a 15%, 35%, 55% e 75% da duração:
    `ffmpeg -ss T -i VIDEO -frames:v 1 -threads 2 -f image2pipe -c:v png -`
    (sem escala: as regras pedem a resolução real), cada um enviado ao ImgBB
-   (`POST https://api.imgbb.com/1/upload`, multipart `key` + `image`). Sem
-   chave configurada → `falhou` com "configure a chave do ImgBB em
-   Configurações → Imagens". Guarda `{url, thumb}`.
+   (`POST https://api.imgbb.com/1/upload`, multipart `key` + `image`). Guarda
+   `{url, thumb}`; `url` é o link direto `i.ibb.co` (resolução original).
+   O ImgBB é **opcional**: sem chave configurada o passo é pulado, o pacote
+   segue, `screens` fica vazio, a descrição não leva `[img]` nem instrução
+   (ela é texto público no site) e o laudo ganha um aviso `Capturas` para
+   baixar os 4 PNG do pacote e anexá-los no formulário. Os instantes saem de `launch::screen_times`, função única do
+   preparo e da rota de download. O laudo guarda ainda o vídeo principal
+   (`capturas`: arquivo, largura, altura, duração) para a tela e para a rota.
 7. **`.torrent`.** Announce do destino: de um torrent do cliente cujo grab é do
    indexador destino, `QbitClient::trackers`, a primeira URL real com status
    2 (funcionando); sem nenhum → `falhou` "nenhum torrent do <site> no cliente
@@ -260,7 +265,41 @@ Tudo em português; cada campo tem botão de copiar na tela.
 Seção nova `imagens` com `imgbb_api_key` (segredo: entra em
 `config::secrets`, Debug redigido, nunca devolvida pela API). Campo na tela de
 Configurações. URL com a chave nunca vai a log: o erro do reqwest é trocado por
-mensagem própria.
+mensagem própria. A chave é opcional: sem ela o pacote não falha (passo 6) e as
+capturas saem só para baixar.
+
+## Capturas para baixar
+
+O formulário do Amigos tem upload de imagem próprio, e o ImgBB só serve a
+miniatura ou uma cópia reduzida no navegador; subir essa versão reduziu as
+capturas (1920×1012 em vez de 3840×2024) e a staff reclamou. Por isso:
+
+`GET /ui/api/biblioteca/para-lancar/{hash}/{indexer}/capturas/{n}`
+(`n` = 1 a 4, também aceito como `{n}.png` e `{n}.jpg`; mesma auth e cabeçalhos de segurança do `.torrent` e do
+`mediainfo.txt`).
+
+- Gera o quadro **na hora** com `mediainfo::screenshot`, no vídeo principal da
+  origem (torrent no cliente, maior vídeo), no mesmo instante do preparo
+  (15/35/55/75% da duração gravada no laudo; pacote antigo relê pelo ffprobe).
+  Resolução real, sem escala. Nada vai a disco.
+- **Limite de 5 MiB** (`mediainfo::LIMITE_CAPTURA`): o formulário do Amigos
+  só aceita imagem de até 5 MB. Regra, sempre na resolução cheia:
+  1. PNG sem perda, no máximo de compressão (`-compression_level 100`, que o
+     ffmpeg corta no 9 do zlib, e `-pred mixed`; 8 bits por canal, `rgb24`).
+  2. Passou de 5 MiB: JPEG (`mjpeg`, `-pix_fmt yuvj420p`, 8 bits mesmo para
+     fonte 10 bits/HDR, sem tonemap nem escala) em `-q:v` 2, 3, 4, 6, 9,
+     parando na primeira qualidade que couber.
+  3. Nem a 9 coube: devolve a menor e registra aviso no log do hub.
+- O formato devolvido é o realmente gerado, qualquer que seja a extensão
+  pedida: `Content-Type: image/png` ou `image/jpeg`; `Content-Disposition:
+  attachment; filename="<vídeo>.captura-<n>.png|jpg"` (nome sem extensão do
+  vídeo, sanitizado). O upload ao ImgBB usa o mesmo resultado (mesmos bytes,
+  nome e MIME do formato gerado), então também fica em até 5 MiB.
+- Um ffmpeg por vez (semáforo em `mediainfo::screenshot`, vale para o preparo
+  também): quem chega depois espera a vez.
+- 404: `n` fora de 1 a 4 ou extensão que não seja `.png`/`.jpg`, pacote inexistente, torrent fora do cliente, sem
+  vídeo ou vídeo fora do disco. 502: cliente de download fora do ar ou ffmpeg
+  falhou (detalhe só no log).
 
 ## Deploy
 
@@ -277,10 +316,12 @@ Página "Para lançar" (`#lancar`), entre as principais.
 - Linha: título, release, tamanho, origem → destino, selo de estado
   ("parecido no destino" quando `layout_differs`), botão Preparar.
 - Diálogo do pacote: checagens agrupadas por status com o número da regra;
-  releases do destino; campos com botão copiar; capturas (miniaturas com link);
+  releases do destino; campos com botão copiar; seção "Capturas" com 4 botões
+  "Baixar captura N" (link para `/capturas/N`, sem extensão; resolução real ao lado, ex.: "3840×2024 — resolução
+  original") e, havendo ImgBB, os links diretos `i.ibb.co` com botão copiar;
   "Baixar .torrent"; "Marquei como enviado"; "Descartar"; enquanto
   `preparando`, o andamento com polling de 3 s.
-- Configurações → Imagens: chave do ImgBB.
+- Configurações → Imagens: chave do ImgBB (opcional).
 
 ## Pasta adaptada (legenda separada para o BJ)
 

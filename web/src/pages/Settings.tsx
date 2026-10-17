@@ -180,7 +180,7 @@ const PAGES: Record<Section, { title: string; description: string; body: () => R
   },
   imagens: {
     title: 'Imagens',
-    description: 'A chave do ImgBB, que hospeda as capturas de “Para lançar”.',
+    description: 'A chave do ImgBB (opcional), que hospeda as capturas de “Para lançar”; sem ela as capturas saem só para baixar.',
     body: () => <ImagesSettings />,
   },
 }

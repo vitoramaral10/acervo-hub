@@ -458,6 +458,60 @@ function SeedSection({ detail }: { detail: LaunchDetail }) {
   )
 }
 
+/** Os quadros do pacote na resolução real: o formulário do site pede o arquivo, não o link do ImgBB. */
+function Captures({ detail }: { detail: LaunchDetail }) {
+  if (detail.estado !== 'pronto' && detail.estado !== 'enviado' && detail.estado !== 'semeando') return null
+  const video = detail.report.capturas
+  return (
+    <section aria-labelledby="lancar-capturas" className="grid gap-3">
+      <h3 id="lancar-capturas" className="text-sm font-semibold">
+        Capturas
+      </h3>
+      <p className="text-xs text-content-muted">
+        Tiradas na hora, do vídeo da origem, sem reduzir. Anexe estas imagens no formulário do site (PNG; JPEG na mesma resolução quando o PNG passa de 5 MB, o limite do Amigos).
+      </p>
+      <ul className="grid gap-2 sm:grid-cols-2">
+        {[1, 2, 3, 4].map((number) => (
+          <li key={number} className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <Button variant="secondary" size="sm" asChild>
+              <a href={launchApi.captureUrl(detail.hash, detail.indexer, number)} download>
+                <Download aria-hidden="true" />
+                Baixar captura {number}
+              </a>
+            </Button>
+            {video && (
+              <span className="text-xs text-content-muted tabular-nums">
+                {video.largura}×{video.altura} — resolução original
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+      {detail.screens.length > 0 && (
+        <div className="grid gap-1.5">
+          <h4 className="text-xs font-medium">Links diretos (resolução original)</h4>
+          <ul className="grid gap-1">
+            {detail.screens.map((screen, index) => (
+              <li key={screen.url} className="flex items-center justify-between gap-2 text-xs">
+                <a
+                  href={safeHref(screen.url)}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="min-w-0 break-all font-mono hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+                  aria-label={`Abrir o link direto da captura ${index + 1}, em nova aba`}
+                >
+                  {screen.url}
+                </a>
+                <CopyButton text={screen.url} label={`link da captura ${index + 1}`} />
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  )
+}
+
 function Package({ detail, item }: { detail: LaunchDetail; item: LaunchItem }) {
   const refresh = useRefreshLaunch()
   const prepare = usePrepare()
@@ -553,33 +607,7 @@ function Package({ detail, item }: { detail: LaunchDetail; item: LaunchItem }) {
         </section>
       )}
 
-      {detail.screens.length > 0 && (
-        <section aria-labelledby="lancar-capturas" className="grid gap-2">
-          <h3 id="lancar-capturas" className="text-sm font-semibold">
-            Capturas de tela
-          </h3>
-          <ul className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-            {detail.screens.map((screen, index) => (
-              <li key={screen.url}>
-                <a
-                  href={safeHref(screen.url)}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="block overflow-hidden rounded-md border border-border focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
-                  aria-label={`Abrir a captura ${index + 1} em tamanho real, em nova aba`}
-                >
-                  <img
-                    src={safeHref(screen.thumb)}
-                    alt={`Captura ${index + 1}`}
-                    loading="lazy"
-                    className="aspect-video w-full object-cover"
-                  />
-                </a>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
+      <Captures detail={detail} />
 
       <div className="flex flex-wrap gap-2 border-t border-border pt-4">
         {detail.tem_torrent && (

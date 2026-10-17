@@ -56,8 +56,10 @@ use text::{Credits, Input, Work};
 /// O andamento de quem espera o pacote da frente.
 pub(crate) const QUEUED: &str = "na fila";
 
-/// Mensagem de quando falta a chave do `ImgBB` (spec, passo 6).
-const NO_IMGBB_KEY: &str = "configure a chave do ImgBB em Configurações → Imagens";
+/// O aviso do laudo quando falta a chave do `ImgBB` (spec, passo 6): o pacote
+/// segue sem links e as capturas saem para baixar.
+const NO_IMGBB_WARNING: &str = "sem a chave do ImgBB (Configurações → Imagens): as capturas não \
+     foram hospedadas; baixe os 4 PNG do pacote e anexe-os no formulário";
 
 /// Os vídeos do torrent, pela extensão.
 const VIDEO_EXTENSIONS: [&str; 5] = ["mkv", "mp4", "avi", "m2ts", "ts"];
@@ -382,6 +384,15 @@ pub(crate) fn main_video(files: &[SourceFile]) -> Option<&SourceFile> {
 pub(crate) fn screen_times(duration: f64) -> Vec<f64> {
     SCREEN_POINTS.iter().map(|p| duration * p).collect()
 }
+
+/// O instante da captura `number` (1 a 4): o mesmo que o preparo usa, para a
+/// rota de download tirar o quadro igual ao que iria ao `ImgBB`.
+pub(crate) fn screen_time(duration: f64, number: usize) -> Option<f64> {
+    screen_times(duration).get(number.checked_sub(1)?).copied()
+}
+
+/// Quantas capturas o pacote tem.
+pub(crate) const SCREEN_COUNT: usize = SCREEN_POINTS.len();
 
 /// A pasta raiz do torrent, ou o arquivo se for avulso: é o nome do release.
 pub(crate) fn release_name(files: &[SourceFile]) -> String {
@@ -992,8 +1003,20 @@ fn generated_subtitles(
 /// O laudo como vai ao banco, com o nome de cada faixa a extrair
 /// (`adaptations[].faixa`): a tela diz "a partir da faixa 3 (Português -
 /// Brasil)".
-fn report_value(report: &Report, videos: &[ProbedVideo]) -> Result<Value> {
+fn report_value(report: &Report, videos: &[ProbedVideo], main: &str) -> Result<Value> {
     let mut value = serde_json::to_value(report)?;
+    // O que a tela mostra ao lado dos botões de captura, e a duração que a
+    // rota de download usa para cair nos mesmos instantes do preparo.
+    if let Some(video) = videos.iter().find(|v| v.path == main)
+        && let Some(facts) = &video.media.video
+    {
+        value["capturas"] = json!({
+            "arquivo": main,
+            "largura": facts.width,
+            "altura": facts.height,
+            "duracao": video.media.duration_seconds,
+        });
+    }
     if let Some(list) = value.get_mut("adaptations").and_then(Value::as_array_mut) {
         for (item, extraction) in list.iter_mut().zip(&report.adaptations) {
             if let Some(label) = track_label(videos, extraction) {
@@ -1810,7 +1833,11 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
     };
     let mut report = rules::check(site, &facts);
     store
-        .save_launch_report(&job.hash, &indexer, &report_value(&report, &facts.videos)?)
+        .save_launch_report(
+            &job.hash,
+            &indexer,
+            &report_value(&report, &facts.videos, &main.path)?,
+        )
         .await?;
     if report.verdict == Verdict::Inelegivel {
         // Preparo anterior que montou a pasta: sem pacote a enviar, ela não
@@ -1839,29 +1866,14 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
     );
 
     // 6. Capturas.
-    let key = config.imgbb_key().context(NO_IMGBB_KEY)?.to_owned();
-    job.secrets.push(key.clone());
-    let duration = main_media
-        .duration_seconds
-        .filter(|d| d.is_finite() && *d > 0.0)
-        .context("o ffprobe não disse a duração do vídeo: sem ela não há onde tirar as capturas")?;
-    let imgbb = imgbb::Imgbb::new()?;
-    let times = screen_times(duration);
-    let mut screens = Vec::new();
-    for (index, at) in times.iter().enumerate() {
-        let number = index + 1;
-        job.step(&format!("captura {number} de {}", times.len()))
-            .await;
-        let png = crate::mediainfo::screenshot(&main_path, *at).await?;
-        let screen = imgbb
-            .upload(&key, png, &format!("captura-{number}.png"))
-            .await
-            .with_context(|| format!("enviando a captura {number}"))?;
-        screens.push(screen);
+    let screens = host_screens(config, job, &main_path, main_media.duration_seconds).await?;
+    if screens.is_empty() {
+        report.checks.push(rules::Check {
+            rule: "Capturas".to_owned(),
+            status: rules::Status::Warn,
+            message: NO_IMGBB_WARNING.to_owned(),
+        });
     }
-    store
-        .save_launch_screens(&job.hash, &indexer, &serde_json::to_value(&screens)?)
-        .await?;
 
     let input = Input {
         title: tmdb.title.unwrap_or(work.title),
@@ -1884,7 +1896,11 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
     report.checks.extend(built.warnings);
     report.checks.extend(mediainfo_warning);
     store
-        .save_launch_report(&job.hash, &indexer, &report_value(&report, &facts.videos)?)
+        .save_launch_report(
+            &job.hash,
+            &indexer,
+            &report_value(&report, &facts.videos, &main.path)?,
+        )
         .await?;
     store
         .save_launch_fields(&job.hash, &indexer, &serde_json::to_value(&built.fields)?)
@@ -1937,6 +1953,49 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
         .save_launch_torrent(&job.hash, &indexer, &bytes)
         .await?;
     Ok(Finish::Ready)
+}
+
+/// As 4 capturas no `ImgBB`, em resolução original (PNG, ou JPEG se o PNG
+/// passar de 5 MiB). Sem chave configurada o
+/// passo é pulado e a lista sai vazia: o pacote não falha, e a tela entrega os
+/// PNG para baixar e anexar no formulário.
+///
+/// # Errors
+///
+/// Com chave: sem duração no ffprobe, o ffmpeg ou o upload falhando.
+async fn host_screens(
+    config: &Config,
+    job: &mut Job<'_>,
+    video: &Path,
+    duration: Option<f64>,
+) -> Result<Vec<imgbb::Screen>> {
+    let Some(key) = config.imgbb_key().map(str::to_owned) else {
+        return Ok(Vec::new());
+    };
+    job.secrets.push(key.clone());
+    let duration = duration
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .context("o ffprobe não disse a duração do vídeo: sem ela não há onde tirar as capturas")?;
+    let imgbb = imgbb::Imgbb::new()?;
+    let times = screen_times(duration);
+    let mut screens = Vec::new();
+    for (index, at) in times.iter().enumerate() {
+        let number = index + 1;
+        job.step(&format!("captura {number} de {}", times.len()))
+            .await;
+        // PNG, ou JPEG na mesma resolução se o PNG passar do limite do Amigos.
+        let (image, format) = crate::mediainfo::screenshot(video, *at).await?;
+        let name = format!("captura-{number}.{}", format.extension());
+        let screen = imgbb
+            .upload(&key, image, &name, format.mime())
+            .await
+            .with_context(|| format!("enviando a captura {number}"))?;
+        screens.push(screen);
+    }
+    job.store
+        .save_launch_screens(&job.hash, &job.indexer, &serde_json::to_value(&screens)?)
+        .await?;
+    Ok(screens)
 }
 
 /// O relatório do `MediaInfo` do vídeo principal. O formulário do Amigos o exige
@@ -2019,6 +2078,85 @@ mod tests {
         for (got, want) in times.iter().zip([900.0, 2_100.0, 3_300.0, 4_500.0]) {
             assert!((got - want).abs() < 1e-6, "{got} != {want}");
         }
+    }
+
+    #[test]
+    fn rota_e_preparo_tiram_o_quadro_no_mesmo_instante() {
+        for duration in [6_000.0, 7_265.432, 0.8] {
+            let times = screen_times(duration);
+            assert_eq!(times.len(), SCREEN_COUNT);
+            for (index, at) in times.iter().enumerate() {
+                assert_eq!(screen_time(duration, index + 1), Some(*at));
+            }
+            assert_eq!(screen_time(duration, 0), None);
+            assert_eq!(screen_time(duration, SCREEN_COUNT + 1), None);
+        }
+    }
+
+    #[test]
+    fn laudo_guarda_a_resolucao_e_a_duracao_do_video_principal() {
+        let report = Report {
+            checks: Vec::new(),
+            destination: Vec::new(),
+            verdict: Verdict::Elegivel,
+            adaptations: Vec::new(),
+        };
+        let videos = vec![ProbedVideo {
+            path: "Filme/Filme.mkv".into(),
+            media: crate::mediainfo::MediaFacts {
+                container: "matroska,webm".into(),
+                duration_seconds: Some(7_200.5),
+                video: Some(crate::mediainfo::VideoFacts {
+                    codec: "hevc".into(),
+                    width: 3840,
+                    height: 2024,
+                    pix_fmt: None,
+                    bit_depth: None,
+                    hdr: crate::mediainfo::Hdr::Sdr,
+                }),
+                audio: Vec::new(),
+                subtitles: Vec::new(),
+            },
+        }];
+        let value = report_value(&report, &videos, "Filme/Filme.mkv").unwrap();
+        assert_eq!(
+            value["capturas"],
+            json!({ "arquivo": "Filme/Filme.mkv", "largura": 3840, "altura": 2024, "duracao": 7_200.5 })
+        );
+        assert!(
+            report_value(&report, &videos, "Outro.mkv")
+                .unwrap()
+                .get("capturas")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn sem_chave_do_imgbb_o_passo_pula_o_upload_e_deixa_as_capturas_vazias() {
+        let Some(db) = acervo_store::testing::TestDb::new("capturas_sem_chave").await else {
+            return;
+        };
+        let hash = "e".repeat(40);
+        let mut job = Job {
+            store: &db.store,
+            hash,
+            indexer: "bjsharecustom".into(),
+            secrets: Vec::new(),
+            shown: String::new(),
+        };
+        // Sem chave não toca no vídeo (que nem existe) nem na duração.
+        let screens = host_screens(
+            &Config::default(),
+            &mut job,
+            Path::new("/nao/existe.mkv"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(screens.is_empty());
+        assert!(job.secrets.is_empty());
+        assert_eq!(job.shown, "", "nenhum andamento de captura");
+        db.drop().await;
     }
 
     #[test]
@@ -2559,7 +2697,7 @@ mod tests {
         };
         assert_eq!(report.adaptations.len(), 1, "a faixa PT vira um .srt");
         // O nome da faixa vai junto ao laudo, para a tela.
-        let value = report_value(&report, &videos).unwrap();
+        let value = report_value(&report, &videos, "Filme/Filme.mkv").unwrap();
         assert_eq!(value["adaptations"][0]["faixa"], "Português - Brasil");
         assert_eq!(value["adaptations"][0]["output"], "Filme/Filme.pt-BR.srt");
 
