@@ -1730,7 +1730,7 @@ fn duplicate(ctx: &Context<'_>, site: Site, rule: &str) -> Check {
         .facts
         .destination
         .iter()
-        .filter(|d| same_resolution(ctx, d) && same_source(ctx.quality, d.quality))
+        .filter(|d| maybe_same_resolution(ctx, d) && same_source(ctx.quality, d.quality))
         .collect();
     if site == Site::Amigos
         && matches!(audio, AudioKind::Dublado | AudioKind::Legendado)
@@ -2229,6 +2229,28 @@ fn resolution_of(video: &VideoFacts) -> u16 {
 fn same_resolution(ctx: &Context<'_>, dest: &DestinationRelease) -> bool {
     let theirs = dest.quality.resolution();
     ctx.resolution > 0 && theirs > 0 && ctx.resolution == theirs
+}
+
+/// Para a duplicidade: mesma resolução, ou o título do destino não diz a
+/// resolução. O site monta o título das etiquetas e, num 4K HDR, a etiqueta
+/// pode ser só "HDR"; sem resolução, o parser cai em 480p e o duplicado
+/// passava (torrent 52763 no Amigos, contra um envio do acervo apagado pela
+/// moderação).
+fn maybe_same_resolution(ctx: &Context<'_>, dest: &DestinationRelease) -> bool {
+    same_resolution(ctx, dest) || (ctx.resolution > 0 && !title_has_resolution(&dest.title))
+}
+
+/// O título diz a resolução: `2160p`, `1080i`, `720p`, `4K`, `UHD`.
+fn title_has_resolution(title: &str) -> bool {
+    title
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| {
+            matches!(token, "4k" | "8k" | "uhd")
+                || token.strip_suffix(['p', 'i']).is_some_and(|digits| {
+                    (3..=4).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
+                })
+        })
 }
 
 /// Mesma fonte; Remux é outra coisa que o Blu-ray reencodado.
@@ -2893,6 +2915,33 @@ mod tests {
         let mut facts = movie();
         facts.destination = vec![dest("Filme.2024.1080p.WEB-DL.DUAL.x264-OUTRO", 4 * GB)];
         assert_eq!(status(Site::Amigos, &facts, "4.2.1"), Some(Status::Warn));
+    }
+
+    #[test]
+    fn amigos_destino_sem_resolucao_no_titulo_conta_como_duplicado() {
+        // O 4K HDR que o site lista só como "HDR": o parser leria 480p.
+        let mut facts = movie();
+        facts.destination = vec![dest(
+            "Filme 2024 HDR WEB-DL H.264 Dual-Audio Brazilian Original",
+            10 * GB + GB / 50,
+        )];
+        let report = check(Site::Amigos, &facts);
+        assert_eq!(report.status_of("4.2.1"), Some(Status::Fail), "{report:?}");
+        // Com resolução diferente no título, segue sem duplicidade.
+        facts.destination = vec![dest("Filme 2024 720p WEB-DL H.264 Dual-Audio", 10 * GB)];
+        assert_eq!(status(Site::Amigos, &facts, "4.2.1"), Some(Status::Ok));
+    }
+
+    #[test]
+    fn resolucao_no_titulo() {
+        assert!(title_has_resolution("Filme 2024 1080p WEB-DL"));
+        assert!(title_has_resolution("Filme.2024.2160p.UHD"));
+        assert!(title_has_resolution("Filme 4K HDR"));
+        assert!(title_has_resolution("Filme 1080i HDTV"));
+        assert!(!title_has_resolution(
+            "Caught Stealing 2025 HDR WEB-DL H.265 Dual-Audio"
+        ));
+        assert!(!title_has_resolution("Filme 2024 x264"));
     }
 
     #[test]
