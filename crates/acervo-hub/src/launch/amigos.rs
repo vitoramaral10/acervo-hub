@@ -196,12 +196,14 @@ pub(crate) struct Choice {
 
 /// Escolhe a opção de cada lista como o formulário faz: gênero e idioma pelo
 /// IMDB, o resto pelo `MediaInfo`, o primeiro nome sugerido que bate com uma
-/// opção. `dublado` é a regra 3.9: Dual sem legenda PT vai como Dublado.
+/// opção. `audio` troca a sugestão do site para o áudio: Dublado pela regra
+/// 3.9 (Dual sem legenda PT) e Nacional para a obra brasileira, que o
+/// `MediaInfo` do site sugere como Dublado.
 pub(crate) fn choose(
     profile: &Profile,
     media: &MediaRead,
     lookup: &Lookup,
-    dublado: bool,
+    audio: Option<&str>,
 ) -> Choice {
     let mut ids = Vec::new();
     let mut shown = Vec::new();
@@ -221,7 +223,7 @@ pub(crate) fn choose(
                         .unwrap_or_default(),
                 )
                 .collect(),
-            "audio_channels" if dublado => vec!["Dublado".to_owned()],
+            "audio_channels" if audio.is_some() => audio.map(str::to_owned).into_iter().collect(),
             kind => media.attributes.get(kind).cloned().unwrap_or_default(),
         };
         let find = |name: &String| {
@@ -324,7 +326,9 @@ pub(crate) struct Package {
     pub(crate) imdb_id: String,
     pub(crate) mediainfo: String,
     pub(crate) description: String,
-    pub(crate) dublado: bool,
+    /// A opção de áudio que vale mais que a sugestão do site (Dublado pela
+    /// 3.9, Nacional para obra brasileira).
+    pub(crate) audio: Option<&'static str>,
     pub(crate) has_subtitle_file: bool,
     pub(crate) screenshots: usize,
 }
@@ -385,7 +389,13 @@ pub(crate) fn package(
         imdb_id,
         mediainfo,
         description: field("descricao"),
-        dublado,
+        audio: if dublado {
+            Some("Dublado")
+        } else if launch.report.get("audio").and_then(Value::as_str) == Some("nacional") {
+            Some("Nacional")
+        } else {
+            None
+        },
         has_subtitle_file,
         screenshots,
     })
@@ -399,7 +409,7 @@ pub(crate) fn draft_from(
     lookup: &Lookup,
 ) -> Draft {
     let profile = &form.profile;
-    let choice = choose(profile, media, lookup, package.dublado);
+    let choice = choose(profile, media, lookup, package.audio);
     let mut missed = choice.missed.clone();
     let want_movie = package.slug == "filmes";
     if want_movie != (lookup.kind == "movie") {
@@ -797,7 +807,7 @@ mod tests {
             imdb_id: "tt0114709".into(),
             mediainfo: "General\n...".into(),
             description: "[b]Sinopse[/b]".into(),
-            dublado: false,
+            audio: None,
             has_subtitle_file: false,
             screenshots: 4,
         }
@@ -840,7 +850,7 @@ mod tests {
     #[test]
     fn escolhe_como_o_formulario_pelo_nome_sem_acento() {
         let form = form_from_page(PAGE, "filmes").unwrap();
-        let choice = choose(&form.profile, &media(), &lookup(), false);
+        let choice = choose(&form.profile, &media(), &lookup(), None);
         // "Comedia" sem acento casa com "Comédia"; "Família" não é opção.
         assert_eq!(choice.ids, vec![225, 206, 207, 1, 59, 199, 195]);
         assert!(choice.missed.is_empty(), "{:?}", choice.missed);
@@ -856,9 +866,25 @@ mod tests {
     #[test]
     fn regra_3_9_troca_dual_por_dublado() {
         let form = form_from_page(PAGE, "filmes").unwrap();
-        let choice = choose(&form.profile, &media(), &lookup(), true);
+        let choice = choose(&form.profile, &media(), &lookup(), Some("Dublado"));
         assert!(choice.ids.contains(&200));
         assert!(!choice.ids.contains(&199));
+    }
+
+    #[test]
+    fn obra_nacional_vai_como_nacional() {
+        let page = PAGE.replace(
+            r#"{"id":198,"name":"Legendado"}"#,
+            r#"{"id":198,"name":"Legendado"},{"id":201,"name":"Nacional"}"#,
+        );
+        let form = form_from_page(&page, "filmes").unwrap();
+        let mut read = media();
+        // O site sugere Dublado para o filme brasileiro.
+        read.attributes
+            .insert("audio_channels".into(), vec!["Dublado".into()]);
+        let choice = choose(&form.profile, &read, &lookup(), Some("Nacional"));
+        assert!(choice.ids.contains(&201), "{choice:?}");
+        assert!(!choice.ids.contains(&200));
     }
 
     #[test]
@@ -868,7 +894,7 @@ mod tests {
         read.attributes
             .insert("resolution".into(), vec!["WEBRip".into()]);
         read.attributes.remove("video_codec");
-        let choice = choose(&form.profile, &read, &lookup(), false);
+        let choice = choose(&form.profile, &read, &lookup(), None);
         assert_eq!(choice.missed.len(), 2, "{:?}", choice.missed);
         assert!(choice.missed[0].contains("WEBRip"));
         assert!(choice.missed[1].contains("sem sugestão"));
