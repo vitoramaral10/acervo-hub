@@ -1779,6 +1779,9 @@ fn duplicate(ctx: &Context<'_>, site: Site, rule: &str) -> Check {
             warning = Some(similar(ctx, rule, dest, diff, codec_differs));
         }
     }
+    if site == Site::Amigos && warning.is_none() {
+        warning = only_quality_differs(ctx, rule, audio);
+    }
     warning.unwrap_or_else(|| {
         Check::ok(
             rule,
@@ -1788,6 +1791,37 @@ fn duplicate(ctx: &Context<'_>, site: Site, rule: &str) -> Check {
             ),
         )
     })
+}
+
+/// Amigos 4.2.1: "quando o lançamento tiver todos os itens iguais a um
+/// lançamento existente (resolução, codecs e tamanho) e somente a qualidade
+/// for diferente, a Staff avaliará individualmente". Na prática a staff
+/// apaga como duplicado (um `BluRay` contra um `WEB-DL` de mesmo tamanho, torrent
+/// 58396): vira aviso, que segura o envio para o usuário decidir.
+fn only_quality_differs(ctx: &Context<'_>, rule: &str, audio: AudioKind) -> Option<Check> {
+    ctx.facts
+        .destination
+        .iter()
+        .filter(|d| {
+            maybe_same_resolution(ctx, d)
+                && !same_source(ctx.quality, d.quality)
+                && comparable_audio(audio, d)
+                && !matches!((ctx.codec, d.codec), (Some(a), Some(b)) if a != b)
+                && size_difference(ctx.size, d.size) < DUPLICATE_SIZE_TOLERANCE
+        })
+        .map(|d| {
+            Check::warn(
+                rule,
+                format!(
+                    "só a qualidade difere de \"{}\" ({} contra {}), com o mesmo tamanho ({:.1}% de diferença): a staff avalia e costuma tratar como duplicado",
+                    d.title,
+                    source_label(ctx.quality.source()),
+                    source_label(d.quality.source()),
+                    size_difference(ctx.size, d.size) * 100.0
+                ),
+            )
+        })
+        .next()
 }
 
 /// Aviso de duplicidade a avaliar: mesma resolução, fonte e áudio, mas outro
@@ -2918,6 +2952,38 @@ mod tests {
     }
 
     #[test]
+    fn amigos_so_a_qualidade_diferente_com_mesmo_tamanho_e_aviso() {
+        // BluRay contra um WEB-DL de mesma resolução, codec, áudio e tamanho.
+        let mut facts = movie();
+        rename(&mut facts, "Filme.2024.1080p.BluRay.DUAL.DDP5.1.x264-GRP");
+        facts.destination = vec![dest(
+            "Filme 2024 1080p WEB-DL H.264 Dual-Audio",
+            10 * GB - GB / 25,
+        )];
+        let report = check(Site::Amigos, &facts);
+        assert_eq!(report.status_of("4.2.1"), Some(Status::Warn), "{report:?}");
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.message.contains("só a qualidade difere"))
+        );
+        // Tamanho bem diferente: não é o caso.
+        facts.destination = vec![dest("Filme 2024 1080p WEB-DL H.264 Dual-Audio", 4 * GB)];
+        assert_eq!(status(Site::Amigos, &facts, "4.2.1"), Some(Status::Ok));
+        // No BJ, nada muda.
+        facts.destination = vec![dest("Filme 2024 1080p WEB-DL H.264 Dual-Audio", 10 * GB)];
+        assert_ne!(
+            check(Site::Bj, &facts)
+                .checks
+                .iter()
+                .find(|c| c.rule == "4.2.1.2")
+                .map(|c| c.message.contains("só a qualidade")),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn amigos_destino_sem_resolucao_no_titulo_conta_como_duplicado() {
         // O 4K HDR que o site lista só como "HDR": o parser leria 480p.
         let mut facts = movie();
@@ -2949,9 +3015,13 @@ mod tests {
         let mut facts = movie();
         facts.destination = vec![
             dest("Filme.2024.720p.WEB-DL.DUAL.x264-OUTRO", 10 * GB),
-            dest("Filme.2024.1080p.BluRay.DUAL.x264-OUTRO", 10 * GB),
+            dest("Filme.2024.1080p.BluRay.DUAL.x264-OUTRO", 4 * GB),
         ];
         assert_eq!(status(Site::Amigos, &facts, "4.2.1"), Some(Status::Ok));
+        // Outra fonte com o mesmo tamanho: só a qualidade difere, e a staff
+        // avalia (aviso).
+        facts.destination = vec![dest("Filme.2024.1080p.BluRay.DUAL.x264-OUTRO", 10 * GB)];
+        assert_eq!(status(Site::Amigos, &facts, "4.2.1"), Some(Status::Warn));
     }
 
     #[test]
