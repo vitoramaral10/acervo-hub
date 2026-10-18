@@ -1048,8 +1048,7 @@ async fn upload(
         .and_then(Value::as_str)
         .filter(|r| !r.trim().is_empty())
         .unwrap_or("lancamento");
-    // O Amigos só aceita na descrição imagem hospedada nele: as capturas do
-    // site entram no lugar das do `ImgBB`.
+    // A descrição vai sem imagem: as capturas aparecem no campo delas.
     let parts =
         super::amigos::upload_parts(&draft, torrent, &format!("{release}.torrent"), &screenshots);
     // A marca vai ao banco antes do POST: se o acervo cai com o envio no ar,
@@ -1137,7 +1136,7 @@ async fn host_screenshots(
     web: &Web,
     launch: &Launch,
     count: usize,
-) -> Result<Vec<super::amigos::Shot>, Response> {
+) -> Result<Vec<String>, Response> {
     let (relative, video) = source_video(web, &launch.hash).await?;
     let recorded = launch
         .report
@@ -1169,10 +1168,10 @@ async fn host_screenshots(
             capture_stem(&relative),
             format.extension()
         );
-        let shot = super::amigos::host_screenshot(&web.catalog, image, &name, format.mime())
+        let path = super::amigos::host_screenshot(&web.catalog, image, &name, format.mime())
             .await
             .map_err(|e| site_error(&e))?;
-        paths.push(shot);
+        paths.push(path);
     }
     Ok(paths)
 }
@@ -2711,11 +2710,14 @@ mod tests {
             "attribute_ids[0]=59",
             "attribute_ids[1]=199",
             "subtitle=none",
-            "description=[b]Sinopse[/b]\n\n[b]Capturas[/b]\n[img]https://site.invalid/storage/captura-1.webp[/img]",
+            "description=[b]Sinopse[/b]&",
         ] {
             assert!(sent.contains(part), "{part} em {sent}");
         }
-        assert!(!sent.contains("ibb.co"), "{sent}");
+        assert!(
+            !sent.contains("[img]") && !sent.contains("Capturas"),
+            "{sent}"
+        );
 
         // Já enviado: não envia de novo.
         let (status, body) = call(&http, reqwest::Method::POST, &url).await;

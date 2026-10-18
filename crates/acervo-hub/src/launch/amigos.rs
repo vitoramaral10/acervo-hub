@@ -169,15 +169,6 @@ pub(crate) struct MediaRead {
 #[derive(Debug, Clone, Deserialize)]
 struct Hosted {
     path: String,
-    url: String,
-}
-
-/// Uma captura hospedada no site: o caminho que vai em `screenshot_paths` e a
-/// URL absoluta que a descrição usa.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Shot {
-    pub(crate) path: String,
-    pub(crate) url: String,
 }
 
 // ------------------------------------------------------------ escolha
@@ -515,21 +506,19 @@ fn created_id(location: &str) -> Option<&str> {
     (!tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit())).then_some(tail)
 }
 
-/// O corpo do envio com as capturas já hospedadas no site: os caminhos vão
-/// em `screenshot_paths`, e as URLs entram na descrição no lugar das de fora.
+/// O corpo do envio, com as capturas já hospedadas no site (`paths`). A
+/// descrição vai sem imagem: as capturas aparecem no campo delas.
 pub(crate) fn upload_parts(
     draft: &Draft,
     torrent: Vec<u8>,
     torrent_name: &str,
-    shots: &[Shot],
+    paths: &[String],
 ) -> Vec<SitePart> {
-    let urls: Vec<String> = shots.iter().map(|s| s.url.clone()).collect();
-    let paths: Vec<String> = shots.iter().map(|s| s.path.clone()).collect();
     let draft = Draft {
-        description: site_description(&draft.description, &urls),
+        description: site_description(&draft.description),
         ..draft.clone()
     };
-    parts(&draft, torrent, torrent_name, &paths)
+    parts(&draft, torrent, torrent_name, paths)
 }
 
 /// Por que o envio não deu o id do torrent criado.
@@ -677,13 +666,13 @@ pub(crate) async fn draft(catalog: &Catalog, package: &Package) -> Result<Draft>
     Ok(draft_from(package, &form, &media, &lookup))
 }
 
-/// Hospeda uma captura no site.
+/// Hospeda uma captura no site: o caminho que vai em `screenshot_paths`.
 pub(crate) async fn host_screenshot(
     catalog: &Catalog,
     image: Vec<u8>,
     file_name: &str,
     mime: &str,
-) -> Result<Shot> {
+) -> Result<String> {
     let response = request(
         catalog,
         SiteRequest::multipart(
@@ -693,52 +682,27 @@ pub(crate) async fn host_screenshot(
     )
     .await?;
     let hosted: Hosted = ok_json(&response, "o site recusou a captura")?;
-    // O site devolve `/storage/...`: absoluto pela URL que foi pedida.
-    let url = url::Url::parse(&response.url)
-        .and_then(|base| base.join(&hosted.url))
-        .context("o site devolveu a captura com uma URL ilegível")?;
-    Ok(Shot {
-        path: hosted.path,
-        url: url.to_string(),
-    })
+    Ok(hosted.path)
 }
 
-/// A descrição como o Amigos aceita: só imagem hospedada nele ("a descrição
-/// só aceita imagens enviadas pelo site"). Sai toda `[img]` de fora (as
-/// capturas do `ImgBB`), e as capturas do site entram sob "Capturas", ou no
-/// fim, se a descrição não tem a seção.
-pub(crate) fn site_description(description: &str, images: &[String]) -> String {
+/// A descrição como vai ao Amigos: sem imagem. O site só aceita imagem
+/// hospedada nele, e as capturas já aparecem no campo delas; repetidas na
+/// descrição, ficam duplicadas. Sai toda `[img]` (as do `ImgBB`) e a seção
+/// "Capturas", que fica vazia.
+pub(crate) fn site_description(description: &str) -> String {
     const HEADER: &str = "[b]Capturas[/b]";
     let mut lines: Vec<String> = Vec::new();
     for line in description.lines() {
         let stripped = strip_images(line);
-        if stripped.trim().is_empty() && stripped.len() != line.len() {
+        let emptied = stripped.trim().is_empty() && stripped.len() != line.len();
+        if emptied || stripped.trim() == HEADER {
+            continue;
+        }
+        // Linha em branco só uma por vez: a seção que saiu não deixa buraco.
+        if stripped.trim().is_empty() && lines.last().is_some_and(|l| l.trim().is_empty()) {
             continue;
         }
         lines.push(stripped);
-    }
-    let shots: Vec<String> = images
-        .iter()
-        .map(|url| format!("[img]{url}[/img]"))
-        .collect();
-    match lines.iter().position(|l| l.trim() == HEADER) {
-        Some(at) if !shots.is_empty() => {
-            for (offset, shot) in shots.into_iter().enumerate() {
-                lines.insert(at + 1 + offset, shot);
-            }
-        }
-        Some(at) => {
-            lines.remove(at);
-        }
-        None if !shots.is_empty() => {
-            while lines.last().is_some_and(|l| l.trim().is_empty()) {
-                lines.pop();
-            }
-            lines.push(String::new());
-            lines.push(HEADER.to_owned());
-            lines.extend(shots);
-        }
-        None => {}
     }
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
@@ -840,26 +804,16 @@ mod tests {
     }
 
     #[test]
-    fn descricao_so_com_imagens_do_site() {
+    fn descricao_vai_sem_imagens_nem_secao_de_capturas() {
         let description = "[b]Filme[/b]\n\n[b]Capturas[/b]\n[img]https://i.ibb.co/a/1.png[/img]\n[IMG]https://i.ibb.co/b/2.png[/IMG]\n";
-        let images = vec![
-            "https://site.invalid/storage/s/1.webp".to_owned(),
-            "https://site.invalid/storage/s/2.webp".to_owned(),
-        ];
+        assert_eq!(site_description(description), "[b]Filme[/b]");
+        // Seção no meio: sai sem deixar buraco; imagem no meio do texto sai e
+        // o texto fica.
         assert_eq!(
-            site_description(description, &images),
-            "[b]Filme[/b]\n\n[b]Capturas[/b]\n[img]https://site.invalid/storage/s/1.webp[/img]\n[img]https://site.invalid/storage/s/2.webp[/img]"
-        );
-        // Sem a seção, as capturas vão ao fim; imagem no meio do texto sai e o
-        // texto fica.
-        assert_eq!(
-            site_description("Texto [img]https://x/y.png[/img] fim\n\n", &images[..1]),
-            "Texto  fim\n\n[b]Capturas[/b]\n[img]https://site.invalid/storage/s/1.webp[/img]"
-        );
-        // Sem capturas do site, a seção vazia sai.
-        assert_eq!(
-            site_description("A\n[b]Capturas[/b]\n[img]https://x/1.png[/img]", &[]),
-            "A"
+            site_description(
+                "A\n\n[b]Capturas[/b]\n[img]https://x/1.png[/img]\n\nB [img]https://x/2.png[/img] fim"
+            ),
+            "A\n\nB  fim"
         );
     }
 
