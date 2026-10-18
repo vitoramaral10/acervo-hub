@@ -10,6 +10,7 @@ use acervo_store::{Grab, GrabState, SeriesGrab, Store};
 use anyhow::{Context, Result};
 
 use crate::config::Config;
+use crate::obligation::Obligations;
 
 /// Tudo que um ciclo precisa: o que foi lido e por onde agir.
 #[derive(Debug)]
@@ -43,11 +44,16 @@ pub async fn collect(config: &Config, store: &Store) -> Result<Session> {
         .context("lendo os grabs em andamento")?;
     tracing::info!(fila = inventory.queued_hashes.len(), "fila interna lida");
 
+    // Sem saber o que o tracker exige, a limpeza apagaria seed devido.
+    let obligations = crate::obligation::load(store)
+        .await
+        .context("lendo as obrigações de seed")?;
+
     let torrents = qbit.torrents().await.context("listando torrents")?;
     tracing::info!(total = torrents.len(), "torrents no cliente");
 
     for torrent in torrents {
-        match read_download(&qbit, &torrent).await {
+        match read_download(&qbit, &torrent, &obligations).await {
             Ok(download) => inventory.downloads.push(download),
             Err(unreadable) => {
                 tracing::warn!(
@@ -95,6 +101,7 @@ fn internal_hashes(grabs: &[Grab], series_grabs: &[SeriesGrab]) -> HashSet<Downl
 async fn read_download(
     qbit: &QbitClient,
     torrent: &TorrentInfo,
+    obligations: &Obligations,
 ) -> Result<Download, UnreadableDownload> {
     let hash = DownloadHash::new(&torrent.hash);
     let now_epoch = std::time::SystemTime::now()
@@ -152,6 +159,7 @@ async fn read_download(
         ratio: torrent.ratio,
         seeded_for: torrent.seeded_for(),
         idle_for: Some(torrent.idle_for(now_epoch)),
+        obligation: obligations.of(&torrent.hash),
         files: facts,
     })
 }

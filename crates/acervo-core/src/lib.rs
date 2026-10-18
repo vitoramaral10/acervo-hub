@@ -9,7 +9,7 @@ pub mod ids;
 pub mod inventory;
 pub mod size;
 
-pub use download::{Download, DownloadState, FileFacts, SEED_TAG_PREFIX, seed_tag};
+pub use download::{Download, DownloadState, FileFacts, SEED_TAG_PREFIX, SeedObligation, seed_tag};
 pub use ids::DownloadHash;
 pub use inventory::{Inventory, UnreadableDownload};
 pub use size::{Allocated, Apparent};

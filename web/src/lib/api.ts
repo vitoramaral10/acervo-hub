@@ -122,6 +122,21 @@ export interface Indexer {
   prioridade: number
   /** Construir ratio: freeleech procurado passa na frente da qualidade e o torrent ganha a tag de semear. */
   modo_ratio: boolean
+  /** Horas de seed de um download concluído; null: o tracker não exige. */
+  seed_min_horas: number | null
+  /** Ratio que dispensa o resto das horas; null: o tracker não exige. */
+  seed_min_ratio: number | null
+  /** Horas de seed do que o usuário lança no site; null: o tracker não exige. */
+  seed_envio_horas: number | null
+}
+
+/** O que o salvar das preferências manda: sempre os cinco campos, null limpa a obrigação. */
+export interface Preferencias {
+  prioridade: number
+  modo_ratio: boolean
+  seed_min_horas: number | null
+  seed_min_ratio: number | null
+  seed_envio_horas: number | null
 }
 
 export interface TestResult {
@@ -354,8 +369,8 @@ export const api = {
     request<{ ok: boolean }>('DELETE', `/ui/api/indexadores/${encodeURIComponent(name)}`),
   setEnabled: (name: string, ativo: boolean) =>
     request<{ ok: boolean }>('PUT', `/ui/api/indexadores/${encodeURIComponent(name)}/ativo`, { ativo }),
-  setPreferences: (name: string, preferencias: { prioridade: number; modo_ratio: boolean }) =>
-    request<{ ok: boolean; prioridade: number; modo_ratio: boolean }>(
+  setPreferences: (name: string, preferencias: Preferencias) =>
+    request<{ ok: boolean } & Preferencias>(
       'PUT',
       `/ui/api/indexadores/${encodeURIComponent(name)}/preferencias`,
       preferencias,

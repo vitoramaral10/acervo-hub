@@ -302,6 +302,20 @@ const MIGRATIONS: &[&str] = &[
     // 41: id do torrent no site, quando o acervo o enviou pelo formulário do
     // site (Amigos): a página e o `.torrent` dele saem desse id.
     r"ALTER TABLE launches ADD COLUMN site_id TEXT;",
+    // 42: obrigação de seed do tracker: o download concluído semeia
+    // `seed_min_hours` OU chega a `seed_min_ratio` (o que vier primeiro); o que
+    // o usuário lançou no site semeia `upload_seed_hours`. NULL: não exige.
+    r"ALTER TABLE indexers
+        ADD COLUMN seed_min_hours INTEGER CHECK (seed_min_hours > 0),
+        ADD COLUMN seed_min_ratio DOUBLE PRECISION CHECK (seed_min_ratio > 0),
+        ADD COLUMN upload_seed_hours INTEGER CHECK (upload_seed_hours > 0);",
+    // 43: seed devido que sobrevive à remoção do filme ou da série: o grab
+    // some em cascata, mas o torrent antigo pode continuar no cliente. Sem FK.
+    r"CREATE TABLE IF NOT EXISTS seed_debts (
+        hash TEXT NOT NULL,
+        indexer TEXT NOT NULL,
+        PRIMARY KEY (hash, indexer)
+    );",
 ];
 
 /// Quanto uma consulta pode levar. A maior consulta real (o catálogo de
@@ -712,10 +726,37 @@ impl Store {
     /// Falha de escrita.
     pub async fn delete_movie(&self, id: i64) -> Result<bool> {
         let client = self.pool.get().await?;
+        // Os grabs saem em cascata; o hash e o indexador de cada um ficam em
+        // `seed_debts` (mesma instrução, atômica) para a obrigação de seed
+        // durar mais que a linha do catálogo.
         Ok(client
-            .execute("DELETE FROM movies WHERE id = $1", &[&id])
+            .execute(
+                "WITH debt AS (
+                    INSERT INTO seed_debts (hash, indexer)
+                    SELECT lower(hash), indexer FROM grabs WHERE movie_id = $1
+                    ON CONFLICT DO NOTHING
+                )
+                DELETE FROM movies WHERE id = $1",
+                &[&id],
+            )
             .await?
             > 0)
+    }
+
+    /// Os torrents que ainda podem dever seed ao tracker depois de o filme ou
+    /// a série dono do grab sair do catálogo: `(hash, indexador)`.
+    ///
+    /// # Errors
+    ///
+    /// Banco inalcançável.
+    pub async fn seed_debts(&self) -> Result<Vec<(String, String)>> {
+        let client = self.pool.get().await?;
+        client
+            .query("SELECT hash, indexer FROM seed_debts", &[])
+            .await?
+            .iter()
+            .map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
+            .collect()
     }
 
     /// Uma configuração guardada pela interface.
@@ -2083,6 +2124,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remover_filme_guarda_o_seed_devido_dos_grabs() {
+        let Some(db) = TestDb::new("gerenciador").await else {
+            return;
+        };
+        let store = &db.store;
+        let id = added(store, movie(10, "Um", false)).await;
+        let grab = Grab {
+            id: 0,
+            movie_id: id,
+            hash: "AABB".into(),
+            title: "Um.2020.1080p.WEB-DL-GRUPO".into(),
+            indexer: "tracker".into(),
+            quality: Quality::WebDl1080p,
+            size: 1,
+            grabbed_at: "2026-01-01T00:00:00Z".into(),
+            state: GrabState::Imported,
+            message: None,
+            imported_path: None,
+            finished_at: None,
+            replaces: None,
+        };
+        store.record_grab(&grab).await.unwrap();
+        assert!(store.seed_debts().await.unwrap().is_empty());
+        assert!(store.delete_movie(id).await.unwrap());
+        assert!(store.grabs().await.unwrap().is_empty());
+        assert_eq!(
+            store.seed_debts().await.unwrap(),
+            vec![("aabb".to_owned(), "tracker".to_owned())]
+        );
+    }
+
+    #[tokio::test]
     async fn guarda_historico_e_bloqueio() {
         let Some(db) = TestDb::new("gerenciador").await else {
             return;
@@ -2330,7 +2403,9 @@ mod tests {
             let client = db.store.pool.get().await.unwrap();
             client
                 .batch_execute(
-                    "ALTER TABLE indexers DROP COLUMN priority, DROP COLUMN ratio_mode;
+                    "ALTER TABLE indexers DROP COLUMN priority, DROP COLUMN ratio_mode,
+                       DROP COLUMN seed_min_hours, DROP COLUMN seed_min_ratio,
+                       DROP COLUMN upload_seed_hours;
                      DROP TABLE launches;
                      DROP TABLE cross_seed_checks;
                      UPDATE schema_version SET version = 35;
@@ -2346,7 +2421,7 @@ mod tests {
             .await
             .unwrap()
             .get(0);
-        assert_eq!(version, 41);
+        assert_eq!(version, 43);
         // A 38 cria o desfecho e a tabela.
         client
             .batch_execute(
@@ -2395,6 +2470,8 @@ mod tests {
                 .batch_execute(
                     "DROP TABLE launches;
                      ALTER TABLE cross_seed_checks DROP COLUMN outcome;
+                     ALTER TABLE indexers DROP COLUMN seed_min_hours, DROP COLUMN seed_min_ratio,
+                       DROP COLUMN upload_seed_hours;
                      UPDATE schema_version SET version = 37;
                      INSERT INTO cross_seed_checks (hash, indexer, checked_at, attempts, found)
                      VALUES ('com-irmao', 'amigos', 't', 1, 'ef01'),
@@ -2427,6 +2504,8 @@ mod tests {
                 .batch_execute(
                     "ALTER TABLE launches DROP COLUMN adapted_path, DROP COLUMN adapted_layout,
                        DROP COLUMN site_hash, DROP COLUMN site_id;
+                     ALTER TABLE indexers DROP COLUMN seed_min_hours, DROP COLUMN seed_min_ratio,
+                       DROP COLUMN upload_seed_hours;
                      UPDATE schema_version SET version = 38;
                      INSERT INTO launches (hash, indexer, state, created_at, updated_at)
                      VALUES ('a', 'bj', 'pronto', 't', 't')",
@@ -2453,6 +2532,8 @@ mod tests {
             client
                 .batch_execute(
                     "ALTER TABLE launches DROP COLUMN site_hash, DROP COLUMN site_id;
+                     ALTER TABLE indexers DROP COLUMN seed_min_hours, DROP COLUMN seed_min_ratio,
+                       DROP COLUMN upload_seed_hours;
                      UPDATE schema_version SET version = 39;
                      INSERT INTO launches (hash, indexer, state, created_at, updated_at)
                      VALUES ('a', 'bj', 'enviado', 't', 't')",
@@ -2478,6 +2559,8 @@ mod tests {
             client
                 .batch_execute(
                     "ALTER TABLE launches DROP COLUMN site_id;
+                     ALTER TABLE indexers DROP COLUMN seed_min_hours, DROP COLUMN seed_min_ratio,
+                       DROP COLUMN upload_seed_hours;
                      UPDATE schema_version SET version = 40;
                      INSERT INTO launches (hash, indexer, state, created_at, updated_at, site_hash)
                      VALUES ('a', 'amigosshare', 'enviado', 't', 't', 'ef01')",
@@ -2490,6 +2573,41 @@ mod tests {
         assert_eq!(launch.state, LaunchState::Enviado);
         assert_eq!(launch.site_hash.as_deref(), Some("ef01"));
         assert_eq!(launch.site_id, None);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn migracao_42_acrescenta_a_obrigacao_de_seed_sem_exigir_nada() {
+        let Some(db) = TestDb::new("migracao_42").await else {
+            return;
+        };
+        {
+            // Volta ao banco da 41: indexador sem as colunas de seed.
+            let client = db.store.pool.get().await.unwrap();
+            client
+                .batch_execute(
+                    "ALTER TABLE indexers DROP COLUMN seed_min_hours,
+                       DROP COLUMN seed_min_ratio, DROP COLUMN upload_seed_hours;
+                     UPDATE schema_version SET version = 41;
+                     INSERT INTO indexers (name, kind) VALUES ('antigo', 'cardigann')",
+                )
+                .await
+                .unwrap();
+        }
+        db.store.migrate().await.unwrap();
+        let indexers = db.store.indexers().await.unwrap();
+        assert_eq!(indexers.len(), 1);
+        assert_eq!(indexers[0].name, "antigo");
+        assert_eq!(indexers[0].seed_min_hours, None);
+        assert_eq!(indexers[0].seed_min_ratio, None);
+        assert_eq!(indexers[0].upload_seed_hours, None);
+        let client = db.store.pool.get().await.unwrap();
+        assert!(
+            client
+                .batch_execute("UPDATE indexers SET seed_min_hours = 0")
+                .await
+                .is_err()
+        );
         db.drop().await;
     }
 }

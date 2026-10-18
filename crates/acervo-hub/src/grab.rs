@@ -1220,10 +1220,12 @@ pub(crate) async fn seed_tag(store: &Store, indexer: &str) -> Option<String> {
 
 /// Os torrents cuja tag de semear muda quando o modo ratio do indexador
 /// liga ou desliga. Ligando, os que vieram dele (`from_indexer`) e ainda não
-/// a têm; desligando, todos que a têm, inclusive os marcados à mão.
+/// a têm; desligando, todos que a têm, inclusive os marcados à mão, menos os
+/// de `keep` (os lançamentos, que seguem semeando por obrigação do tracker).
 fn retag_targets(
     torrents: &[acervo_clients::TorrentInfo],
     from_indexer: &HashSet<String>,
+    keep: &HashSet<String>,
     tag: &str,
     on: bool,
 ) -> Vec<String> {
@@ -1233,7 +1235,7 @@ fn retag_targets(
             if on {
                 !t.has_tag(tag) && from_indexer.contains(&t.hash.to_ascii_lowercase())
             } else {
-                t.has_tag(tag)
+                t.has_tag(tag) && !keep.contains(&t.hash.to_ascii_lowercase())
             }
         })
         .map(|t| t.hash.clone())
@@ -1243,7 +1245,8 @@ fn retag_targets(
 /// Acompanha o modo ratio do indexador no cliente: ligado, os torrents que
 /// vieram dele (grabs de filme e de série) ganham a tag de semear; desligado
 /// ou removido, ela sai de todos que a têm e a limpeza volta a valer para
-/// eles. Devolve quantos torrents mudaram.
+/// eles, exceto os lançamentos, que mantêm a tag. Devolve quantos torrents
+/// mudaram.
 ///
 /// # Errors
 ///
@@ -1273,9 +1276,20 @@ pub(crate) async fn retag_seeds(
                 .map(|g| g.hash.to_ascii_lowercase()),
         );
     }
+    let launched = if on {
+        HashSet::new()
+    } else {
+        crate::obligation::load(store).await?.launched().clone()
+    };
     let client = qbit(config).await?;
     let tag = acervo_core::seed_tag(indexer);
-    let hashes = retag_targets(&client.torrents().await?, &from_indexer, &tag, on);
+    let hashes = retag_targets(
+        &client.torrents().await?,
+        &from_indexer,
+        &launched,
+        &tag,
+        on,
+    );
     if hashes.is_empty() {
         return Ok(0);
     }
@@ -2179,12 +2193,31 @@ pub(crate) fn progress(torrent: &acervo_clients::TorrentInfo) -> String {
 }
 
 /// O que a importação de filmes lê uma vez por volta.
-struct MovieImport {
+struct MovieImport<'a> {
+    store: &'a Store,
     client: QbitClient,
     free_space: Option<u64>,
 }
 
-impl MovieImport {
+impl MovieImport<'_> {
+    /// [`delete_unlinked`], salvo se o torrent já completo ainda deve seed ao
+    /// tracker do grab: aí fica no cliente, com aviso.
+    async fn delete_unless_owed(
+        &self,
+        grab: &Grab,
+        torrent: &acervo_clients::TorrentInfo,
+        why: &str,
+    ) -> Result<(), String> {
+        if crate::obligation::download_owed(self.store, &grab.indexer, torrent).await {
+            tracing::warn!(
+                torrent = %torrent.name,
+                "{why}, mas o tracker ainda exige seed dele: fica no cliente"
+            );
+            return Ok(());
+        }
+        delete_unlinked(&self.client, torrent, why).await
+    }
+
     /// Uma volta de um grab: o estado do torrent decide se espera, se
     /// desiste ou se liga o arquivo.
     #[allow(clippy::too_many_lines)] // A sequência da importação; dividir só espalharia.
@@ -2199,9 +2232,11 @@ impl MovieImport {
         // outro caminho no meio. O torrent, que nada ligou, sai do cliente.
         let current = movie.file.as_ref().map(|f| f.relative_path.as_str());
         if current.is_some() && current != grab.replaces.as_deref() {
-            // Terminado e com a tag de semear, ele segue construindo ratio.
+            // Terminado, ele segue semeando se tem a tag de semear (ratio) ou
+            // se o tracker ainda exige seed dele.
             if let Some(torrent) = &torrent
                 && !(torrent.progress >= 1.0 && has_seed_tag(torrent))
+                && !crate::obligation::download_owed(self.store, &grab.indexer, torrent).await
             {
                 delete_unlinked(client, torrent, "grab que perdeu o motivo").await?;
             }
@@ -2246,7 +2281,8 @@ impl MovieImport {
             // não é do release.
             match failure {
                 Failure::Lost(..) => {
-                    delete_unlinked(client, &torrent, "arquivos sumidos").await?;
+                    self.delete_unless_owed(grab, &torrent, "arquivos sumidos")
+                        .await?;
                 }
                 _ if torrent.state == "missingFiles" => {
                     recheck_once(client, &torrent).await;
@@ -2263,7 +2299,8 @@ impl MovieImport {
             );
             // Como o sem seeds: bloqueio e nova busca vêm do
             // `Failure::Download`; o torrent morto sai do cliente, se nenhum
-            // arquivo dele tem outro link.
+            // arquivo dele tem outro link. Exceção à obrigação de seed: o
+            // tracker não conta mais o torrent, então não há o que cumprir.
             delete_unlinked(client, &torrent, "torrent desregistrado").await?;
             return Err(Failure::Download(
                 FailReason::Unregistered,
@@ -2279,7 +2316,8 @@ impl MovieImport {
             );
             // O bloqueio e a nova busca vêm do `Failure::Download`; o torrent
             // travado, porém, ocuparia vaga e reserva.
-            delete_unlinked(client, &torrent, "torrent sem seeds").await?;
+            self.delete_unless_owed(grab, &torrent, "torrent sem seeds")
+                .await?;
             return Err(Failure::Download(FailReason::NoSeeds, NO_SEEDS.into()));
         }
         if checking(&torrent) {
@@ -2462,6 +2500,7 @@ pub async fn import_downloads(
         return Ok(Vec::new());
     }
     let round = MovieImport {
+        store,
         free_space: client.free_space().await.ok(),
         client,
     };
@@ -3441,10 +3480,32 @@ mod tests {
             torrent("a-mao", &format!("{QUEUE_TAG}, {tag}")),
         ];
         let from = HashSet::from(["do-asc".to_owned(), "do-asc-marcado".to_owned()]);
-        assert_eq!(retag_targets(&torrents, &from, &tag, true), ["do-asc"]);
+        let keep = HashSet::new();
         assert_eq!(
-            retag_targets(&torrents, &from, &tag, false),
+            retag_targets(&torrents, &from, &keep, &tag, true),
+            ["do-asc"]
+        );
+        assert_eq!(
+            retag_targets(&torrents, &from, &keep, &tag, false),
             ["do-asc-marcado", "a-mao"]
+        );
+    }
+
+    #[test]
+    fn modo_ratio_desligado_preserva_a_tag_dos_lancamentos() {
+        let tag = acervo_core::seed_tag("asc");
+        let torrent = |hash: &str| {
+            serde_json::from_value::<acervo_clients::TorrentInfo>(serde_json::json!({
+                "hash": hash, "name": hash, "state": "uploading", "save_path": "/",
+                "category": "acervo", "tags": tag, "added_on": 1,
+            }))
+            .unwrap()
+        };
+        let torrents = [torrent("LANCADO"), torrent("comum")];
+        let keep = HashSet::from(["lancado".to_owned()]);
+        assert_eq!(
+            retag_targets(&torrents, &HashSet::new(), &keep, &tag, false),
+            ["comum"]
         );
     }
 

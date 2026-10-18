@@ -1,6 +1,6 @@
 //! Contratos e adaptadores de teste; o servidor usa tipos concretos em produção.
 
-use crate::api::{DefinitionCatalog, Entry, SettingView};
+use crate::api::{DefinitionCatalog, Entry, Preferences, SettingView};
 use crate::serve::{Database, HubAdmin};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -66,22 +66,18 @@ pub trait Admin: Send + Sync + std::fmt::Debug {
     /// Indexador desconhecido ou falha ao montar ou gravar.
     async fn set_enabled(&self, indexer: &str, enabled: bool) -> Result<Option<Entry>, String>;
 
-    /// Prioridade e modo ratio do cadastro; `None` sem cadastro.
-    fn preferences(&self, _indexer: &str) -> Option<(i32, bool)> {
+    /// Prioridade, modo ratio e obrigação de seed do cadastro; `None` sem
+    /// cadastro.
+    fn preferences(&self, _indexer: &str) -> Option<Preferences> {
         None
     }
 
-    /// Grava prioridade e modo ratio.
+    /// Grava as preferências.
     ///
     /// # Errors
     ///
     /// Indexador desconhecido, prioridade fora da faixa ou falha ao gravar.
-    async fn set_preferences(
-        &self,
-        _indexer: &str,
-        _priority: i32,
-        _ratio_mode: bool,
-    ) -> Result<(), String> {
+    async fn set_preferences(&self, _indexer: &str, _prefs: Preferences) -> Result<(), String> {
         Err("este serviço não edita preferências de indexador".into())
     }
 
@@ -250,16 +246,11 @@ impl Admin for HubAdmin {
     async fn set_enabled(&self, indexer: &str, enabled: bool) -> Result<Option<Entry>, String> {
         HubAdmin::set_enabled(self, indexer, enabled).await
     }
-    fn preferences(&self, indexer: &str) -> Option<(i32, bool)> {
+    fn preferences(&self, indexer: &str) -> Option<Preferences> {
         HubAdmin::preferences(self, indexer)
     }
-    async fn set_preferences(
-        &self,
-        indexer: &str,
-        priority: i32,
-        ratio_mode: bool,
-    ) -> Result<(), String> {
-        HubAdmin::set_preferences(self, indexer, priority, ratio_mode).await
+    async fn set_preferences(&self, indexer: &str, prefs: Preferences) -> Result<(), String> {
+        HubAdmin::set_preferences(self, indexer, prefs).await
     }
     fn tasks(&self) -> serde_json::Value {
         HubAdmin::tasks(self)
