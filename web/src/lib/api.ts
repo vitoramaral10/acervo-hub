@@ -1191,6 +1191,27 @@ export interface LaunchDetail {
   status_tracker: LaunchTrackerStatus | null
   /** O `.torrent` do site já foi enviado e é o semeado. */
   torrent_do_site: boolean
+  /** Id do torrent no site, quando o acervo fez o envio pelo formulário (Amigos). */
+  site_id: string | null
+}
+
+/** O que o envio pelo acervo vai pôr em cada campo do formulário do site. */
+export interface LaunchUploadDraft {
+  tipo: string
+  nome: string
+  ano: string
+  imdb: string
+  largura: number | null
+  altura: number | null
+  /** O IMDB do site trouxe a capa. */
+  capa: boolean
+  /** As listas do formulário e a opção escolhida em cada uma. */
+  campos: { campo: string; valor: string }[]
+  /** `embedded`, `separate` ou `none`; `null` quando o áudio não pede o campo. */
+  legenda: string | null
+  capturas: number
+  /** O que impede o envio. */
+  faltando: string[]
 }
 
 const launchPair = (hash: string, indexer: string) =>
@@ -1214,6 +1235,18 @@ export const launchApi = {
       'POST',
       `${launchPair(hash, indexer)}/torrent-do-site`,
       file,
+    ),
+  /** A prévia do envio pelo acervo (só o Amigos): só leituras no site, nada é publicado. */
+  uploadPreview: (hash: string, indexer: string) =>
+    request<{ previa: LaunchUploadDraft }>('GET', `${launchPair(hash, indexer)}/envio-ao-site`),
+  /**
+   * O envio pelo formulário do site, depois da confirmação: hospeda as capturas, envia e semeia o `.torrent` do
+   * site. `aviso`: enviado, mas o `.torrent` do site não veio ou não entrou no cliente (o motivo vai em `erro`).
+   */
+  upload: (hash: string, indexer: string) =>
+    request<{ ok: boolean; estado: LaunchState; site_id: string; adicionado: boolean; aviso?: string | null }>(
+      'POST',
+      `${launchPair(hash, indexer)}/envio-ao-site`,
     ),
   /** `aviso`: a pasta adaptada ficou no disco (com o que o acervo não criou, ou sem a origem para conferir). */
   discard: (hash: string, indexer: string) =>

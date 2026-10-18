@@ -395,6 +395,120 @@ const TRACKER_TONES: Record<LaunchTrackerStatus, 'success' | 'warning' | 'danger
  * O pacote enviado semeia parado-e-conferido antes da aprovação (os sites só liberam com seeder). Mostra o status do
  * tracker do destino e deixa mandar o `.torrent` que o site entregou, para quando ele troca o hash.
  */
+const SUBTITLE_LABELS: Record<string, string> = { embedded: 'Embutida', separate: 'Separada', none: 'Sem legenda' }
+
+/**
+ * O envio ao Amigos pelo acervo: a prévia (só leituras no site) e, confirmada, o envio de verdade. O botão de enviar
+ * só aparece depois da prévia, e fica desligado enquanto falta algo.
+ */
+function UploadSection({ detail }: { detail: LaunchDetail }) {
+  const refresh = useRefreshLaunch()
+  const [asked, setAsked] = useState(false)
+  const preview = useQuery({
+    queryKey: [...detailKey(detail.hash, detail.indexer), 'envio-ao-site'],
+    queryFn: () => launchApi.uploadPreview(detail.hash, detail.indexer),
+    enabled: asked,
+    retry: false,
+    staleTime: 0,
+  })
+  const upload = useMutation({
+    mutationFn: () => launchApi.upload(detail.hash, detail.indexer),
+    onSuccess: (data) => {
+      if (data.aviso) toast.warning(data.aviso)
+      else toast.success(`Enviado ao ${detail.destino} (torrent ${data.site_id}): o .torrent do site entrou no cliente`)
+      refresh(detail)
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+  const draft = preview.data?.previa
+  const blocked = !draft || draft.faltando.length > 0
+  return (
+    <section aria-labelledby="lancar-envio" className="grid gap-3">
+      <h3 id="lancar-envio" className="text-sm font-semibold">
+        Enviar pelo acervo
+      </h3>
+      <p className="text-sm text-content-muted">
+        O acervo preenche o formulário do {detail.destino} como o site faz: título e capa pelo IMDB, listas pelo
+        MediaInfo e as {draft?.capturas ?? 4} capturas hospedadas lá. Confira a prévia antes de enviar.
+      </p>
+      {!asked ? (
+        <div>
+          <Button variant="secondary" onClick={() => setAsked(true)}>
+            <Rocket aria-hidden="true" />
+            Ver o que vai ao {detail.destino}
+          </Button>
+        </div>
+      ) : preview.isPending ? (
+        <ListSkeleton rows={3} label="Lendo o formulário do site" />
+      ) : preview.isError ? (
+        <Problem
+          title="Não deu para montar a prévia"
+          message={preview.error.message}
+          onRetry={() => void preview.refetch()}
+        />
+      ) : draft ? (
+        <div className="grid gap-3 rounded-md border border-border bg-surface-raised p-3">
+          <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm">
+            <dt className="text-content-muted">Tipo</dt>
+            <dd>{draft.tipo}</dd>
+            <dt className="text-content-muted">Nome</dt>
+            <dd className="break-words">{draft.nome}</dd>
+            <dt className="text-content-muted">Ano</dt>
+            <dd className="tabular-nums">{draft.ano || '—'}</dd>
+            <dt className="text-content-muted">IMDB</dt>
+            <dd className="font-mono text-xs leading-5">{draft.imdb}</dd>
+            <dt className="text-content-muted">Resolução</dt>
+            <dd className="tabular-nums">{draft.largura && draft.altura ? `${draft.largura} × ${draft.altura}` : '—'}</dd>
+            {draft.campos.map(({ campo, valor }) => (
+              <FragmentRow key={campo} label={campo} value={valor} />
+            ))}
+            {draft.legenda && <FragmentRow label="Legenda" value={SUBTITLE_LABELS[draft.legenda] ?? draft.legenda} />}
+            <dt className="text-content-muted">Capa</dt>
+            <dd>{draft.capa ? 'a do IMDB do site' : 'nenhuma'}</dd>
+            <dt className="text-content-muted">Capturas</dt>
+            <dd className="tabular-nums">{draft.capturas}</dd>
+          </dl>
+          {draft.faltando.length > 0 && (
+            <div role="alert" className="rounded-md border border-border bg-danger-bg p-3 text-sm text-danger">
+              <p className="font-medium">O envio não sai enquanto faltar:</p>
+              <ul className="mt-1 list-disc pl-5">
+                {draft.faltando.map((reason) => (
+                  <li key={reason} className="break-words">
+                    {reason}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <div className="flex flex-wrap gap-2">
+            <Button variant="primary" loading={upload.isPending} disabled={blocked} onClick={() => upload.mutate()}>
+              <Send aria-hidden="true" />
+              Enviar ao {detail.destino}
+            </Button>
+            <Button variant="ghost" disabled={upload.isPending} onClick={() => void preview.refetch()}>
+              Refazer a prévia
+            </Button>
+          </div>
+          {upload.isPending && (
+            <p role="status" aria-live="polite" className="text-xs text-content-muted">
+              Enviando: as capturas sobem uma a uma, no ritmo que o site aceita. Pode levar um minuto.
+            </p>
+          )}
+        </div>
+      ) : null}
+    </section>
+  )
+}
+
+function FragmentRow({ label, value }: { label: string; value: string }) {
+  return (
+    <>
+      <dt className="text-content-muted">{label}</dt>
+      <dd className="break-words">{value}</dd>
+    </>
+  )
+}
+
 function SeedSection({ detail }: { detail: LaunchDetail }) {
   const refresh = useRefreshLaunch()
   const input = useRef<HTMLInputElement>(null)
@@ -564,11 +678,19 @@ function Package({ detail, item }: { detail: LaunchDetail; item: LaunchItem }) {
         </p>
       )}
 
+      {detail.estado === 'pronto' && detail.erro && (
+        <p role="alert" className="rounded-md border border-border bg-warning-bg p-3 text-sm text-warning break-words">
+          {detail.erro}
+        </p>
+      )}
+
       {detail.estado === 'enviado' && detail.erro && (
         <p role="alert" className="rounded-md border border-border bg-warning-bg p-3 text-sm text-warning break-words">
           {detail.erro}
         </p>
       )}
+
+      {detail.site === 'amigos' && detail.estado === 'pronto' && !detail.site_id && <UploadSection detail={detail} />}
 
       {(detail.estado === 'enviado' || detail.estado === 'semeando') && <SeedSection detail={detail} />}
 
@@ -657,8 +779,8 @@ function PackageDialog({ item, onClose }: { item: LaunchItem; onClose: () => voi
         <DialogHeader>
           <DialogTitle>{itemTitle(item)}</DialogTitle>
           <DialogDescription>
-            Pacote para o {item.destino ?? item.indexer}. Confira, copie os campos e envie pelo site: o acervo não envia
-            nada sozinho.
+            Pacote para o {item.destino ?? item.indexer}. Confira e copie os campos para enviar pelo site; no Amigos,
+            o acervo também envia por você, depois da sua confirmação.
           </DialogDescription>
         </DialogHeader>
         {detail.isPending ? (

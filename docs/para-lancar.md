@@ -5,8 +5,10 @@ o usuário fazer à mão. O acervo prepara o pacote (checagem de regras, título
 descrição, capturas e `.torrent`), o usuário revisa e envia pelo site, e a
 tarefa `cross-seed` acha o torrent publicado e semeia sozinha.
 
-Nada aqui envia ao site. O BJ proíbe navegação automatizada (regra 1.12) e as
-duas moderações reprovam envio fora do padrão: o envio é sempre do usuário.
+No BJ, nada aqui envia ao site: ele proíbe navegação automatizada (regra
+1.12), e o envio é sempre do usuário. No Amigos, que não proíbe automação, o
+acervo também pode enviar pelo formulário do site, sempre depois da
+confirmação do usuário na tela (ver "Envio ao Amigos pelo acervo").
 
 ## Princípios
 
@@ -454,3 +456,106 @@ torrent não privado, e então o hash publicado tende a ser o mesmo.
   registrado, erro), sem a URL. "Não registrado" logo após o envio é
   esperado até o site processar ou aprovar; persistindo, a tela sugere enviar
   o `.torrent` do site.
+
+## Envio ao Amigos pelo acervo
+
+O formulário do Amigos (`/torrents/upload`, Laravel com Inertia e React) é
+refeito com a sessão do indexador `amigosshare`. O acervo segue os mesmos
+passos do JavaScript do site, e nada sai antes da confirmação na tela.
+
+### Sessão
+
+`Indexer::site_request` (só o Cardigann a implementa) faz GET ou POST com JSON
+ou multipart, sempre na origem do indexador, com os mesmos cabeçalhos do
+JavaScript do site: `Accept: application/json`, `X-Requested-With` e o
+`X-XSRF-TOKEN` lido do cookie. Usa o mesmo orçamento de taxa do indexador.
+Faz um novo login uma vez quando o site responde 401 ou 419 (token CSRF
+vencido), ou quando redireciona para `/login`. O multipart é montado em bytes,
+para a requisição poder ser refeita depois do desafio do Cloudflare.
+`Catalog::site_request` respeita a espera por 429 e o disjuntor. Falha de rede,
+de login ou 429 contam no disjuntor. Resposta HTTP de erro, como a validação
+422, volta para quem chamou.
+
+### Prévia: `GET …/envio-ao-site`
+
+Só para pacote do Amigos `pronto`, sem `site_id` e que o cross-seed não achou
+no destino. Faz três leituras, sem publicar nada:
+
+1. `GET /torrents/upload`: as props do Inertia em `<script data-page>`. Para o
+   tipo (`filmes` ou `series`, que vem de `report.tipo`, ou do nome do release
+   em pacote antigo), elas trazem o perfil: listas com id e nome, quais são
+   obrigatórias, `coverRequired`, `screenshotsMin` e `screenshotsMax`, e
+   `subtitleWhen`. Também trazem a categoria.
+2. `POST /torrents/mediainfo` (`{mediainfo}`): para cada lista, os nomes
+   sugeridos (qualidade, áudio, codecs, extensão, idioma), mais largura,
+   altura, legenda (`embedded`, `separate` ou `none`) e o relatório.
+3. `POST /torrents/lookup` (`{imdb_id}`): tipo, título, ano, gêneros, idioma
+   original e a capa já hospedada (`cover.path`).
+
+A escolha de cada lista é a do próprio formulário: o primeiro nome sugerido
+que, normalizado (sem acento, minúsculo, sem espaço nas pontas), é igual ao de
+uma opção. Gêneros e idioma vêm do IMDB; o resto, do `MediaInfo`.
+
+Ajustes do acervo:
+
+- **Regra 3.9:** se o laudo tem o aviso da 3.9 (Dual sem legenda PT), o áudio
+  vai como Dublado.
+- **Legenda:** o campo só vai quando o áudio escolhido está em `subtitleWhen`.
+  Se o `MediaInfo` diz `none` e o pacote tem arquivo de legenda, vai
+  `separate`.
+
+A prévia lista em `faltando` o que impede o envio:
+
+- lista obrigatória sem opção que bata;
+- IMDB de outro tipo (série num pacote de filme, ou o contrário);
+- falta de capa, quando ela é obrigatória;
+- menos capturas que o mínimo do site.
+
+Os ids das opções nunca ficam fixos no código: são lidos a cada envio.
+
+### Envio: `POST …/envio-ao-site`
+
+Toma a posse do par. Refaz o rascunho (a prévia não é confiada) e recusa com
+409 se algo falta. Depois:
+
+1. Tira as `SCREEN_COUNT` capturas do vídeo de origem, nos instantes do
+   preparo, e as hospeda uma a uma em `POST /torrents/screenshots` (campo
+   `image`, devolve `{path}`).
+2. Faz o `POST /torrents` multipart, como o `forceFormData` do Inertia: listas
+   em `campo[i]`, booleano `1`/`0` e campo ausente como texto vazio. Os campos
+   são:
+   - `torrent` (o `.torrent` gerado), `name`, `year`, `imdb_id` e
+     `category_id`;
+   - `width`, `height` e `mediainfo`;
+   - `description`, que é a `descricao` do pacote;
+   - `cover_path` e `screenshot_paths[i]`;
+   - `subtitle`, `attribute_ids[i]` e `anonymous=0`.
+3. Antes do `POST`, `launches.site_id` (migração 41) recebe a marca
+   `pendente`. Se o acervo cair com o envio no ar, o torrent pode ter chegado
+   ao site, e a marca recusa um segundo envio por cima.
+4. A resposta:
+   - **Sucesso:** um redirect para `/torrents/<id>`. O id e o estado
+     `enviado` vão ao banco numa escrita só (`mark_launch_uploaded`).
+   - **Recusa certa:** um 422 com as mensagens do site, ou o formulário de
+     volta. A marca é limpa, a mensagem vira o erro do pacote e o estado fica
+     `pronto`.
+   - **Sem resposta legível:** rede, sessão ou um status inesperado. A marca
+     fica e o erro pede para conferir os envios no site.
+     - Se o torrent está lá, o usuário usa "Enviar o .torrent do site".
+     - Se não está, "Preparar de novo" limpa a marca e libera o envio.
+5. Baixa `/torrents/<id>/download`, porque o site troca o hash do enviado, e
+   semeia esse torrent pelo mesmo caminho de "Enviar o .torrent do site":
+   confere o layout, grava `site_hash`, adiciona parado e confere antes de
+   iniciar. Daqui em diante, qualquer falha é aviso e nunca erro, porque o
+   envio já existe no site. É o caso do `.torrent` que o site ainda não
+   entrega (aguardando liberação, prisão) e do `.torrent` com outros
+   arquivos. O pacote fica `enviado`, com o aviso para o usuário enviar o
+   `.torrent` à mão depois.
+
+### Tela
+
+No pacote pronto do Amigos, a seção "Enviar pelo acervo" mostra o botão "Ver o
+que vai ao Amigos". Ele carrega a prévia: tipo, nome, ano, IMDB, resolução,
+cada lista com a opção escolhida, legenda, capa e capturas, mais o que falta.
+O botão "Enviar ao Amigos" fica desligado enquanto falta algo.
+

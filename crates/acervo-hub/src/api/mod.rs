@@ -82,6 +82,8 @@ pub enum SearchError {
     IndexerWaiting { indexer: String, until: String },
     #[error("todos os indexadores em espera até {until} UTC")]
     AllWaiting { until: String },
+    #[error("a requisição ao site falhou: {0}")]
+    SiteFailed(String),
 }
 
 struct Server {

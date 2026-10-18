@@ -96,6 +96,8 @@ pub struct Launch {
     /// Infohash do `.torrent` baixado do site depois do envio, quando o site
     /// trocou o hash do gerado.
     pub site_hash: Option<String>,
+    /// Id do torrent no site, quando o acervo fez o envio pelo formulário.
+    pub site_id: Option<String>,
 }
 
 /// Agora, em RFC 3339 UTC, como o resto do schema guarda datas.
@@ -103,7 +105,7 @@ const NOW: &str = "to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\
 
 const COLUMNS: &str = "hash, indexer, state, progress, report, fields, screens, \
                        torrent IS NOT NULL, error, created_at, updated_at, sent_at, \
-                       adapted_path, adapted_layout, site_hash";
+                       adapted_path, adapted_layout, site_hash, site_id";
 
 fn launch_from(row: &Row) -> Result<Launch> {
     let state: String = row.try_get(2)?;
@@ -123,6 +125,7 @@ fn launch_from(row: &Row) -> Result<Launch> {
         adapted_path: row.try_get(12)?,
         adapted_layout: row.try_get(13)?,
         site_hash: row.try_get(14)?,
+        site_id: row.try_get(15)?,
     })
 }
 
@@ -452,6 +455,59 @@ impl Store {
                     &indexer,
                     &site_hash.to_ascii_lowercase(),
                 ],
+            )
+            .await?;
+        Ok(updated > 0)
+    }
+
+    /// Grava (ou, com `None`, limpa) o id do torrent no site: o do envio pelo
+    /// formulário, ou a marca de envio em andamento. Devolve se o par existe.
+    ///
+    /// # Errors
+    ///
+    /// Banco inalcançável.
+    pub async fn save_launch_site_id(
+        &self,
+        hash: &str,
+        indexer: &str,
+        site_id: Option<&str>,
+    ) -> Result<bool> {
+        let client = self.pool.get().await?;
+        let updated = client
+            .execute(
+                &format!(
+                    "UPDATE launches SET site_id = $3, updated_at = {NOW}
+                     WHERE hash = $1 AND indexer = $2"
+                ),
+                &[&hash.to_ascii_lowercase(), &indexer, &site_id],
+            )
+            .await?;
+        Ok(updated > 0)
+    }
+
+    /// O envio pelo formulário deu certo: o id do site e o estado `enviado`
+    /// (em `at`) numa escrita só, para nunca ficar um sem o outro. Devolve se o
+    /// par existe.
+    ///
+    /// # Errors
+    ///
+    /// Banco inalcançável.
+    pub async fn mark_launch_uploaded(
+        &self,
+        hash: &str,
+        indexer: &str,
+        site_id: &str,
+        at: &str,
+    ) -> Result<bool> {
+        let client = self.pool.get().await?;
+        let updated = client
+            .execute(
+                &format!(
+                    "UPDATE launches SET site_id = $3, state = 'enviado', sent_at = $4,
+                       updated_at = {NOW}
+                     WHERE hash = $1 AND indexer = $2"
+                ),
+                &[&hash.to_ascii_lowercase(), &indexer, &site_id, &at],
             )
             .await?;
         Ok(updated > 0)
@@ -874,6 +930,28 @@ mod tests {
         assert_eq!(launch.state, LaunchState::Enviado);
         assert_eq!(launch.error.as_deref(), Some("cliente fora do ar"));
         assert_eq!(launch.site_hash.as_deref(), Some("ef01"));
+        assert_eq!(launch.site_id, None);
+        assert!(
+            store
+                .save_launch_site_id("ABCD", "bj", Some("pendente"))
+                .await
+                .unwrap()
+        );
+        assert!(store.save_launch_site_id("ABCD", "bj", None).await.unwrap());
+        assert_eq!(
+            store.launch("abcd", "bj").await.unwrap().unwrap().site_id,
+            None
+        );
+        assert!(
+            store
+                .mark_launch_uploaded("ABCD", "bj", "77", "2026-10-17T00:00:00Z")
+                .await
+                .unwrap()
+        );
+        let uploaded = store.launch("abcd", "bj").await.unwrap().unwrap();
+        assert_eq!(uploaded.site_id.as_deref(), Some("77"));
+        assert_eq!(uploaded.state, LaunchState::Enviado);
+        assert_eq!(uploaded.sent_at.as_deref(), Some("2026-10-17T00:00:00Z"));
         assert!(store.set_launch_error("abcd", "bj", None).await.unwrap());
         assert_eq!(
             store.launch("abcd", "bj").await.unwrap().unwrap().error,
