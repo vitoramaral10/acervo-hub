@@ -418,6 +418,11 @@ pub(crate) fn release_name(files: &[SourceFile]) -> String {
 /// O que o qBittorrent deve empacotar: `content_path` (pasta raiz, ou o
 /// arquivo avulso); qBittorrent antigo sem ele, montado dos arquivos.
 pub(crate) fn source_path(torrent: &TorrentInfo, files: &[SourceFile]) -> String {
+    // Um arquivo só dentro da pasta raiz: o qBittorrent dá o arquivo como
+    // `content_path`, e o pacote é a pasta (o layout da origem a inclui).
+    if let Some(folder) = boxed_file_folder(torrent, files) {
+        return folder;
+    }
     if !torrent.content_path.is_empty() {
         return torrent.content_path.clone();
     }
@@ -425,6 +430,26 @@ pub(crate) fn source_path(torrent: &TorrentInfo, files: &[SourceFile]) -> String
         .join(release_name(files))
         .to_string_lossy()
         .into_owned()
+}
+
+/// Torrent de um arquivo só dentro de uma pasta raiz cujo `content_path` é
+/// o próprio arquivo (o qBittorrent 5 faz assim): a pasta, para empacotar.
+fn boxed_file_folder(torrent: &TorrentInfo, files: &[SourceFile]) -> Option<String> {
+    let [only] = files else {
+        return None;
+    };
+    only.path.contains('/').then_some(())?;
+    let content = Path::new(&torrent.content_path);
+    let mut inner = Path::new(&only.path).components().rev();
+    let mut outer = content.components().rev();
+    // O `content_path` termina em `pasta/arquivo`, componente a componente.
+    let ends_with = inner.all(|c| outer.next() == Some(c));
+    ends_with.then(|| {
+        PathBuf::from(&torrent.save_path)
+            .join(release_name(files))
+            .to_string_lossy()
+            .into_owned()
+    })
 }
 
 /// O torrent tem pasta raiz própria (ou é um arquivo avulso) e o
@@ -447,7 +472,7 @@ pub(crate) fn ensure_root(torrent: &TorrentInfo, files: &[SourceFile]) -> Result
              o .torrent empacotaria a pasta de download inteira"
         );
     }
-    if !torrent.content_path.is_empty() {
+    if !torrent.content_path.is_empty() && boxed_file_folder(torrent, files).is_none() {
         let last = Path::new(&torrent.content_path)
             .file_name()
             .and_then(|n| n.to_str());
@@ -2239,6 +2264,15 @@ mod tests {
         assert!(ensure_root(&info("/media/f", "/media/f"), &single).is_err());
         let boxed = [file("Filme/Filme.mkv", 1)];
         assert!(ensure_root(&info("/media/f", "/media/f/Filme"), &boxed).is_ok());
+        // qBittorrent 5: um arquivo só dentro da pasta tem o arquivo como
+        // `content_path`; o pacote é a pasta (O Pai da Noiva).
+        assert!(ensure_root(&info("/media/f", "/media/f/Filme/Filme.mkv"), &boxed).is_ok());
+        assert_eq!(
+            source_path(&info("/media/f", "/media/f/Filme/Filme.mkv"), &boxed),
+            "/media/f/Filme"
+        );
+        // Outro arquivo no `content_path` continua recusado.
+        assert!(ensure_root(&info("/media/f", "/media/f/Outro/Filme.mkv"), &boxed).is_err());
     }
 
     /// Um `.torrent` v1 mínimo com os arquivos dados (`pieces` vazio: o
