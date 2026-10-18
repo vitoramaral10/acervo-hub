@@ -560,11 +560,45 @@ fn has_standard_audio(name: &str) -> bool {
         .any(|token| token_at_boundaries(&upper, token, true))
 }
 
-/// O nome tem um codec de vídeo na grafia exata do padrão.
+/// O nome sem a extensão (`.mkv`).
+fn without_extension(name: &str) -> &str {
+    match name.rsplit_once('.') {
+        Some((stem, ext))
+            if (2..=4).contains(&ext.len())
+                && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+                && !ext.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            stem
+        }
+        _ => name,
+    }
+}
+
+/// O nome tem um codec de vídeo na grafia exata do padrão, que o site
+/// reconhece. Codec colado num `-GRUPO` que ainda é seguido de mais segmentos
+/// com ponto é o grupo de um release refeito (`x264-DON.DUAL-outro`,
+/// `X265-IAMABLE.DUAL-Lannister`): o site não o lê. Colado no grupo final
+/// (`H.264-SJB.mkv`), conta.
 fn has_standard_video(name: &str) -> bool {
+    let stem = without_extension(name);
+    STANDARD_VIDEO.iter().any(|token| {
+        stem.match_indices(token).any(|(at, _)| {
+            let rest = &stem[at + token.len()..];
+            boundary_before(stem, at)
+                && match rest.chars().next() {
+                    None => true,
+                    Some('-') => !rest.contains('.'),
+                    Some(c) => !c.is_ascii_alphanumeric(),
+                }
+        })
+    })
+}
+
+/// O codec de vídeo existe, mas colado no grupo de um release refeito.
+fn glued_video_codec(name: &str) -> Option<&'static str> {
     STANDARD_VIDEO
-        .iter()
-        .any(|token| token_at_boundaries(name, token, false))
+        .into_iter()
+        .find(|token| token_at_boundaries(name, token, false))
 }
 
 /// `X264`/`X265` em maiúsculas: o site só aceita o `x` minúsculo.
@@ -584,12 +618,15 @@ pub fn standard_name_gaps(file_name: &str) -> Vec<String> {
         gaps.push("falta o codec de áudio (ex.: DDP5.1, AAC2.0, DTS-HD.MA.5.1)".to_owned());
     }
     if !has_standard_video(file_name) {
-        gaps.push(match uppercase_x_codec(file_name) {
-            Some(token) => format!(
+        gaps.push(match (uppercase_x_codec(file_name), glued_video_codec(file_name)) {
+            (Some(token), _) => format!(
                 "falta o codec de vídeo na grafia padrão (o nome usa '{token}' em maiúsculas; o padrão é '{}')",
                 token.to_lowercase()
             ),
-            None => "falta o codec de vídeo (ex.: H.264, H.265, x265)".to_owned(),
+            (None, Some(token)) => format!(
+                "falta o codec de vídeo que o site reconhece: '{token}' está colado no grupo de um release refeito (como '{token}-GRUPO.DUAL-OUTRO'), e o site só lê o codec no fim do nome ou antes de um ponto"
+            ),
+            (None, None) => "falta o codec de vídeo (ex.: H.264, H.265, x265)".to_owned(),
         });
     }
     gaps
@@ -877,6 +914,20 @@ mod tests {
         assert!(
             toy[1].contains("o nome usa 'X265' em maiúsculas; o padrão é 'x265'"),
             "{toy:?}"
+        );
+        // Release refeito: o codec colado no grupo original, seguido de
+        // `.DUAL-OUTRO`, o site não lê (visto no envio real do torrent 73347).
+        let redone = gaps(
+            "Ele.nao.esta.tao.a.Fim.de.Voce.2009.1080p.BluRay.DD5.1.x264-DON.DUAL-xprince00.mkv",
+        );
+        assert_eq!(redone.len(), 1, "{redone:?}");
+        assert!(
+            redone[0].contains("'x264' está colado no grupo"),
+            "{redone:?}"
+        );
+        assert_eq!(
+            gaps("Resident.Evil.Afterlife.2010.1080p.BluRay.DTS.x264-Japhson.DUAL-ASM").len(),
+            1
         );
         let big = gaps("Operacao.Big.Hero.2015.1080p.BluRay.x264-shaggy");
         assert_eq!(big.len(), 1, "{big:?}");
