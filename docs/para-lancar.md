@@ -507,8 +507,14 @@ no destino. Faz três leituras, sem publicar nada:
    original e a capa já hospedada (`cover.path`).
 
 O áudio é o que o `MediaInfo` do site sugere. Filme só legendado vai como
-"Original" no Amigos, e isso está certo. A única troca é a da regra 3.9: Dual
-sem legenda PT vai Dublado.
+"Original" no Amigos, e isso está certo. Há duas trocas:
+
+- regra 3.9: Dual sem legenda PT vai como Dublado;
+- obra nacional: o laudo grava `report.audio` = `nacional`, e o áudio vai
+  como Nacional. O site sugere Dublado para filme brasileiro, como foi com o
+  Authentic Games (73403).
+
+Pacote preparado antes do `report.audio` usa a sugestão do site.
 
 A escolha de cada lista é a do próprio formulário: o primeiro nome sugerido
 que, normalizado (sem acento, minúsculo, sem espaço nas pontas), é igual ao de

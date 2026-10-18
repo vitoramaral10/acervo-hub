@@ -1044,6 +1044,9 @@ fn generated_subtitles(
 fn report_json(report: &Report, facts: &rules::Facts, main: &str) -> Result<Value> {
     let mut value = report_value(report, &facts.videos, main)?;
     value["tipo"] = json!(kind_name(facts.kind));
+    if let Some(audio) = rules::package_audio(facts) {
+        value["audio"] = json!(audio);
+    }
     Ok(value)
 }
 
