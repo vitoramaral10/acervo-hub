@@ -150,8 +150,8 @@ gravação do desfecho que falhou) é resgatado para `falhou` pelas rotas.
   **urgente**: entra antes dos outros em `due`, ignora `MAX_ATTEMPTS` e
   `RETRY_DAYS` e espera só 1 h entre consultas.
 - Achado o irmão de um par lançado: o irmão recebe a tag de semear do
-  indexador **sempre** (quem envia semeia 7 dias: Amigos 4.7, H&R do
-  uploader). `launches.state` passa a `semeando` só com o irmão conferido
+  indexador **sempre** (quem envia semeia 7 dias, ou até 5 downloads
+  concluídos e 3 seeders além dele: Amigos 4.7 e H&R 18.0 i, de 16/10). `launches.state` passa a `semeando` só com o irmão conferido
   (100%, iniciado); irmão recém-adicionado espera a conferência, e se ela
   recusa o par segue `enviado` e urgente.
 - `run` grava o `outcome` de cada consulta.
@@ -202,12 +202,25 @@ distingue pt-BR de pt-PT: aceitar os dois). "Dual" = áudio PT + original.
   temporada completa → Fail. Série encerrada (`ended`): só temporada
   completa; episódio avulso → Fail. Temporada que não cobre todos os
   episódios exibidos da temporada no catálogo → Fail.
+- **3.9** Dual sem legenda PT completa (embutida ou em arquivo; forçada não
+  conta) → Warn: no formulário vai como Dublado, não Dual Áudio. Dual com
+  legenda → Ok. Não se aplica a quem não é Dual.
 - **4.2.1** duplicidade contra os releases do destino:
-  - mesma resolução, mesma fonte e mesmo tipo de áudio (dual/dublado/
-    legendado) e tamanho a menos de 10% → Fail "duplicado provável";
   - destino tem Dual e este é só dublado ou só legendado → Fail;
-  - mesma resolução e fonte, mas outro codec ou tamanho → Warn "avaliar
-    duplicidade";
+  - entre os de mesma resolução, fonte e tipo de áudio (dual/dublado/
+    legendado), na ordem:
+    - canais: este é 2.0 e o destino tem 5.1/7.1 → Fail (o 2.0 é
+      substituído); este é 5.1/7.1 e o destino é 2.0 → não pesa (este o
+      substitui). Os nossos vêm do ffprobe; os do destino, do título;
+    - outro codec de vídeo → Warn "avaliar duplicidade";
+    - só o codec de áudio difere (pelos dois nomes: DDP/DD+/EAC3, DD/AC3,
+      AAC, DTS, DTS-HD, TrueHD...) → Warn: a staff avalia;
+    - série em andamento (`continuing`), mesmos codecs: mesmo grupo → Fail;
+      diferença de tamanho abaixo de 2 GiB → Fail; outro grupo com 2 GiB ou
+      mais → não pesa (a regra permite). Série finalizada e filme seguem o
+      item abaixo;
+    - tamanho a menos de 10% → Fail "duplicado provável"; senão Warn
+      "avaliar duplicidade";
   - nada parecido → Ok.
 - **4.14** fonte inferior a WEB-DL (WEBRip, HDTV, CAM, TS...) com WEB-DL Dual
   no destino → Fail.

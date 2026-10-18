@@ -14,7 +14,8 @@ use std::collections::HashSet;
 
 use acervo_parser::{
     Language, Modifier, Quality, Source, parse_episode_languages, parse_episode_quality,
-    parse_episode_title, parse_languages, parse_quality,
+    parse_episode_release_group, parse_episode_title, parse_languages, parse_quality,
+    parse_release_group,
 };
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,10 @@ use super::subtitle_sniff::{Completeness, Sniff, SniffLanguage, Sniffs};
 /// Diferença de tamanho (relativa ao release do destino) abaixo da qual dois
 /// releases de mesma resolução, fonte e áudio contam como o mesmo arquivo.
 const DUPLICATE_SIZE_TOLERANCE: f64 = 0.10;
+/// Amigos 4.2.1: série em andamento aceita outro release com os mesmos
+/// codecs só se a diferença de tamanho for de 2 GB ou mais. Em GiB, o maior
+/// dos dois: na dúvida, barra.
+const SERIES_MIN_SIZE_GAP: u64 = 2 * 1024 * 1024 * 1024;
 /// No BJ, acima disso a diferença de tamanho já não pede nem aviso.
 const BJ_SIMILAR_SIZE_TOLERANCE: f64 = 0.30;
 /// Máximo de legendas que acompanham um filme no BJ (4.2.1.10).
@@ -167,6 +172,82 @@ impl Codec {
             Self::Av1 => "AV1",
         }
     }
+}
+
+/// Codec de áudio pelo nome do release, só para comparar dois releases (Amigos
+/// 4.2.1: "apenas o codec de áudio diferente" a staff avalia).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioCodec {
+    Aac,
+    Ac3,
+    Eac3,
+    Dts,
+    DtsHd,
+    TrueHd,
+    Flac,
+    Opus,
+    Pcm,
+}
+
+impl AudioCodec {
+    /// O primeiro codec que o nome cita (`DDP5.1`, `DD+5.1`, `AAC2.0`,
+    /// `DTS-HD.MA`, `TrueHD`). Os dígitos colados (canais) não contam.
+    fn from_title(title: &str) -> Option<Self> {
+        let lower = title.to_lowercase();
+        let tokens: Vec<&str> = lower
+            .split(|c: char| !c.is_alphanumeric() && c != '+')
+            .filter(|t| !t.is_empty())
+            .collect();
+        tokens.iter().enumerate().find_map(|(i, token)| {
+            match token.trim_end_matches(|c: char| c.is_ascii_digit()) {
+                "ddp" | "dd+" | "eac" => Some(Self::Eac3),
+                "dd" | "ac" => Some(Self::Ac3),
+                "aac" => Some(Self::Aac),
+                "truehd" => Some(Self::TrueHd),
+                "dts" => Some(if tokens.get(i + 1) == Some(&"hd") {
+                    Self::DtsHd
+                } else {
+                    Self::Dts
+                }),
+                "flac" => Some(Self::Flac),
+                "opus" => Some(Self::Opus),
+                "lpcm" | "pcm" => Some(Self::Pcm),
+                _ => None,
+            }
+        })
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Aac => "AAC",
+            Self::Ac3 => "AC3",
+            Self::Eac3 => "E-AC3",
+            Self::Dts => "DTS",
+            Self::DtsHd => "DTS-HD",
+            Self::TrueHd => "TrueHD",
+            Self::Flac => "FLAC",
+            Self::Opus => "Opus",
+            Self::Pcm => "PCM",
+        }
+    }
+}
+
+/// Canais que o nome declara (`5.1` → 6, `2.0` → 2, `7.1` → 8), o maior se
+/// houver mais de um. Dígito colado à esquerda não conta: `2024.1080p` e
+/// `S01E02.1080p` não são canais.
+fn channels_from_title(title: &str) -> Option<u32> {
+    let chars: Vec<char> = title.chars().collect();
+    chars
+        .windows(3)
+        .enumerate()
+        .filter_map(|(i, w)| {
+            let (front, lfe) = (w[0].to_digit(10)?, w[2].to_digit(10)?);
+            let glued_left = i > 0 && chars[i - 1].is_ascii_digit();
+            let glued_right = chars.get(i + 3).is_some_and(char::is_ascii_digit);
+            (w[1] == '.' && (1..=7).contains(&front) && lfe <= 2 && !glued_left && !glued_right)
+                .then_some(front + lfe)
+        })
+        .max()
 }
 
 /// Um release que o destino já tem para a mesma obra, com a qualidade que o
@@ -405,6 +486,9 @@ struct Context<'a> {
     resolution: u16,
     audio: Option<AudioKind>,
     codec: Option<Codec>,
+    /// Canais pelo nome do release, como os do destino; sem eles no nome, o
+    /// maior entre as faixas do vídeo principal.
+    channels: Option<u32>,
     size: u64,
     /// Legendas PT embutidas que o BJ vai ganhar em arquivo (pasta adaptada).
     adaptations: Vec<Extraction>,
@@ -433,6 +517,8 @@ impl<'a> Context<'a> {
             .unwrap_or_else(|| quality.resolution());
         let audio = main.map(|v| audio_kind(&v.media, facts.original_language));
         let codec = video.and_then(|v| Codec::from_ffprobe(&v.codec));
+        let channels = channels_from_title(&facts.release_name)
+            .or_else(|| main.and_then(|v| v.media.audio.iter().filter_map(|a| a.channels).max()));
         Self {
             facts,
             main,
@@ -440,6 +526,7 @@ impl<'a> Context<'a> {
             resolution,
             audio,
             codec,
+            channels,
             size: facts.files.iter().map(|f| f.size).sum(),
             // Obra nacional dispensa a legenda: nada a extrair.
             adaptations: if site == Site::Bj && !facts.original_language.is_some_and(is_portuguese)
@@ -464,6 +551,20 @@ impl<'a> Context<'a> {
             .count()
     }
 
+    /// O grupo do release no nome (`-GRP`), pelo parser do tipo da obra.
+    fn group_of(&self, title: &str) -> Option<String> {
+        if self.facts.kind == Kind::Movie {
+            parse_release_group(title)
+        } else {
+            parse_episode_release_group(title)
+        }
+    }
+
+    /// Série ainda em exibição: a 4.2.1 do Amigos tem regra própria para ela.
+    fn continuing_series(&self) -> bool {
+        self.facts.kind != Kind::Movie && self.facts.series_status == Some(SeriesStatus::Continuing)
+    }
+
     fn resolution_label(&self) -> String {
         if self.resolution == 0 {
             "resolução desconhecida".to_owned()
@@ -482,6 +583,7 @@ fn amigos(ctx: &Context<'_>, checks: &mut Vec<Check>) {
     checks.extend(name_matches_file(ctx, "4.0.1"));
     checks.extend(name_standard(ctx, "4.0.1"));
     checks.push(portuguese_available(ctx));
+    checks.extend(dual_without_subtitle(ctx));
     checks.push(site_reference(ctx, "5.6"));
     checks.extend(amigos_series_scope(ctx));
     checks.push(duplicate(ctx, Site::Amigos, "4.2.1"));
@@ -575,6 +677,49 @@ fn name_standard(ctx: &Context<'_>, rule: &str) -> Option<Check> {
     Some(Check::fail(
         rule,
         format!("{message} — renomear é proibido"),
+    ))
+}
+
+/// 3.9: Dual áudio sem legenda em português vai ao formulário como DUBLADO,
+/// não como Dual Áudio. Não barra: o arquivo serve, só o campo muda. Legenda
+/// forçada não conta, porque não legenda o filme inteiro.
+fn dual_without_subtitle(ctx: &Context<'_>) -> Option<Check> {
+    const RULE: &str = "3.9";
+    let facts = ctx.facts;
+    if ctx.audio != Some(AudioKind::Dual) {
+        return None;
+    }
+    let bare: Vec<&ProbedVideo> = facts
+        .videos
+        .iter()
+        .filter(|v| audio_kind(&v.media, facts.original_language) == AudioKind::Dual)
+        .filter(|v| {
+            let embedded = v.media.subtitles.iter().any(|s| {
+                !s.forced && is_portuguese_subtitle(s.language, s.raw_language.as_deref())
+            });
+            let external = has_external_by_name(&facts.files, &v.path, false, true)
+                || siblings(&facts.files, &facts.sniffs, &v.path, false)
+                    .iter()
+                    .any(|(_, s)| standing(s).counts(Site::Amigos));
+            !(embedded || external)
+        })
+        .collect();
+    if bare.is_empty() {
+        return Some(Check::ok(
+            RULE,
+            "Dual com legenda em português: vai como Dual Áudio",
+        ));
+    }
+    let which = if facts.videos.len() > 1 {
+        format!(" ({} de {} vídeos)", bare.len(), facts.videos.len())
+    } else {
+        String::new()
+    };
+    Some(Check::warn(
+        RULE,
+        format!(
+            "Dual sem legenda em português{which}: no formulário do Amigos, marque o áudio como Dublado, não Dual Áudio"
+        ),
     ))
 }
 
@@ -1607,6 +1752,16 @@ fn duplicate(ctx: &Context<'_>, site: Site, rule: &str) -> Check {
     for dest in same.iter().filter(|d| comparable_audio(audio, d)) {
         let diff = size_difference(ctx.size, dest.size);
         let codec_differs = matches!((ctx.codec, dest.codec), (Some(a), Some(b)) if a != b);
+        if site == Site::Amigos {
+            match amigos_against(ctx, rule, audio, dest, diff, codec_differs) {
+                Some(found) if found.status == Status::Fail => return found,
+                Some(found) if found.status == Status::Warn => {
+                    warning.get_or_insert(found);
+                }
+                _ => {}
+            }
+            continue;
+        }
         if diff < DUPLICATE_SIZE_TOLERANCE && !codec_differs {
             return Check::fail(
                 rule,
@@ -1620,27 +1775,8 @@ fn duplicate(ctx: &Context<'_>, site: Site, rule: &str) -> Check {
                 ),
             );
         }
-        let worth_warning = match site {
-            Site::Amigos => true,
-            Site::Bj => codec_differs || diff < BJ_SIMILAR_SIZE_TOLERANCE,
-        };
-        if worth_warning && warning.is_none() {
-            let why = if codec_differs {
-                format!(
-                    "codec {} contra {}",
-                    ctx.codec.map_or("desconhecido", Codec::label),
-                    dest.codec.map_or("desconhecido", Codec::label)
-                )
-            } else {
-                format!("tamanho {:.0}% diferente", diff * 100.0)
-            };
-            warning = Some(Check::warn(
-                rule,
-                format!(
-                    "avaliar duplicidade: mesma resolução, fonte e áudio de \"{}\", mas {why}",
-                    dest.title
-                ),
-            ));
+        if (codec_differs || diff < BJ_SIMILAR_SIZE_TOLERANCE) && warning.is_none() {
+            warning = Some(similar(ctx, rule, dest, diff, codec_differs));
         }
     }
     warning.unwrap_or_else(|| {
@@ -1652,6 +1788,157 @@ fn duplicate(ctx: &Context<'_>, site: Site, rule: &str) -> Check {
             ),
         )
     })
+}
+
+/// Aviso de duplicidade a avaliar: mesma resolução, fonte e áudio, mas outro
+/// codec de vídeo ou outro tamanho.
+fn similar(
+    ctx: &Context<'_>,
+    rule: &str,
+    dest: &DestinationRelease,
+    diff: f64,
+    codec_differs: bool,
+) -> Check {
+    let why = if codec_differs {
+        format!(
+            "codec {} contra {}",
+            ctx.codec.map_or("desconhecido", Codec::label),
+            dest.codec.map_or("desconhecido", Codec::label)
+        )
+    } else {
+        format!("tamanho {:.0}% diferente", diff * 100.0)
+    };
+    Check::warn(
+        rule,
+        format!(
+            "avaliar duplicidade: mesma resolução, fonte e áudio de \"{}\", mas {why}",
+            dest.title
+        ),
+    )
+}
+
+/// Amigos 4.2.1 contra um release do destino de mesma resolução, fonte e
+/// áudio. `None` quando ele não pesa: o nosso o substitui (5.1 sobre 2.0) ou
+/// a série em andamento o permite (outro release, 2 GB de diferença).
+fn amigos_against(
+    ctx: &Context<'_>,
+    rule: &str,
+    audio: AudioKind,
+    dest: &DestinationRelease,
+    diff: f64,
+    codec_differs: bool,
+) -> Option<Check> {
+    // "Arquivos com áudios 2.0 serão substituídos quando arquivos com áudio
+    // 5.1 ou 7.1 forem lançados."
+    if let (Some(ours), Some(theirs)) = (ctx.channels, channels_from_title(&dest.title)) {
+        if ours >= 6 && theirs <= 2 {
+            return None;
+        }
+        if ours <= 2 && theirs >= 6 {
+            return Some(Check::fail(
+                rule,
+                format!(
+                    "o Amigos já tem {} em {} ({}, {}): áudio 2.0 é substituído quando há 5.1 ou 7.1, \"{}\"",
+                    channel_label(theirs),
+                    ctx.resolution_label(),
+                    source_label(ctx.quality.source()),
+                    audio.label(),
+                    dest.title
+                ),
+            ));
+        }
+    }
+    if codec_differs {
+        return Some(similar(ctx, rule, dest, diff, true));
+    }
+    // "Casos onde apenas o Codec de áudio for diferente, a liberação do mesmo
+    // será avaliada pela staff."
+    if let (Some(ours), Some(theirs)) = (
+        AudioCodec::from_title(&ctx.facts.release_name),
+        AudioCodec::from_title(&dest.title),
+    ) && ours != theirs
+    {
+        return Some(Check::warn(
+            rule,
+            format!(
+                "só o codec de áudio difere de \"{}\" ({} contra {}): a staff avalia a liberação",
+                dest.title,
+                ours.label(),
+                theirs.label()
+            ),
+        ));
+    }
+    if ctx.continuing_series() {
+        return continuing_series_duplicate(ctx, rule, dest);
+    }
+    if diff < DUPLICATE_SIZE_TOLERANCE {
+        return Some(Check::fail(
+            rule,
+            format!(
+                "duplicado provável: mesma resolução ({}), fonte ({}) e áudio ({}), tamanho {:.1}% diferente de \"{}\"",
+                ctx.resolution_label(),
+                source_label(ctx.quality.source()),
+                audio.label(),
+                diff * 100.0,
+                dest.title
+            ),
+        ));
+    }
+    Some(similar(ctx, rule, dest, diff, false))
+}
+
+/// Amigos 4.2.1, série em andamento com os mesmos codecs: só entra outro
+/// release (grupo diferente) com [`SERIES_MIN_SIZE_GAP`] ou mais de
+/// diferença de tamanho. Série finalizada segue a regra geral.
+fn continuing_series_duplicate(
+    ctx: &Context<'_>,
+    rule: &str,
+    dest: &DestinationRelease,
+) -> Option<Check> {
+    let ours = ctx.group_of(&ctx.facts.release_name);
+    let theirs = ctx.group_of(&dest.title);
+    if let (Some(ours), Some(theirs)) = (&ours, &theirs)
+        && ours.eq_ignore_ascii_case(theirs)
+    {
+        return Some(Check::fail(
+            rule,
+            format!(
+                "série em andamento: o Amigos já tem o mesmo release ({ours}) com os mesmos codecs, \"{}\"",
+                dest.title
+            ),
+        ));
+    }
+    let gap = ctx.size.abs_diff(dest.size);
+    if gap < SERIES_MIN_SIZE_GAP {
+        #[allow(clippy::cast_precision_loss)]
+        let gib = gap as f64 / f64::from(1u32 << 30);
+        return Some(Check::fail(
+            rule,
+            format!(
+                "série em andamento: com os mesmos codecs, o Amigos só aceita outro release com 2 GB ou mais de diferença de tamanho, e a diferença para \"{}\" é de {gib:.2} GB",
+                dest.title
+            ),
+        ));
+    }
+    if ours.is_none() || theirs.is_none() {
+        return Some(Check::warn(
+            rule,
+            format!(
+                "série em andamento: sem o grupo dos dois nomes não dá para provar que é outro release de \"{}\", e a regra pede release diferente",
+                dest.title
+            ),
+        ));
+    }
+    None
+}
+
+fn channel_label(channels: u32) -> &'static str {
+    match channels {
+        0..=1 => "áudio 1.0",
+        2 => "áudio 2.0",
+        3..=6 => "áudio 5.1",
+        _ => "áudio 7.1",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2317,7 +2604,12 @@ mod tests {
     #[test]
     fn filme_certo_e_elegivel_nos_dois_sites() {
         for site in [Site::Amigos, Site::Bj] {
-            let report = check(site, &movie());
+            let mut facts = movie();
+            // Dual sem legenda PT pede "Dublado" no formulário do Amigos (3.9).
+            if site == Site::Amigos {
+                set_video(&mut facts, |m| m.subtitles = vec![embedded_pt()]);
+            }
+            let report = check(site, &facts);
             assert_eq!(report.verdict, Verdict::Elegivel, "{site:?}: {report:?}");
             assert!(!report.has_warnings(), "{site:?}: {report:?}");
         }
@@ -3679,5 +3971,244 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("S01E01"), "{message}");
+    }
+
+    #[test]
+    fn canais_pelo_nome() {
+        assert_eq!(
+            channels_from_title("Filme.2024.1080p.WEB-DL.DDP5.1.H.264-G"),
+            Some(6)
+        );
+        assert_eq!(
+            channels_from_title("Filme.2024.1080p.WEB-DL.DDP.5.1.H.264-G"),
+            Some(6)
+        );
+        assert_eq!(
+            channels_from_title("Filme.2024.1080p.AMZN.WEB-DL.AAC2.0.H.264-G"),
+            Some(2)
+        );
+        assert_eq!(
+            channels_from_title("Filme.TrueHD.7.1.Atmos.x265-G"),
+            Some(8)
+        );
+        // Ano, resolução, episódio e codec de vídeo não são canais.
+        assert_eq!(
+            channels_from_title("Serie.S01E02.1080p.WEB-DL.H.264-G"),
+            None
+        );
+        assert_eq!(channels_from_title("Filme.2024.1080p.x264-G"), None);
+    }
+
+    #[test]
+    fn codec_de_audio_pelo_nome() {
+        let codec = |t: &str| AudioCodec::from_title(t);
+        assert_eq!(
+            codec("A.1080p.WEB-DL.DDP5.1.H.264-G"),
+            Some(AudioCodec::Eac3)
+        );
+        assert_eq!(
+            codec("A.1080p.WEB-DL.DD+5.1.H.264-G"),
+            Some(AudioCodec::Eac3)
+        );
+        assert_eq!(codec("A.1080p.WEB-DL.DD5.1.H.264-G"), Some(AudioCodec::Ac3));
+        assert_eq!(
+            codec("A.1080p.WEB-DL.AAC2.0.H.264-G"),
+            Some(AudioCodec::Aac)
+        );
+        assert_eq!(
+            codec("A.1080p.BluRay.DTS-HD.MA.5.1.x264-G"),
+            Some(AudioCodec::DtsHd)
+        );
+        assert_eq!(
+            codec("A.1080p.BluRay.DTS.5.1.x264-G"),
+            Some(AudioCodec::Dts)
+        );
+        assert_eq!(
+            codec("A.2160p.BluRay.TrueHD.7.1.x265-G"),
+            Some(AudioCodec::TrueHd)
+        );
+        assert_eq!(codec("A.1080p.WEB-DL.DUAL.x264-G"), None);
+    }
+
+    #[test]
+    fn amigos_3_9_dual_sem_legenda_vai_como_dublado() {
+        let mut facts = movie();
+        let report = check(Site::Amigos, &facts);
+        assert_eq!(report.status_of("3.9"), Some(Status::Warn));
+        assert_eq!(report.verdict, Verdict::Elegivel);
+        // Só a forçada não legenda o filme.
+        let mut forced = embedded_pt();
+        forced.forced = true;
+        set_video(&mut facts, |m| m.subtitles = vec![forced]);
+        assert_eq!(status(Site::Amigos, &facts, "3.9"), Some(Status::Warn));
+        set_video(&mut facts, |m| m.subtitles = vec![embedded_pt()]);
+        assert_eq!(status(Site::Amigos, &facts, "3.9"), Some(Status::Ok));
+    }
+
+    #[test]
+    fn amigos_3_9_legenda_em_arquivo_basta() {
+        let mut facts = movie();
+        facts.files.push(file(
+            "Filme.2024.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP/Filme.2024.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP.pt-BR.srt",
+            1000,
+        ));
+        assert_eq!(status(Site::Amigos, &facts, "3.9"), Some(Status::Ok));
+    }
+
+    #[test]
+    fn amigos_3_9_so_vale_para_dual() {
+        let mut facts = movie();
+        set_video(&mut facts, |m| m.audio = vec![por()]);
+        assert_eq!(status(Site::Amigos, &facts, "3.9"), None);
+        assert_eq!(status(Site::Bj, &movie(), "3.9"), None);
+    }
+
+    #[test]
+    fn amigos_2_0_com_5_1_no_destino_e_substituido() {
+        let mut facts = movie();
+        rename(&mut facts, "Filme.2024.1080p.WEB-DL.DUAL.AAC2.0.x264-GRP");
+        set_video(&mut facts, |m| {
+            for track in &mut m.audio {
+                track.channels = Some(2);
+            }
+        });
+        facts.destination = vec![dest(
+            "Filme.2024.1080p.WEB-DL.DUAL.DDP5.1.x264-OUTRO",
+            4 * GB,
+        )];
+        let report = check(Site::Amigos, &facts);
+        assert_eq!(report.status_of("4.2.1"), Some(Status::Fail));
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.message.contains("áudio 2.0 é substituído"))
+        );
+    }
+
+    #[test]
+    fn amigos_5_1_substitui_o_2_0_do_destino() {
+        let mut facts = movie();
+        // Mesmo tamanho e codec de vídeo: sem os canais seria duplicado.
+        facts.destination = vec![dest(
+            "Filme.2024.1080p.WEB-DL.DUAL.DDP2.0.x264-OUTRO",
+            10 * GB,
+        )];
+        assert_eq!(status(Site::Amigos, &facts, "4.2.1"), Some(Status::Ok));
+    }
+
+    #[test]
+    fn amigos_so_codec_de_audio_diferente_e_aviso() {
+        let mut facts = movie();
+        facts.destination = vec![dest(
+            "Filme.2024.1080p.WEB-DL.DUAL.AAC5.1.x264-OUTRO",
+            10 * GB,
+        )];
+        let report = check(Site::Amigos, &facts);
+        assert_eq!(report.status_of("4.2.1"), Some(Status::Warn));
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.message.contains("só o codec de áudio"))
+        );
+    }
+
+    /// Episódio 1080p WEB-DL H.264 Dual de `size` bytes, da série `status`.
+    fn dual_episode(size: u64, status: SeriesStatus) -> Facts {
+        let mut facts = movie();
+        let name = "Serie.S01E01.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP";
+        facts.kind = Kind::Episode;
+        facts.series_status = Some(status);
+        rename(&mut facts, name);
+        let path = format!("{name}/{name}.mkv");
+        facts.files = vec![file(&path, size)];
+        facts.videos[0].path = path;
+        facts
+    }
+
+    fn episode_dest(title: &str, size: u64) -> DestinationRelease {
+        DestinationRelease::new(title, size, Kind::Episode)
+    }
+
+    #[test]
+    fn amigos_serie_em_andamento_exige_2_gb_de_diferenca() {
+        let mut facts = dual_episode(2 * GB, SeriesStatus::Continuing);
+        // 1 GB a mais (50%): a regra geral só avisaria, a de série barra.
+        facts.destination = vec![episode_dest(
+            "Serie.S01E01.1080p.WEB-DL.DUAL.DDP5.1.x264-OUTRO",
+            3 * GB,
+        )];
+        let report = check(Site::Amigos, &facts);
+        assert_eq!(report.status_of("4.2.1"), Some(Status::Fail));
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.message.contains("2 GB ou mais"))
+        );
+        // 2,5 GB de diferença e outro grupo: permitido.
+        facts.destination[0].size = 4 * GB + GB / 2;
+        assert_eq!(status(Site::Amigos, &facts, "4.2.1"), Some(Status::Ok));
+    }
+
+    #[test]
+    fn amigos_serie_em_andamento_mesmo_release_e_duplicado() {
+        let mut facts = dual_episode(2 * GB, SeriesStatus::Continuing);
+        facts.destination = vec![episode_dest(
+            "Serie.S01E01.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP",
+            6 * GB,
+        )];
+        let report = check(Site::Amigos, &facts);
+        assert_eq!(report.status_of("4.2.1"), Some(Status::Fail));
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.message.contains("mesmo release"))
+        );
+    }
+
+    #[test]
+    fn amigos_serie_em_andamento_sem_grupo_so_avisa() {
+        let mut facts = dual_episode(2 * GB, SeriesStatus::Continuing);
+        facts.destination = vec![episode_dest(
+            "Serie.S01E01.1080p.WEB-DL.DUAL.DDP5.1.x264",
+            5 * GB,
+        )];
+        assert_eq!(status(Site::Amigos, &facts, "4.2.1"), Some(Status::Warn));
+    }
+
+    #[test]
+    fn amigos_canais_vem_do_nome_e_nao_de_faixa_de_comentario() {
+        let mut facts = movie();
+        rename(&mut facts, "Filme.2024.1080p.WEB-DL.DUAL.AAC2.0.x264-GRP");
+        // A faixa principal é 2.0; o comentário em 5.1 não faz do release um 5.1.
+        set_video(&mut facts, |m| m.audio[0].channels = Some(2));
+        facts.destination = vec![dest(
+            "Filme.2024.1080p.WEB-DL.DUAL.DDP5.1.x264-OUTRO",
+            4 * GB,
+        )];
+        assert_eq!(status(Site::Amigos, &facts, "4.2.1"), Some(Status::Fail));
+    }
+
+    #[test]
+    fn amigos_serie_finalizada_segue_a_regra_geral() {
+        let mut facts = dual_episode(2 * GB, SeriesStatus::Ended);
+        facts.destination = vec![episode_dest(
+            "Serie.S01E01.1080p.WEB-DL.DUAL.DDP5.1.x264-OUTRO",
+            3 * GB,
+        )];
+        assert_eq!(status(Site::Amigos, &facts, "4.2.1"), Some(Status::Warn));
+    }
+
+    #[test]
+    fn amigos_serie_em_andamento_com_codec_diferente_so_avisa() {
+        let mut facts = dual_episode(2 * GB, SeriesStatus::Continuing);
+        facts.destination = vec![episode_dest(
+            "Serie.S01E01.1080p.WEB-DL.DUAL.DDP5.1.x265-OUTRO",
+            2 * GB,
+        )];
+        assert_eq!(status(Site::Amigos, &facts, "4.2.1"), Some(Status::Warn));
     }
 }
