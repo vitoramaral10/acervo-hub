@@ -527,7 +527,7 @@ Toma a posse do par. Refaz o rascunho (a prévia não é confiada) e recusa com
    - `torrent` (o `.torrent` gerado), `name`, `year`, `imdb_id` e
      `category_id`;
    - `width`, `height` e `mediainfo`;
-   - `description`, que é a `descricao` do pacote;
+   - `description`: a `descricao` do pacote sem nenhuma `[img]` e sem a seção "Capturas". O site só aceita imagem hospedada nele, e as capturas já aparecem no campo próprio; repetidas na descrição, ficariam duplicadas;
    - `cover_path` e `screenshot_paths[i]`;
    - `subtitle`, `attribute_ids[i]` e `anonymous=0`.
 3. Antes do `POST`, `launches.site_id` (migração 41) recebe a marca
