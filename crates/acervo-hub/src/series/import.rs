@@ -480,12 +480,23 @@ impl Importer<'_> {
 impl Importer<'_> {
     /// Apaga do cliente o torrent de um grab que desistiu, se ele é só deste
     /// grab e nenhum arquivo tem outro link; na dúvida, fica, com aviso.
+    /// Torrent completo que ainda deve seed ao tracker também fica, salvo o
+    /// desregistrado: o tracker não o conta mais, então não há o que cumprir.
     async fn drop_torrent(
         &self,
         grab: &SeriesGrab,
         torrent: &TorrentInfo,
         why: &str,
     ) -> Result<(), Failure> {
+        if why != "torrent desregistrado"
+            && crate::obligation::download_owed(self.store, &grab.indexer, torrent).await
+        {
+            tracing::warn!(
+                release = grab.title,
+                "{why}, mas o tracker ainda exige seed dele: fica no cliente"
+            );
+            return Ok(());
+        }
         if super::grab::owns(self.store, &self.client, grab, torrent).await {
             self.client
                 .delete(&[DownloadHash::new(grab.hash.clone())], true)

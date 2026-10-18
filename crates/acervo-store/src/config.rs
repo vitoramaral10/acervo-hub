@@ -16,7 +16,7 @@ pub const DEFAULT_INDEXER_PRIORITY: i32 = 25;
 pub const INDEXER_PRIORITIES: std::ops::RangeInclusive<i32> = 1..=50;
 
 /// Um indexador cadastrado.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 pub struct IndexerRecord {
     /// O nome servido em `/<nome>/api`; num Cardigann, o id da definição.
     pub name: String,
@@ -33,6 +33,13 @@ pub struct IndexerRecord {
     pub priority: i32,
     /// Modo "construir ratio": freeleech procurado deste indexador vem antes da qualidade, e o torrent ganha a tag de semear.
     pub ratio_mode: bool,
+    /// Obrigação de seed do tracker: horas que um download concluído semeia
+    /// (ou até chegar a `seed_min_ratio`, o que vier primeiro). `None`: não exige.
+    pub seed_min_hours: Option<i32>,
+    /// Ratio que dispensa o resto de `seed_min_hours`. `None`: não exige.
+    pub seed_min_ratio: Option<f64>,
+    /// Horas que o torrent que o usuário lançou no site semeia. `None`: não exige.
+    pub upload_seed_hours: Option<i32>,
     pub added_at: Option<String>,
 }
 
@@ -47,6 +54,9 @@ impl std::fmt::Debug for IndexerRecord {
             .field("enabled", &self.enabled)
             .field("priority", &self.priority)
             .field("ratio_mode", &self.ratio_mode)
+            .field("seed_min_hours", &self.seed_min_hours)
+            .field("seed_min_ratio", &self.seed_min_ratio)
+            .field("upload_seed_hours", &self.upload_seed_hours)
             .field("settings", &self.settings.keys().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
@@ -87,12 +97,16 @@ fn read_indexer(row: &tokio_postgres::Row) -> Result<IndexerRecord> {
         added_at: row.try_get(6)?,
         priority: row.try_get(7)?,
         ratio_mode: row.try_get(8)?,
+        seed_min_hours: row.try_get(9)?,
+        seed_min_ratio: row.try_get(10)?,
+        upload_seed_hours: row.try_get(11)?,
     })
 }
 
 const INSERT_INDEXER: &str =
-    "INSERT INTO indexers (name, kind, definition, url, settings, enabled, added_at, priority, ratio_mode)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    "INSERT INTO indexers (name, kind, definition, url, settings, enabled, added_at, priority, ratio_mode,
+                           seed_min_hours, seed_min_ratio, upload_seed_hours)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
      ON CONFLICT (name) DO NOTHING";
 
 fn count(value: u32) -> i32 {
@@ -142,7 +156,8 @@ impl Store {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "SELECT name, kind, definition, url, settings, enabled, added_at, priority, ratio_mode
+                "SELECT name, kind, definition, url, settings, enabled, added_at, priority, ratio_mode,
+                        seed_min_hours, seed_min_ratio, upload_seed_hours
                  FROM indexers ORDER BY name",
                 &[],
             )
@@ -170,6 +185,9 @@ impl Store {
                     &record.added_at,
                     &record.priority,
                     &record.ratio_mode,
+                    &record.seed_min_hours,
+                    &record.seed_min_ratio,
+                    &record.upload_seed_hours,
                 ],
             )
             .await?;
@@ -200,6 +218,9 @@ impl Store {
                     &record.added_at,
                     &record.priority,
                     &record.ratio_mode,
+                    &record.seed_min_hours,
+                    &record.seed_min_ratio,
+                    &record.upload_seed_hours,
                 ],
             )
             .await?;
@@ -225,7 +246,8 @@ impl Store {
         let updated = client
             .execute(
                 "UPDATE indexers SET kind = $2, definition = $3, url = $4, settings = $5,
-                     enabled = $6, priority = $7, ratio_mode = $8
+                     enabled = $6, priority = $7, ratio_mode = $8,
+                     seed_min_hours = $9, seed_min_ratio = $10, upload_seed_hours = $11
                  WHERE name = $1",
                 &[
                     &record.name,
@@ -236,6 +258,9 @@ impl Store {
                     &record.enabled,
                     &record.priority,
                     &record.ratio_mode,
+                    &record.seed_min_hours,
+                    &record.seed_min_ratio,
+                    &record.upload_seed_hours,
                 ],
             )
             .await?;
@@ -315,6 +340,9 @@ mod tests {
             enabled: true,
             priority: DEFAULT_INDEXER_PRIORITY,
             ratio_mode: false,
+            seed_min_hours: None,
+            seed_min_ratio: None,
+            upload_seed_hours: None,
             added_at: Some("2026-01-01T00:00:00Z".into()),
         }
     }
@@ -345,6 +373,9 @@ mod tests {
         changed.enabled = false;
         changed.priority = 10;
         changed.ratio_mode = true;
+        changed.seed_min_hours = Some(72);
+        changed.seed_min_ratio = Some(1.0);
+        changed.upload_seed_hours = Some(168);
         changed.settings.insert("api_key".into(), "outra".into());
         assert!(store.update_indexer(&changed).await.unwrap());
         assert_eq!(store.indexers().await.unwrap(), [changed]);

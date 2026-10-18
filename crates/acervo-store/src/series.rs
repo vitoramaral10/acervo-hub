@@ -386,8 +386,18 @@ impl Store {
     /// Falha de escrita.
     pub async fn delete_series(&self, id: i64) -> Result<bool> {
         let client = self.pool.get().await?;
+        // O hash e o indexador dos grabs ficam em `seed_debts`: a obrigação de
+        // seed dura mais que a linha do catálogo.
         Ok(client
-            .execute("DELETE FROM series WHERE id = $1", &[&id])
+            .execute(
+                "WITH debt AS (
+                    INSERT INTO seed_debts (hash, indexer)
+                    SELECT lower(hash), indexer FROM series_grabs WHERE series_id = $1
+                    ON CONFLICT DO NOTHING
+                )
+                DELETE FROM series WHERE id = $1",
+                &[&id],
+            )
             .await?
             > 0)
     }

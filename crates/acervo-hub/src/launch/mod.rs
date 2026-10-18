@@ -1412,11 +1412,14 @@ fn read_limited(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
 /// Quantos nomes a mensagem de "o que difere" lista de cada tipo.
 const DIFF_LISTED: usize = 5;
 
-/// Se o `.torrent` já estava no cliente (mesmo hash) ou foi adicionado.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Se o `.torrent` já estava no cliente (mesmo hash), foi adicionado ou o
+/// cliente já tinha um irmão do mesmo tracker, que passou a semear no lugar.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Seeded {
     Added,
     AlreadyThere,
+    /// O irmão adotado, com o hash que ele tem no cliente.
+    Adopted(String),
 }
 
 /// A pasta de download do pacote, como o cliente a vê: o pai da pasta
@@ -1538,7 +1541,7 @@ async fn seed_into(
         crate::crossseed::same_tracker_sibling(client, torrents, &save_path, &torrent).await?
     {
         adopt_existing(client, &existing, launch, &torrent).await?;
-        return Ok(Seeded::AlreadyThere);
+        return Ok(Seeded::Adopted(existing.hash.to_ascii_lowercase()));
     }
     let options = AddOptions {
         category: category.to_owned(),
@@ -3412,7 +3415,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(seeded, Seeded::AlreadyThere);
+        assert_eq!(seeded, Seeded::Adopted(hash));
         drop(server);
     }
 

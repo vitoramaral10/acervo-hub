@@ -45,6 +45,9 @@ pub enum SkipReason {
     UnmanagedCategory,
     /// Tem a tag de semear (modo "construir ratio"): continua no cliente.
     KeepSeeding,
+    /// O tracker exige seed deste torrent (tempo ou ratio) e a obrigação
+    /// ainda não foi cumprida.
+    SeedObligation,
     /// Ainda compartilha inode com a biblioteca: apagar libera zero.
     StillLinked,
     /// Só seed entra na avaliação.
@@ -65,6 +68,7 @@ impl fmt::Display for SkipReason {
             Self::InQueue => "é de um download em andamento do acervo",
             Self::UnmanagedCategory => "categoria fora das gerenciadas (download manual)",
             Self::KeepSeeding => "tag de semear: o tracker está construindo ratio",
+            Self::SeedObligation => "obrigação de seed do tracker ainda não cumprida",
             Self::StillLinked => "ainda tem hardlink na biblioteca",
             Self::NotSeeding => "não está em seeding",
             Self::FilesMissing => "o cliente não acha os arquivos (disco fora?)",

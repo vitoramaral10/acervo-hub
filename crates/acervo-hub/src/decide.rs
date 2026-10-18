@@ -609,6 +609,9 @@ mod tests {
             enabled: true,
             priority: 10,
             ratio_mode: true,
+            seed_min_hours: None,
+            seed_min_ratio: None,
+            upload_seed_hours: None,
             added_at: None,
         };
         let served = ["amigos".to_owned(), "outro".to_owned()];

@@ -792,6 +792,30 @@ async fn seed_generated(web: &Web, store: &Store, launch: &Launch) -> Option<Str
     seed_or_warn(web, store, launch, bytes).await.1
 }
 
+/// Grava o irmão adotado como o torrent do site do pacote, se ele ainda não
+/// tem um: sem isso o hash adotado não entra em `launched` nem recebe a
+/// obrigação de seed do lançamento. Falha só é logada: o envio já valeu.
+async fn remember_adopted(store: &Store, launch: &Launch, adopted: &str) {
+    let (hash, indexer) = (&launch.hash, &launch.indexer);
+    let current = match store.launch(hash, indexer).await {
+        Ok(Some(current)) => current,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                indexer,
+                "pacote não relido para gravar o irmão adotado: {error}"
+            );
+            return;
+        }
+    };
+    if current.site_hash.is_some() {
+        return;
+    }
+    if let Err(error) = store.save_launch_site_hash(hash, indexer, adopted).await {
+        tracing::warn!(indexer, "irmão adotado não gravado como o do site: {error}");
+    }
+}
+
 /// Semeia o `.torrent` (ou o erro de obtê-lo) e fecha o resultado: sucesso
 /// limpa o erro antigo do pacote; falha o grava e vira o aviso da tela. O
 /// estado do pacote já foi gravado antes, e a falha nunca o desfaz.
@@ -804,6 +828,9 @@ async fn seed_or_warn(
     let seeded = async { super::seed_package(&web.config(), launch, bytes?).await }.await;
     let message = match seeded {
         Ok(seeded) => {
+            if let super::Seeded::Adopted(adopted) = &seeded {
+                remember_adopted(store, launch, adopted).await;
+            }
             if launch.error.is_some()
                 && let Err(error) = store
                     .set_launch_error(&launch.hash, &launch.indexer, None)
@@ -1544,6 +1571,9 @@ mod tests {
                 enabled: true,
                 priority: acervo_store::DEFAULT_INDEXER_PRIORITY,
                 ratio_mode: false,
+                seed_min_hours: None,
+                seed_min_ratio: None,
+                upload_seed_hours: None,
                 added_at: None,
             })
             .await
@@ -1987,6 +2017,9 @@ mod tests {
                 enabled: true,
                 priority: acervo_store::DEFAULT_INDEXER_PRIORITY,
                 ratio_mode: false,
+                seed_min_hours: None,
+                seed_min_ratio: None,
+                upload_seed_hours: None,
                 added_at: None,
             })
             .await

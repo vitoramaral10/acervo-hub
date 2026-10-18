@@ -39,6 +39,7 @@ mod mediainfo;
 mod metadata;
 mod movies;
 mod naming;
+mod obligation;
 mod registry;
 mod rename;
 mod rules;
