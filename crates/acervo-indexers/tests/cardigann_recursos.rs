@@ -1360,6 +1360,7 @@ async fn requisicao_ao_site_leva_sessao_e_token_xsrf_como_o_javascript_do_site()
         .await
         .unwrap();
     assert_eq!(looked.status, 200);
+    assert_eq!(looked.url, format!("{}/torrents/lookup", server.uri()));
     assert_eq!(looked.text(), r#"{"title":"Filme"}"#);
     let sent = client
         .site_request(&acervo_indexers::SiteRequest::multipart(

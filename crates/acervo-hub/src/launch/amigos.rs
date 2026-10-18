@@ -169,6 +169,15 @@ pub(crate) struct MediaRead {
 #[derive(Debug, Clone, Deserialize)]
 struct Hosted {
     path: String,
+    url: String,
+}
+
+/// Uma captura hospedada no site: o caminho que vai em `screenshot_paths` e a
+/// URL absoluta que a descrição usa.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Shot {
+    pub(crate) path: String,
+    pub(crate) url: String,
 }
 
 // ------------------------------------------------------------ escolha
@@ -506,6 +515,23 @@ fn created_id(location: &str) -> Option<&str> {
     (!tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit())).then_some(tail)
 }
 
+/// O corpo do envio com as capturas já hospedadas no site: os caminhos vão
+/// em `screenshot_paths`, e as URLs entram na descrição no lugar das de fora.
+pub(crate) fn upload_parts(
+    draft: &Draft,
+    torrent: Vec<u8>,
+    torrent_name: &str,
+    shots: &[Shot],
+) -> Vec<SitePart> {
+    let urls: Vec<String> = shots.iter().map(|s| s.url.clone()).collect();
+    let paths: Vec<String> = shots.iter().map(|s| s.path.clone()).collect();
+    let draft = Draft {
+        description: site_description(&draft.description, &urls),
+        ..draft.clone()
+    };
+    parts(&draft, torrent, torrent_name, &paths)
+}
+
 /// Por que o envio não deu o id do torrent criado.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Refusal {
@@ -651,13 +677,13 @@ pub(crate) async fn draft(catalog: &Catalog, package: &Package) -> Result<Draft>
     Ok(draft_from(package, &form, &media, &lookup))
 }
 
-/// Uma captura hospedada no site: o caminho que vai em `screenshot_paths`.
+/// Hospeda uma captura no site.
 pub(crate) async fn host_screenshot(
     catalog: &Catalog,
     image: Vec<u8>,
     file_name: &str,
     mime: &str,
-) -> Result<String> {
+) -> Result<Shot> {
     let response = request(
         catalog,
         SiteRequest::multipart(
@@ -667,7 +693,74 @@ pub(crate) async fn host_screenshot(
     )
     .await?;
     let hosted: Hosted = ok_json(&response, "o site recusou a captura")?;
-    Ok(hosted.path)
+    // O site devolve `/storage/...`: absoluto pela URL que foi pedida.
+    let url = url::Url::parse(&response.url)
+        .and_then(|base| base.join(&hosted.url))
+        .context("o site devolveu a captura com uma URL ilegível")?;
+    Ok(Shot {
+        path: hosted.path,
+        url: url.to_string(),
+    })
+}
+
+/// A descrição como o Amigos aceita: só imagem hospedada nele ("a descrição
+/// só aceita imagens enviadas pelo site"). Sai toda `[img]` de fora (as
+/// capturas do `ImgBB`), e as capturas do site entram sob "Capturas", ou no
+/// fim, se a descrição não tem a seção.
+pub(crate) fn site_description(description: &str, images: &[String]) -> String {
+    const HEADER: &str = "[b]Capturas[/b]";
+    let mut lines: Vec<String> = Vec::new();
+    for line in description.lines() {
+        let stripped = strip_images(line);
+        if stripped.trim().is_empty() && stripped.len() != line.len() {
+            continue;
+        }
+        lines.push(stripped);
+    }
+    let shots: Vec<String> = images
+        .iter()
+        .map(|url| format!("[img]{url}[/img]"))
+        .collect();
+    match lines.iter().position(|l| l.trim() == HEADER) {
+        Some(at) if !shots.is_empty() => {
+            for (offset, shot) in shots.into_iter().enumerate() {
+                lines.insert(at + 1 + offset, shot);
+            }
+        }
+        Some(at) => {
+            lines.remove(at);
+        }
+        None if !shots.is_empty() => {
+            while lines.last().is_some_and(|l| l.trim().is_empty()) {
+                lines.pop();
+            }
+            lines.push(String::new());
+            lines.push(HEADER.to_owned());
+            lines.extend(shots);
+        }
+        None => {}
+    }
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+/// A linha sem nenhum `[img]…[/img]` (a tag em qualquer caixa).
+fn strip_images(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    let mut out = String::new();
+    let mut at = 0;
+    while let Some(open) = lower[at..].find("[img") {
+        let open = at + open;
+        let Some(close) = lower[open..].find("[/img]") else {
+            break;
+        };
+        out.push_str(&line[at..open]);
+        at = open + close + "[/img]".len();
+    }
+    out.push_str(&line[at..]);
+    out
 }
 
 /// O `POST /torrents`. `Ok` com o id do torrent criado. Sem resposta (rede,
@@ -744,6 +837,30 @@ mod tests {
             has_subtitle_file: false,
             screenshots: 4,
         }
+    }
+
+    #[test]
+    fn descricao_so_com_imagens_do_site() {
+        let description = "[b]Filme[/b]\n\n[b]Capturas[/b]\n[img]https://i.ibb.co/a/1.png[/img]\n[IMG]https://i.ibb.co/b/2.png[/IMG]\n";
+        let images = vec![
+            "https://site.invalid/storage/s/1.webp".to_owned(),
+            "https://site.invalid/storage/s/2.webp".to_owned(),
+        ];
+        assert_eq!(
+            site_description(description, &images),
+            "[b]Filme[/b]\n\n[b]Capturas[/b]\n[img]https://site.invalid/storage/s/1.webp[/img]\n[img]https://site.invalid/storage/s/2.webp[/img]"
+        );
+        // Sem a seção, as capturas vão ao fim; imagem no meio do texto sai e o
+        // texto fica.
+        assert_eq!(
+            site_description("Texto [img]https://x/y.png[/img] fim\n\n", &images[..1]),
+            "Texto  fim\n\n[b]Capturas[/b]\n[img]https://site.invalid/storage/s/1.webp[/img]"
+        );
+        // Sem capturas do site, a seção vazia sai.
+        assert_eq!(
+            site_description("A\n[b]Capturas[/b]\n[img]https://x/1.png[/img]", &[]),
+            "A"
+        );
     }
 
     #[test]
@@ -870,6 +987,7 @@ mod tests {
     #[test]
     fn resposta_do_envio_da_o_id_ou_o_motivo() {
         let response = |status, location: Option<&str>, body: &str| SiteResponse {
+            url: "https://site.invalid/torrents".to_owned(),
             status,
             location: location.map(str::to_owned),
             body: body.as_bytes().to_vec(),
