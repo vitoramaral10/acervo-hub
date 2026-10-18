@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use acervo_indexers::{
     Capabilities, Indexer, IndexerError, IndexerFailure, Release, ResolvedDownload, SearchMode,
-    SearchQuery,
+    SearchQuery, SiteRequest, SiteResponse,
 };
 use futures::future::{BoxFuture, FutureExt, Shared, join_all};
 use time::OffsetDateTime;
@@ -506,6 +506,38 @@ impl Catalog {
             match self.waiting_until(name) {
                 Some(until) if error.rate_limited().is_some() => waiting(name, until),
                 _ => SearchError::DownloadFailed,
+            }
+        })
+    }
+
+    /// Uma requisição ao site do indexador com a sessão dele (o envio de
+    /// torrent). Em espera por 429 ou com o disjuntor aberto, não sai; a falha
+    /// de rede, de login ou o 429 contam no disjuntor. Resposta HTTP de erro
+    /// do site (validação, 4xx) volta como resposta: é de quem chama.
+    ///
+    /// # Errors
+    ///
+    /// Indexador desconhecido, em espera, ou a requisição que nem chegou a
+    /// ter resposta.
+    pub async fn site_request(
+        &self,
+        name: &str,
+        request: &SiteRequest,
+    ) -> Result<SiteResponse, SearchError> {
+        let entry = self
+            .read()
+            .get(name)
+            .cloned()
+            .ok_or(SearchError::NoSuchIndexer)?;
+        if let Some(until) = self.waiting_until(name) {
+            return Err(waiting(name, until));
+        }
+        entry.indexer.site_request(request).await.map_err(|error| {
+            tracing::warn!(indexer = name, path = request.path, %error, "requisição ao site falhou");
+            self.record(name, Err(&error));
+            match self.waiting_until(name) {
+                Some(until) if error.rate_limited().is_some() => waiting(name, until),
+                _ => SearchError::SiteFailed(error.to_string()),
             }
         })
     }

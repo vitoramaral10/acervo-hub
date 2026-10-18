@@ -299,6 +299,9 @@ const MIGRATIONS: &[&str] = &[
     // 40: infohash do `.torrent` que o usuário baixou do site depois do envio
     // (o site pode trocar o hash do gerado); o status do tracker é lido dele.
     r"ALTER TABLE launches ADD COLUMN site_hash TEXT;",
+    // 41: id do torrent no site, quando o acervo o enviou pelo formulário do
+    // site (Amigos): a página e o `.torrent` dele saem desse id.
+    r"ALTER TABLE launches ADD COLUMN site_id TEXT;",
 ];
 
 /// Quanto uma consulta pode levar. A maior consulta real (o catálogo de
@@ -2343,7 +2346,7 @@ mod tests {
             .await
             .unwrap()
             .get(0);
-        assert_eq!(version, 40);
+        assert_eq!(version, 41);
         // A 38 cria o desfecho e a tabela.
         client
             .batch_execute(
@@ -2423,7 +2426,7 @@ mod tests {
             client
                 .batch_execute(
                     "ALTER TABLE launches DROP COLUMN adapted_path, DROP COLUMN adapted_layout,
-                       DROP COLUMN site_hash;
+                       DROP COLUMN site_hash, DROP COLUMN site_id;
                      UPDATE schema_version SET version = 38;
                      INSERT INTO launches (hash, indexer, state, created_at, updated_at)
                      VALUES ('a', 'bj', 'pronto', 't', 't')",
@@ -2449,7 +2452,7 @@ mod tests {
             let client = db.store.pool.get().await.unwrap();
             client
                 .batch_execute(
-                    "ALTER TABLE launches DROP COLUMN site_hash;
+                    "ALTER TABLE launches DROP COLUMN site_hash, DROP COLUMN site_id;
                      UPDATE schema_version SET version = 39;
                      INSERT INTO launches (hash, indexer, state, created_at, updated_at)
                      VALUES ('a', 'bj', 'enviado', 't', 't')",
@@ -2461,6 +2464,32 @@ mod tests {
         let launch = db.store.launch("a", "bj").await.unwrap().unwrap();
         assert_eq!(launch.state, LaunchState::Enviado);
         assert_eq!(launch.site_hash, None);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn migracao_41_acrescenta_o_id_do_site_sem_perder_o_pacote() {
+        let Some(db) = TestDb::new("migracao_41").await else {
+            return;
+        };
+        {
+            // Volta ao banco da 40: pacote sem a coluna do id no site.
+            let client = db.store.pool.get().await.unwrap();
+            client
+                .batch_execute(
+                    "ALTER TABLE launches DROP COLUMN site_id;
+                     UPDATE schema_version SET version = 40;
+                     INSERT INTO launches (hash, indexer, state, created_at, updated_at, site_hash)
+                     VALUES ('a', 'amigosshare', 'enviado', 't', 't', 'ef01')",
+                )
+                .await
+                .unwrap();
+        }
+        db.store.migrate().await.unwrap();
+        let launch = db.store.launch("a", "amigosshare").await.unwrap().unwrap();
+        assert_eq!(launch.state, LaunchState::Enviado);
+        assert_eq!(launch.site_hash.as_deref(), Some("ef01"));
+        assert_eq!(launch.site_id, None);
         db.drop().await;
     }
 }

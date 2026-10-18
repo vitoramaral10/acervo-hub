@@ -30,9 +30,10 @@ use tokio::sync::Mutex;
 use url::Url;
 
 use crate::network::{self, CHALLENGE_PAGE, Challenge, Clearance, Network};
+use crate::site::{BOUNDARY, encode_multipart};
 use crate::{
     Capabilities, Indexer, IndexerError, RateBudget, Release, ResolvedDownload, SearchMode,
-    SearchQuery,
+    SearchQuery, SiteBody, SiteRequest, SiteResponse,
 };
 use charset::Charset;
 use definition::{
@@ -1861,6 +1862,95 @@ impl Indexer for CardigannClient {
             return outcome;
         }
         Err(self.login_error("o site não reconheceu a sessão no download"))
+    }
+
+    async fn site_request(&self, request: &SiteRequest) -> Result<SiteResponse, IndexerError> {
+        let url = same_origin(&self.base, &request.path, "caminho do site")?;
+        let mut cookie = self.ensure_session(false).await?;
+        for attempt in 0..2 {
+            let response = self.send_site(&url, request, cookie.as_ref()).await?;
+            let status = response.status();
+            let location = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            if session_lost(status, location.as_deref())
+                && attempt == 0
+                && self.definition.login.is_some()
+            {
+                cookie = self.ensure_session(true).await?;
+                continue;
+            }
+            let body = self
+                .read_limited(response, MAX_PAGE, "resposta do site de até 8 MiB")
+                .await?;
+            return Ok(SiteResponse {
+                status: status.as_u16(),
+                location,
+                body,
+            });
+        }
+        Err(self.login_error("o site não reconheceu a sessão"))
+    }
+}
+
+/// O site deixou de reconhecer a sessão: 401, 419 (o token CSRF do Laravel
+/// expirou com ela) ou redirect para a página de login.
+fn session_lost(status: reqwest::StatusCode, location: Option<&str>) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED
+        || status.as_u16() == 419
+        || (status.is_redirection() && location.is_some_and(|l| l.contains("/login")))
+}
+
+impl CardigannClient {
+    /// Uma requisição de [`Indexer::site_request`]: como o JavaScript do site a
+    /// faz (`Accept: application/json`, `X-Requested-With`, `X-XSRF-TOKEN` do
+    /// cookie), na vez do orçamento de taxa do indexador.
+    async fn send_site(
+        &self,
+        url: &Url,
+        site: &SiteRequest,
+        cookie: Option<&HeaderValue>,
+    ) -> Result<reqwest::Response, IndexerError> {
+        let headers = self.plain_headers();
+        // Sem o cookie XSRF (sessão por cookie fixo, ou o site não o deixou no
+        // login), uma página do site o deixa; o POST sem ele dá 419.
+        if site.post && self.xsrf_token(url).is_none() {
+            drop(self.get_with(self.base.clone(), cookie, &headers).await?);
+        }
+        self.budget.acquire().await;
+        let mut request = if site.post {
+            self.http.post(url.clone())
+        } else {
+            self.http.get(url.clone())
+        };
+        for (name, value) in &headers {
+            request = request.header(name, value);
+        }
+        request = request
+            .header("Accept", "application/json")
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header(REFERER, self.base.as_str());
+        if let Some(token) = self.xsrf_token(url) {
+            request = request.header("X-XSRF-TOKEN", token);
+        }
+        if let Some(cookie) = cookie {
+            request = request.header(COOKIE, cookie.clone());
+        }
+        request = match &site.body {
+            SiteBody::Empty => request,
+            SiteBody::Json(json) => request
+                .header(CONTENT_TYPE, "application/json")
+                .body(json.clone()),
+            SiteBody::Multipart(parts) => request
+                .header(
+                    CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={BOUNDARY}"),
+                )
+                .body(encode_multipart(parts)),
+        };
+        self.send(request).await
     }
 }
 

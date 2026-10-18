@@ -15,6 +15,7 @@
 //! tirados de qualquer mensagem de erro gravada ([`redact`]).
 
 pub(crate) mod adapt;
+pub(crate) mod amigos;
 pub(crate) mod folder;
 pub(crate) mod imgbb;
 pub(crate) mod name_check;
@@ -1012,6 +1013,23 @@ fn generated_subtitles(
 /// O laudo como vai ao banco, com o nome de cada faixa a extrair
 /// (`adaptations[].faixa`): a tela diz "a partir da faixa 3 (Português -
 /// Brasil)".
+/// O laudo como vai ao banco: o de [`report_value`] mais o tipo do pacote
+/// (`filme`, `episodio` ou `temporada`), que o envio pelo site usa para
+/// escolher a categoria.
+fn report_json(report: &Report, facts: &rules::Facts, main: &str) -> Result<Value> {
+    let mut value = report_value(report, &facts.videos, main)?;
+    value["tipo"] = json!(kind_name(facts.kind));
+    Ok(value)
+}
+
+pub(crate) const fn kind_name(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Movie => "filme",
+        Kind::Episode => "episodio",
+        Kind::Season => "temporada",
+    }
+}
+
 fn report_value(report: &Report, videos: &[ProbedVideo], main: &str) -> Result<Value> {
     let mut value = serde_json::to_value(report)?;
     // O que a tela mostra ao lado dos botões de captura, e a duração que a
@@ -1845,7 +1863,7 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
         .save_launch_report(
             &job.hash,
             &indexer,
-            &report_value(&report, &facts.videos, &main.path)?,
+            &report_json(&report, &facts, &main.path)?,
         )
         .await?;
     if report.verdict == Verdict::Inelegivel {
@@ -1908,7 +1926,7 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
         .save_launch_report(
             &job.hash,
             &indexer,
-            &report_value(&report, &facts.videos, &main.path)?,
+            &report_json(&report, &facts, &main.path)?,
         )
         .await?;
     store
@@ -2898,6 +2916,7 @@ mod tests {
             sent_at: None,
             adapted_path: None,
             site_hash: None,
+            site_id: None,
             adapted_layout: None,
         }
     }
@@ -3153,6 +3172,7 @@ mod tests {
             sent_at: None,
             adapted_path: Some("/media/lancamentos/bj/Filme".into()),
             site_hash: None,
+            site_id: None,
             adapted_layout: Some(json!([
                 ["Filme/Filme.mkv", 10],
                 ["Filme/Filme.en.srt", 1],
