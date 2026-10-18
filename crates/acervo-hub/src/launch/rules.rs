@@ -477,13 +477,6 @@ pub fn check(site: Site, facts: &Facts) -> Report {
     }
 }
 
-/// O tipo de áudio do pacote, pelo vídeo principal, como as regras o veem.
-/// O laudo o grava para o envio pelo site escolher a opção de áudio.
-#[must_use]
-pub(crate) fn package_audio(facts: &Facts) -> Option<AudioKind> {
-    Context::new(facts, Site::Amigos).audio
-}
-
 /// Os fatos mais o que se deriva deles uma vez só.
 struct Context<'a> {
     facts: &'a Facts,

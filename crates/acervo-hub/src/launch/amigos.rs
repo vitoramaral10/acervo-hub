@@ -196,14 +196,12 @@ pub(crate) struct Choice {
 
 /// Escolhe a opção de cada lista como o formulário faz: gênero e idioma pelo
 /// IMDB, o resto pelo `MediaInfo`, o primeiro nome sugerido que bate com uma
-/// opção. `audio` é o nome da opção de áudio que o laudo do pacote já sabe
-/// (Dual-Audio, Dublado, Legendado, Nacional): vale mais que a sugestão do
-/// `MediaInfo`, que diz "Original" para o legendado.
+/// opção. `dublado` é a regra 3.9: Dual sem legenda PT vai como Dublado.
 pub(crate) fn choose(
     profile: &Profile,
     media: &MediaRead,
     lookup: &Lookup,
-    audio: Option<&str>,
+    dublado: bool,
 ) -> Choice {
     let mut ids = Vec::new();
     let mut shown = Vec::new();
@@ -223,7 +221,7 @@ pub(crate) fn choose(
                         .unwrap_or_default(),
                 )
                 .collect(),
-            "audio_channels" if audio.is_some() => audio.map(str::to_owned).into_iter().collect(),
+            "audio_channels" if dublado => vec!["Dublado".to_owned()],
             kind => media.attributes.get(kind).cloned().unwrap_or_default(),
         };
         let find = |name: &String| {
@@ -326,8 +324,7 @@ pub(crate) struct Package {
     pub(crate) imdb_id: String,
     pub(crate) mediainfo: String,
     pub(crate) description: String,
-    /// A opção de áudio pelo laudo; `None` em pacote de antes do laudo dizer.
-    pub(crate) audio: Option<&'static str>,
+    pub(crate) dublado: bool,
     pub(crate) has_subtitle_file: bool,
     pub(crate) screenshots: usize,
 }
@@ -371,7 +368,6 @@ pub(crate) fn package(
     if mediainfo.is_empty() {
         bail!("o pacote não tem o relatório do MediaInfo: prepare de novo");
     }
-    // 3.9: Dual sem legenda PT vai como Dublado.
     let dublado = launch
         .report
         .get("checks")
@@ -389,30 +385,10 @@ pub(crate) fn package(
         imdb_id,
         mediainfo,
         description: field("descricao"),
-        audio: if dublado {
-            Some("Dublado")
-        } else {
-            launch
-                .report
-                .get("audio")
-                .and_then(Value::as_str)
-                .and_then(audio_option)
-        },
+        dublado,
         has_subtitle_file,
         screenshots,
     })
-}
-
-/// O nome da opção de áudio do Amigos para o tipo de áudio do laudo
-/// (`report.audio`, o `AudioKind` em `snake_case`).
-fn audio_option(kind: &str) -> Option<&'static str> {
-    match kind {
-        "dual" => Some("Dual-Audio"),
-        "dublado" => Some("Dublado"),
-        "legendado" => Some("Legendado"),
-        "nacional" => Some("Nacional"),
-        _ => None,
-    }
 }
 
 /// Junta pacote, formulário e as duas leituras do site no rascunho.
@@ -423,7 +399,7 @@ pub(crate) fn draft_from(
     lookup: &Lookup,
 ) -> Draft {
     let profile = &form.profile;
-    let choice = choose(profile, media, lookup, package.audio);
+    let choice = choose(profile, media, lookup, package.dublado);
     let mut missed = choice.missed.clone();
     let want_movie = package.slug == "filmes";
     if want_movie != (lookup.kind == "movie") {
@@ -821,7 +797,7 @@ mod tests {
             imdb_id: "tt0114709".into(),
             mediainfo: "General\n...".into(),
             description: "[b]Sinopse[/b]".into(),
-            audio: Some("Dual-Audio"),
+            dublado: false,
             has_subtitle_file: false,
             screenshots: 4,
         }
@@ -864,7 +840,7 @@ mod tests {
     #[test]
     fn escolhe_como_o_formulario_pelo_nome_sem_acento() {
         let form = form_from_page(PAGE, "filmes").unwrap();
-        let choice = choose(&form.profile, &media(), &lookup(), None);
+        let choice = choose(&form.profile, &media(), &lookup(), false);
         // "Comedia" sem acento casa com "Comédia"; "Família" não é opção.
         assert_eq!(choice.ids, vec![225, 206, 207, 1, 59, 199, 195]);
         assert!(choice.missed.is_empty(), "{:?}", choice.missed);
@@ -880,30 +856,9 @@ mod tests {
     #[test]
     fn regra_3_9_troca_dual_por_dublado() {
         let form = form_from_page(PAGE, "filmes").unwrap();
-        let choice = choose(&form.profile, &media(), &lookup(), Some("Dublado"));
+        let choice = choose(&form.profile, &media(), &lookup(), true);
         assert!(choice.ids.contains(&200));
         assert!(!choice.ids.contains(&199));
-    }
-
-    #[test]
-    fn legendado_pelo_laudo_vale_mais_que_o_original_do_mediainfo() {
-        let form = form_from_page(PAGE, "filmes").unwrap();
-        let mut read = media();
-        // O MediaInfo do site chama de "Original" o vídeo sem áudio PT.
-        read.attributes
-            .insert("audio_channels".into(), vec!["Original".into()]);
-        let mut legendado = package();
-        legendado.audio = Some("Legendado");
-        let draft = draft_from(&legendado, &form, &read, &lookup());
-        assert!(draft.faltando.is_empty(), "{:?}", draft.faltando);
-        assert!(draft.campos.contains(&Chosen {
-            campo: "Áudio".into(),
-            valor: "Legendado".into()
-        }));
-        // Legendado pede o campo de legenda.
-        assert_eq!(draft.legenda.as_deref(), Some("none"));
-        assert_eq!(audio_option("legendado"), Some("Legendado"));
-        assert_eq!(audio_option("outro"), None);
     }
 
     #[test]
@@ -913,7 +868,7 @@ mod tests {
         read.attributes
             .insert("resolution".into(), vec!["WEBRip".into()]);
         read.attributes.remove("video_codec");
-        let choice = choose(&form.profile, &read, &lookup(), None);
+        let choice = choose(&form.profile, &read, &lookup(), false);
         assert_eq!(choice.missed.len(), 2, "{:?}", choice.missed);
         assert!(choice.missed[0].contains("WEBRip"));
         assert!(choice.missed[1].contains("sem sugestão"));

@@ -1014,15 +1014,11 @@ fn generated_subtitles(
 /// (`adaptations[].faixa`): a tela diz "a partir da faixa 3 (Português -
 /// Brasil)".
 /// O laudo como vai ao banco: o de [`report_value`] mais o tipo do pacote
-/// (`filme`, `episodio` ou `temporada`) e o tipo de áudio (`dual`, `dublado`,
-/// `legendado`, `nacional`), que o envio pelo site usa para escolher a
-/// categoria e a opção de áudio.
+/// (`filme`, `episodio` ou `temporada`), que o envio pelo site usa para
+/// escolher a categoria.
 fn report_json(report: &Report, facts: &rules::Facts, main: &str) -> Result<Value> {
     let mut value = report_value(report, &facts.videos, main)?;
     value["tipo"] = json!(kind_name(facts.kind));
-    if let Some(audio) = rules::package_audio(facts) {
-        value["audio"] = json!(audio);
-    }
     Ok(value)
 }
 

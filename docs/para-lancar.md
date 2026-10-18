@@ -495,10 +495,9 @@ no destino. Faz três leituras, sem publicar nada:
 3. `POST /torrents/lookup` (`{imdb_id}`): tipo, título, ano, gêneros, idioma
    original e a capa já hospedada (`cover.path`).
 
-O áudio vem do laudo (`report.audio`: `dual`, `dublado`, `legendado`,
-`nacional`, gravado no preparo), e não do `MediaInfo` do site, que chama de
-"Original" o vídeo só legendado. Com a regra 3.9, vai Dublado. Pacote de antes
-do campo usa a sugestão do site.
+O áudio é o que o `MediaInfo` do site sugere. Filme só legendado vai como
+"Original" no Amigos, e isso está certo. A única troca é a da regra 3.9: Dual
+sem legenda PT vai Dublado.
 
 A escolha de cada lista é a do próprio formulário: o primeiro nome sugerido
 que, normalizado (sem acento, minúsculo, sem espaço nas pontas), é igual ao de
