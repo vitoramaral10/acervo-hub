@@ -192,7 +192,10 @@ distingue pt-BR de pt-PT: aceitar os dois). "Dual" = áudio PT + original.
   `H265`, `x264`, `x265`, `AVC`, `HEVC`, `AV1`, `VC-1`, `MPEG-2`; `h264`/`h265`
   minúsculos também passam (comuns em WEB-DL), mas `X264`/`X265` com X
   maiúsculo falham ("o nome usa 'X265' em maiúsculas; o padrão é 'x265'"),
-  como no Toy Story ...X265-IAMABLE, recusado pelo site. Parser puro em
+  como no Toy Story ...X265-IAMABLE, recusado pelo site. O codec colado num
+  `-GRUPO` que ainda é seguido de mais segmentos com ponto (release refeito,
+  `…x264-DON.DUAL-xprince00.mkv`) o site não lê: falta o codec de vídeo. Isso
+  foi visto no torrent 73347. Colado no grupo final (`H.264-SJB.mkv`), conta. Parser puro em
   `name_check::standard_name_gaps`; é uma segunda linha 4.0.1, independente da
   conferência contra o arquivo.
 - **3.3** obra não falada em português sem áudio PT e sem legenda PT
@@ -491,6 +494,11 @@ no destino. Faz três leituras, sem publicar nada:
    altura, legenda (`embedded`, `separate` ou `none`) e o relatório.
 3. `POST /torrents/lookup` (`{imdb_id}`): tipo, título, ano, gêneros, idioma
    original e a capa já hospedada (`cover.path`).
+
+O áudio vem do laudo (`report.audio`: `dual`, `dublado`, `legendado`,
+`nacional`, gravado no preparo), e não do `MediaInfo` do site, que chama de
+"Original" o vídeo só legendado. Com a regra 3.9, vai Dublado. Pacote de antes
+do campo usa a sugestão do site.
 
 A escolha de cada lista é a do próprio formulário: o primeiro nome sugerido
 que, normalizado (sem acento, minúsculo, sem espaço nas pontas), é igual ao de
