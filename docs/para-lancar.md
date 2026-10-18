@@ -212,6 +212,12 @@ distingue pt-BR de pt-PT: aceitar os dois). "Dual" = áudio PT + original.
   legenda → Ok. Não se aplica a quem não é Dual.
 - **4.2.1** duplicidade contra os releases do destino:
   - destino tem Dual e este é só dublado ou só legendado → Fail;
+  - release do destino sem resolução no título conta como de resolução
+    desconhecida e entra na comparação. O site monta o título pelas
+    etiquetas, e um 4K HDR pode vir só com "HDR"; sem resolução, o parser
+    lia 480p e o duplicado passava. Foi o caso do torrent 52763, que levou a
+    moderação a apagar um envio do acervo. As outras regras que comparam
+    resolução (4.14 e 4.1.10.2) não mudam;
   - entre os de mesma resolução, fonte e tipo de áudio (dual/dublado/
     legendado), na ordem:
     - canais: este é 2.0 e o destino tem 5.1/7.1 → Fail (o 2.0 é
