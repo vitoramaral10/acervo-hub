@@ -1048,7 +1048,10 @@ async fn upload(
         .and_then(Value::as_str)
         .filter(|r| !r.trim().is_empty())
         .unwrap_or("lancamento");
-    let parts = super::amigos::parts(&draft, torrent, &format!("{release}.torrent"), &screenshots);
+    // O Amigos só aceita na descrição imagem hospedada nele: as capturas do
+    // site entram no lugar das do `ImgBB`.
+    let parts =
+        super::amigos::upload_parts(&draft, torrent, &format!("{release}.torrent"), &screenshots);
     // A marca vai ao banco antes do POST: se o acervo cai com o envio no ar,
     // ele pode ter chegado ao site, e a marca impede outro por cima.
     store
@@ -1134,7 +1137,7 @@ async fn host_screenshots(
     web: &Web,
     launch: &Launch,
     count: usize,
-) -> Result<Vec<String>, Response> {
+) -> Result<Vec<super::amigos::Shot>, Response> {
     let (relative, video) = source_video(web, &launch.hash).await?;
     let recorded = launch
         .report
@@ -1166,10 +1169,10 @@ async fn host_screenshots(
             capture_stem(&relative),
             format.extension()
         );
-        let path = super::amigos::host_screenshot(&web.catalog, image, &name, format.mime())
+        let shot = super::amigos::host_screenshot(&web.catalog, image, &name, format.mime())
             .await
             .map_err(|e| site_error(&e))?;
-        paths.push(path);
+        paths.push(shot);
     }
     Ok(paths)
 }
@@ -2572,6 +2575,7 @@ mod tests {
             };
             let reply = |status: u16, location: Option<&str>, body: Vec<u8>| {
                 Ok(acervo_indexers::SiteResponse {
+                    url: format!("https://site.invalid{}", request.path),
                     status,
                     location: location.map(str::to_owned),
                     body,
@@ -2582,7 +2586,7 @@ mod tests {
                 "/torrents/upload" => reply(200, None, page.as_bytes().to_vec()),
                 "/torrents/mediainfo" => reply(200, None, br#"{"width":320,"height":240,"subtitle":"none","report":"General","attributes":{"resolution":["WEB-DL"],"audio_channels":["Dual-Audio"]}}"#.to_vec()),
                 "/torrents/lookup" => reply(200, None, format!(r#"{{"type":"{}","title":"Filme (Film)","year":2024,"genres":[],"language":"Inglês","cover":{{"path":"capa.webp","url":"/x"}}}}"#, self.lookup_kind).into_bytes()),
-                "/torrents/screenshots" => reply(200, None, format!(r#"{{"path":"captura-{shots}.webp","url":"/c"}}"#).into_bytes()),
+                "/torrents/screenshots" => reply(200, None, format!(r#"{{"path":"captura-{shots}.webp","url":"/storage/captura-{shots}.webp"}}"#).into_bytes()),
                 "/torrents" => match self.publish_status {
                     0 => reply(302, Some("https://site.invalid/torrents/77"), Vec::new()),
                     422 => reply(422, None, r#"{"errors":{"name":["Nome fora do padrão"]}}"#.as_bytes().to_vec()),
@@ -2652,7 +2656,7 @@ mod tests {
                 &json!({
                     "release": "Filme.2024.1080p.WEB-DL", "titulo": "Filme (Film)", "ano": "2024",
                     "imdb": "https://www.imdb.com/title/tt1234567/", "mediainfo": "General",
-                    "descricao": "[b]Sinopse[/b]",
+                    "descricao": "[b]Sinopse[/b]\n\n[b]Capturas[/b]\n[img]https://i.ibb.co/x/1.png[/img]",
                 }),
             )
             .await
@@ -2707,9 +2711,11 @@ mod tests {
             "attribute_ids[0]=59",
             "attribute_ids[1]=199",
             "subtitle=none",
+            "description=[b]Sinopse[/b]\n\n[b]Capturas[/b]\n[img]https://site.invalid/storage/captura-1.webp[/img]",
         ] {
             assert!(sent.contains(part), "{part} em {sent}");
         }
+        assert!(!sent.contains("ibb.co"), "{sent}");
 
         // Já enviado: não envia de novo.
         let (status, body) = call(&http, reqwest::Method::POST, &url).await;

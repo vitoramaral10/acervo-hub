@@ -1886,6 +1886,7 @@ impl Indexer for CardigannClient {
                 .read_limited(response, MAX_PAGE, "resposta do site de até 8 MiB")
                 .await?;
             return Ok(SiteResponse {
+                url: url.to_string(),
                 status: status.as_u16(),
                 location,
                 body,

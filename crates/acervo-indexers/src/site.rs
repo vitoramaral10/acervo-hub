@@ -101,6 +101,9 @@ impl SiteRequest {
 /// (o envio responde com o redirect para a página do torrent criado).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SiteResponse {
+    /// A URL absoluta que foi pedida: base para os caminhos relativos que o
+    /// site devolve (`/storage/...` das imagens hospedadas).
+    pub url: String,
     pub status: u16,
     pub location: Option<String>,
     pub body: Vec<u8>,
