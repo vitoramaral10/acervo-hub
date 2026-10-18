@@ -232,6 +232,11 @@ distingue pt-BR de pt-PT: aceitar os dois). "Dual" = áudio PT + original.
       item abaixo;
     - tamanho a menos de 10% → Fail "duplicado provável"; senão Warn
       "avaliar duplicidade";
+  - só a qualidade difere (outra fonte: BluRay contra WEB-DL), mas com a
+    mesma resolução, o mesmo áudio, o mesmo codec de vídeo (ou um codec
+    desconhecido) e tamanho a menos de 10% → Warn. A regra deixa a decisão com
+    a staff, e na prática ela apaga como duplicado: foi o caso do torrent
+    58396;
   - nada parecido → Ok.
 - **4.14** fonte inferior a WEB-DL (WEBRip, HDTV, CAM, TS...) com WEB-DL Dual
   no destino → Fail.
