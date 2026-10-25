@@ -781,6 +781,36 @@ async fn exportar_torrent_devolve_os_bytes_e_status_de_erro_vira_erro_com_o_cami
 }
 
 #[tokio::test]
+async fn sessao_derrubada_faz_login_de_novo_e_repete_o_pedido() {
+    let server = MockServer::start().await;
+    let cliente = sessao(&server).await;
+    // A 5.3 derruba a sessão mais antiga quando o mesmo usuário loga muito:
+    // o primeiro pedido volta 403, o segundo, já com sessão nova, passa.
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrents/trackers"))
+        .respond_with(ResponseTemplate::new(403))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrents/trackers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+
+    assert!(cliente.trackers("a1b2").await.unwrap().is_empty());
+    let logins = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/api/v2/auth/login")
+        .count();
+    assert_eq!(logins, 2, "um login na abertura e outro depois do 403");
+}
+
+#[tokio::test]
 async fn trackers_trazem_estado_e_mensagem() {
     let server = MockServer::start().await;
     let cliente = sessao(&server).await;
