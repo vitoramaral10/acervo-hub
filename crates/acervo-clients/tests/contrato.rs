@@ -781,6 +781,45 @@ async fn exportar_torrent_devolve_os_bytes_e_status_de_erro_vira_erro_com_o_cami
 }
 
 #[tokio::test]
+async fn sessao_derrubada_faz_login_de_novo_e_repete_o_pedido() {
+    let server = MockServer::start().await;
+    // Cada login entrega uma sessão diferente; a repetição tem de ir com a
+    // nova, não com a derrubada.
+    for (sid, prioridade) in [("velho", 1), ("novo", 2)] {
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .respond_with(
+                ResponseTemplate::new(204)
+                    .insert_header("set-cookie", format!("SID={sid}; path=/")),
+            )
+            .up_to_n_times(1)
+            .with_priority(prioridade)
+            .mount(&server)
+            .await;
+    }
+    let cliente = QbitClient::login(&server.uri(), "vigia", "segredo", Duration::from_secs(5))
+        .await
+        .expect("login aceito");
+    // A 5.3 derruba a sessão mais antiga quando o mesmo usuário loga muito.
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrents/trackers"))
+        .and(header("cookie", "SID=velho"))
+        .respond_with(ResponseTemplate::new(403))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/torrents/trackers"))
+        .and(header("cookie", "SID=novo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    assert!(cliente.trackers("a1b2").await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn trackers_trazem_estado_e_mensagem() {
     let server = MockServer::start().await;
     let cliente = sessao(&server).await;
