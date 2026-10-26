@@ -428,6 +428,18 @@ pub(crate) const SITE_TAGS: [&str; 9] = [
     "WOLVERDONFILMES",
 ];
 
+/// Grupos que lançam o próprio DUAL (`…DUAL-PiA`, `…DUAL-ASC`): com eles, a
+/// única tag depois do DUAL é a do grupo do release (Let It Snow, aceito
+/// pela staff; ASC é o grupo do próprio site, nos exemplos da 16.4).
+const OWN_DUAL: [&str; 2] = ["PiA", "ASC"];
+
+/// O corpo do nome termina em DUAL ou `MULTi`, logo antes da tag.
+fn ends_with_language(body: &str) -> bool {
+    body.rsplit(['.', ' ', '_'])
+        .next()
+        .is_some_and(|last| last.eq_ignore_ascii_case("dual") || last.eq_ignore_ascii_case("multi"))
+}
+
 /// Termos técnicos que o nome original pode trazer e o nome no padrão refaz
 /// a partir do arquivo, sem os dígitos de canais colados (`DDP5`, `AAC2`).
 const TECHNICAL: [&str; 62] = [
@@ -897,6 +909,17 @@ pub(crate) fn standard(subject: &Subject<'_>) -> Result<Standard, Vec<String>> {
     {
         gaps.push(format!(
             "a única tag é {tag}, que só acrescenta o áudio PT ao release de outro grupo: a tag original sumiu, e relançar assim é retag (15.2.26)"
+        ));
+    } else if tags.second.is_none()
+        && let Some(tag) = tags.first.as_deref()
+        && ends_with_language(body)
+        && !OWN_DUAL.iter().any(|g| g.eq_ignore_ascii_case(tag))
+    {
+        // `…H.265.DUAL-TOSSATO`: a única tag colada no DUAL é, quase sempre,
+        // de quem acrescentou o áudio PT ao release de um grupo estrangeiro e
+        // tirou a tag dele (Schumacher 94, segurado em 26/10).
+        gaps.push(format!(
+            "a única tag ({tag}) vem logo depois do DUAL/MULTi: é a forma de quem acrescenta o áudio PT ao release de outro grupo e apaga a tag dele, e relançar assim é retag (15.2.26)"
         ));
     }
 
@@ -1690,6 +1713,38 @@ mod tests {
         assert_eq!(clean_title("Straße"), "Strasse");
         assert_eq!(clean_title("Spider-Man:"), "Spider-Man");
         assert_eq!(clean_title("–"), "");
+    }
+
+    #[test]
+    fn unica_tag_colada_no_dual_e_retag() {
+        let media = media(
+            video("hevc", 3840, 2160, Hdr::DolbyVision),
+            vec![
+                track(Language::English, "eac3", 6),
+                track(Language::Portuguese, "eac3", 6),
+            ],
+        );
+        let run = |original| {
+            standard(&Subject {
+                original,
+                media: &media,
+                original_language: Some(Language::English),
+                series: false,
+                dual: true,
+                brrip: false,
+                catalog_title: None,
+                year: None,
+            })
+        };
+        // Schumacher 94, 26/10: TOSSATO não está na lista, mas a forma diz.
+        let gaps = run("Schumacher.94.2026.2160p.NF.WEB-DL.DDP5.1.Atmos.DV.HDR.H.265.DUAL-TOSSATO")
+            .unwrap_err();
+        assert!(gaps[0].contains("retag"), "{gaps:?}");
+        // Quem lança o próprio DUAL passa; duas tags também.
+        assert!(run("Let.It.Snow.2019.1080p.NF.WEB-DL.DD5.1.H.264.DUAL-PiA").is_ok());
+        assert!(run("Filme.2024.1080p.WEB-DL.DDP5.1.H.264-ASC.DUAL-SuaTag").is_ok());
+        // A tag sem DUAL antes (série nacional do mesmo nome) passa.
+        assert!(run("Filme.2024.1080p.AMZN.WEB-DL.DDP5.1.H.264-TOSSATO").is_ok());
     }
 
     #[test]

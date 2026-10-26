@@ -220,7 +220,8 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
   Única tag de quem só acrescenta o áudio PT ao release de outro grupo
   (`naming::DUAL_ADDERS`: shaggy, RK, GMN, Lannister...) → lacuna: a tag
   original sumiu, e relançar é retag (Big Hero, `x264-shaggy`, removido em
-  26/10).
+  26/10). Única tag colada no `DUAL`/`MULTi` (`…H.265.DUAL-TOSSATO`) também,
+  salvo os grupos que lançam o próprio DUAL (`naming::OWN_DUAL`: PiA, ASC).
   O que o padrão pede e nenhum dos dois diz é lacuna → Fail: filme sem ano,
   "WEB" sem `H.264`/`x264` no nome (não dá para separar WEB-DL de WEBRip),
   nome sem source, codec sem grafia (AV1 fora de WEB-DL, 15.2.4). Sigla de
