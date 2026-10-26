@@ -36,6 +36,10 @@ const SERIES_MIN_SIZE_GAP: u64 = 2 * 1024 * 1024 * 1024;
 const BJ_SIMILAR_SIZE_TOLERANCE: f64 = 0.30;
 /// Máximo de legendas que acompanham um filme no BJ (4.2.1.10).
 const BJ_MAX_SUBTITLES: usize = 4;
+/// Teto de arquivos por torrent no BJ (4.1.10), fora Blu-ray em M2TS.
+const BJ_MAX_FILES: usize = 999;
+/// Teto de tamanho de um torrent no BJ (4.1.8).
+const BJ_MAX_SIZE: u64 = 200 * 1024 * 1024 * 1024;
 
 const VIDEO_EXTENSIONS: [&str; 5] = ["mkv", "mp4", "avi", "m2ts", "ts"];
 const SUBTITLE_EXTENSIONS: [&str; 5] = ["srt", "ass", "ssa", "sub", "idx"];
@@ -1219,6 +1223,96 @@ fn bj(ctx: &Context<'_>, checks: &mut Vec<Check>) {
     checks.extend(dual_already_released(ctx));
     checks.push(duplicate(ctx, Site::Bj, "4.2.1.2"));
     checks.push(archives(ctx, "4.1.7", "o BJ"));
+    checks.push(torrent_limits(ctx));
+    checks.extend(mixed_videos(ctx));
+}
+
+/// 4.1.8 / 4.1.10: até 999 arquivos (Blu-ray em M2TS é exceção) e até
+/// 200 GB. Os arquivos não mudam, então passar do teto não tem conserto.
+fn torrent_limits(ctx: &Context<'_>) -> Check {
+    const RULE: &str = "4.1.8 / 4.1.10";
+    let files = ctx.facts.files.len();
+    let bluray = ctx.facts.files.iter().any(|f| has_extension(&f.path, &["m2ts"]));
+    if files > BJ_MAX_FILES && !bluray {
+        return Check::fail(
+            RULE,
+            format!("{files} arquivos: o BJ aceita no máximo {BJ_MAX_FILES} por torrent"),
+        );
+    }
+    if ctx.size > BJ_MAX_SIZE {
+        return Check::fail(
+            RULE,
+            format!(
+                "{} GiB: o BJ aceita no máximo 200 GiB por torrent",
+                ctx.size / (1024 * 1024 * 1024)
+            ),
+        );
+    }
+    Check::ok(RULE, "dentro do limite de arquivos e de tamanho")
+}
+
+/// 4.1.11: os vídeos principais (sem amostra nem extras) não misturam
+/// resolução nem áudio. Ter ou não áudio PT reprova; Dual ao lado de dublado
+/// é aviso, porque uma faixa sem tag de idioma já basta para separá-los.
+fn mixed_videos(ctx: &Context<'_>) -> Option<Check> {
+    const RULE: &str = "4.1.11";
+    let size_of = |path: &str| {
+        ctx.facts
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .map_or(0, |f| f.size)
+    };
+    let median = median(ctx.facts.videos.iter().map(|v| size_of(&v.path)).collect());
+    let main: Vec<&ProbedVideo> = ctx
+        .facts
+        .videos
+        .iter()
+        .filter(|v| {
+            let in_extras = parent(&v.path)
+                .split('/')
+                .any(|dir| EXTRA_FOLDERS.contains(&dir.to_lowercase().as_str()));
+            !in_extras && !is_sample(file_name(&v.path), size_of(&v.path), median)
+        })
+        .collect();
+    if main.len() < 2 {
+        return None;
+    }
+    let mut resolutions: Vec<u16> = main
+        .iter()
+        .filter_map(|v| v.media.video.as_ref().map(resolution_of))
+        .filter(|r| *r > 0)
+        .collect();
+    resolutions.sort_unstable();
+    resolutions.dedup();
+    if resolutions.len() > 1 {
+        let shown: Vec<String> = resolutions.iter().map(|r| format!("{r}p")).collect();
+        return Some(Check::fail(
+            RULE,
+            format!(
+                "vídeos em {}: o BJ não aceita resoluções misturadas no mesmo torrent",
+                shown.join(" e ")
+            ),
+        ));
+    }
+    let kinds: Vec<AudioKind> = main
+        .iter()
+        .map(|v| audio_kind(&v.media, ctx.facts.original_language))
+        .collect();
+    let first = kinds[0];
+    let Some(other) = kinds.iter().copied().find(|k| *k != first) else {
+        return Some(Check::ok(RULE, "vídeos na mesma resolução e com o mesmo áudio"));
+    };
+    let message = format!(
+        "vídeos {} ao lado de vídeos {}: o BJ não aceita áudios misturados no mesmo torrent",
+        first.label(),
+        other.label()
+    );
+    Some(if first == AudioKind::Legendado || other == AudioKind::Legendado {
+        Check::fail(RULE, message)
+    } else {
+        Check::warn(RULE, format!("{message}; confira as faixas"))
+    })
 }
 
 /// 4.1.10.2: só MKV.
@@ -1657,15 +1751,36 @@ fn episode_beside_season(ctx: &Context<'_>) -> Check {
 }
 
 /// 4.1.20: com um Dual lançado, só entram Duais. Vale para qualquer
-/// resolução, como o texto da regra.
+/// resolução, como o texto da regra. Sem Dual, legendado só entra enquanto
+/// não há dublado, e dublado só enquanto não há legenda PT (um legendado no
+/// BJ indica que há, mas ela pode ser ruim: aviso).
 fn dual_already_released(ctx: &Context<'_>) -> Option<Check> {
     const RULE: &str = "4.1.20";
     let audio = ctx.audio?;
-    let dual = ctx
-        .facts
-        .destination
-        .iter()
-        .find(|d| d.audio == AudioKind::Dual)?;
+    let find = |kind: AudioKind| ctx.facts.destination.iter().find(|d| d.audio == kind);
+    let Some(dual) = find(AudioKind::Dual) else {
+        return match audio {
+            AudioKind::Legendado => find(AudioKind::Dublado).map(|d| {
+                Check::fail(
+                    RULE,
+                    format!(
+                        "o BJ já tem a versão dublada (\"{}\"): legendado só entra enquanto não há dublagem PT",
+                        d.title
+                    ),
+                )
+            }),
+            AudioKind::Dublado => find(AudioKind::Legendado).map(|d| {
+                Check::warn(
+                    RULE,
+                    format!(
+                        "o BJ já tem a versão legendada (\"{}\"): dublado só entra enquanto não há legenda PT; prefira um Dual",
+                        d.title
+                    ),
+                )
+            }),
+            AudioKind::Dual | AudioKind::Nacional => None,
+        };
+    };
     Some(if audio == AudioKind::Dual {
         Check::ok(RULE, "o BJ já tem Dual e este também é Dual")
     } else if audio == AudioKind::Nacional {
@@ -2702,6 +2817,71 @@ mod tests {
             m.audio = vec![audio(Language::Unknown, "pt-br"), eng()];
         });
         assert_eq!(status(Site::Bj, &facts, "4.2.1.14.1"), Some(Status::Ok));
+    }
+
+    // --- BJ r8: limites, mistura e dublado/legendado ---
+
+    #[test]
+    fn bj_reprova_mais_de_999_arquivos_fora_do_bluray() {
+        let mut facts = movie();
+        for n in 0..BJ_MAX_FILES {
+            facts.files.push(file(&format!("Filme/extra{n}.nfo"), 1));
+        }
+        assert_eq!(status(Site::Bj, &facts, "4.1.8 / 4.1.10"), Some(Status::Fail));
+        facts.files.push(file("Filme/BDMV/STREAM/00001.m2ts", GB));
+        assert_eq!(status(Site::Bj, &facts, "4.1.8 / 4.1.10"), Some(Status::Ok));
+    }
+
+    #[test]
+    fn bj_reprova_torrent_acima_de_200_gib() {
+        let mut facts = movie();
+        facts.files[0].size = BJ_MAX_SIZE + 1;
+        assert_eq!(status(Site::Bj, &facts, "4.1.8 / 4.1.10"), Some(Status::Fail));
+    }
+
+    #[test]
+    fn bj_reprova_temporada_com_resolucao_misturada() {
+        let mut facts = season(3);
+        set_video(&mut facts, |m| m.video = Some(video("h264", 1280, 720, Hdr::Sdr)));
+        assert_eq!(status(Site::Bj, &facts, "4.1.11"), Some(Status::Fail));
+    }
+
+    #[test]
+    fn bj_mistura_de_audio_reprova_so_quando_falta_pt() {
+        let mut facts = season(3);
+        assert_eq!(status(Site::Bj, &facts, "4.1.11"), Some(Status::Ok));
+        set_video(&mut facts, |m| m.audio = vec![por()]);
+        assert_eq!(status(Site::Bj, &facts, "4.1.11"), Some(Status::Warn));
+        set_video(&mut facts, |m| m.audio = vec![eng()]);
+        assert_eq!(status(Site::Bj, &facts, "4.1.11"), Some(Status::Fail));
+    }
+
+    #[test]
+    fn bj_amostra_nao_conta_como_mistura() {
+        let mut facts = season(3);
+        let path = "Serie.S01.1080p.WEB-DL.DUAL.x264-GRP/Sample/serie.sample.mkv".to_owned();
+        facts.files.push(file(&path, GB / 50));
+        facts.videos.push(ProbedVideo {
+            path,
+            media: media("matroska,webm", video("h264", 1280, 720, Hdr::Sdr), vec![eng()]),
+        });
+        assert_eq!(status(Site::Bj, &facts, "4.1.11"), Some(Status::Ok));
+    }
+
+    #[test]
+    fn bj_legendado_nao_entra_com_dublado_lancado() {
+        let mut facts = movie();
+        set_video(&mut facts, |m| m.audio = vec![eng()]);
+        facts.destination = vec![dest("Filme 2024 720p WEB-DL Dublado x264 [por]", GB)];
+        assert_eq!(status(Site::Bj, &facts, "4.1.20"), Some(Status::Fail));
+    }
+
+    #[test]
+    fn bj_dublado_com_legendado_lancado_e_aviso() {
+        let mut facts = movie();
+        set_video(&mut facts, |m| m.audio = vec![por()]);
+        facts.destination = vec![dest("Filme 2024 720p WEB-DL x264", GB)];
+        assert_eq!(status(Site::Bj, &facts, "4.1.20"), Some(Status::Warn));
     }
 
     // --- Relatório ---
