@@ -301,6 +301,37 @@ struct Claims {
     unknown: Vec<String>,
 }
 
+/// Tags de quem acrescenta o áudio PT ao release de outro grupo (a segunda
+/// tag de 16.12.7), vistas nos releases de 10/2026. Como única tag, o grupo
+/// original foi apagado. O `PiA` também aparece como segunda tag, mas a staff
+/// aceitou um release dele como única tag (Let It Snow), então fica fora.
+const DUAL_ADDERS: [&str; 24] = [
+    "shaggy",
+    "shagyy",
+    "RK",
+    "GMN",
+    "Lannister",
+    "3LT0N",
+    "xprince00",
+    "C76",
+    "alfaHD",
+    "SynysteR",
+    "ASM",
+    "GoT",
+    "KABAL",
+    "LAPUMiA",
+    "THYRSO10",
+    "wastaken",
+    "GUR",
+    "Hiro360",
+    "JK",
+    "FAMG",
+    "DSB",
+    "SpartacusBR",
+    "Tontom",
+    "3LTON",
+];
+
 /// Termos técnicos que o nome original pode trazer e o nome no padrão refaz
 /// a partir do arquivo, sem os dígitos de canais colados (`DDP5`, `AAC2`).
 const TECHNICAL: [&str; 62] = [
@@ -724,6 +755,19 @@ pub(crate) fn standard(subject: &Subject<'_>) -> Result<Standard, Vec<String>> {
     {
         gaps.push(format!(
             "a tag {tag} cita outro site, o que o Amigos proíbe (1.4 e 15.1.8)"
+        ));
+    }
+    // Quem só acrescenta o áudio PT a um release de outro grupo e assina
+    // sozinho apagou a tag original: relançar com ela é retag (15.2.26),
+    // e a staff bane (Big Hero, `x264-shaggy`, 26/10).
+    if tags.second.is_none()
+        && let Some(tag) = tags
+            .first
+            .as_deref()
+            .filter(|tag| DUAL_ADDERS.iter().any(|a| a.eq_ignore_ascii_case(tag)))
+    {
+        gaps.push(format!(
+            "a única tag é {tag}, que só acrescenta o áudio PT ao release de outro grupo: a tag original sumiu, e relançar assim é retag (15.2.26)"
         ));
     }
 
@@ -1223,6 +1267,46 @@ mod tests {
                 true
             ),
             "Drops.of.God.2023.S01E01.1080p.WEB-DL.DDP5.1.H.264-G"
+        );
+    }
+
+    #[test]
+    fn tag_so_de_quem_dubla_e_retag() {
+        let media = media(
+            video("h264", 1920, 1080, Hdr::Sdr),
+            vec![
+                track(Language::English, "ac3", 6),
+                track(Language::Portuguese, "ac3", 6),
+            ],
+        );
+        // Big Hero, 26/10: removido pela staff por retag.
+        let gaps = name(
+            "Operacao.Big.Hero.2015.1080p.BluRay.x264-shaggy",
+            &media,
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(gaps[0].contains("retag"), "{gaps:?}");
+        // Como segunda tag, com o grupo original, está certo.
+        assert!(
+            name(
+                "Ted.2.2015.1080p.BluRay.x264-BLOW.DUAL-RK",
+                &media,
+                false,
+                true
+            )
+            .is_ok()
+        );
+        // O grupo que lança o próprio DUAL passa.
+        assert!(
+            name(
+                "Let.It.Snow.2019.1080p.NF.WEB-DL.DD5.1.H.264.DUAL-PiA",
+                &media,
+                false,
+                true
+            )
+            .is_ok()
         );
     }
 
