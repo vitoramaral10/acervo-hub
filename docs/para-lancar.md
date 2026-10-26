@@ -336,6 +336,12 @@ capturas saem só para baixar.
 
 ## Capturas para baixar
 
+O preparo só tira e hospeda as 4 capturas no ImgBB para o **BJ**, cuja
+descrição colada à mão as leva. No **Amigos** o passo é pulado: o envio pelo
+acervo tira as capturas do vídeo na hora e as sobe ao site, e a descrição de
+lá vai sem imagem. Em 26/10, as capturas eram de 1 a mais de 2 minutos de cada
+preparo, e o 4K DV em que o ffmpeg estoura o tempo deixava o pacote `falhou`.
+
 O formulário do Amigos tem upload de imagem próprio, e o ImgBB só serve a
 miniatura ou uma cópia reduzida no navegador; subir essa versão reduziu as
 capturas (1920×1012 em vez de 3840×2024) e a staff reclamou. Por isso:
