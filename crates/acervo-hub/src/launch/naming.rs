@@ -2,10 +2,13 @@
 //!
 //! O padrão vale mesmo que o nome original seja outro (16.1.4), e colocá-lo no
 //! padrão é a única mudança permitida, sempre mantendo a tag original
-//! (16.12.8). [`standard`] refaz o nome de um vídeo ou da pasta: título, ano
-//! ou `SxxEyy`, edição, Hybrid, REPACK, fonte, sigla de streaming e tags vêm
-//! do nome original, que é o que o arquivo não diz; resolução, áudio, HDR,
-//! HFR, codec de vídeo e DUAL/MULTi vêm do ffprobe. O que o padrão pede e
+//! (16.12.8). A grafia dela só muda quando o nome original veio todo em
+//! minúsculas e a perdeu: aí vale a conhecida do grupo, ou a caixa alta.
+//! [`standard`] refaz o nome de um vídeo ou da pasta: título e ano vêm do
+//! catálogo quando ele os tem (16.2.1, 16.2.2); `SxxEyy`, edição, Hybrid,
+//! REPACK, fonte, sigla de streaming e tags vêm do nome original, que é o que
+//! o arquivo não diz; resolução, áudio, HDR, HFR, codec de vídeo e DUAL/MULTi
+//! vêm do ffprobe. O que o padrão pede e
 //! nenhum dos dois diz (o ano, a fonte de um "WEB" sem codec) não é presumido
 //! (16.1.1): vira lacuna, e o pacote fica inelegível.
 //!
@@ -337,6 +340,33 @@ struct Claims {
     /// O que a parte técnica traz e o acervo não reconhece. Pode ser a tag de
     /// um grupo fora do lugar (`x264 FLAME DUAL-OUTRO`): descartar seria retag.
     unknown: Vec<String>,
+}
+
+/// Grupos com grafia que não é toda maiúscula, para restaurar a tag de um
+/// nome que veio todo em minúsculas.
+const TAG_CASE: [&str; 14] = [
+    "NTb",
+    "playWEB",
+    "iFT",
+    "PiA",
+    "SiGLA",
+    "TERMiNAL",
+    "KiNGS",
+    "SuccessfulCrab",
+    "BiOMA",
+    "LAPUMiA",
+    "SynysteR",
+    "Lannister",
+    "alfaHD",
+    "xprince00",
+];
+
+/// A tag na grafia do grupo: a conhecida, ou caixa alta.
+fn tag_case(tag: &str) -> String {
+    TAG_CASE
+        .iter()
+        .find(|known| known.eq_ignore_ascii_case(tag))
+        .map_or_else(|| tag.to_ascii_uppercase(), |known| (*known).to_owned())
 }
 
 /// Tags de quem acrescenta o áudio PT ao release de outro grupo (a segunda
@@ -776,6 +806,17 @@ pub(crate) fn standard(subject: &Subject<'_>) -> Result<Standard, Vec<String>> {
     let mut gaps = Vec::new();
     let mut warnings = Vec::new();
     let (body, tags) = split_tags(subject.original.trim());
+    // Arquivo da cena todo em minúsculas (`…h264-cakes`) perdeu a grafia da
+    // tag: vale a conhecida do grupo, ou caixa alta (CAKES, S.W.A.T. Exiles
+    // em 26/10). Com alguma maiúscula no nome, a tag fica como veio.
+    let tags = if subject.original.chars().any(|c| c.is_ascii_uppercase()) {
+        tags
+    } else {
+        Tags {
+            first: tags.first.as_deref().map(tag_case),
+            second: tags.second.map(|(repack, tag)| (repack, tag_case(&tag))),
+        }
+    };
     let tokens: Vec<&str> = body
         .split(['.', ' ', '_'])
         .filter(|t| !t.is_empty())
@@ -1579,6 +1620,32 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn tag_de_nome_todo_minusculo_volta_a_grafia_do_grupo() {
+        // S.W.A.T. Exiles S01E04, 26/10: a staff pediu CAKES.
+        let run = |original| {
+            standard(&Subject {
+                original,
+                media: &web_1080(),
+                original_language: Some(Language::English),
+                series: true,
+                dual: false,
+                brrip: false,
+                catalog_title: Some("S.W.A.T. Exiles"),
+                year: None,
+            })
+            .unwrap()
+            .name
+        };
+        assert_eq!(
+            run("s.w.a.t.exiles.s01e04.1080p.web.h264-cakes"),
+            "SWAT.Exiles.S01E04.1080p.WEB-DL.DDP5.1.H.264-CAKES"
+        );
+        assert!(run("s.w.a.t.exiles.s01e04.1080p.web.h264-ntb").ends_with("-NTb"));
+        // Com maiúscula no nome, a tag fica como veio.
+        assert!(run("S.W.A.T.Exiles.S01E04.1080p.WEB.h264-cakes").ends_with("-cakes"));
     }
 
     #[test]
