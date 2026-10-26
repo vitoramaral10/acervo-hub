@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::future::join_all;
 
-use crate::{IndexerError, Release, ResolvedDownload, SearchQuery};
+use crate::{IndexerError, Release, ResolvedDownload, SearchQuery, SiteRequest, SiteResponse};
 
 #[async_trait]
 pub trait Indexer: std::fmt::Debug + Send + Sync {
@@ -42,6 +42,20 @@ pub trait Indexer: std::fmt::Debug + Send + Sync {
     /// nem magnet.
     async fn resolve_download(&self, url: &url::Url) -> Result<ResolvedDownload, IndexerError> {
         self.download(url).await.map(ResolvedDownload::Torrent)
+    }
+
+    /// Uma requisição ao site com a sessão do indexador, para o que não é
+    /// busca nem download (o envio de torrent pelo formulário do site).
+    ///
+    /// # Errors
+    ///
+    /// Indexador sem sessão de site, caminho fora da origem dele, sessão
+    /// recusada ou falha de rede.
+    async fn site_request(&self, request: &SiteRequest) -> Result<SiteResponse, IndexerError> {
+        let _ = request;
+        Err(IndexerError::UnsupportedQuery {
+            reason: "este indexador não faz requisições ao site",
+        })
     }
 }
 

@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use acervo_core::{
     Allocated, Apparent, Download, DownloadHash, DownloadState, FileFacts, Inventory,
+    SeedObligation,
 };
 use acervo_janitor::{Abort, Action, Policy, SkipReason, StrikeLedger, reconcile};
 
@@ -41,6 +42,7 @@ fn seed(hash: &str, links: u64, bytes: u64) -> Download {
         ratio: 0.0,
         seeded_for: 500 * HORA,
         idle_for: None,
+        obligation: None,
         files: vec![arquivo(links, bytes, 90 * HORA)],
     }
 }
@@ -668,4 +670,98 @@ fn privado_completo_pausado_sem_dono_fica_ate_cumprir_a_carencia() {
     let inv = inventario_com(vec![pausado(120)], vec![]);
     let plano = reconcile(&inv, &politica, &mut ledger, agora()).expect("sem abort");
     assert_eq!(strikes_de_sem_dono(&plano), [1]);
+}
+
+// ---- obrigação de seed do tracker
+
+/// Obrigação do download concluído no Amigos: 72 h de seed OU ratio 1.0.
+fn obrigacao_amigos() -> SeedObligation {
+    SeedObligation {
+        min_seed: Some(72 * HORA),
+        min_ratio: Some(1.0),
+    }
+}
+
+/// Roda a limpeza e devolve o plano.
+fn planeja(download: Download) -> acervo_janitor::Plan {
+    let mut inv = Inventory::new(Allocated::from_bytes(100 * GIB));
+    inv.downloads = vec![download];
+    reconcile(&inv, &politica_de_seed(), &mut StrikeLedger::new(), agora()).expect("sem abort")
+}
+
+fn pulado_por_obrigacao(plano: &acervo_janitor::Plan) -> bool {
+    plano.actions.is_empty()
+        && plano
+            .skipped
+            .iter()
+            .any(|s| s.reason == SkipReason::SeedObligation)
+}
+
+#[test]
+fn obrigacao_pendente_segura_seed_que_a_regra_ociosa_apagaria() {
+    // Sem a obrigação, 30 h ocioso passa das 24 h e o seed sai.
+    assert!(sai(privado(0.2, 30, Some(30)), &politica_de_seed()));
+
+    let com_obrigacao = Download {
+        obligation: Some(obrigacao_amigos()),
+        ..privado(0.2, 30, Some(30))
+    };
+    assert!(pulado_por_obrigacao(&planeja(com_obrigacao)));
+}
+
+#[test]
+fn obrigacao_cumprida_por_tempo_libera_o_seed() {
+    let d = Download {
+        obligation: Some(obrigacao_amigos()),
+        ..privado(0.2, 80, Some(30))
+    };
+    assert!(sai(d, &politica_de_seed()));
+}
+
+#[test]
+fn obrigacao_cumprida_por_ratio_libera_o_seed_com_poucas_horas() {
+    let d = Download {
+        obligation: Some(obrigacao_amigos()),
+        ..privado(1.0, 10, Some(0))
+    };
+    assert!(sai(d, &politica_de_seed()));
+}
+
+#[test]
+fn obrigacao_de_lancamento_so_de_tempo_ignora_o_ratio() {
+    let d = Download {
+        obligation: Some(SeedObligation {
+            min_seed: Some(168 * HORA),
+            min_ratio: None,
+        }),
+        ..privado(3.0, 100, Some(30))
+    };
+    assert!(pulado_por_obrigacao(&planeja(d)));
+}
+
+#[test]
+fn obrigacao_nao_protege_incompleto_sem_dono() {
+    let d = Download {
+        obligation: Some(obrigacao_amigos()),
+        ..sem_dono("inc", 10 * GIB)
+    };
+    let plano = planeja(d);
+    assert_eq!(strikes_de_sem_dono(&plano), vec![1]);
+    assert!(
+        !plano
+            .skipped
+            .iter()
+            .any(|s| s.reason == SkipReason::SeedObligation)
+    );
+}
+
+#[test]
+fn obrigacao_pendente_nao_da_strike_em_completo_parado() {
+    let d = Download {
+        state: DownloadState::Paused,
+        obligation: Some(obrigacao_amigos()),
+        ..privado(0.2, 10, Some(0))
+    };
+    let plano = planeja(d);
+    assert!(plano.actions.is_empty());
 }

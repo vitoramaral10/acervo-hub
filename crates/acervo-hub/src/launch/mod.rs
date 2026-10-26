@@ -15,6 +15,7 @@
 //! tirados de qualquer mensagem de erro gravada ([`redact`]).
 
 pub(crate) mod adapt;
+pub(crate) mod amigos;
 pub(crate) mod folder;
 pub(crate) mod imgbb;
 pub(crate) mod name_check;
@@ -43,6 +44,7 @@ use tokio::sync::Semaphore;
 use crate::api::Catalog;
 use crate::config::Config;
 use crate::crossseed::{Origin, Source};
+use crate::live::{self, Bus};
 use crate::tasks::Cancel;
 use crate::web::Web;
 use adapt::{AdaptationPlan, Extraction};
@@ -56,8 +58,10 @@ use text::{Credits, Input, Work};
 /// O andamento de quem espera o pacote da frente.
 pub(crate) const QUEUED: &str = "na fila";
 
-/// Mensagem de quando falta a chave do `ImgBB` (spec, passo 6).
-const NO_IMGBB_KEY: &str = "configure a chave do ImgBB em Configurações → Imagens";
+/// O aviso do laudo quando falta a chave do `ImgBB` (spec, passo 6): o pacote
+/// segue sem links e as capturas saem para baixar.
+const NO_IMGBB_WARNING: &str = "sem a chave do ImgBB (Configurações → Imagens): as capturas não \
+     foram hospedadas; baixe os 4 PNG do pacote e anexe-os no formulário";
 
 /// Os vídeos do torrent, pela extensão.
 const VIDEO_EXTENSIONS: [&str; 5] = ["mkv", "mp4", "avi", "m2ts", "ts"];
@@ -157,6 +161,8 @@ struct Job<'a> {
     secrets: Vec<String>,
     /// O último andamento gravado, para não regravar o mesmo.
     shown: String,
+    /// Cada mudança de estado ou de andamento avisa a tela (`lancar`).
+    events: Bus,
 }
 
 impl Job<'_> {
@@ -180,6 +186,7 @@ impl Job<'_> {
         {
             tracing::warn!(indexer = self.indexer, "andamento do lançamento: {error}");
         }
+        self.events.emit(&[live::LAUNCH]);
     }
 }
 
@@ -220,6 +227,7 @@ pub(crate) async fn run(web: Arc<Web>, hash: String, indexer: String, claim: Cla
             if let Err(error) = error {
                 tracing::warn!(indexer, "pacote da fila não marcado como interrompido: {error}");
             }
+            web.events.emit(&[live::LAUNCH]);
             return;
         }
     };
@@ -233,6 +241,7 @@ pub(crate) async fn run(web: Arc<Web>, hash: String, indexer: String, claim: Cla
         indexer,
         secrets: Vec::new(),
         shown: QUEUED.to_owned(),
+        events: web.events.clone(),
     };
     let outcome = prepare(&config, &web.catalog, &mut job).await;
     let (state, error) = match outcome {
@@ -271,7 +280,10 @@ async fn save_outcome(
             .upsert_launch_state(&job.hash, &job.indexer, state, None, error)
             .await
         {
-            Ok(()) => return,
+            Ok(()) => {
+                job.events.emit(&[live::LAUNCH]);
+                return;
+            }
             Err(failure) => {
                 let Some(wait) = waits.next() else {
                     tracing::error!(
@@ -383,6 +395,15 @@ pub(crate) fn screen_times(duration: f64) -> Vec<f64> {
     SCREEN_POINTS.iter().map(|p| duration * p).collect()
 }
 
+/// O instante da captura `number` (1 a 4): o mesmo que o preparo usa, para a
+/// rota de download tirar o quadro igual ao que iria ao `ImgBB`.
+pub(crate) fn screen_time(duration: f64, number: usize) -> Option<f64> {
+    screen_times(duration).get(number.checked_sub(1)?).copied()
+}
+
+/// Quantas capturas o pacote tem.
+pub(crate) const SCREEN_COUNT: usize = SCREEN_POINTS.len();
+
 /// A pasta raiz do torrent, ou o arquivo se for avulso: é o nome do release.
 pub(crate) fn release_name(files: &[SourceFile]) -> String {
     let Some(first) = files.first() else {
@@ -397,6 +418,11 @@ pub(crate) fn release_name(files: &[SourceFile]) -> String {
 /// O que o qBittorrent deve empacotar: `content_path` (pasta raiz, ou o
 /// arquivo avulso); qBittorrent antigo sem ele, montado dos arquivos.
 pub(crate) fn source_path(torrent: &TorrentInfo, files: &[SourceFile]) -> String {
+    // Um arquivo só dentro da pasta raiz: o qBittorrent dá o arquivo como
+    // `content_path`, e o pacote é a pasta (o layout da origem a inclui).
+    if let Some(folder) = boxed_file_folder(torrent, files) {
+        return folder;
+    }
     if !torrent.content_path.is_empty() {
         return torrent.content_path.clone();
     }
@@ -404,6 +430,26 @@ pub(crate) fn source_path(torrent: &TorrentInfo, files: &[SourceFile]) -> String
         .join(release_name(files))
         .to_string_lossy()
         .into_owned()
+}
+
+/// Torrent de um arquivo só dentro de uma pasta raiz cujo `content_path` é
+/// o próprio arquivo (o qBittorrent 5 faz assim): a pasta, para empacotar.
+fn boxed_file_folder(torrent: &TorrentInfo, files: &[SourceFile]) -> Option<String> {
+    let [only] = files else {
+        return None;
+    };
+    only.path.contains('/').then_some(())?;
+    let content = Path::new(&torrent.content_path);
+    let mut inner = Path::new(&only.path).components().rev();
+    let mut outer = content.components().rev();
+    // O `content_path` termina em `pasta/arquivo`, componente a componente.
+    let ends_with = inner.all(|c| outer.next() == Some(c));
+    ends_with.then(|| {
+        PathBuf::from(&torrent.save_path)
+            .join(release_name(files))
+            .to_string_lossy()
+            .into_owned()
+    })
 }
 
 /// O torrent tem pasta raiz própria (ou é um arquivo avulso) e o
@@ -426,7 +472,7 @@ pub(crate) fn ensure_root(torrent: &TorrentInfo, files: &[SourceFile]) -> Result
              o .torrent empacotaria a pasta de download inteira"
         );
     }
-    if !torrent.content_path.is_empty() {
+    if !torrent.content_path.is_empty() && boxed_file_folder(torrent, files).is_none() {
         let last = Path::new(&torrent.content_path)
             .file_name()
             .and_then(|n| n.to_str());
@@ -992,8 +1038,40 @@ fn generated_subtitles(
 /// O laudo como vai ao banco, com o nome de cada faixa a extrair
 /// (`adaptations[].faixa`): a tela diz "a partir da faixa 3 (Português -
 /// Brasil)".
-fn report_value(report: &Report, videos: &[ProbedVideo]) -> Result<Value> {
+/// O laudo como vai ao banco: o de [`report_value`] mais o tipo do pacote
+/// (`filme`, `episodio` ou `temporada`), que o envio pelo site usa para
+/// escolher a categoria.
+fn report_json(report: &Report, facts: &rules::Facts, main: &str) -> Result<Value> {
+    let mut value = report_value(report, &facts.videos, main)?;
+    value["tipo"] = json!(kind_name(facts.kind));
+    if let Some(audio) = rules::package_audio(facts) {
+        value["audio"] = json!(audio);
+    }
+    Ok(value)
+}
+
+pub(crate) const fn kind_name(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Movie => "filme",
+        Kind::Episode => "episodio",
+        Kind::Season => "temporada",
+    }
+}
+
+fn report_value(report: &Report, videos: &[ProbedVideo], main: &str) -> Result<Value> {
     let mut value = serde_json::to_value(report)?;
+    // O que a tela mostra ao lado dos botões de captura, e a duração que a
+    // rota de download usa para cair nos mesmos instantes do preparo.
+    if let Some(video) = videos.iter().find(|v| v.path == main)
+        && let Some(facts) = &video.media.video
+    {
+        value["capturas"] = json!({
+            "arquivo": main,
+            "largura": facts.width,
+            "altura": facts.height,
+            "duracao": video.media.duration_seconds,
+        });
+    }
     if let Some(list) = value.get_mut("adaptations").and_then(Value::as_array_mut) {
         for (item, extraction) in list.iter_mut().zip(&report.adaptations) {
             if let Some(label) = track_label(videos, extraction) {
@@ -1334,11 +1412,14 @@ fn read_limited(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
 /// Quantos nomes a mensagem de "o que difere" lista de cada tipo.
 const DIFF_LISTED: usize = 5;
 
-/// Se o `.torrent` já estava no cliente (mesmo hash) ou foi adicionado.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Se o `.torrent` já estava no cliente (mesmo hash), foi adicionado ou o
+/// cliente já tinha um irmão do mesmo tracker, que passou a semear no lugar.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Seeded {
     Added,
     AlreadyThere,
+    /// O irmão adotado, com o hash que ele tem no cliente.
+    Adopted(String),
 }
 
 /// A pasta de download do pacote, como o cliente a vê: o pai da pasta
@@ -1460,7 +1541,7 @@ async fn seed_into(
         crate::crossseed::same_tracker_sibling(client, torrents, &save_path, &torrent).await?
     {
         adopt_existing(client, &existing, launch, &torrent).await?;
-        return Ok(Seeded::AlreadyThere);
+        return Ok(Seeded::Adopted(existing.hash.to_ascii_lowercase()));
     }
     let options = AddOptions {
         category: category.to_owned(),
@@ -1810,7 +1891,11 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
     };
     let mut report = rules::check(site, &facts);
     store
-        .save_launch_report(&job.hash, &indexer, &report_value(&report, &facts.videos)?)
+        .save_launch_report(
+            &job.hash,
+            &indexer,
+            &report_json(&report, &facts, &main.path)?,
+        )
         .await?;
     if report.verdict == Verdict::Inelegivel {
         // Preparo anterior que montou a pasta: sem pacote a enviar, ela não
@@ -1839,29 +1924,14 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
     );
 
     // 6. Capturas.
-    let key = config.imgbb_key().context(NO_IMGBB_KEY)?.to_owned();
-    job.secrets.push(key.clone());
-    let duration = main_media
-        .duration_seconds
-        .filter(|d| d.is_finite() && *d > 0.0)
-        .context("o ffprobe não disse a duração do vídeo: sem ela não há onde tirar as capturas")?;
-    let imgbb = imgbb::Imgbb::new()?;
-    let times = screen_times(duration);
-    let mut screens = Vec::new();
-    for (index, at) in times.iter().enumerate() {
-        let number = index + 1;
-        job.step(&format!("captura {number} de {}", times.len()))
-            .await;
-        let png = crate::mediainfo::screenshot(&main_path, *at).await?;
-        let screen = imgbb
-            .upload(&key, png, &format!("captura-{number}.png"))
-            .await
-            .with_context(|| format!("enviando a captura {number}"))?;
-        screens.push(screen);
+    let screens = host_screens(config, job, &main_path, main_media.duration_seconds).await?;
+    if screens.is_empty() {
+        report.checks.push(rules::Check {
+            rule: "Capturas".to_owned(),
+            status: rules::Status::Warn,
+            message: NO_IMGBB_WARNING.to_owned(),
+        });
     }
-    store
-        .save_launch_screens(&job.hash, &indexer, &serde_json::to_value(&screens)?)
-        .await?;
 
     let input = Input {
         title: tmdb.title.unwrap_or(work.title),
@@ -1884,7 +1954,11 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
     report.checks.extend(built.warnings);
     report.checks.extend(mediainfo_warning);
     store
-        .save_launch_report(&job.hash, &indexer, &report_value(&report, &facts.videos)?)
+        .save_launch_report(
+            &job.hash,
+            &indexer,
+            &report_json(&report, &facts, &main.path)?,
+        )
         .await?;
     store
         .save_launch_fields(&job.hash, &indexer, &serde_json::to_value(&built.fields)?)
@@ -1937,6 +2011,49 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
         .save_launch_torrent(&job.hash, &indexer, &bytes)
         .await?;
     Ok(Finish::Ready)
+}
+
+/// As 4 capturas no `ImgBB`, em resolução original (PNG, ou JPEG se o PNG
+/// passar de 5 MiB). Sem chave configurada o
+/// passo é pulado e a lista sai vazia: o pacote não falha, e a tela entrega os
+/// PNG para baixar e anexar no formulário.
+///
+/// # Errors
+///
+/// Com chave: sem duração no ffprobe, o ffmpeg ou o upload falhando.
+async fn host_screens(
+    config: &Config,
+    job: &mut Job<'_>,
+    video: &Path,
+    duration: Option<f64>,
+) -> Result<Vec<imgbb::Screen>> {
+    let Some(key) = config.imgbb_key().map(str::to_owned) else {
+        return Ok(Vec::new());
+    };
+    job.secrets.push(key.clone());
+    let duration = duration
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .context("o ffprobe não disse a duração do vídeo: sem ela não há onde tirar as capturas")?;
+    let imgbb = imgbb::Imgbb::new()?;
+    let times = screen_times(duration);
+    let mut screens = Vec::new();
+    for (index, at) in times.iter().enumerate() {
+        let number = index + 1;
+        job.step(&format!("captura {number} de {}", times.len()))
+            .await;
+        // PNG, ou JPEG na mesma resolução se o PNG passar do limite do Amigos.
+        let (image, format) = crate::mediainfo::screenshot(video, *at).await?;
+        let name = format!("captura-{number}.{}", format.extension());
+        let screen = imgbb
+            .upload(&key, image, &name, format.mime())
+            .await
+            .with_context(|| format!("enviando a captura {number}"))?;
+        screens.push(screen);
+    }
+    job.store
+        .save_launch_screens(&job.hash, &job.indexer, &serde_json::to_value(&screens)?)
+        .await?;
+    Ok(screens)
 }
 
 /// O relatório do `MediaInfo` do vídeo principal. O formulário do Amigos o exige
@@ -2022,6 +2139,86 @@ mod tests {
     }
 
     #[test]
+    fn rota_e_preparo_tiram_o_quadro_no_mesmo_instante() {
+        for duration in [6_000.0, 7_265.432, 0.8] {
+            let times = screen_times(duration);
+            assert_eq!(times.len(), SCREEN_COUNT);
+            for (index, at) in times.iter().enumerate() {
+                assert_eq!(screen_time(duration, index + 1), Some(*at));
+            }
+            assert_eq!(screen_time(duration, 0), None);
+            assert_eq!(screen_time(duration, SCREEN_COUNT + 1), None);
+        }
+    }
+
+    #[test]
+    fn laudo_guarda_a_resolucao_e_a_duracao_do_video_principal() {
+        let report = Report {
+            checks: Vec::new(),
+            destination: Vec::new(),
+            verdict: Verdict::Elegivel,
+            adaptations: Vec::new(),
+        };
+        let videos = vec![ProbedVideo {
+            path: "Filme/Filme.mkv".into(),
+            media: crate::mediainfo::MediaFacts {
+                container: "matroska,webm".into(),
+                duration_seconds: Some(7_200.5),
+                video: Some(crate::mediainfo::VideoFacts {
+                    codec: "hevc".into(),
+                    width: 3840,
+                    height: 2024,
+                    pix_fmt: None,
+                    bit_depth: None,
+                    hdr: crate::mediainfo::Hdr::Sdr,
+                }),
+                audio: Vec::new(),
+                subtitles: Vec::new(),
+            },
+        }];
+        let value = report_value(&report, &videos, "Filme/Filme.mkv").unwrap();
+        assert_eq!(
+            value["capturas"],
+            json!({ "arquivo": "Filme/Filme.mkv", "largura": 3840, "altura": 2024, "duracao": 7_200.5 })
+        );
+        assert!(
+            report_value(&report, &videos, "Outro.mkv")
+                .unwrap()
+                .get("capturas")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn sem_chave_do_imgbb_o_passo_pula_o_upload_e_deixa_as_capturas_vazias() {
+        let Some(db) = acervo_store::testing::TestDb::new("capturas_sem_chave").await else {
+            return;
+        };
+        let hash = "e".repeat(40);
+        let mut job = Job {
+            store: &db.store,
+            hash,
+            indexer: "bjsharecustom".into(),
+            secrets: Vec::new(),
+            shown: String::new(),
+            events: Bus::default(),
+        };
+        // Sem chave não toca no vídeo (que nem existe) nem na duração.
+        let screens = host_screens(
+            &Config::default(),
+            &mut job,
+            Path::new("/nao/existe.mkv"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(screens.is_empty());
+        assert!(job.secrets.is_empty());
+        assert_eq!(job.shown, "", "nenhum andamento de captura");
+        db.drop().await;
+    }
+
+    #[test]
     fn nome_do_release_e_a_pasta_raiz_ou_o_arquivo() {
         assert_eq!(
             release_name(&[file("Filme.2024.1080p/Filme.mkv", 1)]),
@@ -2073,6 +2270,15 @@ mod tests {
         assert!(ensure_root(&info("/media/f", "/media/f"), &single).is_err());
         let boxed = [file("Filme/Filme.mkv", 1)];
         assert!(ensure_root(&info("/media/f", "/media/f/Filme"), &boxed).is_ok());
+        // qBittorrent 5: um arquivo só dentro da pasta tem o arquivo como
+        // `content_path`; o pacote é a pasta (O Pai da Noiva).
+        assert!(ensure_root(&info("/media/f", "/media/f/Filme/Filme.mkv"), &boxed).is_ok());
+        assert_eq!(
+            source_path(&info("/media/f", "/media/f/Filme/Filme.mkv"), &boxed),
+            "/media/f/Filme"
+        );
+        // Outro arquivo no `content_path` continua recusado.
+        assert!(ensure_root(&info("/media/f", "/media/f/Outro/Filme.mkv"), &boxed).is_err());
     }
 
     /// Um `.torrent` v1 mínimo com os arquivos dados (`pieces` vazio: o
@@ -2194,6 +2400,7 @@ mod tests {
             indexer: "bjsharecustom".into(),
             secrets: Vec::new(),
             shown: QUEUED.to_owned(),
+            events: Bus::default(),
         };
         let cancel = Cancel::default();
         let stopper = cancel.clone();
@@ -2278,6 +2485,7 @@ mod tests {
             indexer: "bjsharecustom".into(),
             secrets: Vec::new(),
             shown: QUEUED.to_owned(),
+            events: Bus::default(),
         };
         let cancel = Cancel::default();
         let stopper = cancel.clone();
@@ -2354,6 +2562,7 @@ mod tests {
             indexer: "bjsharecustom".into(),
             secrets: Vec::new(),
             shown: QUEUED.to_owned(),
+            events: Bus::default(),
         };
         let result = create_torrent(
             &client,
@@ -2559,7 +2768,7 @@ mod tests {
         };
         assert_eq!(report.adaptations.len(), 1, "a faixa PT vira um .srt");
         // O nome da faixa vai junto ao laudo, para a tela.
-        let value = report_value(&report, &videos).unwrap();
+        let value = report_value(&report, &videos, "Filme/Filme.mkv").unwrap();
         assert_eq!(value["adaptations"][0]["faixa"], "Português - Brasil");
         assert_eq!(value["adaptations"][0]["output"], "Filme/Filme.pt-BR.srt");
 
@@ -2579,6 +2788,7 @@ mod tests {
             indexer: "bjsharecustom".into(),
             secrets: Vec::new(),
             shown: QUEUED.to_owned(),
+            events: Bus::default(),
         };
         let target = root.join("lancamentos/bj/Filme");
 
@@ -2746,6 +2956,7 @@ mod tests {
             sent_at: None,
             adapted_path: None,
             site_hash: None,
+            site_id: None,
             adapted_layout: None,
         }
     }
@@ -3001,6 +3212,7 @@ mod tests {
             sent_at: None,
             adapted_path: Some("/media/lancamentos/bj/Filme".into()),
             site_hash: None,
+            site_id: None,
             adapted_layout: Some(json!([
                 ["Filme/Filme.mkv", 10],
                 ["Filme/Filme.en.srt", 1],
@@ -3203,7 +3415,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(seeded, Seeded::AlreadyThere);
+        assert_eq!(seeded, Seeded::Adopted(hash));
         drop(server);
     }
 

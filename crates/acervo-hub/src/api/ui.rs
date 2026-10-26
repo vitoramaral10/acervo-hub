@@ -91,6 +91,57 @@ pub struct SettingView {
     pub value: Option<String>,
 }
 
+/// As preferências de um indexador: ordem na busca, modo ratio e a obrigação
+/// de seed do tracker (`None`: não exige).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Preferences {
+    pub priority: i32,
+    pub ratio_mode: bool,
+    /// Horas de seed de um download concluído.
+    pub seed_min_hours: Option<i32>,
+    /// Ratio que dispensa o resto das horas.
+    pub seed_min_ratio: Option<f64>,
+    /// Horas de seed do que o usuário lançou no site.
+    pub upload_seed_hours: Option<i32>,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            priority: acervo_store::DEFAULT_INDEXER_PRIORITY,
+            ratio_mode: false,
+            seed_min_hours: None,
+            seed_min_ratio: None,
+            upload_seed_hours: None,
+        }
+    }
+}
+
+/// Horas de seed aceitas: de uma hora a um ano.
+const SEED_HOURS: std::ops::RangeInclusive<i32> = 1..=8760;
+/// Maior ratio mínima aceita.
+const MAX_SEED_RATIO: f64 = 100.0;
+
+impl Preferences {
+    /// Confere as faixas; a mensagem vai para a tela.
+    fn validate(&self) -> Result<(), &'static str> {
+        if !acervo_store::INDEXER_PRIORITIES.contains(&self.priority) {
+            return Err("a prioridade vai de 1 a 50");
+        }
+        let hours_ok = |h: Option<i32>| h.is_none_or(|h| SEED_HOURS.contains(&h));
+        if !hours_ok(self.seed_min_hours) || !hours_ok(self.upload_seed_hours) {
+            return Err("o seed mínimo vai de 1 a 8760 horas");
+        }
+        if self
+            .seed_min_ratio
+            .is_some_and(|r| !(r > 0.0 && r <= MAX_SEED_RATIO))
+        {
+            return Err("a ratio mínima fica acima de 0 e vai até 100");
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn routes() -> Router<Arc<Server>> {
     Router::new()
         .route(
@@ -408,14 +459,15 @@ fn timestamp(value: Option<time::OffsetDateTime>) -> serde_json::Value {
 fn indexer_json(server: &Server, view: &super::IndexerView) -> serde_json::Value {
     let caps = &view.capabilities;
     let admin = server.admin.as_ref();
-    let (priority, ratio) = admin
-        .preferences(&view.name)
-        .unwrap_or((acervo_store::DEFAULT_INDEXER_PRIORITY, false));
+    let prefs = admin.preferences(&view.name).unwrap_or_default();
     json!({
         "nome": view.name,
         "ativo": true,
-        "prioridade": priority,
-        "modo_ratio": ratio,
+        "prioridade": prefs.priority,
+        "modo_ratio": prefs.ratio_mode,
+        "seed_min_horas": prefs.seed_min_hours,
+        "seed_min_ratio": prefs.seed_min_ratio,
+        "seed_envio_horas": prefs.upload_seed_hours,
         "origem": admin.origin(&view.name).unwrap_or("cadastro"),
         "privado": view.proxies_downloads,
         "editavel": admin.settings(&view.name).is_some(),
@@ -453,14 +505,15 @@ async fn indexers(
     {
         let admin = &server.admin;
         for (name, origin) in admin.disabled() {
-            let (priority, ratio) = admin
-                .preferences(&name)
-                .unwrap_or((acervo_store::DEFAULT_INDEXER_PRIORITY, false));
+            let prefs = admin.preferences(&name).unwrap_or_default();
             list.push(json!({
                 "nome": name,
                 "ativo": false,
-                "prioridade": priority,
-                "modo_ratio": ratio,
+                "prioridade": prefs.priority,
+                "modo_ratio": prefs.ratio_mode,
+                "seed_min_horas": prefs.seed_min_hours,
+                "seed_min_ratio": prefs.seed_min_ratio,
+                "seed_envio_horas": prefs.upload_seed_hours,
                 "origem": origin,
                 "privado": false,
                 "editavel": admin.settings(&name).is_some(),
@@ -553,6 +606,13 @@ async fn set_enabled(
 struct PreferencesBody {
     prioridade: i32,
     modo_ratio: bool,
+    /// Vazio (`null` ou ausente): o tracker não exige.
+    #[serde(default)]
+    seed_min_horas: Option<i32>,
+    #[serde(default)]
+    seed_min_ratio: Option<f64>,
+    #[serde(default)]
+    seed_envio_horas: Option<i32>,
 }
 
 async fn set_preferences(
@@ -562,21 +622,28 @@ async fn set_preferences(
     Json(body): Json<PreferencesBody>,
 ) -> Result<Response, UiError> {
     guard(&server, &headers, &Method::PUT).await?;
-    if !acervo_store::INDEXER_PRIORITIES.contains(&body.prioridade) {
-        return Err(UiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "a prioridade vai de 1 a 50".into(),
-        ));
-    }
+    let prefs = Preferences {
+        priority: body.prioridade,
+        ratio_mode: body.modo_ratio,
+        seed_min_hours: body.seed_min_horas,
+        seed_min_ratio: body.seed_min_ratio,
+        upload_seed_hours: body.seed_envio_horas,
+    };
+    prefs
+        .validate()
+        .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error.into()))?;
     server
         .admin
-        .set_preferences(&name, body.prioridade, body.modo_ratio)
+        .set_preferences(&name, prefs)
         .await
         .map_err(|error| UiError(StatusCode::UNPROCESSABLE_ENTITY, error))?;
     Ok(ok(json!({
         "ok": true,
-        "prioridade": body.prioridade,
-        "modo_ratio": body.modo_ratio,
+        "prioridade": prefs.priority,
+        "modo_ratio": prefs.ratio_mode,
+        "seed_min_horas": prefs.seed_min_hours,
+        "seed_min_ratio": prefs.seed_min_ratio,
+        "seed_envio_horas": prefs.upload_seed_hours,
     })))
 }
 

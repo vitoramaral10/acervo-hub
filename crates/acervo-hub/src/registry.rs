@@ -344,6 +344,9 @@ mod tests {
             enabled: true,
             priority: acervo_store::DEFAULT_INDEXER_PRIORITY,
             ratio_mode: false,
+            seed_min_hours: None,
+            seed_min_ratio: None,
+            upload_seed_hours: None,
             added_at: None,
         }
     }

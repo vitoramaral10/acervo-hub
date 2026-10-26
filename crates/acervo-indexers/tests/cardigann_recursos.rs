@@ -1279,3 +1279,136 @@ fn as_definicoes_de_producao_continuam_carregando() {
     loaded.sort();
     assert_eq!(loaded, ["amigosshare", "bjsharecustom"]);
 }
+
+fn site_yaml() -> String {
+    format!(
+        "{HEAD}
+type: private
+settings:
+  - {{name: apikey, type: password, label: Chave}}
+login:
+  method: get
+  path: api/entrar
+  inputs:
+    chave: '{{{{ .Config.apikey }}}}'
+  test:
+    path: api/eu
+search:
+  paths:
+    - path: api/lista
+      response: {{type: json}}
+  inputs: {{q: '{{{{ .Keywords }}}}'}}
+  rows: {{selector: itens}}
+  fields:
+    title: {{selector: nome}}
+    download: {{selector: link}}
+    size: {{selector: bytes}}
+"
+    )
+    .replace("type: public\n", "")
+}
+
+async fn site_login(server: &MockServer, logins: u64) {
+    Mock::given(path("/api/entrar"))
+        .respond_with(
+            json("{}")
+                .append_header("set-cookie", "s=1; Path=/")
+                .append_header("set-cookie", "XSRF-TOKEN=tok%3D%2B1; Path=/"),
+        )
+        .expect(logins)
+        .mount(server)
+        .await;
+    Mock::given(path("/api/eu"))
+        .respond_with(json("{}"))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn requisicao_ao_site_leva_sessao_e_token_xsrf_como_o_javascript_do_site() {
+    let server = MockServer::start().await;
+    site_login(&server, 1).await;
+    Mock::given(method("POST"))
+        .and(path("/torrents/lookup"))
+        .and(header_regex("cookie", "s=1"))
+        .and(header("x-xsrf-token", "tok=+1"))
+        .and(header("accept", "application/json"))
+        .and(header("x-requested-with", "XMLHttpRequest"))
+        .and(header("content-type", "application/json"))
+        .and(body_string_contains(r#""imdb_id":"tt1""#))
+        .respond_with(json(r#"{"title":"Filme"}"#))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/torrents"))
+        .and(header_regex(
+            "content-type",
+            "^multipart/form-data; boundary=",
+        ))
+        .and(body_string_contains("name=\"name\"\r\n\r\nFilme (2024)"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", "/torrents/77"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = client(&site_yaml(), &server, &[("apikey", "k")]);
+    let looked = client
+        .site_request(&acervo_indexers::SiteRequest::json(
+            "/torrents/lookup",
+            r#"{"imdb_id":"tt1"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(looked.status, 200);
+    assert_eq!(looked.url, format!("{}/torrents/lookup", server.uri()));
+    assert_eq!(looked.text(), r#"{"title":"Filme"}"#);
+    let sent = client
+        .site_request(&acervo_indexers::SiteRequest::multipart(
+            "/torrents",
+            vec![acervo_indexers::SitePart::text("name", "Filme (2024)")],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(sent.status, 302);
+    assert_eq!(sent.location.as_deref(), Some("/torrents/77"));
+}
+
+#[tokio::test]
+async fn requisicao_ao_site_refaz_o_login_quando_o_token_expira() {
+    let server = MockServer::start().await;
+    site_login(&server, 2).await;
+    Mock::given(method("POST"))
+        .and(path("/torrents/lookup"))
+        .respond_with(ResponseTemplate::new(419))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/torrents/lookup"))
+        .respond_with(json("{}"))
+        .mount(&server)
+        .await;
+    let response = client(&site_yaml(), &server, &[("apikey", "k")])
+        .site_request(&acervo_indexers::SiteRequest::json(
+            "/torrents/lookup",
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status, 200);
+}
+
+#[tokio::test]
+async fn requisicao_ao_site_nao_sai_da_origem_do_indexador() {
+    let server = MockServer::start().await;
+    let error = client(&site_yaml(), &server, &[("apikey", "k")])
+        .site_request(&acervo_indexers::SiteRequest::get(
+            "https://outro.invalid/x",
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, IndexerError::Definition { .. }),
+        "{error:?}"
+    );
+}

@@ -12,6 +12,62 @@ export class ApiError extends Error {
 
 export const isUnauthorized = (error: unknown) => error instanceof ApiError && error.status === 401
 
+/**
+ * Tópicos do canal de eventos (`/ui/api/eventos`) e as `queryKey` do react-query
+ * que cada um invalida. É o único mapa: tela nova que usa um tópico entra aqui.
+ */
+export const TOPIC_KEYS: Record<string, readonly (readonly string[])[]> = {
+  fila: [['fila'], ['bloqueados']],
+  filmes: [['filmes'], ['faltando'], ['calendario']],
+  series: [['series'], ['faltando'], ['calendario']],
+  lancar: [['para-lancar']],
+  tarefas: [['tarefas'], ['tarefas-historico'], ['filmes-busca']],
+  indexadores: [['indexadores'], ['catalogo'], ['settings']],
+  configuracoes: [['configuracoes'], ['configuracao'], ['notificacoes'], ['regras'], ['biblioteca-opcoes']],
+  apagar: [['para-apagar'], ['para-apagar-sugestoes']],
+  descobrir: [['descobrir']],
+  historico: [['historico']],
+}
+
+// Sessão do Cloudflare Access expirada: o Access responde a requisição de fetch
+// com um redirecionamento para o login. Com `redirect: 'manual'` ele chega como
+// `opaqueredirect`, e a saída é recarregar a página, para o navegador refazer o
+// login do Access. No máximo uma recarga a cada minuto, para não entrar em laço.
+const RELOAD_KEY = 'acervo.sessao.recarga'
+const RELOAD_EVERY_MS = 60_000
+
+let sessionExpired = false
+const expiredListeners = new Set<() => void>()
+
+export const sessionExpiredStore = {
+  subscribe: (listener: () => void) => {
+    expiredListeners.add(listener)
+    return () => void expiredListeners.delete(listener)
+  },
+  get: () => sessionExpired,
+}
+
+function accessExpired() {
+  let last = 0
+  try {
+    last = Number(sessionStorage.getItem(RELOAD_KEY)) || 0
+  } catch {
+    // Sem sessionStorage, só a mensagem vale (nunca recarrega sozinha).
+    last = Date.now()
+  }
+  if (Date.now() - last >= RELOAD_EVERY_MS) {
+    try {
+      sessionStorage.setItem(RELOAD_KEY, String(Date.now()))
+    } catch {
+      // Já tratado acima.
+    }
+    window.location.reload()
+    return
+  }
+  sessionExpired = true
+  for (const listener of expiredListeners) listener()
+}
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (method !== 'GET') headers['X-Acervo'] = '1'
@@ -24,10 +80,15 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
       method,
       headers,
       credentials: 'same-origin',
+      redirect: 'manual',
       body: body === undefined ? undefined : raw ? body : JSON.stringify(body),
     })
   } catch {
     throw new ApiError(0, 'Sem conexão com o acervo-hub.')
+  }
+  if (response.type === 'opaqueredirect') {
+    accessExpired()
+    throw new ApiError(0, 'Sua sessão expirou.')
   }
   const data = await response.json().catch(() => ({}))
   if (!response.ok) {
@@ -61,6 +122,21 @@ export interface Indexer {
   prioridade: number
   /** Construir ratio: freeleech procurado passa na frente da qualidade e o torrent ganha a tag de semear. */
   modo_ratio: boolean
+  /** Horas de seed de um download concluído; null: o tracker não exige. */
+  seed_min_horas: number | null
+  /** Ratio que dispensa o resto das horas; null: o tracker não exige. */
+  seed_min_ratio: number | null
+  /** Horas de seed do que o usuário lança no site; null: o tracker não exige. */
+  seed_envio_horas: number | null
+}
+
+/** O que o salvar das preferências manda: sempre os cinco campos, null limpa a obrigação. */
+export interface Preferencias {
+  prioridade: number
+  modo_ratio: boolean
+  seed_min_horas: number | null
+  seed_min_ratio: number | null
+  seed_envio_horas: number | null
 }
 
 export interface TestResult {
@@ -293,8 +369,8 @@ export const api = {
     request<{ ok: boolean }>('DELETE', `/ui/api/indexadores/${encodeURIComponent(name)}`),
   setEnabled: (name: string, ativo: boolean) =>
     request<{ ok: boolean }>('PUT', `/ui/api/indexadores/${encodeURIComponent(name)}/ativo`, { ativo }),
-  setPreferences: (name: string, preferencias: { prioridade: number; modo_ratio: boolean }) =>
-    request<{ ok: boolean; prioridade: number; modo_ratio: boolean }>(
+  setPreferences: (name: string, preferencias: Preferencias) =>
+    request<{ ok: boolean } & Preferencias>(
       'PUT',
       `/ui/api/indexadores/${encodeURIComponent(name)}/preferencias`,
       preferencias,
@@ -1081,6 +1157,8 @@ export interface LaunchReport {
   verdict: 'elegivel' | 'inelegivel'
   /** Ausente em laudos anteriores à pasta adaptada. */
   adaptations?: LaunchAdaptation[]
+  /** O vídeo principal, de onde saem as capturas; ausente em pacote anterior às capturas para baixar. */
+  capturas?: { arquivo: string; largura: number; altura: number; duracao: number | null }
 }
 
 /** O texto gerado; cada campo vira um botão de copiar. */
@@ -1128,6 +1206,27 @@ export interface LaunchDetail {
   status_tracker: LaunchTrackerStatus | null
   /** O `.torrent` do site já foi enviado e é o semeado. */
   torrent_do_site: boolean
+  /** Id do torrent no site, quando o acervo fez o envio pelo formulário (Amigos). */
+  site_id: string | null
+}
+
+/** O que o envio pelo acervo vai pôr em cada campo do formulário do site. */
+export interface LaunchUploadDraft {
+  tipo: string
+  nome: string
+  ano: string
+  imdb: string
+  largura: number | null
+  altura: number | null
+  /** O IMDB do site trouxe a capa. */
+  capa: boolean
+  /** As listas do formulário e a opção escolhida em cada uma. */
+  campos: { campo: string; valor: string }[]
+  /** `embedded`, `separate` ou `none`; `null` quando o áudio não pede o campo. */
+  legenda: string | null
+  capturas: number
+  /** O que impede o envio. */
+  faltando: string[]
 }
 
 const launchPair = (hash: string, indexer: string) =>
@@ -1152,6 +1251,18 @@ export const launchApi = {
       `${launchPair(hash, indexer)}/torrent-do-site`,
       file,
     ),
+  /** A prévia do envio pelo acervo (só o Amigos): só leituras no site, nada é publicado. */
+  uploadPreview: (hash: string, indexer: string) =>
+    request<{ previa: LaunchUploadDraft }>('GET', `${launchPair(hash, indexer)}/envio-ao-site`),
+  /**
+   * O envio pelo formulário do site, depois da confirmação: hospeda as capturas, envia e semeia o `.torrent` do
+   * site. `aviso`: enviado, mas o `.torrent` do site não veio ou não entrou no cliente (o motivo vai em `erro`).
+   */
+  upload: (hash: string, indexer: string) =>
+    request<{ ok: boolean; estado: LaunchState; site_id: string; adicionado: boolean; aviso?: string | null }>(
+      'POST',
+      `${launchPair(hash, indexer)}/envio-ao-site`,
+    ),
   /** `aviso`: a pasta adaptada ficou no disco (com o que o acervo não criou, ou sem a origem para conferir). */
   discard: (hash: string, indexer: string) =>
     request<{ ok: boolean; estado: LaunchState; aviso?: string | null }>(
@@ -1161,4 +1272,6 @@ export const launchApi = {
   /** O download não passa por `request` (que só lê JSON): é um `<a href download>` com a sessão. */
   torrentUrl: (hash: string, indexer: string) => `${launchPair(hash, indexer)}/torrent`,
   mediainfoUrl: (hash: string, indexer: string) => `${launchPair(hash, indexer)}/mediainfo.txt`,
+  /** A captura `number` (1 a 4), tirada na hora em resolução original: PNG, ou JPEG se o PNG passar de 5 MiB. */
+  captureUrl: (hash: string, indexer: string, number: number) => `${launchPair(hash, indexer)}/capturas/${number}`,
 }

@@ -1378,6 +1378,7 @@ mod tests {
             adapted_path: None,
             adapted_layout: None,
             site_hash: None,
+            site_id: None,
         }
     }
 

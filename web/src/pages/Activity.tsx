@@ -22,6 +22,13 @@ import { formatAgo, formatCount, formatSize } from '@/lib/format'
 import { isStuck, queueStatus, stuckFirst } from '@/lib/queue'
 import { cn } from '@/lib/utils'
 
+/**
+ * A fila só repete a consulta pelo andamento (%) e pela velocidade, e só com
+ * download na fila: a mudança de estado chega pelo canal de eventos.
+ */
+const queueRefetch = (query: { state: { data?: { fila: QueueItem[] } } }) =>
+  (query.state.data?.fila.length ?? 0) > 0 ? 10_000 : false
+
 function formatEta(seconds: number): string {
   if (seconds < 60) return 'menos de 1 min'
   const minutes = Math.round(seconds / 60)
@@ -201,7 +208,7 @@ function QueueRow({ item, onRemove }: { item: QueueItem; onRemove: () => void })
 }
 
 function QueueTab() {
-  const queue = useQuery({ queryKey: ['fila'], queryFn: library.queue, refetchInterval: 5_000 })
+  const queue = useQuery({ queryKey: ['fila'], queryFn: library.queue, refetchInterval: queueRefetch })
   const [removing, setRemoving] = useState<QueueItem | null>(null)
   if (queue.isPending) return <ListSkeleton rows={3} />
   if (queue.isError) return <ErrorBox message={queue.error.message} onRetry={() => void queue.refetch()} />
@@ -386,7 +393,7 @@ function ListSkeleton({ rows }: { rows: number }) {
 }
 
 export function ActivityPage() {
-  const queue = useQuery({ queryKey: ['fila'], queryFn: library.queue, refetchInterval: 5_000 })
+  const queue = useQuery({ queryKey: ['fila'], queryFn: library.queue, refetchInterval: queueRefetch })
   const count = queue.data?.fila.length ?? 0
   return (
     <>

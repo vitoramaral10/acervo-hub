@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::api::{
-    Accounts, Admin, Catalog, DefinitionCatalog, DefinitionView, Entry, SettingView, router,
+    Accounts, Admin, Catalog, DefinitionCatalog, DefinitionView, Entry, Preferences, SettingView,
+    router,
 };
 use acervo_indexers::{
     Capabilities, Category, Indexer, IndexerError, Release, SearchQuery, SearchSupport,
@@ -85,7 +86,7 @@ fn entry(cookie: &str) -> Entry {
 struct FakeAdmin {
     saved: Mutex<BTreeMap<String, String>>,
     disabled: Mutex<Vec<String>>,
-    preferences: Mutex<BTreeMap<String, (i32, bool)>>,
+    preferences: Mutex<BTreeMap<String, Preferences>>,
 }
 
 #[async_trait]
@@ -203,30 +204,25 @@ impl Admin for FakeAdmin {
         }
     }
 
-    fn preferences(&self, indexer: &str) -> Option<(i32, bool)> {
+    fn preferences(&self, indexer: &str) -> Option<Preferences> {
         (indexer == "privado").then(|| {
             self.preferences
                 .lock()
                 .unwrap()
                 .get(indexer)
                 .copied()
-                .unwrap_or((25, false))
+                .unwrap_or_default()
         })
     }
 
-    async fn set_preferences(
-        &self,
-        indexer: &str,
-        priority: i32,
-        ratio_mode: bool,
-    ) -> Result<(), String> {
+    async fn set_preferences(&self, indexer: &str, prefs: Preferences) -> Result<(), String> {
         if indexer != "privado" {
             return Err("indexador desconhecido".into());
         }
         self.preferences
             .lock()
             .unwrap()
-            .insert(indexer.to_owned(), (priority, ratio_mode));
+            .insert(indexer.to_owned(), prefs);
         Ok(())
     }
 
@@ -748,6 +744,72 @@ async fn prioridade_e_modo_ratio_vao_e_voltam() {
     )
     .await;
     assert_eq!(status, 422);
+}
+
+#[tokio::test]
+async fn obrigacao_de_seed_vai_e_volta_e_vazio_limpa() {
+    let base = serve().await;
+    let cookie = login(&base).await;
+    let privado = |list: &Value| {
+        list["indexadores"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["nome"] == "privado")
+            .unwrap()
+            .clone()
+    };
+    let (_, list) = get(&base, "/ui/api/indexadores", &cookie).await;
+    assert!(privado(&list)["seed_min_horas"].is_null());
+    assert!(privado(&list)["seed_min_ratio"].is_null());
+    assert!(privado(&list)["seed_envio_horas"].is_null());
+
+    let put = |body: Value| {
+        let (base, cookie) = (base.clone(), cookie.clone());
+        async move {
+            send(
+                &base,
+                reqwest::Method::PUT,
+                "/ui/api/indexadores/privado/preferencias",
+                &cookie,
+                body,
+            )
+            .await
+        }
+    };
+    let (status, body) = put(json!({
+        "prioridade": 10, "modo_ratio": false,
+        "seed_min_horas": 72, "seed_min_ratio": 1.0, "seed_envio_horas": 168,
+    }))
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["seed_min_horas"], 72);
+    let (_, list) = get(&base, "/ui/api/indexadores", &cookie).await;
+    assert_eq!(privado(&list)["seed_min_horas"], 72);
+    assert_eq!(privado(&list)["seed_min_ratio"], 1.0);
+    assert_eq!(privado(&list)["seed_envio_horas"], 168);
+
+    for fora in [
+        json!({ "seed_min_horas": 0 }),
+        json!({ "seed_min_horas": 8761 }),
+        json!({ "seed_envio_horas": -1 }),
+        json!({ "seed_min_ratio": 0.0 }),
+        json!({ "seed_min_ratio": 100.5 }),
+    ] {
+        let mut body = json!({ "prioridade": 10, "modo_ratio": false });
+        body.as_object_mut()
+            .unwrap()
+            .extend(fora.as_object().unwrap().clone());
+        let (status, _) = put(body).await;
+        assert_eq!(status, 422, "{fora}");
+    }
+
+    // Os campos ausentes limpam: o salvar manda sempre os cinco.
+    let (status, _) = put(json!({ "prioridade": 10, "modo_ratio": false })).await;
+    assert_eq!(status, 200);
+    let (_, list) = get(&base, "/ui/api/indexadores", &cookie).await;
+    assert!(privado(&list)["seed_min_horas"].is_null());
+    assert!(privado(&list)["seed_envio_horas"].is_null());
 }
 
 #[tokio::test]

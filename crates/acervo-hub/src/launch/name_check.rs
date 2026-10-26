@@ -504,6 +504,134 @@ pub fn findings(file_name: &str, media: &MediaFacts) -> Vec<(Status, String)> {
     out
 }
 
+/// Codecs de áudio na grafia de release padrão, do mais longo ao mais curto
+/// (`DTS-HD.MA` antes de `DTS`). Comparados em maiúsculas; canais opcionais
+/// (`5.1`, `.5.1`, `2.0`) podem vir colados ou depois de um ponto.
+const STANDARD_AUDIO: [&str; 16] = [
+    "DTS-HD.MA",
+    "DTS-HD",
+    "DTS-X",
+    "DTS",
+    "TRUEHD",
+    "DDPA",
+    "DDP",
+    "DD+",
+    "DD",
+    "EAC3",
+    "AC3",
+    "AAC",
+    "FLAC",
+    "OPUS",
+    "LPCM",
+    "PCM",
+];
+
+/// Codecs de vídeo na grafia exata que o formulário do Amigos aceita. `h264`
+/// e `h265` minúsculos entram por serem comuns em WEB-DL.
+const STANDARD_VIDEO: [&str; 13] = [
+    "H.264", "H.265", "H264", "H265", "h264", "h265", "x264", "x265", "AVC", "HEVC", "AV1", "VC-1",
+    "MPEG-2",
+];
+
+fn boundary_before(name: &str, at: usize) -> bool {
+    name[..at]
+        .chars()
+        .next_back()
+        .is_none_or(|c| !c.is_ascii_alphanumeric())
+}
+
+/// Posições (byte) onde `token` aparece em `name` com borda à esquerda e sem
+/// letra colada à direita (dígito pode: `DDP5.1`, `AAC2.0`).
+fn token_at_boundaries(name: &str, token: &str, digit_ok: bool) -> bool {
+    name.match_indices(token).any(|(at, _)| {
+        boundary_before(name, at)
+            && name[at + token.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphabetic() && (digit_ok || !c.is_ascii_digit()))
+    })
+}
+
+/// O nome tem um codec de áudio na grafia padrão (sem diferenciar maiúsculas).
+fn has_standard_audio(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    STANDARD_AUDIO
+        .iter()
+        .any(|token| token_at_boundaries(&upper, token, true))
+}
+
+/// O nome sem a extensão (`.mkv`).
+fn without_extension(name: &str) -> &str {
+    match name.rsplit_once('.') {
+        Some((stem, ext))
+            if (2..=4).contains(&ext.len())
+                && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+                && !ext.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            stem
+        }
+        _ => name,
+    }
+}
+
+/// O nome tem um codec de vídeo na grafia exata do padrão, que o site
+/// reconhece. Codec colado num `-GRUPO` que ainda é seguido de mais segmentos
+/// com ponto é o grupo de um release refeito (`x264-DON.DUAL-outro`,
+/// `X265-IAMABLE.DUAL-Lannister`): o site não o lê. Colado no grupo final
+/// (`H.264-SJB.mkv`), conta.
+fn has_standard_video(name: &str) -> bool {
+    let stem = without_extension(name);
+    STANDARD_VIDEO.iter().any(|token| {
+        stem.match_indices(token).any(|(at, _)| {
+            let rest = &stem[at + token.len()..];
+            boundary_before(stem, at)
+                && match rest.chars().next() {
+                    None => true,
+                    Some('-') => !rest.contains('.'),
+                    Some(c) => !c.is_ascii_alphanumeric(),
+                }
+        })
+    })
+}
+
+/// O codec de vídeo existe, mas colado no grupo de um release refeito.
+fn glued_video_codec(name: &str) -> Option<&'static str> {
+    STANDARD_VIDEO
+        .into_iter()
+        .find(|token| token_at_boundaries(name, token, false))
+}
+
+/// `X264`/`X265` em maiúsculas: o site só aceita o `x` minúsculo.
+fn uppercase_x_codec(name: &str) -> Option<&'static str> {
+    ["X264", "X265"]
+        .into_iter()
+        .find(|token| token_at_boundaries(name, token, false))
+}
+
+/// O que falta ao nome do arquivo para passar no "padrão de nome" do Amigos
+/// (4.0.1): codec de áudio e codec de vídeo na grafia de release padrão.
+/// Lê só o nome, sem o `ffprobe`; vazio quando o nome está no padrão.
+#[must_use]
+pub fn standard_name_gaps(file_name: &str) -> Vec<String> {
+    let mut gaps = Vec::new();
+    if !has_standard_audio(file_name) {
+        gaps.push("falta o codec de áudio (ex.: DDP5.1, AAC2.0, DTS-HD.MA.5.1)".to_owned());
+    }
+    if !has_standard_video(file_name) {
+        gaps.push(match (uppercase_x_codec(file_name), glued_video_codec(file_name)) {
+            (Some(token), _) => format!(
+                "falta o codec de vídeo na grafia padrão (o nome usa '{token}' em maiúsculas; o padrão é '{}')",
+                token.to_lowercase()
+            ),
+            (None, Some(token)) => format!(
+                "falta o codec de vídeo que o site reconhece: '{token}' está colado no grupo de um release refeito (como '{token}-GRUPO.DUAL-OUTRO'), e o site só lê o codec no fim do nome ou antes de um ponto"
+            ),
+            (None, None) => "falta o codec de vídeo (ex.: H.264, H.265, x265)".to_owned(),
+        });
+    }
+    gaps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -764,5 +892,48 @@ mod tests {
         );
         assert!(findings("Filme.mkv", &m).is_empty());
         assert!(findings("Filme.2024.WEB-DL-GRUPO.mkv", &m).is_empty());
+    }
+
+    #[test]
+    fn padrao_de_nome_do_amigos() {
+        let gaps = |n: &str| standard_name_gaps(n);
+        for ok in [
+            "Man.Of.War.2026.1080p.AMZN.WEB-DL.DD.5.1.H.264-playWEB.mkv",
+            "2DIE4.24.Horas.no.Limite.2026.2160p.iT.WEB-DL.DDP.5.1.Atmos.DV.HDR.H.265-GHK.mkv",
+            "Escalada.Mortal.2022.1080p.AMZN.WEB-DL.DDP5.1.H.264-DUAL-C76.mkv",
+            "The.Ark.S03E08.1080p.AMZN.WEB-DL.DD+5.1.H.264-playWEB",
+            "A.2024.BluRay.DTS-HD.MA.5.1.x265-G.mkv",
+            "A.2024.WEB-DL.AAC2.0.h264-G.mkv",
+            "A.2024.WEB-DL.TrueHD.7.1.Atmos.HEVC-G.mkv",
+        ] {
+            assert!(gaps(ok).is_empty(), "{ok}: {:?}", gaps(ok));
+        }
+        let toy = gaps("Toy.Story.1995.2160p.UHD.BluRay.X265-IAMABLE.DUAL-Lannister.mkv");
+        assert_eq!(toy.len(), 2, "{toy:?}");
+        assert!(toy[0].contains("codec de áudio"), "{toy:?}");
+        assert!(
+            toy[1].contains("o nome usa 'X265' em maiúsculas; o padrão é 'x265'"),
+            "{toy:?}"
+        );
+        // Release refeito: o codec colado no grupo original, seguido de
+        // `.DUAL-OUTRO`, o site não lê (visto no envio real do torrent 73347).
+        let redone = gaps(
+            "Ele.nao.esta.tao.a.Fim.de.Voce.2009.1080p.BluRay.DD5.1.x264-DON.DUAL-xprince00.mkv",
+        );
+        assert_eq!(redone.len(), 1, "{redone:?}");
+        assert!(
+            redone[0].contains("'x264' está colado no grupo"),
+            "{redone:?}"
+        );
+        assert_eq!(
+            gaps("Resident.Evil.Afterlife.2010.1080p.BluRay.DTS.x264-Japhson.DUAL-ASM").len(),
+            1
+        );
+        let big = gaps("Operacao.Big.Hero.2015.1080p.BluRay.x264-shaggy");
+        assert_eq!(big.len(), 1, "{big:?}");
+        assert!(big[0].contains("codec de áudio"));
+        // Atmos sozinho não é codec; AC3 dentro de outra palavra não conta.
+        assert_eq!(gaps("A.Atmos.x264-G").len(), 1);
+        assert_eq!(gaps("A.DDX.x264-G").len(), 1);
     }
 }

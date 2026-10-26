@@ -5,8 +5,10 @@ o usuário fazer à mão. O acervo prepara o pacote (checagem de regras, título
 descrição, capturas e `.torrent`), o usuário revisa e envia pelo site, e a
 tarefa `cross-seed` acha o torrent publicado e semeia sozinha.
 
-Nada aqui envia ao site. O BJ proíbe navegação automatizada (regra 1.12) e as
-duas moderações reprovam envio fora do padrão: o envio é sempre do usuário.
+No BJ, nada aqui envia ao site: ele proíbe navegação automatizada (regra
+1.12), e o envio é sempre do usuário. No Amigos, que não proíbe automação, o
+acervo também pode enviar pelo formulário do site, sempre depois da
+confirmação do usuário na tela (ver "Envio ao Amigos pelo acervo").
 
 ## Princípios
 
@@ -106,9 +108,14 @@ gravação do desfecho que falhou) é resgatado para `falhou` pelas rotas.
 6. **Capturas.** 4 quadros a 15%, 35%, 55% e 75% da duração:
    `ffmpeg -ss T -i VIDEO -frames:v 1 -threads 2 -f image2pipe -c:v png -`
    (sem escala: as regras pedem a resolução real), cada um enviado ao ImgBB
-   (`POST https://api.imgbb.com/1/upload`, multipart `key` + `image`). Sem
-   chave configurada → `falhou` com "configure a chave do ImgBB em
-   Configurações → Imagens". Guarda `{url, thumb}`.
+   (`POST https://api.imgbb.com/1/upload`, multipart `key` + `image`). Guarda
+   `{url, thumb}`; `url` é o link direto `i.ibb.co` (resolução original).
+   O ImgBB é **opcional**: sem chave configurada o passo é pulado, o pacote
+   segue, `screens` fica vazio, a descrição não leva `[img]` nem instrução
+   (ela é texto público no site) e o laudo ganha um aviso `Capturas` para
+   baixar os 4 PNG do pacote e anexá-los no formulário. Os instantes saem de `launch::screen_times`, função única do
+   preparo e da rota de download. O laudo guarda ainda o vídeo principal
+   (`capturas`: arquivo, largura, altura, duração) para a tela e para a rota.
 7. **`.torrent`.** Announce do destino: de um torrent do cliente cujo grab é do
    indexador destino, `QbitClient::trackers`, a primeira URL real com status
    2 (funcionando); sem nenhum → `falhou` "nenhum torrent do <site> no cliente
@@ -145,8 +152,8 @@ gravação do desfecho que falhou) é resgatado para `falhou` pelas rotas.
   **urgente**: entra antes dos outros em `due`, ignora `MAX_ATTEMPTS` e
   `RETRY_DAYS` e espera só 1 h entre consultas.
 - Achado o irmão de um par lançado: o irmão recebe a tag de semear do
-  indexador **sempre** (quem envia semeia 7 dias: Amigos 4.7, H&R do
-  uploader). `launches.state` passa a `semeando` só com o irmão conferido
+  indexador **sempre** (quem envia semeia 7 dias, ou até 5 downloads
+  concluídos e 3 seeders além dele: Amigos 4.7 e H&R 18.0 i, de 16/10). `launches.state` passa a `semeando` só com o irmão conferido
   (100%, iniciado); irmão recém-adicionado espera a conferência, e se ela
   recusa o par segue `enviado` e urgente.
 - `run` grava o `outcome` de cada consulta.
@@ -175,6 +182,22 @@ distingue pt-BR de pt-PT: aceitar os dois). "Dual" = áudio PT + original.
   lido pelo ffprobe → Fail, citando o arquivo quando o pacote tem mais de um
   vídeo. O site valida o nome contra o MediaInfo e renomear é proibido, então
   o pacote fica inelegível antes do envio. Ver "Nome contra o arquivo" abaixo.
+- **4.0.1 (padrão de nome)** o nome de cada vídeo precisa trazer um codec de
+  áudio e um de vídeo na grafia de release padrão, ou o formulário o recusa
+  ("Nome fora do padrão") e renomear é proibido → Fail, só no Amigos (o BJ não
+  muda). Áudio (sem diferenciar maiúsculas; canais colados ou após ponto):
+  `DDP5.1`/`DDP.5.1`/`DD5.1`/`DD.5.1`/`DD+5.1`/`AAC2.0`/`AAC`/`AC3`/`EAC3`/
+  `DTS`/`DTS-HD.MA.5.1`/`DTS-HD`/`DTS-X`/`TrueHD`/`FLAC`/`Opus`/`LPCM`/`PCM`;
+  Atmos sozinho não conta. Vídeo (grafia exata): `H.264`, `H.265`, `H264`,
+  `H265`, `x264`, `x265`, `AVC`, `HEVC`, `AV1`, `VC-1`, `MPEG-2`; `h264`/`h265`
+  minúsculos também passam (comuns em WEB-DL), mas `X264`/`X265` com X
+  maiúsculo falham ("o nome usa 'X265' em maiúsculas; o padrão é 'x265'"),
+  como no Toy Story ...X265-IAMABLE, recusado pelo site. O codec colado num
+  `-GRUPO` que ainda é seguido de mais segmentos com ponto (release refeito,
+  `…x264-DON.DUAL-xprince00.mkv`) o site não lê: falta o codec de vídeo. Isso
+  foi visto no torrent 73347. Colado no grupo final (`H.264-SJB.mkv`), conta. Parser puro em
+  `name_check::standard_name_gaps`; é uma segunda linha 4.0.1, independente da
+  conferência contra o arquivo.
 - **3.3** obra não falada em português sem áudio PT e sem legenda PT
   (embutida ou arquivo) → Fail.
 - **5.6** nome de arquivo/pasta com referência a site (lista: `bj-share`,
@@ -184,12 +207,36 @@ distingue pt-BR de pt-PT: aceitar os dois). "Dual" = áudio PT + original.
   temporada completa → Fail. Série encerrada (`ended`): só temporada
   completa; episódio avulso → Fail. Temporada que não cobre todos os
   episódios exibidos da temporada no catálogo → Fail.
+- **3.9** Dual sem legenda PT completa (embutida ou em arquivo; forçada não
+  conta) → Warn: no formulário vai como Dublado, não Dual Áudio. Dual com
+  legenda → Ok. Não se aplica a quem não é Dual.
 - **4.2.1** duplicidade contra os releases do destino:
-  - mesma resolução, mesma fonte e mesmo tipo de áudio (dual/dublado/
-    legendado) e tamanho a menos de 10% → Fail "duplicado provável";
   - destino tem Dual e este é só dublado ou só legendado → Fail;
-  - mesma resolução e fonte, mas outro codec ou tamanho → Warn "avaliar
-    duplicidade";
+  - release do destino sem resolução no título conta como de resolução
+    desconhecida e entra na comparação. O site monta o título pelas
+    etiquetas, e um 4K HDR pode vir só com "HDR"; sem resolução, o parser
+    lia 480p e o duplicado passava. Foi o caso do torrent 52763, que levou a
+    moderação a apagar um envio do acervo. As outras regras que comparam
+    resolução (4.14 e 4.1.10.2) não mudam;
+  - entre os de mesma resolução, fonte e tipo de áudio (dual/dublado/
+    legendado), na ordem:
+    - canais: este é 2.0 e o destino tem 5.1/7.1 → Fail (o 2.0 é
+      substituído); este é 5.1/7.1 e o destino é 2.0 → não pesa (este o
+      substitui). Os nossos vêm do ffprobe; os do destino, do título;
+    - outro codec de vídeo → Warn "avaliar duplicidade";
+    - só o codec de áudio difere (pelos dois nomes: DDP/DD+/EAC3, DD/AC3,
+      AAC, DTS, DTS-HD, TrueHD...) → Warn: a staff avalia;
+    - série em andamento (`continuing`), mesmos codecs: mesmo grupo → Fail;
+      diferença de tamanho abaixo de 2 GiB → Fail; outro grupo com 2 GiB ou
+      mais → não pesa (a regra permite). Série finalizada e filme seguem o
+      item abaixo;
+    - tamanho a menos de 10% → Fail "duplicado provável"; senão Warn
+      "avaliar duplicidade";
+  - só a qualidade difere (outra fonte: BluRay contra WEB-DL), mas com a
+    mesma resolução, o mesmo áudio, o mesmo codec de vídeo (ou um codec
+    desconhecido) e tamanho a menos de 10% → Warn. A regra deixa a decisão com
+    a staff, e na prática ela apaga como duplicado: foi o caso do torrent
+    58396;
   - nada parecido → Ok.
 - **4.14** fonte inferior a WEB-DL (WEBRip, HDTV, CAM, TS...) com WEB-DL Dual
   no destino → Fail.
@@ -247,7 +294,41 @@ Tudo em português; cada campo tem botão de copiar na tela.
 Seção nova `imagens` com `imgbb_api_key` (segredo: entra em
 `config::secrets`, Debug redigido, nunca devolvida pela API). Campo na tela de
 Configurações. URL com a chave nunca vai a log: o erro do reqwest é trocado por
-mensagem própria.
+mensagem própria. A chave é opcional: sem ela o pacote não falha (passo 6) e as
+capturas saem só para baixar.
+
+## Capturas para baixar
+
+O formulário do Amigos tem upload de imagem próprio, e o ImgBB só serve a
+miniatura ou uma cópia reduzida no navegador; subir essa versão reduziu as
+capturas (1920×1012 em vez de 3840×2024) e a staff reclamou. Por isso:
+
+`GET /ui/api/biblioteca/para-lancar/{hash}/{indexer}/capturas/{n}`
+(`n` = 1 a 4, também aceito como `{n}.png` e `{n}.jpg`; mesma auth e cabeçalhos de segurança do `.torrent` e do
+`mediainfo.txt`).
+
+- Gera o quadro **na hora** com `mediainfo::screenshot`, no vídeo principal da
+  origem (torrent no cliente, maior vídeo), no mesmo instante do preparo
+  (15/35/55/75% da duração gravada no laudo; pacote antigo relê pelo ffprobe).
+  Resolução real, sem escala. Nada vai a disco.
+- **Limite de 5 MiB** (`mediainfo::LIMITE_CAPTURA`): o formulário do Amigos
+  só aceita imagem de até 5 MB. Regra, sempre na resolução cheia:
+  1. PNG sem perda, no máximo de compressão (`-compression_level 100`, que o
+     ffmpeg corta no 9 do zlib, e `-pred mixed`; 8 bits por canal, `rgb24`).
+  2. Passou de 5 MiB: JPEG (`mjpeg`, `-pix_fmt yuvj420p`, 8 bits mesmo para
+     fonte 10 bits/HDR, sem tonemap nem escala) em `-q:v` 2, 3, 4, 6, 9,
+     parando na primeira qualidade que couber.
+  3. Nem a 9 coube: devolve a menor e registra aviso no log do hub.
+- O formato devolvido é o realmente gerado, qualquer que seja a extensão
+  pedida: `Content-Type: image/png` ou `image/jpeg`; `Content-Disposition:
+  attachment; filename="<vídeo>.captura-<n>.png|jpg"` (nome sem extensão do
+  vídeo, sanitizado). O upload ao ImgBB usa o mesmo resultado (mesmos bytes,
+  nome e MIME do formato gerado), então também fica em até 5 MiB.
+- Um ffmpeg por vez (semáforo em `mediainfo::screenshot`, vale para o preparo
+  também): quem chega depois espera a vez.
+- 404: `n` fora de 1 a 4 ou extensão que não seja `.png`/`.jpg`, pacote inexistente, torrent fora do cliente, sem
+  vídeo ou vídeo fora do disco. 502: cliente de download fora do ar ou ffmpeg
+  falhou (detalhe só no log).
 
 ## Deploy
 
@@ -264,10 +345,12 @@ Página "Para lançar" (`#lancar`), entre as principais.
 - Linha: título, release, tamanho, origem → destino, selo de estado
   ("parecido no destino" quando `layout_differs`), botão Preparar.
 - Diálogo do pacote: checagens agrupadas por status com o número da regra;
-  releases do destino; campos com botão copiar; capturas (miniaturas com link);
+  releases do destino; campos com botão copiar; seção "Capturas" com 4 botões
+  "Baixar captura N" (link para `/capturas/N`, sem extensão; resolução real ao lado, ex.: "3840×2024 — resolução
+  original") e, havendo ImgBB, os links diretos `i.ibb.co` com botão copiar;
   "Baixar .torrent"; "Marquei como enviado"; "Descartar"; enquanto
   `preparando`, o andamento com polling de 3 s.
-- Configurações → Imagens: chave do ImgBB.
+- Configurações → Imagens: chave do ImgBB (opcional).
 
 ## Pasta adaptada (legenda separada para o BJ)
 
@@ -387,3 +470,116 @@ torrent não privado, e então o hash publicado tende a ser o mesmo.
   registrado, erro), sem a URL. "Não registrado" logo após o envio é
   esperado até o site processar ou aprovar; persistindo, a tela sugere enviar
   o `.torrent` do site.
+
+## Envio ao Amigos pelo acervo
+
+O formulário do Amigos (`/torrents/upload`, Laravel com Inertia e React) é
+refeito com a sessão do indexador `amigosshare`. O acervo segue os mesmos
+passos do JavaScript do site, e nada sai antes da confirmação na tela.
+
+### Sessão
+
+`Indexer::site_request` (só o Cardigann a implementa) faz GET ou POST com JSON
+ou multipart, sempre na origem do indexador, com os mesmos cabeçalhos do
+JavaScript do site: `Accept: application/json`, `X-Requested-With` e o
+`X-XSRF-TOKEN` lido do cookie. Usa o mesmo orçamento de taxa do indexador.
+Faz um novo login uma vez quando o site responde 401 ou 419 (token CSRF
+vencido), ou quando redireciona para `/login`. O multipart é montado em bytes,
+para a requisição poder ser refeita depois do desafio do Cloudflare.
+`Catalog::site_request` respeita a espera por 429 e o disjuntor. Falha de rede,
+de login ou 429 contam no disjuntor. Resposta HTTP de erro, como a validação
+422, volta para quem chamou.
+
+### Prévia: `GET …/envio-ao-site`
+
+Só para pacote do Amigos `pronto`, sem `site_id` e que o cross-seed não achou
+no destino. Faz três leituras, sem publicar nada:
+
+1. `GET /torrents/upload`: as props do Inertia em `<script data-page>`. Para o
+   tipo (`filmes` ou `series`, que vem de `report.tipo`, ou do nome do release
+   em pacote antigo), elas trazem o perfil: listas com id e nome, quais são
+   obrigatórias, `coverRequired`, `screenshotsMin` e `screenshotsMax`, e
+   `subtitleWhen`. Também trazem a categoria.
+2. `POST /torrents/mediainfo` (`{mediainfo}`): para cada lista, os nomes
+   sugeridos (qualidade, áudio, codecs, extensão, idioma), mais largura,
+   altura, legenda (`embedded`, `separate` ou `none`) e o relatório.
+3. `POST /torrents/lookup` (`{imdb_id}`): tipo, título, ano, gêneros, idioma
+   original e a capa já hospedada (`cover.path`).
+
+O áudio é o que o `MediaInfo` do site sugere. Filme só legendado vai como
+"Original" no Amigos, e isso está certo. Há duas trocas:
+
+- regra 3.9: Dual sem legenda PT vai como Dublado;
+- obra nacional: o laudo grava `report.audio` = `nacional`, e o áudio vai
+  como Nacional. O site sugere Dublado para filme brasileiro, como foi com o
+  Authentic Games (73403).
+
+Pacote preparado antes do `report.audio` usa a sugestão do site.
+
+A escolha de cada lista é a do próprio formulário: o primeiro nome sugerido
+que, normalizado (sem acento, minúsculo, sem espaço nas pontas), é igual ao de
+uma opção. Gêneros e idioma vêm do IMDB; o resto, do `MediaInfo`.
+
+Ajustes do acervo:
+
+- **Regra 3.9:** se o laudo tem o aviso da 3.9 (Dual sem legenda PT), o áudio
+  vai como Dublado.
+- **Legenda:** o campo só vai quando o áudio escolhido está em `subtitleWhen`.
+  Se o `MediaInfo` diz `none` e o pacote tem arquivo de legenda, vai
+  `separate`.
+
+A prévia lista em `faltando` o que impede o envio:
+
+- lista obrigatória sem opção que bata;
+- IMDB de outro tipo (série num pacote de filme, ou o contrário);
+- falta de capa, quando ela é obrigatória;
+- menos capturas que o mínimo do site.
+
+Os ids das opções nunca ficam fixos no código: são lidos a cada envio.
+
+### Envio: `POST …/envio-ao-site`
+
+Toma a posse do par. Refaz o rascunho (a prévia não é confiada) e recusa com
+409 se algo falta. Depois:
+
+1. Tira as `SCREEN_COUNT` capturas do vídeo de origem, nos instantes do
+   preparo, e as hospeda uma a uma em `POST /torrents/screenshots` (campo
+   `image`, devolve `{path}`).
+2. Faz o `POST /torrents` multipart, como o `forceFormData` do Inertia: listas
+   em `campo[i]`, booleano `1`/`0` e campo ausente como texto vazio. Os campos
+   são:
+   - `torrent` (o `.torrent` gerado), `name`, `year`, `imdb_id` e
+     `category_id`;
+   - `width`, `height` e `mediainfo`;
+   - `description`: a `descricao` do pacote sem nenhuma `[img]` e sem a seção "Capturas". O site só aceita imagem hospedada nele, e as capturas já aparecem no campo próprio; repetidas na descrição, ficariam duplicadas;
+   - `cover_path` e `screenshot_paths[i]`;
+   - `subtitle`, `attribute_ids[i]` e `anonymous=0`.
+3. Antes do `POST`, `launches.site_id` (migração 41) recebe a marca
+   `pendente`. Se o acervo cair com o envio no ar, o torrent pode ter chegado
+   ao site, e a marca recusa um segundo envio por cima.
+4. A resposta:
+   - **Sucesso:** um redirect para `/torrents/<id>`. O id e o estado
+     `enviado` vão ao banco numa escrita só (`mark_launch_uploaded`).
+   - **Recusa certa:** um 422 com as mensagens do site, ou o formulário de
+     volta. A marca é limpa, a mensagem vira o erro do pacote e o estado fica
+     `pronto`.
+   - **Sem resposta legível:** rede, sessão ou um status inesperado. A marca
+     fica e o erro pede para conferir os envios no site.
+     - Se o torrent está lá, o usuário usa "Enviar o .torrent do site".
+     - Se não está, "Preparar de novo" limpa a marca e libera o envio.
+5. Baixa `/torrents/<id>/download`, porque o site troca o hash do enviado, e
+   semeia esse torrent pelo mesmo caminho de "Enviar o .torrent do site":
+   confere o layout, grava `site_hash`, adiciona parado e confere antes de
+   iniciar. Daqui em diante, qualquer falha é aviso e nunca erro, porque o
+   envio já existe no site. É o caso do `.torrent` que o site ainda não
+   entrega (aguardando liberação, prisão) e do `.torrent` com outros
+   arquivos. O pacote fica `enviado`, com o aviso para o usuário enviar o
+   `.torrent` à mão depois.
+
+### Tela
+
+No pacote pronto do Amigos, a seção "Enviar pelo acervo" mostra o botão "Ver o
+que vai ao Amigos". Ele carrega a prévia: tipo, nome, ano, IMDB, resolução,
+cada lista com a opção escolhida, legenda, capa e capturas, mais o que falta.
+O botão "Enviar ao Amigos" fica desligado enquanto falta algo.
+

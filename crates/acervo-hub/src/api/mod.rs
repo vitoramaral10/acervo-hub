@@ -28,7 +28,8 @@ pub use catalog::{ALL, Catalog, Entry, IndexerView};
 #[cfg(test)]
 pub use catalog::{CatalogError, Health};
 pub use ui::{
-    DefinitionCatalog, DefinitionView, SettingView, authorize_ui, secure_headers, ui_json,
+    DefinitionCatalog, DefinitionView, Preferences, SettingView, authorize_ui, secure_headers,
+    ui_json,
 };
 
 /// A chave da interface, lida a cada requisição: trocada pela tela, a nova
@@ -82,6 +83,8 @@ pub enum SearchError {
     IndexerWaiting { indexer: String, until: String },
     #[error("todos os indexadores em espera até {until} UTC")]
     AllWaiting { until: String },
+    #[error("a requisição ao site falhou: {0}")]
+    SiteFailed(String),
 }
 
 struct Server {

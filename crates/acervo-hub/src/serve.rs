@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
-use crate::api::{ApiKey, Catalog, DefinitionCatalog, DefinitionView, Entry, SettingView};
+use crate::api::{
+    ApiKey, Catalog, DefinitionCatalog, DefinitionView, Entry, Preferences, SettingView,
+};
 use acervo_indexers::{CardigannDefinition, SettingInfo, SettingInfoKind};
 use acervo_store::{IndexerRecord, Store};
 use anyhow::{Context, Result};
@@ -17,6 +19,7 @@ use serde_json::json;
 
 use crate::config::{Config, SERVIDOR, ServerConfig};
 use crate::decide::Progress;
+use crate::live::Bus;
 use crate::registry::{
     CARDIGANN, FLARESOLVERR_OPTIONS, Registry, USE_FLARESOLVERR, USE_PROXY, build, cardigann,
     check_reserved, reserved, scan,
@@ -115,10 +118,14 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
     let database = Database::connected(store);
     // O andamento da busca dos que faltam, que a tela de filmes acompanha.
     let missing = Arc::new(Progress::default());
-    let tasks = Arc::new(Tasks::new(
-        database.clone(),
-        crate::tasks::service(&settings, &database, &catalog, &missing),
-    ));
+    let events = Bus::default();
+    let tasks = Arc::new(
+        Tasks::new(
+            database.clone(),
+            crate::tasks::service(&settings, &database, &catalog, &missing),
+        )
+        .with_events(events.clone()),
+    );
     tasks.watch_settings(settings.subscribe());
     tasks.start().await;
     // Indexador falhando e pouco espaço em disco viram aviso na mudança.
@@ -142,6 +149,7 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         catalog: catalog.clone(),
         searches: tokio::sync::Mutex::default(),
         series_searches: tokio::sync::Mutex::default(),
+        events: events.clone(),
     });
     let readiness = Arc::new(crate::health::Readiness {
         settings: Arc::clone(&settings),
@@ -162,14 +170,10 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         .with_context(|| format!("abrindo `{bind}`"))?;
     axum::serve(
         listener,
-        crate::api::router(catalog, api_key, Arc::new(admin), accounts)
-            .merge(crate::web::router(Arc::clone(&web)))
-            .merge(crate::agenda::router(Arc::clone(&web)))
-            .merge(crate::marks::router(Arc::clone(&web)))
-            .merge(crate::discover::router(Arc::clone(&web)))
-            .merge(crate::launch::web::router(Arc::clone(&web)))
-            .merge(crate::series::web::router(web))
-            .merge(crate::health::router(readiness)),
+        app(catalog, api_key, Arc::new(admin), accounts, web, readiness).layer(
+            // Depois de toda rota da interface que muda algo, avisa a tela.
+            axum::middleware::from_fn_with_state(events.clone(), crate::live::emit_after),
+        ),
     )
     .with_graceful_shutdown({
         let tasks = Arc::clone(&tasks);
@@ -177,6 +181,8 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
             shutdown().await;
             // Para de agendar já; quem está rodando termina em `drain`.
             tasks.stop();
+            // Fecha os canais de eventos: conexão aberta seguraria o desligamento.
+            events.close();
             // O preparo de lançamento apaga a tarefa que deixou no qBittorrent.
             crate::launch::stop();
         }
@@ -200,6 +206,25 @@ pub async fn run(store: Store, bind: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Todas as rotas do serviço, ainda sem o aviso de tempo real.
+fn app(
+    catalog: Catalog,
+    api_key: ApiKey,
+    admin: Arc<HubAdmin>,
+    accounts: Arc<Database>,
+    web: Arc<crate::web::Web>,
+    readiness: Arc<crate::health::Readiness>,
+) -> axum::Router {
+    crate::api::router(catalog, api_key, admin, accounts)
+        .merge(crate::web::router(Arc::clone(&web)))
+        .merge(crate::agenda::router(Arc::clone(&web)))
+        .merge(crate::marks::router(Arc::clone(&web)))
+        .merge(crate::discover::router(Arc::clone(&web)))
+        .merge(crate::launch::web::router(Arc::clone(&web)))
+        .merge(crate::series::web::router(web))
+        .merge(crate::health::router(readiness))
 }
 
 /// Os indexadores cadastrados: os cadastros ativos que sobem.
@@ -593,6 +618,9 @@ impl HubAdmin {
             enabled: true,
             priority: acervo_store::DEFAULT_INDEXER_PRIORITY,
             ratio_mode: false,
+            seed_min_hours: None,
+            seed_min_ratio: None,
+            upload_seed_hours: None,
             added_at: Some(now()),
         };
         let entry = cardigann(&record, parsed, &config).map_err(|e| message(&e))?;
@@ -672,18 +700,28 @@ impl HubAdmin {
         Ok(Some(entry))
     }
 
-    pub(crate) fn preferences(&self, indexer: &str) -> Option<(i32, bool)> {
-        self.record(indexer).map(|r| (r.priority, r.ratio_mode))
+    pub(crate) fn preferences(&self, indexer: &str) -> Option<Preferences> {
+        self.record(indexer).map(|r| Preferences {
+            priority: r.priority,
+            ratio_mode: r.ratio_mode,
+            seed_min_hours: r.seed_min_hours,
+            seed_min_ratio: r.seed_min_ratio,
+            upload_seed_hours: r.upload_seed_hours,
+        })
     }
 
-    /// Grava prioridade e modo ratio. A decisão lê do banco, então o
-    /// catálogo não é remontado.
+    /// Grava prioridade, modo ratio e obrigação de seed. A decisão e a limpeza
+    /// leem do banco, então o catálogo não é remontado.
     pub(crate) async fn set_preferences(
         &self,
         indexer: &str,
-        priority: i32,
-        ratio_mode: bool,
+        prefs: Preferences,
     ) -> Result<(), String> {
+        let Preferences {
+            priority,
+            ratio_mode,
+            ..
+        } = prefs;
         if !acervo_store::INDEXER_PRIORITIES.contains(&priority) {
             return Err("a prioridade vai de 1 a 50".into());
         }
@@ -692,11 +730,17 @@ impl HubAdmin {
         let toggled = record.ratio_mode != ratio_mode;
         record.priority = priority;
         record.ratio_mode = ratio_mode;
+        record.seed_min_hours = prefs.seed_min_hours;
+        record.seed_min_ratio = prefs.seed_min_ratio;
+        record.upload_seed_hours = prefs.upload_seed_hours;
         self.persist(record, false).await?;
         tracing::info!(
             indexer,
             prioridade = priority,
             modo_ratio = ratio_mode,
+            seed_min_horas = prefs.seed_min_hours,
+            seed_min_ratio = prefs.seed_min_ratio,
+            seed_envio_horas = prefs.upload_seed_hours,
             "preferências atualizadas pela interface"
         );
         if toggled {
@@ -915,6 +959,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // O ciclo de vida inteiro do cadastro, num banco só.
     async fn cardigann_cadastrado_edita_desativa_e_sai() {
         let Some(db) = acervo_store::testing::TestDb::new("serve_cardigann").await else {
             return;
@@ -943,18 +988,26 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].settings["cookie"], "do-cadastro");
         assert_eq!((stored[0].priority, stored[0].ratio_mode), (25, false));
+        let salvas = Preferences {
+            priority: 10,
+            ratio_mode: true,
+            seed_min_hours: Some(72),
+            seed_min_ratio: Some(1.0),
+            upload_seed_hours: Some(168),
+        };
         admin
-            .set_preferences("cookie-privado", 10, true)
+            .set_preferences("cookie-privado", salvas)
             .await
             .unwrap();
-        assert_eq!(admin.preferences("cookie-privado"), Some((10, true)));
-        assert!(
-            admin
-                .set_preferences("cookie-privado", 0, true)
-                .await
-                .is_err()
-        );
-        assert!(admin.set_preferences("nao-existe", 10, true).await.is_err());
+        assert_eq!(admin.preferences("cookie-privado"), Some(salvas));
+        let stored = db.store.indexers().await.unwrap();
+        assert_eq!(stored[0].upload_seed_hours, Some(168));
+        let fora = Preferences {
+            priority: 0,
+            ..salvas
+        };
+        assert!(admin.set_preferences("cookie-privado", fora).await.is_err());
+        assert!(admin.set_preferences("nao-existe", salvas).await.is_err());
         assert_eq!(entries(&settings.get(), &admin.registry).await.len(), 1);
 
         // Segredo em branco mantém; o resto troca, e nada volta com valor.

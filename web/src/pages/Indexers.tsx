@@ -32,7 +32,7 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Badge, Skeleton, Switch, Tooltip } from '@/components/ui/misc'
-import { type Indexer, api } from '@/lib/api'
+import { type Indexer, type Preferencias, api } from '@/lib/api'
 import { formatAgo, formatClock, formatCount } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
@@ -145,6 +145,63 @@ function Stat({ label, value, tone }: { label: string; value: number; tone?: 'su
   )
 }
 
+/** Campo numérico opcional da obrigação de seed: vazio é "o tracker não exige" e salva null. */
+function SeedField({
+  label,
+  value,
+  min,
+  max,
+  step,
+  disabled,
+  onSave,
+}: {
+  label: string
+  value: number | null
+  min: number
+  max: number
+  step: number
+  disabled: boolean
+  onSave: (value: number | null) => void
+}) {
+  return (
+    <label className="flex flex-col gap-1 text-sm">
+      <span>{label}</span>
+      <Input
+        type="number"
+        min={min}
+        max={max}
+        step={step}
+        inputMode="decimal"
+        className="h-8 w-28 tabular-nums"
+        defaultValue={value ?? ''}
+        placeholder="sem exigência"
+        disabled={disabled}
+        aria-label={label}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') e.currentTarget.blur()
+        }}
+        onBlur={(e) => {
+          // Entrada que não forma número ('1e', '72-') chega como '' ao DOM: não é "sem exigência".
+          if (e.currentTarget.validity.badInput) {
+            e.currentTarget.value = value === null ? '' : String(value)
+            toast.error(`${label}: de ${min} a ${max}`)
+            return
+          }
+          const text = e.currentTarget.value.trim()
+          const n = text === '' ? null : Number(text)
+          if (n !== null && (!Number.isFinite(n) || n < min || n > max || (step === 1 && !Number.isInteger(n)))) {
+            e.currentTarget.value = value === null ? '' : String(value)
+            toast.error(`${label}: de ${min} a ${max}`)
+            return
+          }
+          if (n === value) return
+          onSave(n)
+        }}
+      />
+    </label>
+  )
+}
+
 function IndexerCard({
   indexer,
   onEdit,
@@ -171,8 +228,19 @@ function IndexerCard({
     onSettled: () => void queryClient.invalidateQueries({ queryKey: ['indexadores'] }),
   })
   const prioridadeInput = useRef<HTMLInputElement>(null)
+  // Os campos de seed não são controlados: depois de um erro, remontam com o gravado.
+  const [seedKey, setSeedKey] = useState(0)
+  // O salvar manda sempre os cinco campos; cada controle troca só o seu.
+  const prefs = (change: Partial<Preferencias> = {}): Preferencias => ({
+    prioridade: indexer.prioridade,
+    modo_ratio: indexer.modo_ratio,
+    seed_min_horas: indexer.seed_min_horas,
+    seed_min_ratio: indexer.seed_min_ratio,
+    seed_envio_horas: indexer.seed_envio_horas,
+    ...change,
+  })
   const preferences = useMutation({
-    mutationFn: (p: { prioridade: number; modo_ratio: boolean }) => api.setPreferences(indexer.nome, p),
+    mutationFn: (p: Preferencias) => api.setPreferences(indexer.nome, p),
     onSuccess: (saved) => {
       toast.success(`${indexer.nome}: preferências salvas`)
       // O card já mostra o gravado; a próxima alteração parte dele, não do snapshot velho da lista.
@@ -180,7 +248,16 @@ function IndexerCard({
         old && {
           ...old,
           indexadores: old.indexadores.map((i) =>
-            i.nome === indexer.nome ? { ...i, prioridade: saved.prioridade, modo_ratio: saved.modo_ratio } : i,
+            i.nome === indexer.nome
+              ? {
+                  ...i,
+                  prioridade: saved.prioridade,
+                  modo_ratio: saved.modo_ratio,
+                  seed_min_horas: saved.seed_min_horas,
+                  seed_min_ratio: saved.seed_min_ratio,
+                  seed_envio_horas: saved.seed_envio_horas,
+                }
+              : i,
           ),
         },
       )
@@ -189,6 +266,7 @@ function IndexerCard({
       toast.error(error.message)
       // O campo não é controlado: sem isto ele seguiria mostrando o que não foi gravado.
       if (prioridadeInput.current) prioridadeInput.current.value = String(indexer.prioridade)
+      setSeedKey((k) => k + 1)
     },
     // Devolver a promise segura o isPending até o refetch chegar.
     onSettled: () => queryClient.invalidateQueries({ queryKey: ['indexadores'] }),
@@ -332,7 +410,7 @@ function IndexerCard({
                 return
               }
               if (n === indexer.prioridade) return
-              preferences.mutate({ prioridade: n, modo_ratio: indexer.modo_ratio })
+              preferences.mutate(prefs({ prioridade: n }))
             }}
           />
         </label>
@@ -340,7 +418,7 @@ function IndexerCard({
           <Switch
             checked={indexer.modo_ratio}
             disabled={preferences.isPending}
-            onCheckedChange={(modo_ratio) => preferences.mutate({ prioridade: indexer.prioridade, modo_ratio })}
+            onCheckedChange={(modo_ratio) => preferences.mutate(prefs({ modo_ratio }))}
             aria-label={
               indexer.modo_ratio
                 ? `Desligar construir ratio em ${indexer.nome}`
@@ -352,6 +430,41 @@ function IndexerCard({
           >
             <span>Construir ratio</span>
           </Tooltip>
+        </div>
+        <div className="flex basis-full flex-wrap items-end gap-x-6 gap-y-3">
+          <SeedField
+            key={`min-horas-${seedKey}-${indexer.seed_min_horas}`}
+            label="Seed mínimo por download (horas)"
+            value={indexer.seed_min_horas}
+            min={1}
+            max={8760}
+            step={1}
+            disabled={preferences.isPending}
+            onSave={(seed_min_horas) => preferences.mutate(prefs({ seed_min_horas }))}
+          />
+          <SeedField
+            key={`min-ratio-${seedKey}-${indexer.seed_min_ratio}`}
+            label="Ratio mínima por download"
+            value={indexer.seed_min_ratio}
+            min={0.01}
+            max={100}
+            step={0.1}
+            disabled={preferences.isPending}
+            onSave={(seed_min_ratio) => preferences.mutate(prefs({ seed_min_ratio }))}
+          />
+          <SeedField
+            key={`envio-horas-${seedKey}-${indexer.seed_envio_horas}`}
+            label="Seed mínimo do que você lança (horas)"
+            value={indexer.seed_envio_horas}
+            min={1}
+            max={8760}
+            step={1}
+            disabled={preferences.isPending}
+            onSave={(seed_envio_horas) => preferences.mutate(prefs({ seed_envio_horas }))}
+          />
+          <p className="basis-full text-xs text-content-muted">
+            Vazio: o tracker não exige. A limpeza não apaga nada antes de cumprir, com ou sem o modo ratio.
+          </p>
         </div>
       </div>
 

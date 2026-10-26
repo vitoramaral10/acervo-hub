@@ -86,7 +86,7 @@ export function MissingPage() {
     queryKey: ['faltando', filter],
     queryFn: () => library.missing(filter === 'todos' ? undefined : filter),
     // Enquanto algum item baixa, a lista acompanha o que o servidor importa.
-    refetchInterval: (state) => (state.state.data?.itens.some((item) => item.baixando) ? 5_000 : false),
+    refetchInterval: (state) => (state.state.data?.itens.some((item) => item.baixando) ? 10_000 : false),
   })
 
   return (

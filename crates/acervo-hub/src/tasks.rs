@@ -27,6 +27,7 @@ use tokio::time::Instant;
 use crate::decide::{Progress, now_rfc3339};
 use crate::events::{Alert, Change, notify_alert};
 use crate::health::{TASK_FAILURES, cleanup_message, task_message, track_streak};
+use crate::live::{self, Bus};
 use crate::serve::Database;
 use crate::settings::Settings;
 
@@ -275,6 +276,8 @@ pub struct Tasks {
     /// [`STAGGER`]; menor nos testes.
     stagger: Duration,
     cancel: Cancel,
+    /// Onde o fim de cada execução avisa a tela.
+    events: Bus,
     /// Quando o desligamento começou: dali conta a espera das execuções.
     stopped_at: Mutex<Option<Instant>>,
 }
@@ -303,8 +306,17 @@ impl Tasks {
             ceiling: CEILING,
             stagger: STAGGER,
             cancel: Cancel::default(),
+            events: Bus::default(),
             stopped_at: Mutex::new(None),
         }
+    }
+
+    /// Liga o registro ao barramento do tempo real: o início e o fim de cada
+    /// execução viram tópicos.
+    #[must_use]
+    pub fn with_events(mut self, events: Bus) -> Self {
+        self.events = events;
+        self
     }
 
     /// O aviso de desligamento, para quem mais precisa parar com as tarefas.
@@ -550,6 +562,7 @@ impl Tasks {
     async fn execute(&self, slot: &Slot, trigger: Trigger) {
         let started_at = now_rfc3339();
         slot.lock().started = Some(started_at.clone());
+        self.events.emit(&[live::TASKS]);
         let clock = Instant::now();
         let job = Arc::clone(&slot.task.job);
         // Numa task à parte: pânico no trabalho vira execução com falha, e o
@@ -608,6 +621,7 @@ impl Tasks {
             state.failures = failures;
             (failures, change)
         };
+        self.events.emit(live::task_topics(slot.task.id));
         if let Some(change) = change
             && let Ok(store) = self.database.get()
         {
@@ -1389,6 +1403,58 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("esperando: {what}");
+    }
+
+    /// Um trabalho que termina na hora.
+    #[derive(Debug)]
+    struct Quick;
+
+    #[async_trait]
+    impl Job for Quick {
+        async fn run(&self, _: Trigger) -> Result<Outcome> {
+            Ok(Outcome::new(true, "feito"))
+        }
+    }
+
+    #[tokio::test]
+    async fn tarefa_terminada_emite_os_topicos_do_mapa() {
+        let bus = Bus::default();
+        let mut events = bus.subscribe();
+        let tasks = Arc::new(
+            Tasks::new(
+                Database::default(),
+                vec![Task {
+                    id: "importacao",
+                    name: "Importação",
+                    interval: Duration::ZERO,
+                    first: First::Now,
+                    job: Arc::new(Quick) as Arc<dyn Job>,
+                }],
+            )
+            .with_events(bus),
+        );
+        tasks.start().await;
+        assert_eq!(tasks.run_now("importacao"), Some(true));
+        // No início, `tarefas`; no fim, o mapa da importação.
+        let mut got = Vec::new();
+        until("tópicos do fim da execução", || {
+            while let Ok(topic) = events.try_recv() {
+                got.push(topic);
+            }
+            got.len() >= 6
+        })
+        .await;
+        assert_eq!(
+            got,
+            [
+                live::TASKS,
+                live::TASKS,
+                live::QUEUE,
+                live::MOVIES,
+                live::SERIES,
+                live::HISTORY
+            ]
+        );
     }
 
     #[tokio::test]

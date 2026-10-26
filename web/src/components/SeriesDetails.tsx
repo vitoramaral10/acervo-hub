@@ -909,7 +909,7 @@ export function SeriesDetails({ id, onClose }: { id: number; onClose: () => void
     queryKey: ['series', id],
     queryFn: () => seriesApi.get(id),
     // Enquanto baixa, a tela acompanha o que o servidor importa.
-    refetchInterval: (state) => ((state.state.data?.episodios.baixando ?? 0) > 0 ? 5_000 : false),
+    refetchInterval: (state) => ((state.state.data?.episodios.baixando ?? 0) > 0 ? 10_000 : false),
   })
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>

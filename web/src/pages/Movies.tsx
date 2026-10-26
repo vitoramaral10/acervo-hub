@@ -289,7 +289,7 @@ export function MoviesPage() {
     queryFn: api.movies,
     // Enquanto algum filme baixa, a lista acompanha o que o servidor importa.
     refetchInterval: (state) =>
-      state.state.data?.filmes.some((movie) => movie.download?.estado === 'downloading') ? 5_000 : false,
+      state.state.data?.filmes.some((movie) => movie.download?.estado === 'downloading') ? 10_000 : false,
   })
   const [query, setQuery] = useState('')
   const [prefs, setPrefs] = useState<MovieListPrefs>(loadPrefs)
@@ -304,7 +304,7 @@ export function MoviesPage() {
   const progress = useQuery({
     queryKey: ['filmes-busca'],
     queryFn: api.missingSearch,
-    refetchInterval: (state) => (state.state.data?.rodando ? 2000 : false),
+    refetchInterval: (state) => (state.state.data?.rodando ? 3000 : false),
   })
   const searching = progress.data?.rodando ?? false
   const searched = progress.data?.buscados ?? 0

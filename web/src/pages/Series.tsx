@@ -94,7 +94,7 @@ export function SeriesPage() {
     queryFn: seriesApi.list,
     // Enquanto algum episódio baixa, a lista acompanha o que o servidor importa.
     refetchInterval: (state) =>
-      state.state.data?.series.some((item) => item.episodios.baixando > 0) ? 5_000 : false,
+      state.state.data?.series.some((item) => item.episodios.baixando > 0) ? 10_000 : false,
   })
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<SeriesFilter>('todas')

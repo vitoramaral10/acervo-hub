@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use acervo_core::{DownloadHash, DownloadState};
@@ -163,6 +164,22 @@ impl std::fmt::Debug for CreateTorrentOptions {
 pub struct QbitClient {
     base: Url,
     http: reqwest::Client,
+    login: Arc<Login>,
+}
+
+/// Credencial guardada para refazer o login quando a sessão cai.
+struct Login {
+    username: String,
+    password: String,
+}
+
+impl std::fmt::Debug for Login {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Login")
+            .field("username", &self.username)
+            .field("password", &"<redigido>")
+            .finish()
+    }
 }
 
 impl QbitClient {
@@ -191,13 +208,31 @@ impl QbitClient {
             .cookie_store(true)
             .build()?;
 
-        let url = base.join("api/v2/auth/login")?;
-        let response = http
+        let client = Self {
+            base,
+            http,
+            login: Arc::new(Login {
+                username: username.to_string(),
+                password: password.to_string(),
+            }),
+        };
+        client.authenticate().await?;
+        Ok(client)
+    }
+
+    /// Abre uma sessão nova no `cookie_store`, trocando a anterior.
+    async fn authenticate(&self) -> Result<(), QbitError> {
+        let url = self.base.join("api/v2/auth/login")?;
+        let response = self
+            .http
             .post(url)
             // O Referer é exigido pela proteção de CSRF da WebUI; sem ele o
             // login responde 403 mesmo com credencial correta.
-            .header(reqwest::header::REFERER, base.as_str())
-            .form(&[("username", username), ("password", password)])
+            .header(reqwest::header::REFERER, self.base.as_str())
+            .form(&[
+                ("username", self.login.username.as_str()),
+                ("password", self.login.password.as_str()),
+            ])
             .send()
             .await?;
 
@@ -221,7 +256,25 @@ impl QbitClient {
             }
         }
 
-        Ok(Self { base, http })
+        Ok(())
+    }
+
+    /// Manda o pedido; se a sessão caiu (403), autentica de novo e repete uma
+    /// vez. Desde a 5.3 o qBittorrent derruba as sessões mais antigas de quem
+    /// loga muito, e uma sessão guardada pelo preparo de um lançamento morre
+    /// no meio dele.
+    async fn send(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response, QbitError> {
+        // shortcut: o multipart (add) não se clona e não é repetido; mudar se
+        // o add também cair no 403.
+        let retry = request.try_clone();
+        let response = request.send().await?;
+        match retry {
+            Some(retry) if response.status() == reqwest::StatusCode::FORBIDDEN => {
+                self.authenticate().await?;
+                Ok(retry.send().await?)
+            }
+            _ => Ok(response),
+        }
     }
 
     /// Lista todos os torrents do cliente.
@@ -255,10 +308,11 @@ impl QbitClient {
     pub async fn export_torrent(&self, hash: &str) -> Result<Vec<u8>, QbitError> {
         let path = "api/v2/torrents/export";
         let response = self
-            .http
-            .get(self.base.join(path)?)
-            .query(&[("hash", hash)])
-            .send()
+            .send(
+                self.http
+                    .get(self.base.join(path)?)
+                    .query(&[("hash", hash)]),
+            )
             .await?;
         let status = response.status();
         if !status.is_success() {
@@ -395,11 +449,12 @@ impl QbitClient {
     pub async fn ensure_category(&self, name: &str) -> Result<(), QbitError> {
         let path = "api/v2/torrents/createCategory";
         let response = self
-            .http
-            .post(self.base.join(path)?)
-            .header(reqwest::header::REFERER, self.base.as_str())
-            .form(&[("category", name), ("savePath", "")])
-            .send()
+            .send(
+                self.http
+                    .post(self.base.join(path)?)
+                    .header(reqwest::header::REFERER, self.base.as_str())
+                    .form(&[("category", name), ("savePath", "")]),
+            )
             .await?;
         // 409: a categoria já existe.
         match response.status() {
@@ -445,11 +500,12 @@ impl QbitClient {
             NewTorrent::Magnet(link) => form.text("urls", link),
         };
         let response = self
-            .http
-            .post(self.base.join(path)?)
-            .header(reqwest::header::REFERER, self.base.as_str())
-            .multipart(form)
-            .send()
+            .send(
+                self.http
+                    .post(self.base.join(path)?)
+                    .header(reqwest::header::REFERER, self.base.as_str())
+                    .multipart(form),
+            )
             .await?;
         let status = response.status();
         if status == reqwest::StatusCode::CONFLICT {
@@ -617,11 +673,12 @@ impl QbitClient {
             form.push(("source", source.clone()));
         }
         let response = self
-            .http
-            .post(self.base.join(path)?)
-            .header(reqwest::header::REFERER, self.base.as_str())
-            .form(&form)
-            .send()
+            .send(
+                self.http
+                    .post(self.base.join(path)?)
+                    .header(reqwest::header::REFERER, self.base.as_str())
+                    .form(&form),
+            )
             .await?;
         let status = response.status();
         if status == reqwest::StatusCode::CONFLICT {
@@ -649,10 +706,11 @@ impl QbitClient {
     ) -> Result<Option<TorrentTaskStatus>, QbitError> {
         let path = "api/v2/torrentcreator/status";
         let response = self
-            .http
-            .get(self.base.join(path)?)
-            .query(&[("taskID", task_id)])
-            .send()
+            .send(
+                self.http
+                    .get(self.base.join(path)?)
+                    .query(&[("taskID", task_id)]),
+            )
             .await?;
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
@@ -688,10 +746,11 @@ impl QbitClient {
     pub async fn torrent_task_file(&self, task_id: &str) -> Result<Vec<u8>, QbitError> {
         let path = "api/v2/torrentcreator/torrentFile";
         let response = self
-            .http
-            .get(self.base.join(path)?)
-            .query(&[("taskID", task_id)])
-            .send()
+            .send(
+                self.http
+                    .get(self.base.join(path)?)
+                    .query(&[("taskID", task_id)]),
+            )
             .await?;
         let status = response.status();
         if matches!(
@@ -777,14 +836,15 @@ impl QbitClient {
         let url = self.base.join("api/v2/torrents/delete")?;
 
         let response = self
-            .http
-            .post(url)
-            .header(reqwest::header::REFERER, self.base.as_str())
-            .form(&[
-                ("hashes", joined.as_str()),
-                ("deleteFiles", if delete_files { "true" } else { "false" }),
-            ])
-            .send()
+            .send(
+                self.http
+                    .post(url)
+                    .header(reqwest::header::REFERER, self.base.as_str())
+                    .form(&[
+                        ("hashes", joined.as_str()),
+                        ("deleteFiles", if delete_files { "true" } else { "false" }),
+                    ]),
+            )
             .await?;
 
         if response.status().is_success() {
@@ -835,11 +895,12 @@ impl QbitClient {
         form: &[(&str, &str)],
     ) -> Result<reqwest::StatusCode, QbitError> {
         Ok(self
-            .http
-            .post(self.base.join(path)?)
-            .header(reqwest::header::REFERER, self.base.as_str())
-            .form(form)
-            .send()
+            .send(
+                self.http
+                    .post(self.base.join(path)?)
+                    .header(reqwest::header::REFERER, self.base.as_str())
+                    .form(form),
+            )
             .await?
             .status())
     }
@@ -850,7 +911,7 @@ impl QbitClient {
         query: &[(&str, &str)],
     ) -> Result<T, QbitError> {
         let url = self.base.join(path)?;
-        let response = self.http.get(url).query(query).send().await?;
+        let response = self.send(self.http.get(url).query(query)).await?;
 
         if !response.status().is_success() {
             return Err(QbitError::Status {

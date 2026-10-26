@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 
 use crate::config::Config;
 use crate::decide::{Decider, now_rfc3339};
+use crate::live::Bus;
 use crate::serve::Database;
 use crate::settings::Settings;
 
@@ -44,6 +45,8 @@ pub struct Web {
     pub searches: tokio::sync::Mutex<HashMap<i64, Cached>>,
     /// O mesmo, de cada série.
     pub series_searches: tokio::sync::Mutex<HashMap<i64, Cached>>,
+    /// O barramento de tópicos do tempo real (`GET /ui/api/eventos`).
+    pub events: Bus,
 }
 
 impl Web {
@@ -102,6 +105,7 @@ pub fn router(web: Arc<Web>) -> Router {
 /// As rotas, ainda sem o estado.
 pub(crate) fn routes() -> Router<Arc<Web>> {
     Router::new()
+        .route("/ui/api/eventos", get(events))
         .route("/ui/api/biblioteca/opcoes", get(options))
         .route("/ui/api/biblioteca/tmdb", get(tmdb_search))
         .route("/ui/api/biblioteca/filmes", post(add_movie))
@@ -155,6 +159,22 @@ pub(crate) fn routes() -> Router<Arc<Web>> {
             "/ui/api/biblioteca/notificacoes/testar",
             post(test_notification),
         )
+}
+
+// ---------------------------------------------------------------- eventos
+
+/// O canal de eventos: a mesma entrada das outras rotas (sessão, ou chave
+/// em `X-Api-Key`). Sem autorização, o fluxo nem abre.
+async fn events(State(web): Shared, headers: HeaderMap) -> WebResult {
+    authorize_ui(
+        &web.config().server.api_key,
+        &web.database,
+        &headers,
+        &Method::GET,
+    )
+    .await
+    .map_err(|response| *response)?;
+    Ok(crate::live::stream(&web.events))
 }
 
 // ---------------------------------------------------------------- opções
@@ -842,3 +862,96 @@ async fn test_notification(
 }
 
 // ---------------------------------------------------------------- listas
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::live::{HISTORY, QUEUE};
+
+    const KEY: &str = "chave-de-teste-sse-0123";
+
+    /// Lê o fluxo até `needle` aparecer (ou estoura o tempo).
+    async fn read_until(response: &mut reqwest::Response, seen: &mut String, needle: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !seen.contains(needle) {
+                let chunk = response.chunk().await.unwrap().expect("fluxo fechado");
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("esperando `{needle}` em {seen:?}"));
+    }
+
+    #[tokio::test]
+    async fn eventos_entrega_ola_e_mudanca_so_com_autorizacao() {
+        let Some(db) = acervo_store::testing::TestDb::new("eventos_sse").await else {
+            return;
+        };
+        let settings = Arc::new(
+            crate::settings::Settings::load(db.store.clone())
+                .await
+                .unwrap(),
+        );
+        settings
+            .save_section(crate::config::SERVIDOR, json!({ "api_key": KEY }))
+            .await
+            .unwrap();
+        let web = Arc::new(Web {
+            settings,
+            database: crate::serve::Database::connected(db.store.clone()),
+            catalog: Catalog::default(),
+            searches: tokio::sync::Mutex::default(),
+            series_searches: tokio::sync::Mutex::default(),
+            events: Bus::default(),
+        });
+        let events = web.events.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/ui/api/eventos", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router(web)).await });
+        let http = reqwest::Client::new();
+
+        // Sem credencial, ou com a errada, o fluxo não abre.
+        let denied = http.get(&url).send().await.unwrap();
+        assert_eq!(denied.status().as_u16(), 401);
+        assert!(
+            denied
+                .headers()
+                .get("content-type")
+                .is_none_or(|kind| !kind.to_str().unwrap().contains("event-stream"))
+        );
+        let wrong = http.get(&url).header("X-Api-Key", "outra").send().await;
+        assert_eq!(wrong.unwrap().status().as_u16(), 401);
+
+        let mut stream = http
+            .get(&url)
+            .header("X-Api-Key", KEY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stream.status().as_u16(), 200);
+        let headers = stream.headers().clone();
+        assert!(
+            headers["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/event-stream")
+        );
+        assert_eq!(headers["cache-control"], "no-cache");
+        assert_eq!(headers["x-accel-buffering"], "no");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        assert!(headers.contains_key("content-security-policy"));
+
+        let mut seen = String::new();
+        read_until(&mut stream, &mut seen, "event: ola").await;
+        events.emit(&[HISTORY, QUEUE]);
+        events.emit(&[QUEUE]);
+        read_until(&mut stream, &mut seen, "event: mudanca").await;
+        read_until(&mut stream, &mut seen, "\n\n").await;
+        assert!(
+            seen.contains(r#"data: {"topicos":["fila","historico"]}"#),
+            "{seen:?}"
+        );
+        // Um só `mudanca` para as três emissões.
+        assert_eq!(seen.matches("event: mudanca").count(), 1, "{seen:?}");
+    }
+}

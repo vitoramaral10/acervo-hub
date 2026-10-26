@@ -539,6 +539,8 @@ fn description(input: &Input, synopsis: &str, sheet: &str, technical: &str) -> S
         .filter(|url| !url.trim().is_empty())
         .map(|url| format!("[img]{}[/img]", url.trim()))
         .collect();
+    // Sem ImgBB não há link: as capturas vão como arquivo, pelo formulário, e
+    // a descrição (texto público no site) não leva instrução nenhuma.
     if !screens.is_empty() {
         sections.push(format!("[b]Capturas[/b]\n{}", screens.join("\n")));
     }
@@ -854,6 +856,16 @@ mod tests {
         assert!(descricao.contains("[b]Ficha[/b]\nDireção: Frank Darabont"));
         assert!(descricao.contains("[b]Informações técnicas[/b]\nFormato: MKV"));
         assert!(descricao.contains("[b]Capturas[/b]\n[img]https://i.ibb.co/a/1.png[/img]\n[img]https://i.ibb.co/b/2.png[/img]"));
+    }
+
+    #[test]
+    fn descricao_sem_capturas_hospedadas_nao_leva_imagem_nem_instrucao() {
+        let mut entrada = input();
+        entrada.screens.clear();
+        let descricao = build(&entrada).description;
+        assert!(!descricao.contains("[img]"), "{descricao}");
+        assert!(!descricao.contains("[b]Capturas[/b]"), "{descricao}");
+        assert!(!descricao.contains("anexe"), "{descricao}");
     }
 
     #[test]

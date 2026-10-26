@@ -333,16 +333,131 @@ fn ffmpeg_binary() -> String {
 
 const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
-/// Um quadro do vídeo, em PNG, na resolução original (as regras pedem a
-/// resolução real). `-ss` antes de `-i` busca pelo índice, sem decodificar o
-/// arquivo até lá. `-threads 1` antes de `-i` limita o decodificador (depois
-/// do `-i` só valeria para o encoder): sem ele o ffmpeg sobe uma thread por
-/// núcleo do host, ignorando a cota de CPU do container, e a memória estoura.
+/// O maior arquivo que o formulário do Amigos aceita numa imagem (5 MB; aqui
+/// 5 MiB, a leitura segura). Passou disso, o site recusa o anexo.
+pub const LIMITE_CAPTURA: usize = 5 * 1024 * 1024;
+
+/// Qualidades do `-q:v` do mjpeg tentadas em ordem (2 é a mais alta usual).
+/// Poucas, porque cada tentativa é um ffmpeg inteiro.
+const QUALIDADES_JPEG: [u8; 5] = [2, 3, 4, 6, 9];
+
+/// O formato de uma captura.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureFormat {
+    Png,
+    Jpg,
+}
+
+impl CaptureFormat {
+    #[must_use]
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpg => "jpg",
+        }
+    }
+
+    #[must_use]
+    pub const fn mime(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpg => "image/jpeg",
+        }
+    }
+}
+
+/// Uma tentativa de codificar o quadro.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attempt {
+    Png,
+    Jpeg(u8),
+}
+
+/// A decisão pura: dado o que acabou de sair e o tamanho, a próxima tentativa,
+/// ou `None` quando coube (ou quando não há mais o que tentar). PNG sem perda
+/// primeiro; passou do limite, JPEG na mesma resolução, subindo a compressão.
+fn next_attempt(done: Attempt, size: usize) -> Option<Attempt> {
+    if size <= LIMITE_CAPTURA {
+        return None;
+    }
+    match done {
+        Attempt::Png => Some(Attempt::Jpeg(QUALIDADES_JPEG[0])),
+        Attempt::Jpeg(q) => QUALIDADES_JPEG
+            .iter()
+            .copied()
+            .find(|candidate| *candidate > q)
+            .map(Attempt::Jpeg),
+    }
+}
+
+/// Um quadro do vídeo na resolução original (as regras pedem a resolução
+/// real; nunca se escala). Sai em PNG, com a compressão máxima e sem perda;
+/// se passar de [`LIMITE_CAPTURA`], em JPEG de qualidade alta na mesma
+/// resolução, a mais alta que couber. Se nem a mais comprimida couber,
+/// devolve a menor e registra o aviso. Devolve os bytes e o formato gerado.
 ///
-/// `-pix_fmt rgb24` força 8 bits por canal: fonte de 10 bits faria o encoder
-/// escolher `rgb48be` (16 bits), um PNG 4K de ~40 MB que passa do limite do
-/// `ImgBB` e ocupa dezenas de MiB a mais na memória do hub.
-pub async fn screenshot(path: &Path, at_seconds: f64) -> anyhow::Result<Vec<u8>> {
+/// `-ss` antes de `-i` busca pelo índice, sem decodificar o arquivo até lá.
+/// `-threads 1` antes de `-i` limita o decodificador (depois do `-i` só
+/// valeria para o encoder): sem ele o ffmpeg sobe uma thread por núcleo do
+/// host, ignorando a cota de CPU do container, e a memória estoura.
+///
+/// `-pix_fmt rgb24` (PNG) e `yuvj420p` (JPEG) forçam 8 bits por canal, sem
+/// escala: fonte de 10 bits faria o encoder escolher `rgb48be` (16 bits), um
+/// PNG 4K de ~40 MB que passa do limite e ocupa dezenas de MiB a mais na
+/// memória do hub.
+pub async fn screenshot(path: &Path, at_seconds: f64) -> anyhow::Result<(Vec<u8>, CaptureFormat)> {
+    // Um ffmpeg por vez, no preparo e na rota de download: um quadro 4K ocupa
+    // dezenas de MiB e o hub divide a máquina com o resto. Quem chega depois
+    // espera a vez.
+    static ONE_AT_A_TIME: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    let _turn = ONE_AT_A_TIME.acquire().await?;
+    let mut attempt = Attempt::Png;
+    let mut smallest: Option<(Vec<u8>, CaptureFormat)> = None;
+    loop {
+        let bytes = encode_frame(path, at_seconds, attempt).await?;
+        let format = match attempt {
+            Attempt::Png => CaptureFormat::Png,
+            Attempt::Jpeg(_) => CaptureFormat::Jpg,
+        };
+        let next = next_attempt(attempt, bytes.len());
+        if smallest
+            .as_ref()
+            .is_none_or(|(best, _)| bytes.len() < best.len())
+        {
+            smallest = Some((bytes, format));
+        }
+        match next {
+            Some(next) => attempt = next,
+            None => break,
+        }
+    }
+    let (bytes, format) = smallest.expect("ao menos uma tentativa");
+    if bytes.len() > LIMITE_CAPTURA {
+        tracing::warn!(
+            bytes = bytes.len(),
+            "captura acima do limite de 5 MiB do Amigos, mesmo no JPEG mais comprimido"
+        );
+    }
+    Ok((bytes, format))
+}
+
+async fn encode_frame(path: &Path, at_seconds: f64, attempt: Attempt) -> anyhow::Result<Vec<u8>> {
+    // `-compression_level 100` é cortado no máximo do zlib (9); `-pred mixed`
+    // escolhe o filtro por linha e rende uns 5% a mais.
+    let (encoder, pix_fmt): (Vec<String>, &str) = match attempt {
+        Attempt::Png => (
+            ["-c:v", "png", "-compression_level", "100", "-pred", "mixed"]
+                .map(str::to_owned)
+                .into(),
+            "rgb24",
+        ),
+        Attempt::Jpeg(q) => (
+            ["-c:v", "mjpeg", "-q:v", &q.to_string()]
+                .map(str::to_owned)
+                .into(),
+            "yuvj420p",
+        ),
+    };
     let output = tokio::time::timeout(
         Duration::from_secs(120),
         tokio::process::Command::new(ffmpeg_binary())
@@ -350,19 +465,9 @@ pub async fn screenshot(path: &Path, at_seconds: f64) -> anyhow::Result<Vec<u8>>
             .arg(format!("{at_seconds:.3}"))
             .arg("-i")
             .arg(path)
-            .args([
-                "-frames:v",
-                "1",
-                "-threads",
-                "2",
-                "-f",
-                "image2pipe",
-                "-c:v",
-                "png",
-                "-pix_fmt",
-                "rgb24",
-                "-",
-            ])
+            .args(["-frames:v", "1", "-threads", "2", "-f", "image2pipe"])
+            .args(encoder)
+            .args(["-pix_fmt", pix_fmt, "-"])
             .stdin(Stdio::null())
             .kill_on_drop(true)
             .output(),
@@ -379,8 +484,12 @@ pub async fn screenshot(path: &Path, at_seconds: f64) -> anyhow::Result<Vec<u8>>
             stderr.lines().last().unwrap_or("sem mensagem")
         );
     }
-    if !output.stdout.starts_with(&PNG_SIGNATURE) {
-        anyhow::bail!("ffmpeg não devolveu um PNG (posição além do fim do vídeo?)");
+    let signature_ok = match attempt {
+        Attempt::Png => output.stdout.starts_with(&PNG_SIGNATURE),
+        Attempt::Jpeg(_) => output.stdout.starts_with(&[0xff, 0xd8, 0xff]),
+    };
+    if !signature_ok {
+        anyhow::bail!("ffmpeg não devolveu a imagem (posição além do fim do vídeo?)");
     }
     Ok(output.stdout)
 }
@@ -765,6 +874,113 @@ mod tests {
         }
     }
 
+    #[test]
+    fn decisao_do_formato_segue_o_tamanho_ate_caber() {
+        let cabe = LIMITE_CAPTURA;
+        let passa = LIMITE_CAPTURA + 1;
+        // Coube: para onde está.
+        assert_eq!(next_attempt(Attempt::Png, cabe), None);
+        assert_eq!(next_attempt(Attempt::Jpeg(3), 1), None);
+        // PNG grande demais: JPEG na qualidade mais alta.
+        assert_eq!(
+            next_attempt(Attempt::Png, passa),
+            Some(Attempt::Jpeg(QUALIDADES_JPEG[0]))
+        );
+        // JPEG grande demais: a próxima qualidade da lista, até acabar.
+        let mut tentativa = Attempt::Png;
+        let mut vistas = Vec::new();
+        while let Some(next) = next_attempt(tentativa, passa) {
+            vistas.push(next);
+            tentativa = next;
+        }
+        let esperado: Vec<_> = QUALIDADES_JPEG.map(Attempt::Jpeg).into();
+        assert_eq!(vistas, esperado);
+        assert!(QUALIDADES_JPEG.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn formato_da_captura_tem_extensao_e_mime() {
+        assert_eq!(CaptureFormat::Png.extension(), "png");
+        assert_eq!(CaptureFormat::Png.mime(), "image/png");
+        assert_eq!(CaptureFormat::Jpg.extension(), "jpg");
+        assert_eq!(CaptureFormat::Jpg.mime(), "image/jpeg");
+    }
+
+    /// Largura e altura do primeiro marcador SOF de um JPEG.
+    fn jpeg_dimensions(jpeg: &[u8]) -> (u32, u32) {
+        let mut i = 2;
+        while i + 9 < jpeg.len() {
+            assert_eq!(jpeg[i], 0xff, "marcador em {i}");
+            let marker = jpeg[i + 1];
+            let length = usize::from(u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]));
+            if matches!(marker, 0xc0..=0xc3) {
+                let height = u32::from(u16::from_be_bytes([jpeg[i + 5], jpeg[i + 6]]));
+                let width = u32::from(u16::from_be_bytes([jpeg[i + 7], jpeg[i + 8]]));
+                return (width, height);
+            }
+            i += 2 + length;
+        }
+        panic!("JPEG sem SOF");
+    }
+
+    /// Um vídeo de um quadro feito pelo ffmpeg a partir de `filtro`; `None`
+    /// quando o ffmpeg não existe ou não sabe fazê-lo.
+    fn video_de_um_quadro(dir: &Path, filtro: &str) -> Option<std::path::PathBuf> {
+        std::fs::create_dir_all(dir).ok()?;
+        let video = dir.join("quadro.mkv");
+        std::process::Command::new(ffmpeg_binary())
+            .args(["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(filtro)
+            .args(["-frames:v", "1", "-c:v", "ffv1"])
+            .arg(&video)
+            .status()
+            .is_ok_and(|s| s.success())
+            .then_some(video)
+    }
+
+    #[tokio::test]
+    async fn quadro_de_ruido_4k_passa_de_5_mib_em_png_e_sai_em_jpeg_na_resolucao_cheia() {
+        if !binario_existe(&ffmpeg_binary()) {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("acervo-captura-ruido-{}", std::process::id()));
+        let filtro = "nullsrc=s=3840x2160,geq=random(1)*255:128:128";
+        let Some(video) = video_de_um_quadro(&dir, filtro) else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+
+        let (bytes, formato) = screenshot(&video, 0.0).await.expect("quadro");
+        // O PNG desse ruído não cabe (mais de 10 MB): tem de ter caído no JPEG.
+        assert_eq!(formato, CaptureFormat::Jpg);
+        assert!(bytes.starts_with(&[0xff, 0xd8, 0xff]));
+        assert!(bytes.len() <= LIMITE_CAPTURA, "{} bytes", bytes.len());
+        assert_eq!(jpeg_dimensions(&bytes), (3840, 2160), "sem escala");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn quadro_liso_fica_em_png_na_resolucao_cheia() {
+        if !binario_existe(&ffmpeg_binary()) {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("acervo-captura-liso-{}", std::process::id()));
+        let Some(video) = video_de_um_quadro(&dir, "color=c=gray:s=1920x1080") else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+
+        let (bytes, formato) = screenshot(&video, 0.0).await.expect("quadro");
+        assert_eq!(formato, CaptureFormat::Png);
+        assert!(bytes.starts_with(&PNG_SIGNATURE));
+        assert!(bytes.len() <= LIMITE_CAPTURA);
+        assert_eq!(u32::from_be_bytes(bytes[16..20].try_into().unwrap()), 1920);
+        assert_eq!(u32::from_be_bytes(bytes[20..24].try_into().unwrap()), 1080);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn binario_existe(nome: &str) -> bool {
         std::process::Command::new(nome)
             .arg("-version")
@@ -804,7 +1020,8 @@ mod tests {
                 .is_some_and(|d| (1.5..2.5).contains(&d))
         );
 
-        let png = screenshot(&video, 1.0).await.expect("quadro");
+        let (png, formato) = screenshot(&video, 1.0).await.expect("quadro");
+        assert_eq!(formato, CaptureFormat::Png);
         assert!(png.starts_with(&PNG_SIGNATURE));
         // Além do fim não sai quadro: erro claro, não PNG vazio.
         assert!(screenshot(&video, 600.0).await.is_err());
@@ -832,7 +1049,7 @@ mod tests {
             return;
         }
 
-        let png = screenshot(&video, 0.0).await.expect("quadro");
+        let (png, _) = screenshot(&video, 0.0).await.expect("quadro");
         // IHDR: 8 bytes de assinatura, 8 de cabeçalho do chunk, 4 + 4 de
         // largura e altura; depois a profundidade (byte 24) e o tipo de cor.
         assert_eq!(png[24], 8, "profundidade de cor do PNG");
