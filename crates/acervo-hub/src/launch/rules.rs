@@ -688,22 +688,39 @@ fn amigos_layout(ctx: &Context<'_>) -> (Vec<Check>, Vec<Placement>) {
             Err(found) => gaps.push(format!("{name}: {}", found.join("; "))),
         }
     }
+    // Episódios que dariam à pasta um nome diferente do do maior (15.2.27).
+    let mut diverging: Vec<String> = Vec::new();
+    let mut reference = String::new();
     let folder = if facts.kind == Kind::Season {
         let biggest = ctx
             .main
             .filter(|v| is_main_video(&v.path))
             .unwrap_or(main[0]);
-        match naming::standard(&naming::Subject {
-            original: &facts.release_name,
-            media: &biggest.media,
-            original_language: facts.original_language,
-            series,
-            dual: dual(biggest),
-            brrip: ctx.brrip,
-            catalog_title: facts.catalog_title.as_deref(),
-            year: facts.year.filter(|_| facts.kind == Kind::Movie),
-        }) {
-            Ok(standard) => Some(standard),
+        let folder_for = |video: &ProbedVideo| {
+            naming::standard(&naming::Subject {
+                original: &facts.release_name,
+                media: &video.media,
+                original_language: facts.original_language,
+                series,
+                dual: dual(video),
+                brrip: ctx.brrip,
+                catalog_title: facts.catalog_title.as_deref(),
+                year: facts.year.filter(|_| facts.kind == Kind::Movie),
+            })
+        };
+        match folder_for(biggest) {
+            Ok(standard) => {
+                // Err por episódio já sai no loop acima; aqui só o nome que diverge.
+                reference = format!("{}: {}", file_name(&biggest.path), standard.name);
+                for video in &main {
+                    if let Ok(other) = folder_for(video)
+                        && other.name != standard.name
+                    {
+                        diverging.push(format!("{}: {}", file_name(&video.path), other.name));
+                    }
+                }
+                Some(standard)
+            }
             Err(found) => {
                 gaps.push(format!(
                     "pasta {}: {}",
@@ -736,6 +753,28 @@ fn amigos_layout(ctx: &Context<'_>) -> (Vec<Check>, Vec<Placement>) {
             ),
         ));
         return (checks, Vec::new());
+    }
+    if !diverging.is_empty() {
+        let shown: Vec<&str> = diverging
+            .iter()
+            .take(NAME_CHECK_LISTED)
+            .map(String::as_str)
+            .collect();
+        let more = diverging.len() - shown.len();
+        let more = if more > 0 {
+            format!(" (e mais {more})")
+        } else {
+            String::new()
+        };
+        // A referência é o maior episódio: se o diferente for ele, todos os
+        // outros aparecem como divergentes, e é ele que se procura.
+        checks.push(Check::fail(
+            "15.2.27",
+            format!(
+                "os episódios não têm as mesmas características e por isso a pasta não tem um nome que valha para todos: pelo maior ({reference}); divergem {}{more}",
+                shown.join(" | ")
+            ),
+        ));
     }
 
     let mut warnings: Vec<String> = named
@@ -4935,6 +4974,34 @@ mod tests {
         // Sem grupo, a série não entra.
         rename_video(&mut facts, 1, "Serie.S01E02.1080p.WEB-DL.DDP5.1.H.264.mkv");
         assert_eq!(status(Site::Amigos, &facts, "15.2.28"), Some(Status::Fail));
+    }
+
+    #[test]
+    fn amigos_pack_com_episodios_de_caracteristicas_diferentes_falha() {
+        let mut facts = season(2);
+        facts.series_status = Some(SeriesStatus::Ended);
+        facts.season_episodes = Some(aired(2));
+        rename_video(
+            &mut facts,
+            0,
+            "Serie.S01E01.1080p.WEB-DL.DDP5.1.H.264-GRP.mkv",
+        );
+        rename_video(
+            &mut facts,
+            1,
+            "Serie.S01E02.1080p.WEB-DL.DDP5.1.H.264-GRP.mkv",
+        );
+        assert_eq!(status(Site::Amigos, &facts, "15.2.27"), Some(Status::Ok));
+        // Um episódio em 720p: a pasta 1080p mentiria sobre ele.
+        facts.videos[1].media.video = Some(video("h264", 1280, 720, Hdr::Sdr));
+        assert_eq!(status(Site::Amigos, &facts, "15.2.27"), Some(Status::Fail));
+        // Um episódio sem o áudio PT, o outro DUAL.
+        facts.videos[1].media = media(
+            "matroska,webm",
+            video("h264", 1920, 1080, Hdr::Sdr),
+            vec![eng()],
+        );
+        assert_eq!(status(Site::Amigos, &facts, "15.2.27"), Some(Status::Fail));
     }
 
     #[test]
