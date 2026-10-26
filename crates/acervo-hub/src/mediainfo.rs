@@ -81,6 +81,8 @@ pub struct VideoFacts {
     /// 8, 10 ou 12; `None` quando nem `bits_per_raw_sample` nem o `pix_fmt` dizem.
     pub bit_depth: Option<u8>,
     pub hdr: Hdr,
+    /// Quadros por segundo (`avg_frame_rate`); `None` sem a medida.
+    pub frame_rate: Option<f64>,
 }
 
 /// Uma faixa de áudio.
@@ -239,6 +241,13 @@ fn bit_depth(stream: &Value) -> Option<u8> {
     Some(8)
 }
 
+/// `24000/1001` → 23.976; `0/0` (sem medida) → `None`.
+fn frame_rate(stream: &Value) -> Option<f64> {
+    let (num, den) = stream["avg_frame_rate"].as_str()?.split_once('/')?;
+    let (num, den): (f64, f64) = (num.parse().ok()?, den.parse().ok()?);
+    (num > 0.0 && den > 0.0).then(|| num / den)
+}
+
 fn hdr(stream: &Value) -> Hdr {
     let dolby_vision = stream["side_data_list"]
         .as_array()
@@ -275,6 +284,7 @@ pub fn facts_from_ffprobe(value: &Value) -> MediaFacts {
         pix_fmt: text(&s["pix_fmt"]),
         bit_depth: bit_depth(s),
         hdr: hdr(s),
+        frame_rate: frame_rate(s),
     });
     let audio = streams(value, "audio")
         .map(|s| {
@@ -663,6 +673,15 @@ mod tests {
             probe.audio_languages,
             [Language::Portuguese, Language::English]
         );
+    }
+
+    #[test]
+    fn le_quadros_por_segundo() {
+        let rate = |r: &str| frame_rate(&json!({ "avg_frame_rate": r }));
+        assert!(rate("24000/1001").is_some_and(|f| (f - 23.976).abs() < 0.001));
+        assert_eq!(rate("50/1"), Some(50.0));
+        assert_eq!(rate("0/0"), None);
+        assert_eq!(frame_rate(&json!({})), None);
     }
 
     /// Amostra: filme 4K HEVC com HDR10, uma faixa PT e uma original.

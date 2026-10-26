@@ -19,6 +19,7 @@ pub(crate) mod amigos;
 pub(crate) mod folder;
 pub(crate) mod imgbb;
 pub(crate) mod name_check;
+pub(crate) mod naming;
 pub(crate) mod rules;
 pub(crate) mod subtitle_sniff;
 pub(crate) mod text;
@@ -952,7 +953,8 @@ async fn follow_task(client: &QbitClient, job: &mut Job<'_>, task: &str) -> Resu
 const SENT_FOLDER: &str = "o pacote já foi enviado ao site: a pasta adaptada é de onde o publicado \
                            semeia, e não é apagada nem refeita";
 
-/// A pasta adaptada montada: onde está e o layout dela, relativo ao pai.
+/// A pasta adaptada montada: o conteúdo do torrent (a pasta, ou o arquivo no
+/// torrent de um arquivo só) e o layout, relativo ao pai dele.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Adapted {
     target: PathBuf,
@@ -969,6 +971,19 @@ pub(crate) fn adapted_layout(launch: &Launch) -> Option<Vec<(String, u64)>> {
         .filter(|layout: &Vec<(String, u64)>| !layout.is_empty())
 }
 
+/// A pasta adaptada do pacote: `adapted_path` é o conteúdo do torrent, que no
+/// torrent de um arquivo só (Amigos, 15.2.17) é o arquivo dentro dela.
+pub(crate) fn adapted_dir(launch: &Launch) -> Option<PathBuf> {
+    let path = Path::new(launch.adapted_path.as_deref()?);
+    let single = adapted_layout(launch)
+        .is_some_and(|layout| layout.len() == 1 && !layout[0].0.contains('/'));
+    if single {
+        path.parent().map(Path::to_path_buf)
+    } else {
+        Some(path.to_path_buf())
+    }
+}
+
 /// A pasta adaptada do pacote pode ser apagada: ele não foi ao site. Depois
 /// do envio, o irmão do cross-seed semeia dela.
 pub(crate) fn may_remove_folder(launch: &Launch) -> bool {
@@ -980,9 +995,7 @@ pub(crate) fn may_remove_folder(launch: &Launch) -> bool {
 fn folder_in_use(launches: &[Launch], hash: &str, indexer: &str, target: &Path) -> bool {
     launches.iter().any(|l| {
         !(l.hash.eq_ignore_ascii_case(hash) && l.indexer == indexer)
-            && l.adapted_path
-                .as_deref()
-                .is_some_and(|p| Path::new(p) == target)
+            && adapted_dir(l).is_some_and(|dir| dir == target)
             && !may_remove_folder(l)
     })
 }
@@ -1011,7 +1024,7 @@ fn generated_subtitles(
     let Some(launch) = launch else {
         return out;
     };
-    if launch.adapted_path.as_deref().map(Path::new) != Some(target) {
+    if adapted_dir(launch).as_deref() != Some(target) {
         return out;
     }
     if let Some(layout) = adapted_layout(launch) {
@@ -1140,7 +1153,15 @@ async fn adapt_folder(
 ) -> Result<Option<Adapted>> {
     let store = job.store;
     let save_path = PathBuf::from(&torrent.save_path);
-    let plan: Option<AdaptationPlan> = if report.adaptations.is_empty() {
+    let plan: Option<AdaptationPlan> = if !report.placements.is_empty() {
+        let content = PathBuf::from(source_path(torrent, files));
+        Some(
+            adapt::amigos_plan(&report.placements, files, &content, &save_path).context(
+                "o nome precisa ir para o padrão do Amigos, mas a origem não deixa montar a \
+                 pasta adaptada",
+            )?,
+        )
+    } else if report.adaptations.is_empty() {
         None
     } else {
         let content = PathBuf::from(source_path(torrent, files));
@@ -1155,7 +1176,7 @@ async fn adapt_folder(
     let own = launches
         .iter()
         .find(|l| l.hash.eq_ignore_ascii_case(&job.hash) && l.indexer == job.indexer);
-    let previous = own.and_then(|l| l.adapted_path.clone()).map(PathBuf::from);
+    let previous = own.and_then(adapted_dir);
     if plan.is_none() && previous.is_none() {
         return Ok(None);
     }
@@ -1252,16 +1273,19 @@ async fn build_folder(
             return Err(error.context("montando a pasta adaptada"));
         }
     };
+    // Com o layout gravado, o caminho passa a ser o do conteúdo do torrent
+    // (o arquivo, no torrent de um arquivo só): é o que o cross-seed semeia.
+    let content = plan.content();
     store
         .save_launch_adaptation(
             &job.hash,
             &job.indexer,
-            Some(&target),
+            Some(&content.to_string_lossy()),
             Some(&serde_json::to_value(&layout)?),
         )
         .await?;
     Ok(Adapted {
-        target: plan.target,
+        target: content,
         layout,
     })
 }
@@ -1274,11 +1298,12 @@ pub(crate) async fn discard_folder(
     store: &Store,
     launch: &Launch,
 ) -> Option<String> {
-    let target = launch.adapted_path.as_deref()?;
+    let target = adapted_dir(launch)?;
+    let target = target.display();
     if !may_remove_folder(launch) {
         return Some(format!("a pasta adaptada `{target}` fica: {SENT_FOLDER}"));
     }
-    match remove_folder(config, store, launch, Path::new(target)).await {
+    match remove_folder(config, store, launch, &adapted_dir(launch)?).await {
         Ok(Cleanup::Absent | Cleanup::Removed) => {
             if let Err(error) = store
                 .save_launch_adaptation(&launch.hash, &launch.indexer, None, None)
@@ -1943,7 +1968,8 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
         work: work.work,
         synopsis: tmdb.synopsis.or(work.overview),
         credits: tmdb.credits,
-        release_name: release,
+        // No Amigos, o nome no padrão que a pasta adaptada vai levar.
+        release_name: adapt::release_name(&report.placements).unwrap_or(release),
         files: files.clone(),
         size: total_size,
         media: main_media,
@@ -1975,6 +2001,29 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
         site,
     )
     .await?;
+    // O formulário do Amigos confere o nome contra o "Complete name" do
+    // MediaInfo: com o vídeo renomeado, o relatório sai do arquivo novo.
+    if let Some(adapted) = &adapted
+        && let Some(placed) = report.placements.iter().find(|p| p.from == main.path)
+    {
+        let renamed = if adapted.layout.len() == 1 && !placed.to.contains('/') {
+            adapted.target.clone()
+        } else {
+            adapted
+                .target
+                .parent()
+                .context("a pasta adaptada não tem pasta pai")?
+                .join(&placed.to)
+        };
+        job.step("gerando o relatório do MediaInfo do nome no padrão")
+            .await;
+        built.fields.mediainfo = crate::mediainfo::mediainfo_report(&renamed)
+            .await
+            .context("relatório do MediaInfo do vídeo renomeado (o Amigos exige)")?;
+        store
+            .save_launch_fields(&job.hash, &indexer, &serde_json::to_value(&built.fields)?)
+            .await?;
+    }
 
     // 8. `.torrent`, com o announce do destino, conferido contra a origem (ou
     // contra a pasta adaptada, que é o que ele empacota).
@@ -2158,6 +2207,7 @@ mod tests {
             destination: Vec::new(),
             verdict: Verdict::Elegivel,
             adaptations: Vec::new(),
+            placements: Vec::new(),
         };
         let videos = vec![ProbedVideo {
             path: "Filme/Filme.mkv".into(),
@@ -2171,6 +2221,7 @@ mod tests {
                     pix_fmt: None,
                     bit_depth: None,
                     hdr: crate::mediainfo::Hdr::Sdr,
+                    frame_rate: None,
                 }),
                 audio: Vec::new(),
                 subtitles: Vec::new(),
@@ -2765,6 +2816,7 @@ mod tests {
             destination: Vec::new(),
             verdict: Verdict::Elegivel,
             adaptations: adapt::extractions(&files, &videos, &Sniffs::new()),
+            placements: Vec::new(),
         };
         assert_eq!(report.adaptations.len(), 1, "a faixa PT vira um .srt");
         // O nome da faixa vai junto ao laudo, para a tela.
@@ -3226,6 +3278,7 @@ mod tests {
             generated,
             HashMap::from([("Filme/Filme.pt-BR.srt".to_owned(), Some(5))])
         );
+        assert_eq!(adapted_dir(&launch).as_deref(), Some(target));
         // Pasta que não é a registrada pelo pacote: nenhum .srt é do acervo.
         let other = Path::new("/media/lancamentos/bj/Outra");
         assert!(generated_subtitles(&files, Some(&launch), other).is_empty());
@@ -3241,6 +3294,14 @@ mod tests {
         assert_eq!(
             origin_in_folder(&single),
             HashSet::from(["Filme.2024/Filme.2024.srt".to_owned()])
+        );
+        // Amigos sem pasta (15.2.17): o caminho é o arquivo, a pasta é a de cima.
+        let mut amigos = launch.clone();
+        amigos.adapted_path = Some("/media/lancamentos/amigos/Novo/Novo.mkv".into());
+        amigos.adapted_layout = Some(json!([["Novo.mkv", 10]]));
+        assert_eq!(
+            adapted_dir(&amigos).as_deref(),
+            Some(Path::new("/media/lancamentos/amigos/Novo"))
         );
         assert!(may_remove_folder(&launch));
         launch.sent_at = Some("2026-10-14T10:00:00Z".into());

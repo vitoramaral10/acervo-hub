@@ -42,6 +42,17 @@ pub struct Extraction {
     pub forced: bool,
 }
 
+/// Um arquivo da origem e o caminho dele no torrent do Amigos no padrão de
+/// nome (seção 16): `<pasta>/<arquivo>`, ou só `<arquivo>` no torrent de um
+/// arquivo só (filme ou episódio sem legenda solta, 15.2.17). Arquivo da
+/// origem sem `Placement` fica fora do torrent (15.2.16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Placement {
+    /// Caminho na origem (com a pasta raiz do torrent).
+    pub from: String,
+    pub to: String,
+}
+
 /// Um hardlink: o arquivo da origem e onde ele aparece na pasta adaptada.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
@@ -53,10 +64,14 @@ pub struct Link {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdaptationPlan {
-    /// `<raiz>/lancamentos/bj/<nome>`.
+    /// `<raiz>/lancamentos/<site>/<nome>`: a pasta nova, que o acervo cria e
+    /// apaga inteira.
     pub target: PathBuf,
     pub links: Vec<Link>,
     pub extractions: Vec<Extraction>,
+    /// O torrent é o único arquivo dentro de `target` (Amigos: filme sem
+    /// legenda solta vai sem pasta, 15.2.17), e não a pasta.
+    pub single: bool,
 }
 
 impl AdaptationPlan {
@@ -77,6 +92,7 @@ impl AdaptationPlan {
 
     /// O layout final, com o tamanho de cada `.srt` já extraído (`size_of`
     /// recebe o `output` da extração). `None` se algum `.srt` não tem tamanho.
+    /// Relativo ao pai do conteúdo do torrent: no `single`, é só o arquivo.
     #[must_use]
     pub fn final_layout(
         &self,
@@ -84,8 +100,25 @@ impl AdaptationPlan {
     ) -> Option<Vec<(String, u64)>> {
         self.expected_layout()
             .into_iter()
-            .map(|(path, size)| Some((path.clone(), size.or_else(|| size_of(&path))?)))
+            .map(|(path, size)| {
+                let size = size.or_else(|| size_of(&path))?;
+                let path = if self.single {
+                    file_name(&path).to_owned()
+                } else {
+                    path
+                };
+                Some((path, size))
+            })
             .collect()
+    }
+
+    /// O conteúdo do torrent: a pasta, ou o arquivo dentro dela no `single`.
+    #[must_use]
+    pub fn content(&self) -> PathBuf {
+        match self.links.first() {
+            Some(link) if self.single => self.target.join(file_name(&link.to)),
+            _ => self.target.clone(),
+        }
     }
 }
 
@@ -342,6 +375,72 @@ pub fn plan(
         target,
         links,
         extractions,
+        single: false,
+    })
+}
+
+/// O nome do release no torrent do Amigos: a pasta, ou o arquivo sem a
+/// extensão no torrent de um arquivo só.
+#[must_use]
+pub fn release_name(placements: &[Placement]) -> Option<String> {
+    let first = placements.first()?;
+    Some(match first.to.split_once('/') {
+        Some((root, _)) => root.to_owned(),
+        None => stem(&first.to).to_owned(),
+    })
+}
+
+/// O plano da pasta adaptada do Amigos: hardlinks da origem com o nome no
+/// padrão (`placements`, que as regras montaram), sem legenda a extrair.
+/// A pasta destino é `<pai do save_path>/lancamentos/amigos/<nome>`; no
+/// torrent de um arquivo só, o arquivo fica dentro dela e o `.torrent` é dele.
+/// `None` com a origem que não bate (`content_path` fora da pasta raiz,
+/// arquivo do mapa que a origem não tem).
+#[must_use]
+pub fn amigos_plan(
+    placements: &[Placement],
+    source_files: &[SourceFile],
+    content_path: &Path,
+    save_path: &Path,
+) -> Option<AdaptationPlan> {
+    let origin = folder_name(source_files)?;
+    let single_origin = !source_files[0].path.contains('/');
+    let expected = if single_origin {
+        file_name(&source_files[0].path)
+    } else {
+        &origin
+    };
+    if content_path.file_name()?.to_str()? != expected {
+        return None;
+    }
+    let name = release_name(placements)?;
+    let single = placements.len() == 1 && !placements[0].to.contains('/');
+    let links = placements
+        .iter()
+        .map(|p| {
+            let size = source_files.iter().find(|f| f.path == p.from)?.size;
+            let from = if single_origin {
+                content_path.to_path_buf()
+            } else {
+                content_path.join(p.from.split_once('/')?.1)
+            };
+            let to = if single {
+                format!("{name}/{}", p.to)
+            } else {
+                p.to.clone()
+            };
+            Some(Link { from, to, size })
+        })
+        .collect::<Option<Vec<Link>>>()?;
+    Some(AdaptationPlan {
+        target: save_path
+            .parent()?
+            .join(ADAPTED_DIR)
+            .join("amigos")
+            .join(&name),
+        links,
+        extractions: Vec::new(),
+        single,
     })
 }
 
@@ -636,6 +735,89 @@ mod tests {
         assert_eq!(
             plan.extractions[0].output,
             "Amélie [2001] (Dir. Cut)/Amélie [2001] (Dir. Cut) #1 & Cia.pt-BR.srt"
+        );
+    }
+
+    #[test]
+    fn plano_do_amigos_renomeia_e_deixa_de_fora() {
+        let placements = [
+            Placement {
+                from: "Filme/filme.mkv".to_owned(),
+                to: "Novo/Novo.mkv".to_owned(),
+            },
+            Placement {
+                from: "Filme/Subs/pt.srt".to_owned(),
+                to: "Novo/Novo.srt".to_owned(),
+            },
+        ];
+        let files = [
+            file("Filme/filme.mkv", GB),
+            file("Filme/Subs/pt.srt", 10),
+            file("Filme/filme.nfo", 1),
+        ];
+        let plan = amigos_plan(
+            &placements,
+            &files,
+            Path::new("/media/downloads/Filme"),
+            Path::new("/media/downloads"),
+        )
+        .unwrap();
+        assert_eq!(plan.target, Path::new("/media/lancamentos/amigos/Novo"));
+        assert!(!plan.single);
+        assert_eq!(plan.content(), plan.target);
+        assert_eq!(
+            plan.links,
+            vec![
+                Link {
+                    from: PathBuf::from("/media/downloads/Filme/filme.mkv"),
+                    to: "Novo/Novo.mkv".to_owned(),
+                    size: GB,
+                },
+                Link {
+                    from: PathBuf::from("/media/downloads/Filme/Subs/pt.srt"),
+                    to: "Novo/Novo.srt".to_owned(),
+                    size: 10,
+                },
+            ]
+        );
+        assert_eq!(release_name(&placements).as_deref(), Some("Novo"));
+    }
+
+    #[test]
+    fn plano_do_amigos_de_um_arquivo_so() {
+        let placements = [Placement {
+            from: "filme.mkv".to_owned(),
+            to: "Novo.mkv".to_owned(),
+        }];
+        let files = [file("filme.mkv", GB)];
+        let plan = amigos_plan(
+            &placements,
+            &files,
+            Path::new("/media/downloads/filme.mkv"),
+            Path::new("/media/downloads"),
+        )
+        .unwrap();
+        assert!(plan.single);
+        assert_eq!(plan.links[0].from, Path::new("/media/downloads/filme.mkv"));
+        assert_eq!(plan.links[0].to, "Novo/Novo.mkv");
+        assert_eq!(
+            plan.content(),
+            Path::new("/media/lancamentos/amigos/Novo/Novo.mkv")
+        );
+        assert_eq!(
+            plan.final_layout(|_| None),
+            Some(vec![("Novo.mkv".to_owned(), GB)])
+        );
+        assert_eq!(release_name(&placements).as_deref(), Some("Novo"));
+        // Origem que não bate com o caminho do conteúdo: sem plano.
+        assert!(
+            amigos_plan(
+                &placements,
+                &files,
+                Path::new("/media/downloads/outro.mkv"),
+                Path::new("/media/downloads"),
+            )
+            .is_none()
         );
     }
 
