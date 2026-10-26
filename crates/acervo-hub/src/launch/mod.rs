@@ -1952,9 +1952,14 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
         Some(Language::Portuguese | Language::PortugueseBr)
     );
 
-    // 6. Capturas.
-    let screens = host_screens(config, job, &main_path, main_media.duration_seconds).await?;
-    if screens.is_empty() {
+    // 6. Capturas, só no BJ: a descrição que o usuário cola leva as do
+    // `ImgBB`. O envio ao Amigos tira as suas do vídeo e as sobe ao site, e a
+    // descrição de lá vai sem imagem: aqui seria o ffmpeg rodando à toa.
+    let screens = match site {
+        Site::Bj => host_screens(config, job, &main_path, main_media.duration_seconds).await?,
+        Site::Amigos => Vec::new(),
+    };
+    if screens.is_empty() && site == Site::Bj {
         report.checks.push(rules::Check {
             rule: "Capturas".to_owned(),
             status: rules::Status::Warn,
