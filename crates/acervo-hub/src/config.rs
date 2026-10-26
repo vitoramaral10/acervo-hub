@@ -396,9 +396,9 @@ impl Config {
         Policy {
             orphan_strikes: 3,
             delete_private_orphans: true,
-            private_seed_grace: Some(Duration::from_secs(120 * 3600)),
-            private_seed_ratio: Some(1.0),
-            private_seed_idle: Some(Duration::from_secs(24 * 3600)),
+            private_seed_grace: Some(Duration::from_secs(7 * 24 * 3600)),
+            private_seed_ratio: None,
+            private_seed_idle: None,
             managed_categories: vec![self.library.category.clone()],
             guards: Guards {
                 recent_change_grace: Duration::from_secs(24 * 3600),

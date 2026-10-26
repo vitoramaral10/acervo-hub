@@ -204,13 +204,14 @@ ou todas de uma vez; marcar não apaga.
 
 `limpeza` (a cada 60 minutos) lê a fila do acervo, o cliente e o disco, e apaga do cliente:
 
-- o **seed que perdeu o hardlink** com a biblioteca — o privado só depois do ratio alvo, da
-  ociosidade ou do teto de tempo de seed;
+- o **seed que perdeu o hardlink** com a biblioteca — o privado só depois da carência de
+  tempo de seed;
 - o **download sem dono** — sem grab em andamento, sem seed e sem hardlink — depois de
   aparecer assim em ciclos seguidos.
 
 Só na categoria de `biblioteca.category`. A política é fixa: 3 strikes; privados têm
-teto de 120 horas de seed, ratio alvo 1,0 ou 24 horas ociosos; arquivos alterados nas últimas
+7 dias de seed antes de sair, mesmo pausados (a regra de hit&run comum: ratio
+ou ociosidade não cumprem); arquivos alterados nas últimas
 24 horas são protegidos. O lote tem teto de 300 GiB e de 30% da biblioteca, e os órfãos
 privados elegíveis saem com seus dados. Fila do acervo ilegível falha a tarefa antes de planejar
 qualquer remoção; catálogo vazio é um estado válido. As travas abortam o ciclo inteiro
