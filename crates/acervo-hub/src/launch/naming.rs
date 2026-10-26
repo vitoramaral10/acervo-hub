@@ -2,10 +2,13 @@
 //!
 //! O padrão vale mesmo que o nome original seja outro (16.1.4), e colocá-lo no
 //! padrão é a única mudança permitida, sempre mantendo a tag original
-//! (16.12.8). [`standard`] refaz o nome de um vídeo ou da pasta: título, ano
-//! ou `SxxEyy`, edição, Hybrid, REPACK, fonte, sigla de streaming e tags vêm
-//! do nome original, que é o que o arquivo não diz; resolução, áudio, HDR,
-//! HFR, codec de vídeo e DUAL/MULTi vêm do ffprobe. O que o padrão pede e
+//! (16.12.8). A grafia dela só muda quando o nome original veio todo em
+//! minúsculas e a perdeu: aí vale a conhecida do grupo, ou a caixa alta.
+//! [`standard`] refaz o nome de um vídeo ou da pasta: título e ano vêm do
+//! catálogo quando ele os tem (16.2.1, 16.2.2); `SxxEyy`, edição, Hybrid,
+//! REPACK, fonte, sigla de streaming e tags vêm do nome original, que é o que
+//! o arquivo não diz; resolução, áudio, HDR, HFR, codec de vídeo e DUAL/MULTi
+//! vêm do ffprobe. O que o padrão pede e
 //! nenhum dos dois diz (o ano, a fonte de um "WEB" sem codec) não é presumido
 //! (16.1.1): vira lacuna, e o pacote fica inelegível.
 //!
@@ -52,12 +55,23 @@ pub(crate) struct Subject<'a> {
 }
 
 /// Só letras e dígitos, minúsculos: para comparar títulos sem pontuação.
-fn squash(text: &str) -> String {
+pub(crate) fn squash(text: &str) -> String {
     clean_title(text)
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .map(|c| c.to_ascii_lowercase())
         .collect()
+}
+
+/// O release do site começa pelo título e pelo ano da obra (o do catálogo,
+/// com um de folga para o `IMDb`): é a mesma obra, não uma continuação nem
+/// outra de mesmo nome.
+pub(crate) fn title_year_match(release: &str, title: &str, year: u16) -> bool {
+    let release = squash(release);
+    let title = squash(title);
+    !title.is_empty()
+        && (year.saturating_sub(1)..=year.saturating_add(1))
+            .any(|y| release.starts_with(&format!("{title}{y}")))
 }
 
 /// As palavras do título do catálogo no padrão: `Spider-Man: Across the
@@ -1632,6 +1646,24 @@ mod tests {
         assert!(run("s.w.a.t.exiles.s01e04.1080p.web.h264-ntb").ends_with("-NTb"));
         // Com maiúscula no nome, a tag fica como veio.
         assert!(run("S.W.A.T.Exiles.S01E04.1080p.WEB.h264-cakes").ends_with("-cakes"));
+    }
+
+    #[test]
+    fn titulo_e_ano_no_comeco_do_release_do_site() {
+        let hit = |release, title, year| title_year_match(release, title, year);
+        assert!(hit(
+            "O Grinch 2018 1080p BluRay Dual-Audio",
+            "O Grinch",
+            2018
+        ));
+        assert!(hit("The Grinch 2018 1080p BluRay", "The Grinch", 2018));
+        // O IMDb e o TMDB às vezes diferem em um ano.
+        assert!(hit("The Grinch 2019 1080p WEB-DL", "The Grinch", 2018));
+        // Outra obra com o mesmo nome, ou continuação.
+        assert!(!hit("O Grinch 2000 1080p BluRay", "O Grinch", 2018));
+        assert!(!hit("Ted 2 2015 1080p WEB-DL", "Ted", 2012));
+        assert!(hit("Ted 2012 1080p WEB-DL Dual-Audio", "Ted", 2012));
+        assert!(hit("Cangaço Novo 2023 S01 1080p", "Cangaço Novo", 2023));
     }
 
     #[test]
