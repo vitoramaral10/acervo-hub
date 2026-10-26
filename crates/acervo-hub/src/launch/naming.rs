@@ -39,6 +39,9 @@ pub(crate) struct Subject<'a> {
     pub series: bool,
     /// Áudio original + PT no arquivo (o DUAL das regras).
     pub dual: bool,
+    /// Encode de Blu-ray abaixo do bitrate mínimo (15.2.5): a source é `BRRip`
+    /// (16.6), qualquer que seja a do nome original.
+    pub brrip: bool,
 }
 
 /// 16.7, na grafia da regra.
@@ -798,6 +801,7 @@ pub(crate) fn standard(subject: &Subject<'_>) -> Result<Standard, Vec<String>> {
         }
         Class::Encode => {
             parts.push(match claims.source {
+                Some(Source::BluRay) if subject.brrip => "BRRip".to_owned(),
                 Some(Source::BrRip) => "BRRip".to_owned(),
                 Some(Source::DvdRip) => "DVDRip".to_owned(),
                 _ => bluray.to_owned(),
@@ -912,6 +916,7 @@ mod tests {
             original_language: Some(Language::English),
             series,
             dual,
+            brrip: false,
         })
         .map(|s| s.name)
     }
@@ -1055,6 +1060,7 @@ mod tests {
             original_language: Some(Language::English),
             series: false,
             dual: true,
+            brrip: false,
         })
         .unwrap();
         assert_eq!(
