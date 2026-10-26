@@ -273,8 +273,8 @@ pub struct Facts {
     /// Idioma original da obra (`Language::from_name` do que o banco guarda).
     pub original_language: Option<Language>,
     /// O título original da obra quando é o que a 16.2.1 pede no nome do
-    /// Amigos: o em inglês (obra em inglês) ou o nacional (obra brasileira).
-    /// `None` nas outras.
+    /// Amigos: o em inglês (o original na obra em inglês, o do TMDB en-US nas
+    /// outras estrangeiras) ou o nacional (obra brasileira).
     pub catalog_title: Option<String>,
     /// O ano da obra no catálogo (16.2.2).
     pub year: Option<u16>,

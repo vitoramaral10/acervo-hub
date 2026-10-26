@@ -202,8 +202,10 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
   (`New.Bandits` vira `Cangaco.Novo`), na grafia do catálogo e sem os pontos
   de sigla (`s.w.a.t.exiles` vira `SWAT.Exiles`). Na série, o do release fica
   quando começa pelo do catálogo e é mais longo (ano ou país que separa
-  séries de mesmo nome). Obra estrangeira de outro idioma: o catálogo não tem
-  o título em inglês, então é lacuna (Sua.Culpa é Your.Fault). O ano é o do
+  séries de mesmo nome). Obra estrangeira de outro idioma: o preparo busca o
+  título en-US no TMDB (Sua.Culpa vira Your.Fault); é lacuna quando o TMDB
+  não tem tradução (devolve o original, ou um título que some na limpeza do
+  nome) ou quando a busca falha ou falta a chave, com aviso no log. O ano é o do
   catálogo (16.2.2; The Tender Bar é 2021, não o 2022 do release). Source de
   disco em 2160p é `UHD.BluRay` mesmo sem "UHD" no nome (16.6). `MA` antes da
   source é a sigla do Movies Anywhere (fica, com Warn 16.7); hífen solto no

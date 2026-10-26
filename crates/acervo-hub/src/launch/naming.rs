@@ -46,8 +46,8 @@ pub(crate) struct Subject<'a> {
     /// (16.6), qualquer que seja a do nome original.
     pub brrip: bool,
     /// O título original da obra, do catálogo, quando ele é o que a 16.2.1
-    /// pede: o em inglês na obra em inglês, o nacional na obra brasileira.
-    /// `None` nas outras.
+    /// pede: o em inglês (o original na obra em inglês, o do TMDB en-US nas
+    /// outras estrangeiras), o nacional na obra brasileira.
     pub catalog_title: Option<&'a str>,
     /// O ano da obra no catálogo (16.2.2: o do `IMDb`, não o do streaming);
     /// vale no filme, no lugar do ano do release.
@@ -941,16 +941,16 @@ pub(crate) fn standard(subject: &Subject<'_>) -> Result<Standard, Vec<String>> {
     let (Some(class), Some(audio), Some(codec)) = (class, audio, codec) else {
         return Err(gaps);
     };
-    // 16.2.1: obra estrangeira leva o título em inglês do `IMDb`, e o
-    // catálogo só tem o original. Fora do inglês, não há como saber: o nome
-    // do release costuma vir em português (Sua.Culpa é Your.Fault).
+    // 16.2.1: obra estrangeira leva o título em inglês. Fora do inglês, ele
+    // vem do TMDB en-US no preparo; sem tradução lá (ou com a busca falhando),
+    // não há como saber, e o nome do release costuma vir em português.
     if subject.catalog_title.is_none()
         && subject
             .original_language
             .is_some_and(|l| !portuguese(l) && l != Language::English && l != Language::Unknown)
     {
         gaps.push(
-            "obra estrangeira fora do inglês: o acervo não tem o título em inglês do IMDb que a 16.2.1 pede"
+            "obra estrangeira fora do inglês: o TMDB não tem o título em inglês que a 16.2.1 pede (ou a busca falhou)"
                 .to_owned(),
         );
     }
