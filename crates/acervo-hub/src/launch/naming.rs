@@ -416,7 +416,7 @@ const DUAL_ADDERS: [&str; 24] = [
 /// Tags que são nome de site de torrent: citar outro site é proibido (1.4,
 /// 15.1.8), e a tag não pode sair (15.2.26). `LAPUMiA` passou como segunda
 /// tag em 26/10.
-const SITE_TAGS: [&str; 9] = [
+pub(crate) const SITE_TAGS: [&str; 9] = [
     "LAPUMiA",
     "BLUDV",
     "COMANDO",

@@ -3079,6 +3079,17 @@ fn name_cites_site(name: &str) -> bool {
     if squashed.contains("bjshare") || squashed.contains("amigosshare") {
         return true;
     }
+    // Nome de site de torrent como tag (`DUAL-LAPUMiA`) ou depois de `@`
+    // (`EPiC@HDArea`): no BJ passou O Bom Dinossauro `-LAPUMiA` como pronto.
+    if name.contains('@')
+        || name.split(|c: char| !c.is_alphanumeric()).any(|token| {
+            naming::SITE_TAGS
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(token))
+        })
+    {
+        return true;
+    }
     if lower.contains("www.") {
         return true;
     }
@@ -3513,6 +3524,28 @@ mod tests {
         assert_eq!(status(Site::Amigos, &facts, "15.1.8"), Some(Status::Ok));
         facts.files[0].path = "Filme.2024-BJ-Share/Filme.2024.mkv".to_owned();
         assert_eq!(status(Site::Amigos, &facts, "15.1.8"), Some(Status::Fail));
+    }
+
+    #[test]
+    fn referencia_a_site_de_torrent_na_tag() {
+        // O Bom Dinossauro, pronto para o BJ em 26/10.
+        assert!(name_cites_site(
+            "O.Bom.Dinossauro.2016.1080p.BluRay.DUAL-LAPUMiA"
+        ));
+        assert!(name_cites_site(
+            "Os.Descendentes.2011.1080p.BluRay.x264-EPiC@HDArea.DUAL-GMN"
+        ));
+        assert!(!name_cites_site("Lapa.2024.1080p.WEB-DL.H.264-GRP"));
+        let mut facts = movie();
+        rename_video(
+            &mut facts,
+            0,
+            "O.Bom.Dinossauro.2016.1080p.BluRay.DUAL-LAPUMiA.mkv",
+        );
+        assert_eq!(
+            status(Site::Bj, &facts, "4.1.2 / 4.1.3"),
+            Some(Status::Fail)
+        );
     }
 
     #[test]

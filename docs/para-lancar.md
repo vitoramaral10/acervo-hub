@@ -241,8 +241,9 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
 - **15.2.11** obra não falada em português sem áudio PT e sem legenda PT
   completa (embutida ou arquivo; a forçada não conta) → Fail.
 - **15.1.8** nome de arquivo/pasta com referência a site (`bj-share`,
-  `bjshare`, `amigos-share`, `amigosshare`, e `www.`/`.com`/`.net`/`.org`
-  dentro do nome) → Fail.
+  `bjshare`, `amigos-share`, `amigosshare`, `www.`/`.com`/`.net`/`.org`
+  dentro do nome, `@` e nome de site de torrent como palavra, de
+  `naming::SITE_TAGS`: LAPUMiA, BLUDV...) → Fail.
 - **15.2.18 / 15.2.19** temporada em exibição (o catálogo tem episódio dela
   que não foi ao ar, `season_pending > 0`): pack → Fail, episódio → Ok.
   Temporada já exibida: pack completo (o que não cobre os episódios exibidos
