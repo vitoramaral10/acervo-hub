@@ -229,8 +229,9 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
 - **15.2.5** encode de Blu-ray (não REMUX) em 720p, 1080p e 2160p (a regra
   não tem número para 2160p; a staff aplica o de 1080p, resposta de 26/10):
   pelo bitrate do vídeo (`bit_rate` ou a tag `BPS` do MKV), abaixo do mínimo
-  de animação (3500/6000 kbps) → Fail (é BRRip), abaixo do geral (5000/8000)
-  → Warn (só animação passa). Sem o bitrate do vídeo, vale o médio do arquivo
+  de animação (3500/6000 kbps) → Warn e a source vai como **BRRip** no nome
+  (16.6; a staff mandou renomear e lançar o Frozen II), abaixo do geral
+  (5000/8000) → Warn (só animação passa como BluRay). Sem o bitrate do vídeo, vale o médio do arquivo
   inteiro, que o áudio infla: só reprova abaixo do de animação e avisa abaixo
   do geral. O Frozen II 2160p tinha 15,8 Mb/s no arquivo e 5998 kb/s no vídeo.
 - **15.2.6** REMUX sem áudio PT → Warn (só se a obra nunca teve dublagem).
@@ -242,8 +243,11 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
 - **15.3** duplicidade e substituição contra os releases do destino de mesma
   edição (16.14; edição diferente convive). Um DUAL completo (com legenda PT
   embutida) não disputa vaga com só dublado e só legendado (15.3.3). Na ordem:
-  - **15.3.4** source inferior (abaixo de WEB-DL/Blu-ray, ou abaixo de 720p)
-    com uma superior no site → Fail;
+  - **15.3.1** mesma resolução e tamanho a menos de 1% → Fail: é o mesmo
+    arquivo, qualquer que seja a etiqueta do site (Balls Up, 26/10);
+  - **15.3.4** source inferior (abaixo de WEB-DL/Blu-ray, BRRip pela 15.2.5,
+    ou abaixo de 720p) com uma superior de mesma resolução ou maior no site →
+    Fail;
   - **15.3.3** só dublado ou só legendado com DUAL na mesma resolução → Fail;
   - **15.3.2** 720p: já há 720p → Fail; há 1080p/2160p com áudio igual ou
     melhor → Fail **15.3.5**; senão Warn **15.3.5** (Trumpable);
