@@ -152,6 +152,8 @@ fn plan_unowned_downloads(
                 download.state,
                 DownloadState::Unknown | DownloadState::MissingFiles
             )
+            // Completo e pausado ainda deve seed: apagar antes da carência é hit&run.
+            || (download.private && download.complete && !private_seed_done(download, policy))
         {
             continue;
         }

@@ -450,12 +450,27 @@ fn privado(ratio: f64, seeded_h: u64, idle_h: Option<u64>) -> Download {
     }
 }
 
-/// Política com os padrões de seed (ratio 1.0, 24 h ocioso, teto de 120 h).
+/// Política com as três condições de seed ligadas (ratio 1.0, 24 h ocioso,
+/// teto de 120 h), para exercitar cada uma.
 fn politica_de_seed() -> Policy {
     Policy {
         managed_categories: vec!["tv-sonarr".into()],
+        private_seed_grace: Some(120 * HORA),
+        private_seed_ratio: Some(1.0),
+        private_seed_idle: Some(24 * HORA),
         ..Policy::default()
     }
+}
+
+#[test]
+fn padrao_segura_privado_sete_dias_mesmo_com_ratio_alto_e_ocioso() {
+    // Hit&run típico de tracker privado: 7 dias semeando, e ratio não cumpre.
+    let padrao = Policy {
+        managed_categories: vec!["tv-sonarr".into()],
+        ..Policy::default()
+    };
+    assert!(!sai(privado(5.0, 7 * 24 - 1, Some(100)), &padrao));
+    assert!(sai(privado(0.0, 7 * 24, Some(0)), &padrao));
 }
 
 /// Roda a limpeza e diz se o seed saiu.
@@ -628,6 +643,33 @@ fn biblioteca_zerada_aborta_mesmo_quando_a_remocao_libera_zero() {
         .expect_err("remoção com biblioteca zerada tem de abortar");
 
     assert!(matches!(erro, Abort::LibraryUnmeasured { .. }));
+}
+
+#[test]
+fn privado_completo_pausado_sem_dono_fica_ate_cumprir_a_carencia() {
+    // Pausar não é hit&run, apagar é: o completo pausado não leva strike
+    // enquanto não semeou o teto.
+    let politica = Policy {
+        private_seed_grace: Some(120 * HORA),
+        ..politica_aplicando()
+    };
+    let pausado = |seeded_h| Download {
+        private: true,
+        complete: true,
+        seeded_for: horas(seeded_h),
+        ..sem_dono("pp", GIB)
+    };
+    let mut ledger = StrikeLedger::new();
+
+    for _ in 0..=politica.orphan_strikes {
+        let inv = inventario_com(vec![pausado(119)], vec![]);
+        let plano = reconcile(&inv, &politica, &mut ledger, agora()).expect("sem abort");
+        assert!(strikes_de_sem_dono(&plano).is_empty());
+    }
+
+    let inv = inventario_com(vec![pausado(120)], vec![]);
+    let plano = reconcile(&inv, &politica, &mut ledger, agora()).expect("sem abort");
+    assert_eq!(strikes_de_sem_dono(&plano), [1]);
 }
 
 // ---- obrigação de seed do tracker

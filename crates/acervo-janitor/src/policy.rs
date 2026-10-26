@@ -45,6 +45,8 @@ pub struct Policy {
     /// hit&run se o torrent for recente.
     ///
     /// É o teto: as duas condições abaixo antecipam a saída, nunca a atrasam.
+    /// O padrão é 7 dias só de tempo, a regra de hit&run mais comum nos
+    /// trackers privados (ratio ou ociosidade não a cumprem).
     pub private_seed_grace: Option<Duration>,
     /// Ratio a partir do qual o seed privado sem vínculo já cumpriu o que o
     /// tracker espera. `None` desliga a condição.
@@ -64,9 +66,9 @@ impl Default for Policy {
         Self {
             orphan_strikes: 3,
             delete_private_orphans: false,
-            private_seed_grace: Some(Duration::from_secs(120 * 60 * 60)),
-            private_seed_ratio: Some(1.0),
-            private_seed_idle: Some(Duration::from_secs(24 * 60 * 60)),
+            private_seed_grace: Some(Duration::from_secs(7 * 24 * 60 * 60)),
+            private_seed_ratio: None,
+            private_seed_idle: None,
             managed_categories: Vec::new(),
             guards: Guards::default(),
         }
