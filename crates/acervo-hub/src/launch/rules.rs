@@ -1231,7 +1231,8 @@ fn bj(ctx: &Context<'_>, checks: &mut Vec<Check>) {
 /// 200 GB. Os arquivos não mudam, então passar do teto não tem conserto.
 fn torrent_limits(ctx: &Context<'_>) -> Check {
     const RULE: &str = "4.1.8 / 4.1.10";
-    let files = ctx.facts.files.len();
+    // Os `.srt` que a pasta adaptada vai criar entram no torrent enviado.
+    let files = ctx.facts.files.len() + ctx.adaptations.len();
     // Só o Blu-ray de verdade: M2TS dentro de BDMV/STREAM.
     let bluray = ctx.facts.files.iter().any(|f| {
         has_extension(&f.path, &["m2ts"]) && parent(&f.path).to_uppercase().ends_with("BDMV/STREAM")
@@ -2845,6 +2846,23 @@ mod tests {
         );
         facts.files.push(file("Filme/BDMV/STREAM/00001.m2ts", GB));
         assert_eq!(status(Site::Bj, &facts, "4.1.8 / 4.1.10"), Some(Status::Ok));
+    }
+
+    #[test]
+    fn bj_legenda_a_extrair_conta_no_teto_de_arquivos() {
+        let mut facts = movie();
+        set_video(&mut facts, |m| {
+            m.audio = vec![eng()];
+            m.subtitles = vec![embedded_pt()];
+        });
+        let root = parent(&facts.files[0].path).to_owned();
+        for n in 1..BJ_MAX_FILES {
+            facts.files.push(file(&format!("{root}/extra{n}.nfo"), 1));
+        }
+        assert_eq!(
+            status(Site::Bj, &facts, "4.1.8 / 4.1.10"),
+            Some(Status::Fail)
+        );
     }
 
     #[test]
