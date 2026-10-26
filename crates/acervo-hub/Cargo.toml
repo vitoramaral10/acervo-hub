@@ -37,6 +37,7 @@ tokio = { workspace = true, features = ["net", "signal", "process", "sync", "tim
 tracing.workspace = true
 time = { workspace = true, features = ["formatting", "macros"] }
 tracing-subscriber.workspace = true
+unicode-normalization.workspace = true
 url.workspace = true
 reqwest.workspace = true
 # `renameat2` com `RENAME_NOREPLACE`: renomear sem sobrescrever.

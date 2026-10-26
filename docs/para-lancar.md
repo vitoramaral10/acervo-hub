@@ -12,12 +12,14 @@ confirmação do usuário na tela (ver "Envio ao Amigos pelo acervo").
 
 ## Princípios
 
-1. **Os arquivos nunca mudam.** O pacote usa os arquivos do torrent de origem
-   como estão: mesma pasta raiz, mesmos nomes, mesmos tamanhos. Release que
-   precisaria de mudança para passar nas regras (legenda a separar, faixa a
-   tirar, nome com referência a site) é **não elegível**, com o motivo. Isso
-   respeita "não alterar o release original" (Amigos 4.0.1, BJ 4.1.1) e mantém
-   o layout que `crossseed::same_layout` exige para achar o publicado.
+1. **O conteúdo dos arquivos nunca muda.** O pacote usa os arquivos do
+   torrent de origem como estão. Release que precisaria de mudança no arquivo
+   para passar nas regras (faixa a tirar, remux) é **não elegível**, com o
+   motivo. O que muda é só a pasta, sempre com hardlinks numa pasta adaptada:
+   no BJ, a legenda PT embutida extraída para `.srt` (4.2.1.5); no Amigos, o
+   nome no padrão e o que fica fora do torrent (16.1.4, 15.2.16). O layout
+   gravado da pasta adaptada é o que `crossseed::same_layout` usa para achar
+   o publicado.
 2. **Checagem pelo arquivo, não pelo nome.** Codec, resolução, HDR, faixas de
    áudio e legendas vêm do `ffprobe`; o nome do release só completa (fonte
    WEB-DL/BluRay, grupo).
@@ -153,7 +155,7 @@ gravação do desfecho que falhou) é resgatado para `falhou` pelas rotas.
   `RETRY_DAYS` e espera só 1 h entre consultas.
 - Achado o irmão de um par lançado: o irmão recebe a tag de semear do
   indexador **sempre** (quem envia semeia 7 dias, ou até 5 downloads
-  concluídos e 3 seeders além dele: Amigos 4.7 e H&R 18.0 i, de 16/10). `launches.state` passa a `semeando` só com o irmão conferido
+  concluídos e 3 seeders além dele no BJ, H&R 18.0 i, de 16/10; no Amigos, 7 dias ou 15 seeders, 13.9). `launches.state` passa a `semeando` só com o irmão conferido
   (100%, iniciado); irmão recém-adicionado espera a conferência, e se ela
   recusa o par segue `enviado` e urgente.
 - `run` grava o `outcome` de cada consulta.
@@ -177,69 +179,77 @@ releases do destino (título, tamanho, qualidade parseada).
 distingue pt-BR de pt-PT: aceitar os dois). "Dual" = áudio PT + original.
 
 ### Amigos (`Site::Amigos`)
-- **3.2** arquivo compactado (`.rar`, `.zip`, `.7z`, `.r00`...) → Fail.
-- **4.0.1** o nome de cada vídeo (o arquivo, não a pasta) contradiz o arquivo
-  lido pelo ffprobe → Fail, citando o arquivo quando o pacote tem mais de um
-  vídeo. O site valida o nome contra o MediaInfo e renomear é proibido, então
-  o pacote fica inelegível antes do envio. Ver "Nome contra o arquivo" abaixo.
-- **4.0.1 (padrão de nome)** o nome de cada vídeo precisa trazer um codec de
-  áudio e um de vídeo na grafia de release padrão, ou o formulário o recusa
-  ("Nome fora do padrão") e renomear é proibido → Fail, só no Amigos (o BJ não
-  muda). Áudio (sem diferenciar maiúsculas; canais colados ou após ponto):
-  `DDP5.1`/`DDP.5.1`/`DD5.1`/`DD.5.1`/`DD+5.1`/`AAC2.0`/`AAC`/`AC3`/`EAC3`/
-  `DTS`/`DTS-HD.MA.5.1`/`DTS-HD`/`DTS-X`/`TrueHD`/`FLAC`/`Opus`/`LPCM`/`PCM`;
-  Atmos sozinho não conta. Vídeo (grafia exata): `H.264`, `H.265`, `H264`,
-  `H265`, `x264`, `x265`, `AVC`, `HEVC`, `AV1`, `VC-1`, `MPEG-2`; `h264`/`h265`
-  minúsculos também passam (comuns em WEB-DL), mas `X264`/`X265` com X
-  maiúsculo falham ("o nome usa 'X265' em maiúsculas; o padrão é 'x265'"),
-  como no Toy Story ...X265-IAMABLE, recusado pelo site. O codec colado num
-  `-GRUPO` que ainda é seguido de mais segmentos com ponto (release refeito,
-  `…x264-DON.DUAL-xprince00.mkv`) o site não lê: falta o codec de vídeo. Isso
-  foi visto no torrent 73347. Colado no grupo final (`H.264-SJB.mkv`), conta. Parser puro em
-  `name_check::standard_name_gaps`; é uma segunda linha 4.0.1, independente da
-  conferência contra o arquivo.
-- **3.3** obra não falada em português sem áudio PT e sem legenda PT
+
+Regras de 23 e 24/10/2026 (a numeração mudou toda: H&R é a seção 13, Upload a
+15, Padrão de Nomenclatura a 16). Desde então **renomear é exigido**: o nome
+segue o padrão mesmo que o original seja outro (16.1.4), e colocar no padrão é
+a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
+(15.2.26) e nome que simula o que o arquivo não tem (15.2.27) seguem proibidos.
+
+- **15.1.6** arquivo compactado → Fail.
+- **15.2.27** nome do vídeo contra o arquivo (ver "Nome contra o arquivo"):
+  no máximo Warn, porque o nome no padrão sai do arquivo.
+- **16.1.4** nome no padrão (`launch/naming.rs`, função pura): título, ano ou
+  `SxxEyy`, edição, Hybrid, REPACK, source, sigla de streaming e tags vêm do
+  nome original; resolução (16.10), áudio da faixa no idioma original com
+  canais e Atmos (16.12), HDR na grafia que o original escolheu (16.9), HFR
+  (16.11, `avg_frame_rate` ≥ 50), codec pela source (16.8: WEB-DL `H.264`,
+  encode/WEBRip `x264`, REMUX `AVC`) e DUAL/MULTi pelos idiomas do áudio vêm do
+  ffprobe. Ordem dos campos da 16.4 (REMUX põe o codec antes do áudio). Título
+  sem acento e sem `, : ; ! ? * " ' ( ) / \ | < >`, `&` vira `and` (16.2.4).
+  Sem grupo: `NoGroup`. Segunda tag (`-GRUPO.DUAL-OUTRO`, 16.12.7) é mantida.
+  O que o padrão pede e nenhum dos dois diz é lacuna → Fail: filme sem ano,
+  "WEB" sem `H.264`/`x264` no nome (não dá para separar WEB-DL de WEBRip),
+  nome sem source, codec sem grafia (AV1 fora de WEB-DL, 15.2.4). Sigla de
+  streaming fora da lista da 16.7 → Warn **16.7**.
+- **Estrutura** (`Report.placements`): o torrent leva só os vídeos principais
+  (sem amostra nem pasta de extras) e a legenda PT completa em `.srt`/`.ass`
+  de cada um, com o mesmo nome do vídeo (16.19.2); o resto fica de fora
+  (Ok **15.2.16** listando). Filme e episódio sem legenda solta vão **sem
+  pasta** (15.2.17); temporada vai na pasta do pack, nome padrão da pasta da
+  origem (16.19.4). Em DUAL a legenda vai embutida (16.19.3): a solta fica de
+  fora (Ok **16.19.3**). Legenda PT necessária em `.sub`/`.idx`/`.ssa` → Fail
+  **15.2.12**. Filme ou episódio com mais de um vídeo principal → Fail
+  **15.2.17**. Episódios de grupos diferentes: pasta com `MiXED` (16.17) e
+  Warn **15.2.20** (Trumpable). Série sem grupo → Fail **15.2.28**.
+  `placements` vazio = a origem já é o torrent do padrão.
+- **15.2.11** obra não falada em português sem áudio PT e sem legenda PT
   (embutida ou arquivo) → Fail.
-- **5.6** nome de arquivo/pasta com referência a site (lista: `bj-share`,
+- **15.1.8** nome de arquivo/pasta com referência a site (`bj-share`,
   `bjshare`, `amigos-share`, `amigosshare`, e `www.`/`.com`/`.net`/`.org`
   dentro do nome) → Fail.
-- **3.11 / 4.15** série em andamento (`continuing`): só episódio avulso;
-  temporada completa → Fail. Série encerrada (`ended`): só temporada
-  completa; episódio avulso → Fail. Temporada que não cobre todos os
-  episódios exibidos da temporada no catálogo → Fail.
-- **3.9** Dual sem legenda PT completa (embutida ou em arquivo; forçada não
-  conta) → Warn: no formulário vai como Dublado, não Dual Áudio. Dual com
-  legenda → Ok. Não se aplica a quem não é Dual.
-- **4.2.1** duplicidade contra os releases do destino:
-  - destino tem Dual e este é só dublado ou só legendado → Fail;
+- **15.2.18 / 15.2.19** temporada em exibição (o catálogo tem episódio dela
+  que não foi ao ar, `season_pending > 0`): pack → Fail, episódio → Ok.
+  Temporada já exibida: pack completo (o que não cobre os episódios exibidos
+  → Fail), episódio → Fail. Série em andamento sem episódio futuro no catálogo
+  (a data pode só não ter saído) → Warn nos dois.
+- **15.2.5** encode de Blu-ray (não REMUX) em 720p/1080p: bitrate médio do
+  arquivo inteiro abaixo do mínimo de animação (3500/6000 kbps) → Fail (é
+  BRRip); abaixo do geral (5000/8000) → Warn (só animação passa).
+- **15.2.6** REMUX sem áudio PT → Warn (só se a obra nunca teve dublagem).
+- **15.2.8** vídeo fora de MKV → Warn (Trumpable).
+- **15.3** duplicidade e substituição contra os releases do destino de mesma
+  edição (16.14; edição diferente convive). Um DUAL completo (com legenda PT
+  embutida) não disputa vaga com só dublado e só legendado (15.3.3). Na ordem:
+  - **15.3.4** source inferior (abaixo de WEB-DL/Blu-ray, ou abaixo de 720p)
+    com uma superior no site → Fail;
+  - **15.3.3** só dublado ou só legendado com DUAL na mesma resolução → Fail;
+  - **15.3.2** 720p: já há 720p → Fail; há 1080p/2160p com áudio igual ou
+    melhor → Fail **15.3.5**; senão Warn **15.3.5** (Trumpable);
+  - **15.3.2** 1080p WEB-DL: até dois por codec (x264 e x265 são vagas
+    separadas); o terceiro → Fail; o segundo precisa de 2 GB de diferença (6 GB
+    no pack de temporada) → Fail abaixo disso. x265 só dublado ou só legendado
+    com DUAL no site → Fail;
+  - **15.3.2** 2160p: uma vaga SDR e uma DV + HDR, pela faixa dinâmica do
+    título (e do arquivo, no nosso). Mesma vaga ocupada → Fail; só HDR ou só DV
+    com híbrido no site → Fail; só HDR ou só DV com a vaga livre → Warn;
+  - outras resoluções e 1080p fora de WEB-DL: a comparação genérica (mesma
+    resolução, source e áudio; tamanho a menos de 10% e mesmo codec → Fail
+    "duplicado provável", senão Warn), na regra **15.3.1**;
   - release do destino sem resolução no título conta como de resolução
-    desconhecida e entra na comparação. O site monta o título pelas
-    etiquetas, e um 4K HDR pode vir só com "HDR"; sem resolução, o parser
-    lia 480p e o duplicado passava. Foi o caso do torrent 52763, que levou a
-    moderação a apagar um envio do acervo. As outras regras que comparam
-    resolução (4.14 e 4.1.10.2) não mudam;
-  - entre os de mesma resolução, fonte e tipo de áudio (dual/dublado/
-    legendado), na ordem:
-    - canais: este é 2.0 e o destino tem 5.1/7.1 → Fail (o 2.0 é
-      substituído); este é 5.1/7.1 e o destino é 2.0 → não pesa (este o
-      substitui). Os nossos vêm do ffprobe; os do destino, do título;
-    - outro codec de vídeo → Warn "avaliar duplicidade";
-    - só o codec de áudio difere (pelos dois nomes: DDP/DD+/EAC3, DD/AC3,
-      AAC, DTS, DTS-HD, TrueHD...) → Warn: a staff avalia;
-    - série em andamento (`continuing`), mesmos codecs: mesmo grupo → Fail;
-      diferença de tamanho abaixo de 2 GiB → Fail; outro grupo com 2 GiB ou
-      mais → não pesa (a regra permite). Série finalizada e filme seguem o
-      item abaixo;
-    - tamanho a menos de 10% → Fail "duplicado provável"; senão Warn
-      "avaliar duplicidade";
-  - só a qualidade difere (outra fonte: BluRay contra WEB-DL), mas com a
-    mesma resolução, o mesmo áudio, o mesmo codec de vídeo (ou um codec
-    desconhecido) e tamanho a menos de 10% → Warn. A regra deixa a decisão com
-    a staff, e na prática ela apaga como duplicado: foi o caso do torrent
-    58396;
-  - nada parecido → Ok.
-- **4.14** fonte inferior a WEB-DL (WEBRip, HDTV, CAM, TS...) com WEB-DL Dual
-  no destino → Fail.
+    desconhecida e entra na comparação (torrent 52763).
+- Sai a antiga 3.9: DUAL sem legenda é DUAL (15.2.15), e o envio não troca
+  mais o áudio para Dublado.
 
 ### BJ (`Site::Bj`)
 - **4.1.1** mesma conferência de nome contra o arquivo (renomear é proibido
@@ -402,7 +412,28 @@ vez de recusado. O vídeo continua intacto: o que muda é a pasta.
   da pasta adaptada. O resto do fluxo (parado, conferido, 100%, tag de
   semear) é o mesmo.
 
-### Nome contra o arquivo (Amigos 4.0.1, BJ 4.1.1)
+### Pasta adaptada do Amigos (nome no padrão)
+
+Com `report.placements` não vazio, o passo "adaptando a pasta" monta
+`<raiz>/lancamentos/amigos/<nome no padrão>/` com um hardlink por
+`Placement` (`adapt::amigos_plan`): o mesmo inode com o nome novo, nada
+copiado e nenhuma legenda extraída. O que não tem `Placement` não entra.
+
+- **Torrent de um arquivo só** (filme ou episódio sem legenda solta, 15.2.17):
+  o arquivo fica dentro da pasta nova e o `.torrent` é dele
+  (`AdaptationPlan.single`). `launches.adapted_path` guarda o conteúdo do
+  torrent (o arquivo, nesse caso) e `adapted_layout` só `[[arquivo,
+  tamanho]]`; a pasta a limpar é a de cima (`launch::adapted_dir`), e o
+  cross-seed semeia com `save_path` = a pasta nova.
+- **MediaInfo:** o formulário confere o nome contra o "Complete name", então,
+  com a pasta montada, o relatório é refeito a partir do vídeo renomeado.
+- `Fields.release` é o nome no padrão (`adapt::release_name`).
+- A limpeza segura é a mesma do BJ: só apaga hardlink da origem (mesmo
+  dev+inode), qualquer que seja o nome.
+- Pacotes do Amigos preparados antes de 26/10 não têm `placements`: prepare
+  de novo antes de enviar.
+
+### Nome contra o arquivo (Amigos 15.2.27, BJ 4.1.1)
 
 `launch/name_check.rs`. O parser de tokens é puro (`NameClaims::parse`): separa
 o nome do arquivo por ponto, espaço, hífen, sublinhado, colchetes etc. (mantém
@@ -454,7 +485,7 @@ imitação a partir do ffprobe.
 
 ## Semear antes da aprovação
 
-Os dois sites só liberam envio com seeder (Amigos 4.6: sem seed some em
+Os dois sites só liberam envio com seeder (Amigos 15.1.2: sem seed some em
 12 h). O torrent publicado ainda não aparece na busca antes da aprovação, então
 o cross-seed não o acha a tempo. O acervo semeia o próprio `.torrent` gerado,
 que é privado e já leva o announce do destino. O Amigos diz que só converte
@@ -514,9 +545,9 @@ no destino. Faz três leituras, sem publicar nada:
    original e a capa já hospedada (`cover.path`).
 
 O áudio é o que o `MediaInfo` do site sugere. Filme só legendado vai como
-"Original" no Amigos, e isso está certo. Há duas trocas:
+"Original" no Amigos, e isso está certo. Dual sem legenda continua Dual
+(15.2.15). Há uma troca:
 
-- regra 3.9: Dual sem legenda PT vai como Dublado;
 - obra nacional: o laudo grava `report.audio` = `nacional`, e o áudio vai
   como Nacional. O site sugere Dublado para filme brasileiro, como foi com o
   Authentic Games (73403).
@@ -529,8 +560,6 @@ uma opção. Gêneros e idioma vêm do IMDB; o resto, do `MediaInfo`.
 
 Ajustes do acervo:
 
-- **Regra 3.9:** se o laudo tem o aviso da 3.9 (Dual sem legenda PT), o áudio
-  vai como Dublado.
 - **Legenda:** o campo só vai quando o áudio escolhido está em `subtitleWhen`.
   Se o `MediaInfo` diz `none` e o pacote tem arquivo de legenda, vai
   `separate`.

@@ -5,10 +5,11 @@
 //! do vídeo principal, arquivos do torrent, URLs das capturas) e devolve os
 //! campos que o usuário copia para o formulário do site, mais os avisos para
 //! o `Report`. Nada aqui lê disco, rede ou banco. O release nunca é alterado:
-//! `release` repete o nome da pasta raiz como veio.
+//! `release` repete o nome da pasta raiz como veio; no Amigos, o nome no
+//! padrão que a pasta adaptada leva (seção 16).
 //!
 //! A descrição junta sinopse, ficha, técnico e capturas e não cita site algum
-//! (Amigos 1.16): nem os links do `IMDb` e do `TMDB`, que ficam só nos campos
+//! (Amigos 1.5 e 15.1.8): nem os links do `IMDb` e do `TMDB`, que ficam só nos campos
 //! próprios, nem o nome do release, que pode trazer o do grupo ou de um site.
 
 use std::fmt::Write as _;
@@ -176,7 +177,7 @@ fn missing_synopsis(site: Site) -> Check {
 }
 
 /// "Título em português (Título original)"; sem o original se for igual ou se
-/// a obra é nacional; sem ano (Amigos 4.5).
+/// a obra é nacional; sem ano (Amigos 6.2 e 6.3).
 fn title(input: &Input) -> String {
     let mut title = input.title.trim().to_owned();
     let original = input
@@ -560,6 +561,7 @@ mod tests {
             pix_fmt: Some("yuv420p10le".into()),
             bit_depth: Some(10),
             hdr,
+            frame_rate: None,
         }
     }
 

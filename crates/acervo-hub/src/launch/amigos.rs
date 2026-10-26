@@ -196,9 +196,9 @@ pub(crate) struct Choice {
 
 /// Escolhe a opção de cada lista como o formulário faz: gênero e idioma pelo
 /// IMDB, o resto pelo `MediaInfo`, o primeiro nome sugerido que bate com uma
-/// opção. `audio` troca a sugestão do site para o áudio: Dublado pela regra
-/// 3.9 (Dual sem legenda PT) e Nacional para a obra brasileira, que o
-/// `MediaInfo` do site sugere como Dublado.
+/// opção. `audio` troca a sugestão do site para o áudio: Nacional para a obra
+/// brasileira, que o `MediaInfo` do site sugere como Dublado. Dual sem
+/// legenda continua Dual (15.2.15).
 pub(crate) fn choose(
     profile: &Profile,
     media: &MediaRead,
@@ -326,8 +326,8 @@ pub(crate) struct Package {
     pub(crate) imdb_id: String,
     pub(crate) mediainfo: String,
     pub(crate) description: String,
-    /// A opção de áudio que vale mais que a sugestão do site (Dublado pela
-    /// 3.9, Nacional para obra brasileira).
+    /// A opção de áudio que vale mais que a sugestão do site (Nacional para
+    /// obra brasileira).
     pub(crate) audio: Option<&'static str>,
     pub(crate) has_subtitle_file: bool,
     pub(crate) screenshots: usize,
@@ -345,7 +345,7 @@ fn imdb_id(text: &str) -> Option<&str> {
 }
 
 /// O pacote como o envio o lê: o tipo (`report.tipo`, ou pelo nome do release
-/// nos pacotes de antes dele), os campos de texto e a regra 3.9 do laudo.
+/// nos pacotes de antes dele) e os campos de texto.
 pub(crate) fn package(
     launch: &acervo_store::Launch,
     has_subtitle_file: bool,
@@ -372,16 +372,6 @@ pub(crate) fn package(
     if mediainfo.is_empty() {
         bail!("o pacote não tem o relatório do MediaInfo: prepare de novo");
     }
-    let dublado = launch
-        .report
-        .get("checks")
-        .and_then(Value::as_array)
-        .is_some_and(|checks| {
-            checks.iter().any(|c| {
-                c.get("rule").and_then(Value::as_str) == Some("3.9")
-                    && c.get("status").and_then(Value::as_str) == Some("warn")
-            })
-        });
     Ok(Package {
         slug: if series { "series" } else { "filmes" },
         name: field("titulo"),
@@ -389,13 +379,8 @@ pub(crate) fn package(
         imdb_id,
         mediainfo,
         description: field("descricao"),
-        audio: if dublado {
-            Some("Dublado")
-        } else if launch.report.get("audio").and_then(Value::as_str) == Some("nacional") {
-            Some("Nacional")
-        } else {
-            None
-        },
+        audio: (launch.report.get("audio").and_then(Value::as_str) == Some("nacional"))
+            .then_some("Nacional"),
         has_subtitle_file,
         screenshots,
     })
@@ -861,14 +846,6 @@ mod tests {
                 valor: "Animação, Aventura, Comédia".into()
             }
         );
-    }
-
-    #[test]
-    fn regra_3_9_troca_dual_por_dublado() {
-        let form = form_from_page(PAGE, "filmes").unwrap();
-        let choice = choose(&form.profile, &media(), &lookup(), Some("Dublado"));
-        assert!(choice.ids.contains(&200));
-        assert!(!choice.ids.contains(&199));
     }
 
     #[test]

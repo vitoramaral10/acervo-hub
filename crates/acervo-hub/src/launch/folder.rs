@@ -473,6 +473,7 @@ mod tests {
         fs::write(content.join("Filme.mkv"), vec![7_u8; 4096]).unwrap();
         fs::write(content.join("Filme.nfo"), b"nfo").unwrap();
         let plan = AdaptationPlan {
+            single: false,
             target: root.join("lancamentos/bj/Filme"),
             links: vec![
                 Link {
@@ -550,6 +551,7 @@ mod tests {
         fs::create_dir_all(&download).unwrap();
         fs::write(download.join("Filme.2024.mkv"), vec![1_u8; 100]).unwrap();
         let plan = AdaptationPlan {
+            single: false,
             target: scratch.0.join("lancamentos/bj/Filme.2024"),
             links: vec![Link {
                 from: download.join("Filme.2024.mkv"),
@@ -573,6 +575,37 @@ mod tests {
             ]
         );
         assert!(plan.target.join("Filme.2024.mkv").is_file());
+    }
+
+    #[test]
+    fn amigos_arquivo_unico_renomeado_e_o_torrent_e_o_arquivo() {
+        let scratch = Scratch::new("amigos-unico");
+        let download = scratch.0.join("downloads/Filme.2024");
+        fs::create_dir_all(&download).unwrap();
+        fs::write(download.join("filme.mkv"), vec![1_u8; 100]).unwrap();
+        fs::write(download.join("filme.nfo"), b"nfo").unwrap();
+        let name = "Filme.2024.1080p.WEB-DL.DDP5.1.H.264-GRP";
+        let plan = AdaptationPlan {
+            single: true,
+            target: scratch.0.join(format!("lancamentos/amigos/{name}")),
+            links: vec![Link {
+                from: download.join("filme.mkv"),
+                to: format!("{name}/{name}.mkv"),
+                size: 100,
+            }],
+            extractions: Vec::new(),
+        };
+        let layout = build(&plan, &scratch.0, &[]).unwrap();
+        assert_eq!(layout, vec![(format!("{name}.mkv"), 100)]);
+        assert_eq!(plan.content(), plan.target.join(format!("{name}.mkv")));
+        let renamed = fs::metadata(plan.content()).unwrap();
+        let source = fs::metadata(download.join("filme.mkv")).unwrap();
+        assert_eq!(renamed.ino(), source.ino(), "hardlink, não cópia");
+        // A limpeza reconhece o hardlink renomeado e leva a pasta inteira.
+        let origin = vec![download.join("filme.mkv"), download.join("filme.nfo")];
+        let cleaned = remove(&plan.target, &scratch.0, &origin, &HashMap::new()).unwrap();
+        assert_eq!(cleaned, Cleanup::Removed);
+        assert!(!plan.target.exists());
     }
 
     #[test]
