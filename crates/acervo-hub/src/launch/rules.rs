@@ -630,7 +630,8 @@ fn few(names: &[&str]) -> String {
 /// nome da seção 16, a legenda PT solta de cada um ao lado com o mesmo nome
 /// (16.19.2) e nada mais (15.2.16). Filme e episódio sem legenda solta vão
 /// sem pasta (15.2.17); temporada vai na pasta do pack (16.19.4). Em DUAL a
-/// legenda vai embutida (16.19.3): a solta fica de fora.
+/// regra pede a legenda embutida (16.19.3), mas sem ela a staff recusa: a
+/// solta vai junto, porque embutir seria remux.
 ///
 /// Devolve as checagens e o mapa da origem para o torrent; o mapa sai vazio
 /// quando o torrent da origem já é o do padrão (ou quando o nome não fecha,
@@ -771,9 +772,10 @@ fn amigos_layout(ctx: &Context<'_>) -> (Vec<Check>, Vec<Placement>) {
         let Some(path) = amigos_subtitle_file(&facts.files, &facts.sniffs, &video.path) else {
             continue;
         };
-        if dual(video) {
-            embedded_only.push(path);
-        } else if has_extension(path, &AMIGOS_SUBTITLES) {
+        if has_extension(path, &AMIGOS_SUBTITLES) {
+            if dual(video) {
+                embedded_only.push(path);
+            }
             subtitles.push((path, format!("{}{}", standard.name, dot_extension(path))));
         } else {
             let needed = !video.media.audio.iter().any(is_portuguese_audio)
@@ -798,7 +800,7 @@ fn amigos_layout(ctx: &Context<'_>) -> (Vec<Check>, Vec<Placement>) {
         checks.push(Check::ok(
             "16.19.3",
             format!(
-                "DUAL leva a legenda embutida: a solta ({}) fica fora do torrent",
+                "a 16.19.3 pede a legenda embutida no DUAL, mas embuti-la seria remux: a solta ({}) vai ao lado do vídeo, porque DUAL sem legenda PT-BR a staff recusa (Big Hero, 26/10)",
                 few(&embedded_only)
             ),
         ));
@@ -4761,7 +4763,8 @@ mod tests {
     }
 
     #[test]
-    fn amigos_dual_deixa_a_legenda_solta_de_fora() {
+    fn amigos_dual_leva_a_legenda_solta() {
+        // Big Hero, 26/10: DUAL sem a legenda PT-BR foi recusado.
         let mut facts = movie();
         let root = "Filme.2024.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP";
         facts
@@ -4769,10 +4772,14 @@ mod tests {
             .push(file(&format!("{root}/{root}.pt-BR.srt"), 1000));
         let report = check(Site::Amigos, &facts);
         assert_eq!(report.status_of("16.19.3"), Some(Status::Ok));
-        assert_eq!(report.placements.len(), 1);
+        let name = "Filme.2024.1080p.WEB-DL.DDP5.1.H.264.DUAL-GRP";
         assert_eq!(
-            report.placements[0].to,
-            "Filme.2024.1080p.WEB-DL.DDP5.1.H.264.DUAL-GRP.mkv"
+            report
+                .placements
+                .iter()
+                .map(|p| p.to.as_str())
+                .collect::<Vec<_>>(),
+            [format!("{name}/{name}.mkv"), format!("{name}/{name}.srt")]
         );
     }
 

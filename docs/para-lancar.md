@@ -210,8 +210,9 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
   de cada um, com o mesmo nome do vídeo (16.19.2); o resto fica de fora
   (Ok **15.2.16** listando). Filme e episódio sem legenda solta vão **sem
   pasta** (15.2.17); temporada vai na pasta do pack, nome padrão da pasta da
-  origem (16.19.4). Em DUAL a legenda vai embutida (16.19.3): a solta fica de
-  fora (Ok **16.19.3**). Legenda PT necessária em `.sub`/`.idx`/`.ssa` → Fail
+  origem (16.19.4). Em DUAL a regra pede a legenda embutida (16.19.3), mas
+  embutir seria remux e DUAL sem legenda PT-BR a staff recusa (Big Hero,
+  26/10): a solta vai junto (Ok **16.19.3**). Legenda PT necessária em `.sub`/`.idx`/`.ssa` → Fail
   **15.2.12**. Filme ou episódio com mais de um vídeo principal → Fail
   **15.2.17**. Episódios de grupos diferentes: pasta com `MiXED` (16.17) e
   Warn **15.2.20** (Trumpable). Série sem grupo → Fail **15.2.28**.
@@ -564,7 +565,10 @@ O áudio é o que o `MediaInfo` do site sugere. Filme só legendado vai como
 (15.2.15). Há uma troca:
 
 - obra nacional: o laudo grava `report.audio` = `nacional`, e o áudio vai
-  como Nacional. O site sugere Dublado para filme brasileiro, como foi com o
+  como Nacional.
+- Qualidade: a source do nome no padrão (`BluRay` → Blu-Ray, `BRRip`,
+  `WEB-DL`...) vem antes da sugestão do site, que leu o encode de Blu-ray de
+  animação do Big Hero como BRRip (26/10). O site sugere Dublado para filme brasileiro, como foi com o
   Authentic Games (73403).
 
 Pacote preparado antes do `report.audio` usa a sugestão do site.

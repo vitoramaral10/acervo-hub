@@ -198,12 +198,15 @@ pub(crate) struct Choice {
 /// IMDB, o resto pelo `MediaInfo`, o primeiro nome sugerido que bate com uma
 /// opção. `audio` troca a sugestão do site para o áudio: Nacional para a obra
 /// brasileira, que o `MediaInfo` do site sugere como Dublado. Dual sem
-/// legenda continua Dual (15.2.15).
+/// legenda continua Dual (15.2.15). `quality` vem antes da sugestão do site
+/// na Qualidade: o site lê o encode de Blu-ray de animação como BRRip, e a
+/// staff confirmou que é BluRay (Big Hero, 26/10).
 pub(crate) fn choose(
     profile: &Profile,
     media: &MediaRead,
     lookup: &Lookup,
     audio: Option<&str>,
+    quality: &[&str],
 ) -> Choice {
     let mut ids = Vec::new();
     let mut shown = Vec::new();
@@ -224,6 +227,17 @@ pub(crate) fn choose(
                 )
                 .collect(),
             "audio_channels" if audio.is_some() => audio.map(str::to_owned).into_iter().collect(),
+            "resolution" => quality
+                .iter()
+                .map(|q| (*q).to_owned())
+                .chain(
+                    media
+                        .attributes
+                        .get("resolution")
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+                .collect(),
             kind => media.attributes.get(kind).cloned().unwrap_or_default(),
         };
         let find = |name: &String| {
@@ -329,6 +343,9 @@ pub(crate) struct Package {
     /// A opção de áudio que vale mais que a sugestão do site (Nacional para
     /// obra brasileira).
     pub(crate) audio: Option<&'static str>,
+    /// Os nomes da Qualidade pela source do nome no padrão, do mais ao menos
+    /// provável no formulário.
+    pub(crate) quality: Vec<&'static str>,
     pub(crate) has_subtitle_file: bool,
     pub(crate) screenshots: usize,
 }
@@ -342,6 +359,34 @@ fn imdb_id(text: &str) -> Option<&str> {
             .count();
         (digits >= 5).then(|| &text[at..at + 2 + digits])
     })
+}
+
+/// Os nomes da Qualidade do formulário para a source do nome do release
+/// (16.6), na grafia do site e nas variantes. Vazio sem source no nome: aí
+/// vale a sugestão do site.
+fn quality_names(release: &str) -> Vec<&'static str> {
+    let tokens: Vec<String> = release
+        .split(['.', ' ', '_'])
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let has = |t: &str| tokens.iter().any(|token| token == t);
+    if has("remux") {
+        vec!["Remux", "BluRay Remux", "Blu-Ray Remux"]
+    } else if has("brrip") {
+        vec!["BRRip"]
+    } else if has("bluray") || has("blu-ray") {
+        vec!["Blu-Ray", "BluRay", "Encode", "BDRip"]
+    } else if has("web-dl") {
+        vec!["WEB-DL"]
+    } else if has("webrip") {
+        vec!["WEBRip", "WEB-Rip"]
+    } else if has("hdtv") {
+        vec!["HDTV"]
+    } else if has("dvdrip") {
+        vec!["DVDRip"]
+    } else {
+        Vec::new()
+    }
 }
 
 /// O pacote como o envio o lê: o tipo (`report.tipo`, ou pelo nome do release
@@ -381,6 +426,7 @@ pub(crate) fn package(
         description: field("descricao"),
         audio: (launch.report.get("audio").and_then(Value::as_str) == Some("nacional"))
             .then_some("Nacional"),
+        quality: quality_names(&release),
         has_subtitle_file,
         screenshots,
     })
@@ -394,7 +440,7 @@ pub(crate) fn draft_from(
     lookup: &Lookup,
 ) -> Draft {
     let profile = &form.profile;
-    let choice = choose(profile, media, lookup, package.audio);
+    let choice = choose(profile, media, lookup, package.audio, &package.quality);
     let mut missed = choice.missed.clone();
     let want_movie = package.slug == "filmes";
     if want_movie != (lookup.kind == "movie") {
@@ -793,6 +839,7 @@ mod tests {
             mediainfo: "General\n...".into(),
             description: "[b]Sinopse[/b]".into(),
             audio: None,
+            quality: Vec::new(),
             has_subtitle_file: false,
             screenshots: 4,
         }
@@ -835,7 +882,7 @@ mod tests {
     #[test]
     fn escolhe_como_o_formulario_pelo_nome_sem_acento() {
         let form = form_from_page(PAGE, "filmes").unwrap();
-        let choice = choose(&form.profile, &media(), &lookup(), None);
+        let choice = choose(&form.profile, &media(), &lookup(), None, &[]);
         // "Comedia" sem acento casa com "Comédia"; "Família" não é opção.
         assert_eq!(choice.ids, vec![225, 206, 207, 1, 59, 199, 195]);
         assert!(choice.missed.is_empty(), "{:?}", choice.missed);
@@ -845,6 +892,31 @@ mod tests {
                 campo: "Gêneros".into(),
                 valor: "Animação, Aventura, Comédia".into()
             }
+        );
+    }
+
+    #[test]
+    fn qualidade_segue_o_nome_e_nao_a_sugestao_do_site() {
+        let page = PAGE.replace(
+            r#"{"id":49,"name":"Blu-Ray"}"#,
+            r#"{"id":49,"name":"Blu-Ray"},{"id":50,"name":"BRRip"}"#,
+        );
+        let form = form_from_page(&page, "filmes").unwrap();
+        let mut read = media();
+        // Big Hero, 26/10: o site sugeriu BRRip para o encode de animação.
+        read.attributes
+            .insert("resolution".into(), vec!["BRRip".into()]);
+        let quality = quality_names("Operacao.Big.Hero.2015.1080p.BluRay.DD5.1.x264.DUAL-shaggy");
+        let choice = choose(&form.profile, &read, &lookup(), None, &quality);
+        assert!(choice.ids.contains(&49), "{choice:?}");
+        assert!(!choice.ids.contains(&50));
+        // Sem source no nome, vale a do site.
+        let choice = choose(&form.profile, &read, &lookup(), None, &[]);
+        assert!(choice.ids.contains(&50));
+        assert_eq!(quality_names("Filme.2160p.BRRip.x265-G"), ["BRRip"]);
+        assert_eq!(
+            quality_names("Filme.1080p.AMZN.WEB-DL.H.264-G")[0],
+            "WEB-DL"
         );
     }
 
@@ -859,7 +931,7 @@ mod tests {
         // O site sugere Dublado para o filme brasileiro.
         read.attributes
             .insert("audio_channels".into(), vec!["Dublado".into()]);
-        let choice = choose(&form.profile, &read, &lookup(), Some("Nacional"));
+        let choice = choose(&form.profile, &read, &lookup(), Some("Nacional"), &[]);
         assert!(choice.ids.contains(&201), "{choice:?}");
         assert!(!choice.ids.contains(&200));
     }
@@ -871,7 +943,7 @@ mod tests {
         read.attributes
             .insert("resolution".into(), vec!["WEBRip".into()]);
         read.attributes.remove("video_codec");
-        let choice = choose(&form.profile, &read, &lookup(), None);
+        let choice = choose(&form.profile, &read, &lookup(), None, &[]);
         assert_eq!(choice.missed.len(), 2, "{:?}", choice.missed);
         assert!(choice.missed[0].contains("WEBRip"));
         assert!(choice.missed[1].contains("sem sugestão"));
