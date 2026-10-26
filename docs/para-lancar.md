@@ -205,6 +205,10 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
   Termo na parte técnica que o acervo não reconhece (`x264 FLAME DUAL-OUTRO`,
   `x264-iFT.DUAL.THYRSO10`, `- By Fulano`) é lacuna: pode ser tag de grupo,
   e descartá-la seria retag (15.2.26). Tag com `@` cita outro site → lacuna.
+  Única tag de quem só acrescenta o áudio PT ao release de outro grupo
+  (`naming::DUAL_ADDERS`: shaggy, RK, GMN, Lannister...) → lacuna: a tag
+  original sumiu, e relançar é retag (Big Hero, `x264-shaggy`, removido em
+  26/10).
   O que o padrão pede e nenhum dos dois diz é lacuna → Fail: filme sem ano,
   "WEB" sem `H.264`/`x264` no nome (não dá para separar WEB-DL de WEBRip),
   nome sem source, codec sem grafia (AV1 fora de WEB-DL, 15.2.4). Sigla de
