@@ -197,7 +197,11 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
   encode/WEBRip `x264`, REMUX `AVC`) e DUAL/MULTi pelos idiomas do áudio vêm do
   ffprobe. Ordem dos campos da 16.4 (REMUX põe o codec antes do áudio). Título
   sem acento e sem `, : ; ! ? * " ' ( ) / \ | < >`, `&` vira `and` (16.2.4).
-  Sem grupo: `NoGroup`. Segunda tag (`-GRUPO.DUAL-OUTRO`, 16.12.7) é mantida.
+  Obra em inglês leva o título original do catálogo (16.2.1; `Facts.english_title`),
+  salvo quando o do release já é ele ou, na série, começa por ele (ano ou
+  país que separa séries de mesmo nome): `Deixe.A.Neve.Cair` vira
+  `Let.It.Snow`. Obra estrangeira de outro idioma: Warn **16.7** para conferir
+  o título à mão. Sem grupo: `NoGroup`. Segunda tag (`-GRUPO.DUAL-OUTRO`, 16.12.7) é mantida.
   Termo na parte técnica que o acervo não reconhece (`x264 FLAME DUAL-OUTRO`,
   `x264-iFT.DUAL.THYRSO10`, `- By Fulano`) é lacuna: pode ser tag de grupo,
   e descartá-la seria retag (15.2.26). Tag com `@` cita outro site → lacuna.

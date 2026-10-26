@@ -42,6 +42,29 @@ pub(crate) struct Subject<'a> {
     /// Encode de Blu-ray abaixo do bitrate mínimo (15.2.5): a source é `BRRip`
     /// (16.6), qualquer que seja a do nome original.
     pub brrip: bool,
+    /// O título original da obra em inglês, do catálogo (16.2.1: obra
+    /// estrangeira usa o título em inglês do `IMDb`); `None` fora de obra em
+    /// inglês.
+    pub english_title: Option<&'a str>,
+}
+
+/// Só letras e dígitos, minúsculos: para comparar títulos sem pontuação.
+fn squash(text: &str) -> String {
+    clean_title(text)
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// As palavras do título do catálogo no padrão: `Spider-Man: Across the
+/// Spider-Verse` → `Spider-Man`, `Across`, `the`, `Spider-Verse`.
+fn title_words(title: &str) -> Vec<String> {
+    title
+        .split(|c: char| c.is_whitespace() || c == '.')
+        .map(clean_title)
+        .filter(|t| !t.is_empty())
+        .collect()
 }
 
 /// 16.7, na grafia da regra.
@@ -767,6 +790,25 @@ pub(crate) fn standard(subject: &Subject<'_>) -> Result<Standard, Vec<String>> {
         .map(|t| clean_title(t))
         .filter(|t| !t.is_empty())
         .collect();
+    // 16.2.1: obra estrangeira leva o título em inglês. O do release fica
+    // quando já é ele (preserva a escolha do hífen) ou, na série, quando
+    // começa por ele (o ano ou o país que separa séries de mesmo nome).
+    if let Some(english) = subject.english_title.filter(|t| !squash(t).is_empty()) {
+        let ours = squash(&parts.join("."));
+        let theirs = squash(english);
+        let keep = ours == theirs || (subject.series && ours.starts_with(&theirs));
+        if !keep {
+            parts = title_words(english);
+        }
+    } else if subject
+        .original_language
+        .is_some_and(|l| !portuguese(l) && l != Language::English && l != Language::Unknown)
+    {
+        warnings.push(
+            "obra estrangeira fora do inglês: confira se o título do nome é o em inglês do IMDb (16.2.1)"
+                .to_owned(),
+        );
+    }
     parts.push(id.clone());
     if subject.series && is_episode_id(&id) {
         parts.extend(
@@ -917,6 +959,7 @@ mod tests {
             series,
             dual,
             brrip: false,
+            english_title: None,
         })
         .map(|s| s.name)
     }
@@ -1061,6 +1104,7 @@ mod tests {
             series: false,
             dual: true,
             brrip: false,
+            english_title: None,
         })
         .unwrap();
         assert_eq!(
@@ -1135,6 +1179,50 @@ mod tests {
             )
             .unwrap(),
             "Ted.2012.1080p.BluRay.DTS-HD.MA5.1.x264-DAA.DUAL-3LT0N"
+        );
+    }
+
+    #[test]
+    fn obra_em_ingles_leva_o_titulo_em_ingles() {
+        let with = |original: &str, english: &str, series: bool| {
+            standard(&Subject {
+                original,
+                media: &web_1080(),
+                original_language: Some(Language::English),
+                series,
+                dual: false,
+                brrip: false,
+                english_title: Some(english),
+            })
+            .unwrap()
+            .name
+        };
+        // Deixe a Neve Cair, 26/10: o título em português passou.
+        assert_eq!(
+            with(
+                "Deixe.A.Neve.Cair.2019.1080p.NF.WEB-DL.DD5.1.x264-PiA",
+                "Let It Snow",
+                false
+            ),
+            "Let.It.Snow.2019.1080p.NF.WEB-DL.DDP5.1.H.264-PiA"
+        );
+        // Já em inglês: fica como está, inclusive o hífen.
+        assert_eq!(
+            with(
+                "Spider-Man.Across.the.Spider-Verse.2023.1080p.WEB-DL.DDP5.1.H.264-G",
+                "Spider-Man: Across the Spider-Verse",
+                false
+            ),
+            "Spider-Man.Across.the.Spider-Verse.2023.1080p.WEB-DL.DDP5.1.H.264-G"
+        );
+        // Série com o ano que a separa da outra de mesmo nome.
+        assert_eq!(
+            with(
+                "Drops.of.God.2023.S01E01.1080p.WEB-DL.H.264-G",
+                "Drops of God",
+                true
+            ),
+            "Drops.of.God.2023.S01E01.1080p.WEB-DL.DDP5.1.H.264-G"
         );
     }
 
