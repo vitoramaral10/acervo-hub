@@ -272,6 +272,9 @@ pub struct Facts {
     pub videos: Vec<ProbedVideo>,
     /// Idioma original da obra (`Language::from_name` do que o banco guarda).
     pub original_language: Option<Language>,
+    /// O título original da obra quando ela é em inglês (o nome no padrão do
+    /// Amigos usa o título em inglês, 16.2.1); `None` nas outras.
+    pub english_title: Option<String>,
     pub series_status: Option<SeriesStatus>,
     /// Os pares (temporada, episódio) exibidos da temporada no catálogo.
     pub season_episodes: Option<Vec<(u16, u16)>>,
@@ -675,6 +678,7 @@ fn amigos_layout(ctx: &Context<'_>) -> (Vec<Check>, Vec<Placement>) {
             series,
             dual: dual(video),
             brrip: ctx.brrip,
+            english_title: facts.english_title.as_deref(),
         }) {
             Ok(standard) => named.push((video, standard)),
             Err(found) => gaps.push(format!("{name}: {}", found.join("; "))),
@@ -692,6 +696,7 @@ fn amigos_layout(ctx: &Context<'_>) -> (Vec<Check>, Vec<Placement>) {
             series,
             dual: dual(biggest),
             brrip: ctx.brrip,
+            english_title: facts.english_title.as_deref(),
         }) {
             Ok(standard) => Some(standard),
             Err(found) => {
@@ -3110,6 +3115,7 @@ mod tests {
                 ),
             }],
             original_language: Some(Language::English),
+            english_title: None,
             series_status: None,
             season_episodes: None,
             season_pending: 0,
