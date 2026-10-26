@@ -42,10 +42,13 @@ pub(crate) struct Subject<'a> {
     /// Encode de Blu-ray abaixo do bitrate mínimo (15.2.5): a source é `BRRip`
     /// (16.6), qualquer que seja a do nome original.
     pub brrip: bool,
-    /// O título original da obra em inglês, do catálogo (16.2.1: obra
-    /// estrangeira usa o título em inglês do `IMDb`); `None` fora de obra em
-    /// inglês.
-    pub english_title: Option<&'a str>,
+    /// O título original da obra, do catálogo, quando ele é o que a 16.2.1
+    /// pede: o em inglês na obra em inglês, o nacional na obra brasileira.
+    /// `None` nas outras.
+    pub catalog_title: Option<&'a str>,
+    /// O ano da obra no catálogo (16.2.2: o do `IMDb`, não o do streaming);
+    /// vale no filme, no lugar do ano do release.
+    pub year: Option<u16>,
 }
 
 /// Só letras e dígitos, minúsculos: para comparar títulos sem pontuação.
@@ -61,8 +64,9 @@ fn squash(text: &str) -> String {
 /// Spider-Verse` → `Spider-Man`, `Across`, `the`, `Spider-Verse`.
 fn title_words(title: &str) -> Vec<String> {
     title
-        .split(|c: char| c.is_whitespace() || c == '.')
-        .map(clean_title)
+        .split(char::is_whitespace)
+        // 16.2.4 tira o ponto: a sigla `S.W.A.T.` vira `SWAT`.
+        .map(|word| clean_title(&word.replace('.', "")))
         .filter(|t| !t.is_empty())
         .collect()
 }
@@ -227,7 +231,27 @@ fn tag_at_end(text: &str) -> Option<(&str, &str)> {
     valid.then_some((body, tag))
 }
 
+/// Palavra de idioma no lugar da tag (`…5.1-DUAL`): não é grupo.
+fn language_word(tag: &str) -> bool {
+    matches!(
+        tag.to_ascii_lowercase().as_str(),
+        "dual" | "multi" | "dublado" | "dual-audio" | "legendado" | "nacional"
+    )
+}
+
 fn split_tags(stem: &str) -> (&str, Tags) {
+    if let Some((body, last)) = stem.rsplit_once('-')
+        && language_word(last)
+        && !body.is_empty()
+    {
+        return (
+            body,
+            Tags {
+                first: None,
+                second: None,
+            },
+        );
+    }
     let Some((body, last)) = tag_at_end(stem) else {
         return (
             stem,
@@ -272,7 +296,10 @@ fn clean_title(token: &str) -> String {
         .nfd()
         .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
         .filter(|c| !",:;!?*\"'()/\\|<>[]{}".contains(*c))
-        .collect()
+        .collect::<String>()
+        // Hífen só dentro do nome (16.3.2): o solto de "Nome - Subtítulo" sai.
+        .trim_matches('-')
+        .to_owned()
 }
 
 /// O que o nome original afirma depois do identificador.
@@ -330,6 +357,21 @@ const DUAL_ADDERS: [&str; 24] = [
     "SpartacusBR",
     "Tontom",
     "3LTON",
+];
+
+/// Tags que são nome de site de torrent: citar outro site é proibido (1.4,
+/// 15.1.8), e a tag não pode sair (15.2.26). `LAPUMiA` passou como segunda
+/// tag em 26/10.
+const SITE_TAGS: [&str; 9] = [
+    "LAPUMiA",
+    "BLUDV",
+    "COMANDO",
+    "ComandoTorrents",
+    "TorrentDosFilmes",
+    "VACATORRENT",
+    "MegaTorrents",
+    "ThePirateFilmes",
+    "WOLVERDONFILMES",
 ];
 
 /// Termos técnicos que o nome original pode trazer e o nome no padrão refaz
@@ -467,6 +509,10 @@ impl Claims {
                 "hdr10+" => claims.hdr = Some("HDR10+"),
                 "hdr10p" => claims.hdr = Some("HDR10P"),
                 "x264" | "x265" => claims.x_codec = true,
+                // `MA` é Movies Anywhere antes da source, e o DTS-HD MA depois.
+                "ma" if next.is_some_and(|n| source_of(n).is_some()) => {
+                    claims.service.get_or_insert(("MA", false));
+                }
                 "h264" | "h265" | "avc" | "hevc" => claims.h_codec = true,
                 "h" if matches!(next, Some("264" | "265")) => {
                     claims.h_codec = true;
@@ -608,15 +654,23 @@ fn audio_label(track: &AudioFacts, original_name: &str, claims: &Claims) -> Resu
         "eac3" => ("DDP", true),
         "truehd" | "mlp" => ("TrueHD", true),
         "dts" => {
-            let said = |t: &str| profile.contains(t) || (profile.is_empty() && name.contains(t));
+            // Palavra inteira, nunca pedaço: "Schumacher" tem "ma" e o perfil
+            // "DTS Express" tem "es", e o nome mentiria (15.2.27). Sem o
+            // perfil no ffprobe, vale o que o nome do release diz.
+            let words: Vec<&str> = if profile.is_empty() {
+                name.split(['.', ' ', '_']).collect()
+            } else {
+                profile.split([' ', '+']).collect()
+            };
+            let said = |options: &[&str]| words.iter().any(|w| options.contains(w));
             (
-                if said("dts:x") || said("dts-x") {
+                if said(&["dts:x", "dts-x"]) {
                     "DTS-X"
-                } else if said("ma") {
+                } else if said(&["ma", "dts-hdma"]) {
                     "DTS-HD.MA"
-                } else if said("hra") || said("96/24") {
+                } else if said(&["hra", "96/24"]) {
                     "DTS-HD.HRA"
-                } else if said("es") {
+                } else if said(&["es", "dts-es"]) {
                     "DTS-ES"
                 } else {
                     "DTS"
@@ -730,10 +784,15 @@ pub(crate) fn standard(subject: &Subject<'_>) -> Result<Standard, Vec<String>> {
             "o nome não tem o ano, que o padrão exige (16.2.2)".to_owned()
         }]);
     };
+    // 16.2.2: o ano do `IMDb`; o do release pode ser o da entrada no
+    // streaming (The Tender Bar, 2021, saiu como 2022).
     let id = if subject.series {
         season_id(tokens[id_at]).unwrap_or_default()
     } else {
-        year_of(tokens[id_at]).unwrap_or_default().to_owned()
+        subject.year.map_or_else(
+            || year_of(tokens[id_at]).unwrap_or_default().to_owned(),
+            |year| year.to_string(),
+        )
     };
     let rest = &tokens[id_at + 1..];
     let technical_from = rest
@@ -751,7 +810,7 @@ pub(crate) fn standard(subject: &Subject<'_>) -> Result<Standard, Vec<String>> {
         .first
         .iter()
         .chain(tags.second.iter().map(|(_, tag)| tag))
-        .filter(|tag| tag.contains('@'))
+        .filter(|tag| tag.contains('@') || SITE_TAGS.iter().any(|s| s.eq_ignore_ascii_case(tag)))
     {
         gaps.push(format!(
             "a tag {tag} cita outro site, o que o Amigos proíbe (1.4 e 15.1.8)"
@@ -825,6 +884,19 @@ pub(crate) fn standard(subject: &Subject<'_>) -> Result<Standard, Vec<String>> {
     let (Some(class), Some(audio), Some(codec)) = (class, audio, codec) else {
         return Err(gaps);
     };
+    // 16.2.1: obra estrangeira leva o título em inglês do `IMDb`, e o
+    // catálogo só tem o original. Fora do inglês, não há como saber: o nome
+    // do release costuma vir em português (Sua.Culpa é Your.Fault).
+    if subject.catalog_title.is_none()
+        && subject
+            .original_language
+            .is_some_and(|l| !portuguese(l) && l != Language::English && l != Language::Unknown)
+    {
+        gaps.push(
+            "obra estrangeira fora do inglês: o acervo não tem o título em inglês do IMDb que a 16.2.1 pede"
+                .to_owned(),
+        );
+    }
     if !gaps.is_empty() {
         return Err(gaps);
     }
@@ -834,24 +906,18 @@ pub(crate) fn standard(subject: &Subject<'_>) -> Result<Standard, Vec<String>> {
         .map(|t| clean_title(t))
         .filter(|t| !t.is_empty())
         .collect();
-    // 16.2.1: obra estrangeira leva o título em inglês. O do release fica
-    // quando já é ele (preserva a escolha do hífen) ou, na série, quando
-    // começa por ele (o ano ou o país que separa séries de mesmo nome).
-    if let Some(english) = subject.english_title.filter(|t| !squash(t).is_empty()) {
+    // 16.2.1: obra estrangeira leva o título em inglês, e a nacional o
+    // nacional (New Bandits é Cangaço Novo). O do release fica quando já é
+    // ele (preserva a escolha do hífen) ou, na série, quando começa por ele
+    // (o ano ou o país que separa séries de mesmo nome).
+    if let Some(catalog) = subject.catalog_title.filter(|t| !squash(t).is_empty()) {
         let ours = squash(&parts.join("."));
-        let theirs = squash(english);
-        let keep = ours == theirs || (subject.series && ours.starts_with(&theirs));
+        let theirs = squash(catalog);
+        // Igual, vale a grafia do catálogo (`s.w.a.t.exiles` vira SWAT.Exiles).
+        let keep = subject.series && ours.starts_with(&theirs) && ours != theirs;
         if !keep {
-            parts = title_words(english);
+            parts = title_words(catalog);
         }
-    } else if subject
-        .original_language
-        .is_some_and(|l| !portuguese(l) && l != Language::English && l != Language::Unknown)
-    {
-        warnings.push(
-            "obra estrangeira fora do inglês: confira se o título do nome é o em inglês do IMDb (16.2.1)"
-                .to_owned(),
-        );
     }
     parts.push(id.clone());
     if subject.series && is_episode_id(&id) {
@@ -877,7 +943,10 @@ pub(crate) fn standard(subject: &Subject<'_>) -> Result<Standard, Vec<String>> {
         .frame_rate
         .filter(|fps| *fps >= 49.5)
         .map(|_| "HFR".to_owned());
-    let bluray = if claims.uhd { "UHD.BluRay" } else { "BluRay" };
+    // 16.6: Blu-ray comum vai a 1080p, então source de disco em 2160p é UHD,
+    // diga o nome original ou não (Tenet `2160p.HDR.BluRay`).
+    let uhd = claims.uhd || resolution(video, dvd) == "2160p";
+    let bluray = if uhd { "UHD.BluRay" } else { "BluRay" };
     match class {
         Class::Remux => {
             parts.extend([bluray.to_owned(), "REMUX".to_owned()]);
@@ -1003,7 +1072,8 @@ mod tests {
             series,
             dual,
             brrip: false,
-            english_title: None,
+            catalog_title: None,
+            year: None,
         })
         .map(|s| s.name)
     }
@@ -1148,7 +1218,8 @@ mod tests {
             series: false,
             dual: true,
             brrip: false,
-            english_title: None,
+            catalog_title: None,
+            year: None,
         })
         .unwrap();
         assert_eq!(
@@ -1227,6 +1298,162 @@ mod tests {
     }
 
     #[test]
+    fn furos_da_fila_de_26_10() {
+        let subject = |original: &'static str, title: Option<&'static str>, year, series, dual| {
+            let media = Box::leak(Box::new(media(
+                video("h264", 1920, 1080, Hdr::Sdr),
+                vec![
+                    track(Language::English, "dts", 6),
+                    track(Language::Portuguese, "ac3", 6),
+                ],
+            )));
+            standard(&Subject {
+                original,
+                media,
+                original_language: Some(Language::English),
+                series,
+                dual,
+                brrip: false,
+                catalog_title: title,
+                year,
+            })
+        };
+        // "-DUAL" no lugar da tag não é grupo.
+        assert_eq!(
+            subject(
+                "Especialista.Em.Crise.2015.1080p.BluRay.x264.DTS-HD.MA.5.1-DUAL",
+                Some("Our Brand Is Crisis"),
+                Some(2015),
+                false,
+                true
+            )
+            .unwrap()
+            .name,
+            "Our.Brand.Is.Crisis.2015.1080p.BluRay.DTS-HD.MA5.1.x264.DUAL-NoGroup"
+        );
+        // DTS sem perfil no ffprobe: "Schumacher" não é "MA".
+        // Hífen solto no título sai.
+        assert_eq!(
+            subject(
+                "Schumacher.94.-.The.Birth.of.a.Legend.2026.1080p.NF.WEB-DL.DDP5.1.H.264-G",
+                None,
+                None,
+                false,
+                false
+            )
+            .unwrap()
+            .name,
+            "Schumacher.94.The.Birth.of.a.Legend.2026.1080p.NF.WEB-DL.DTS5.1.H.264-G"
+        );
+        // Obra nacional: o título nacional do catálogo.
+        assert_eq!(
+            subject(
+                "New.Bandits.S01.1080p.AMZN.WEB-DL.DDP5.1.H.264-SiGLA",
+                Some("Cangaço Novo"),
+                None,
+                true,
+                false
+            )
+            .unwrap()
+            .name,
+            "Cangaco.Novo.S01.1080p.AMZN.WEB-DL.DTS5.1.H.264-SiGLA"
+        );
+        // O ano do catálogo, não o do release.
+        assert_eq!(
+            subject(
+                "The.Tender.Bar.2022.1080p.AMZN.WEB-DL.DDP5.1.H.264-CMRG",
+                Some("The Tender Bar"),
+                Some(2021),
+                false,
+                false
+            )
+            .unwrap()
+            .name,
+            "The.Tender.Bar.2021.1080p.AMZN.WEB-DL.DTS5.1.H.264-CMRG"
+        );
+    }
+
+    #[test]
+    fn furos_da_varredura_de_26_10() {
+        let uhd = media(
+            video("hevc", 3840, 1600, Hdr::Hdr10),
+            vec![
+                track(Language::English, "ac3", 6),
+                track(Language::Portuguese, "ac3", 6),
+            ],
+        );
+        let run = |original, media: &MediaFacts, language, title, series| {
+            standard(&Subject {
+                original,
+                media,
+                original_language: Some(language),
+                series,
+                dual: true,
+                brrip: false,
+                catalog_title: title,
+                year: None,
+            })
+        };
+        // 2160p de disco é UHD.BluRay, diga o nome ou não (16.6).
+        assert_eq!(
+            run(
+                "Tenet.2020.IMAX.REPACK.2160p.HDR.BluRay.x265-C4K.DUAL-RK",
+                &uhd,
+                Language::English,
+                Some("Tenet"),
+                false
+            )
+            .unwrap()
+            .name,
+            "Tenet.2020.IMAX.REPACK.2160p.UHD.BluRay.DD5.1.HDR.x265-C4K.DUAL-RK"
+        );
+        // Obra estrangeira fora do inglês: sem o título em inglês, lacuna.
+        let gaps = run(
+            "Sua.Culpa.2024.2160p.AMZN.WEB-DL.DDP5.1.HDR.H.265.DUAL-PiA",
+            &uhd,
+            Language::Spanish,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(gaps[0].contains("16.2.1"), "{gaps:?}");
+        // A sigla MA (Movies Anywhere) fica, com aviso; o MA do DTS-HD não.
+        let rental = run(
+            "Rental.Family.2025.2160p.MA.WEB-DL.DDP5.1.Atmos.DV.HDR.H.265-BYNDR.DUAL-wastaken",
+            &uhd,
+            Language::English,
+            Some("Rental Family"),
+            false,
+        )
+        .unwrap();
+        assert!(rental.name.contains(".2160p.MA.WEB-DL."), "{}", rental.name);
+        assert!(rental.warnings.iter().any(|w| w.contains("MA")));
+        // A grafia vem do catálogo, sem os pontos da sigla (16.2.4).
+        assert!(
+            run(
+                "s.w.a.t.exiles.s01e04.1080p.web.h264-cakes",
+                &web_1080(),
+                Language::English,
+                Some("S.W.A.T. Exiles"),
+                true
+            )
+            .unwrap()
+            .name
+            .starts_with("SWAT.Exiles.S01E04.")
+        );
+        // Tag com nome de site de torrent, mesmo como segunda tag.
+        let gaps = run(
+            "Oito.Mulheres.e.Um.Segredo.2018.1080p.BluRay.x264-SPARKS.DUAL-LAPUMiA",
+            &uhd,
+            Language::English,
+            Some("Ocean's Eight"),
+            false,
+        )
+        .unwrap_err();
+        assert!(gaps[0].contains("outro site"), "{gaps:?}");
+    }
+
+    #[test]
     fn obra_em_ingles_leva_o_titulo_em_ingles() {
         let with = |original: &str, english: &str, series: bool| {
             standard(&Subject {
@@ -1236,7 +1463,8 @@ mod tests {
                 series,
                 dual: false,
                 brrip: false,
-                english_title: Some(english),
+                catalog_title: Some(english),
+                year: None,
             })
             .unwrap()
             .name

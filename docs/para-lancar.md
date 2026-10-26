@@ -197,14 +197,22 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
   encode/WEBRip `x264`, REMUX `AVC`) e DUAL/MULTi pelos idiomas do áudio vêm do
   ffprobe. Ordem dos campos da 16.4 (REMUX põe o codec antes do áudio). Título
   sem acento e sem `, : ; ! ? * " ' ( ) / \ | < >`, `&` vira `and` (16.2.4).
-  Obra em inglês leva o título original do catálogo (16.2.1; `Facts.english_title`),
-  salvo quando o do release já é ele ou, na série, começa por ele (ano ou
-  país que separa séries de mesmo nome): `Deixe.A.Neve.Cair` vira
-  `Let.It.Snow`. Obra estrangeira de outro idioma: Warn **16.7** para conferir
-  o título à mão. Sem grupo: `NoGroup`. Segunda tag (`-GRUPO.DUAL-OUTRO`, 16.12.7) é mantida.
+  O título vem do catálogo (16.2.1; `Facts.catalog_title`): o original na
+  obra em inglês (`Deixe.A.Neve.Cair` vira `Let.It.Snow`) e na brasileira
+  (`New.Bandits` vira `Cangaco.Novo`), na grafia do catálogo e sem os pontos
+  de sigla (`s.w.a.t.exiles` vira `SWAT.Exiles`). Na série, o do release fica
+  quando começa pelo do catálogo e é mais longo (ano ou país que separa
+  séries de mesmo nome). Obra estrangeira de outro idioma: o catálogo não tem
+  o título em inglês, então é lacuna (Sua.Culpa é Your.Fault). O ano é o do
+  catálogo (16.2.2; The Tender Bar é 2021, não o 2022 do release). Source de
+  disco em 2160p é `UHD.BluRay` mesmo sem "UHD" no nome (16.6). `MA` antes da
+  source é a sigla do Movies Anywhere (fica, com Warn 16.7); hífen solto no
+  título sai; `-DUAL` no fim não é tag. Sem grupo: `NoGroup`. Segunda tag (`-GRUPO.DUAL-OUTRO`, 16.12.7) é mantida.
   Termo na parte técnica que o acervo não reconhece (`x264 FLAME DUAL-OUTRO`,
   `x264-iFT.DUAL.THYRSO10`, `- By Fulano`) é lacuna: pode ser tag de grupo,
-  e descartá-la seria retag (15.2.26). Tag com `@` cita outro site → lacuna.
+  e descartá-la seria retag (15.2.26). Tag com `@` ou com nome de site
+  de torrent (`naming::SITE_TAGS`: LAPUMiA, BLUDV...), mesmo como segunda tag,
+  cita outro site → lacuna.
   Única tag de quem só acrescenta o áudio PT ao release de outro grupo
   (`naming::DUAL_ADDERS`: shaggy, RK, GMN, Lannister...) → lacuna: a tag
   original sumiu, e relançar é retag (Big Hero, `x264-shaggy`, removido em
@@ -226,7 +234,7 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
   Warn **15.2.20** (Trumpable). Série sem grupo → Fail **15.2.28**.
   `placements` vazio = a origem já é o torrent do padrão.
 - **15.2.11** obra não falada em português sem áudio PT e sem legenda PT
-  (embutida ou arquivo) → Fail.
+  completa (embutida ou arquivo; a forçada não conta) → Fail.
 - **15.1.8** nome de arquivo/pasta com referência a site (`bj-share`,
   `bjshare`, `amigos-share`, `amigosshare`, e `www.`/`.com`/`.net`/`.org`
   dentro do nome) → Fail.
@@ -250,7 +258,8 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
   menos de 10% → Fail: a staff trata como a mesma versão (torrents 58396 e
   Ted 2, apagado em 26/10).
 - **15.3** duplicidade e substituição contra os releases do destino de mesma
-  edição (16.14; edição diferente convive). Um DUAL completo (com legenda PT
+  edição (16.14; edição declarada diferente convive; o título do site nunca
+  escreve a edição, então o sem edição entra na comparação). Um DUAL completo (com legenda PT
   embutida) não disputa vaga com só dublado e só legendado (15.3.3). Na ordem:
   - **15.3.1** mesma resolução e tamanho a menos de 1% → Fail: é o mesmo
     arquivo, qualquer que seja a etiqueta do site (Balls Up, 26/10);
@@ -265,8 +274,11 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
     no pack de temporada) → Fail abaixo disso. x265 só dublado ou só legendado
     com DUAL no site → Fail;
   - **15.3.2** 2160p: uma vaga SDR e uma DV + HDR, pela faixa dinâmica do
-    título (e do arquivo, no nosso). Mesma vaga ocupada → Fail; só HDR ou só DV
-    com híbrido no site → Fail; só HDR ou só DV com a vaga livre → Warn;
+    título (e do arquivo, no nosso; "Dolby Vision" por extenso conta). Mesma
+    vaga ocupada → Fail; só HDR ou só DV contra híbrido, só HDR ou só DV no site
+    → Fail (os provisórios disputam a vaga do híbrido); título do site sem
+    faixa → Warn para conferir no MediaInfo dele; só HDR ou só DV com a vaga
+    livre → Warn;
   - outras resoluções e 1080p fora de WEB-DL: a comparação genérica (mesma
     resolução, source e áudio; tamanho a menos de 10% e mesmo codec → Fail
     "duplicado provável", senão Warn), na regra **15.3.1**;
