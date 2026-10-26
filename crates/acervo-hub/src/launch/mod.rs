@@ -1908,10 +1908,13 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
         files: files.clone(),
         videos,
         original_language: work.original_language,
-        english_title: work
-            .original_title
-            .clone()
-            .filter(|_| work.original_language == Some(Language::English)),
+        catalog_title: work.original_title.clone().filter(|_| {
+            matches!(
+                work.original_language,
+                Some(Language::English | Language::Portuguese | Language::PortugueseBr)
+            )
+        }),
+        year: work.year,
         series_status: work.series_status,
         season_episodes: work.season_episodes.clone(),
         season_pending: work.season_pending,

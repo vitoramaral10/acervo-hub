@@ -272,9 +272,12 @@ pub struct Facts {
     pub videos: Vec<ProbedVideo>,
     /// Idioma original da obra (`Language::from_name` do que o banco guarda).
     pub original_language: Option<Language>,
-    /// O título original da obra quando ela é em inglês (o nome no padrão do
-    /// Amigos usa o título em inglês, 16.2.1); `None` nas outras.
-    pub english_title: Option<String>,
+    /// O título original da obra quando é o que a 16.2.1 pede no nome do
+    /// Amigos: o em inglês (obra em inglês) ou o nacional (obra brasileira).
+    /// `None` nas outras.
+    pub catalog_title: Option<String>,
+    /// O ano da obra no catálogo (16.2.2).
+    pub year: Option<u16>,
     pub series_status: Option<SeriesStatus>,
     /// Os pares (temporada, episódio) exibidos da temporada no catálogo.
     pub season_episodes: Option<Vec<(u16, u16)>>,
@@ -678,7 +681,8 @@ fn amigos_layout(ctx: &Context<'_>) -> (Vec<Check>, Vec<Placement>) {
             series,
             dual: dual(video),
             brrip: ctx.brrip,
-            english_title: facts.english_title.as_deref(),
+            catalog_title: facts.catalog_title.as_deref(),
+            year: facts.year.filter(|_| facts.kind == Kind::Movie),
         }) {
             Ok(standard) => named.push((video, standard)),
             Err(found) => gaps.push(format!("{name}: {}", found.join("; "))),
@@ -696,7 +700,8 @@ fn amigos_layout(ctx: &Context<'_>) -> (Vec<Check>, Vec<Placement>) {
             series,
             dual: dual(biggest),
             brrip: ctx.brrip,
-            english_title: facts.english_title.as_deref(),
+            catalog_title: facts.catalog_title.as_deref(),
+            year: facts.year.filter(|_| facts.kind == Kind::Movie),
         }) {
             Ok(standard) => Some(standard),
             Err(found) => {
@@ -1034,7 +1039,10 @@ pub(super) fn videos_without_portuguese<'a>(
                     .media
                     .subtitles
                     .iter()
-                    .any(|s| is_portuguese_subtitle(s.language, s.raw_language.as_deref()));
+                    // A forçada só legenda trechos: não é a legenda PT-BR.
+                    .any(|s| {
+                        !s.forced && is_portuguese_subtitle(s.language, s.raw_language.as_deref())
+                    });
             !(audio || embedded || has_external_portuguese(files, sniffs, &video.path, site))
         })
         .collect()
@@ -1043,7 +1051,7 @@ pub(super) fn videos_without_portuguese<'a>(
 /// Há legenda PT em arquivo associada ao vídeo: pelo sufixo de idioma do
 /// nome (`.pt-BR`, `.por`, `.forced`) ou, sem sufixo, pelo conteúdo.
 fn has_external_portuguese(files: &[SourceFile], sniffs: &Sniffs, video: &str, site: Site) -> bool {
-    has_external_by_name(files, video, site == Site::Bj, site == Site::Bj)
+    has_external_by_name(files, video, site == Site::Bj, true)
         || siblings(files, sniffs, video, site == Site::Bj)
             .iter()
             .any(|(_, s)| standing(s).counts(site))
@@ -1475,6 +1483,8 @@ enum Range {
     Hybrid,
     HdrOnly,
     DvOnly,
+    /// Release do site sem faixa no título.
+    Unknown,
 }
 
 impl Range {
@@ -1484,13 +1494,23 @@ impl Range {
             .split(|c: char| !c.is_ascii_alphanumeric() && c != '+')
             .map(str::to_owned)
             .collect();
-        let dv = file == Some(Hdr::DolbyVision) || tokens.iter().any(|t| t == "dv" || t == "dovi");
+        // O site escreve "Dolby Vision" por extenso (Rental Family, Captain
+        // America e Avatar Aang passavam como SDR em 26/10).
+        let dolby_vision = tokens
+            .windows(2)
+            .any(|w| w[0] == "dolby" && w[1] == "vision");
+        let dv = file == Some(Hdr::DolbyVision)
+            || dolby_vision
+            || tokens.iter().any(|t| t == "dv" || t == "dovi");
         let hdr = matches!(file, Some(Hdr::Hdr10 | Hdr::Hlg))
             || tokens.iter().any(|t| t.starts_with("hdr") || t == "hlg");
         match (dv, hdr) {
             (true, true) => Self::Hybrid,
             (true, false) => Self::DvOnly,
             (false, true) => Self::HdrOnly,
+            // Título do site sem etiqueta de faixa não prova que é SDR: o
+            // 4K de streaming quase sempre tem HDR (Shadow Force, 26/10).
+            (false, false) if file.is_none() => Self::Unknown,
             (false, false) => Self::Sdr,
         }
     }
@@ -1501,6 +1521,7 @@ impl Range {
             Self::Hybrid => "DV + HDR",
             Self::HdrOnly => "só HDR",
             Self::DvOnly => "só Dolby Vision",
+            Self::Unknown => "sem a faixa no título",
         }
     }
 }
@@ -1565,7 +1586,11 @@ fn amigos_duplicate(ctx: &Context<'_>) -> Check {
         .facts
         .destination
         .iter()
-        .filter(|d| editions(&d.title) == ours_editions)
+        .filter(|d| {
+            // O título do site nunca traz a edição: sem ela, pode ser a mesma.
+            let theirs = editions(&d.title);
+            theirs.is_empty() || theirs == ours_editions
+        })
         .filter(|d| !(complete && matches!(d.audio, AudioKind::Dublado | AudioKind::Legendado)))
         .collect();
     let source = ctx.quality.source();
@@ -1754,7 +1779,12 @@ fn amigos_duplicate(ctx: &Context<'_>) -> Check {
             let clash = theirs.iter().find(|(range, _)| match ours {
                 Range::Sdr => *range == Range::Sdr,
                 Range::Hybrid => *range == Range::Hybrid,
-                Range::HdrOnly | Range::DvOnly => *range == Range::Hybrid || *range == ours,
+                // Só HDR e só DV ocupam, provisórios, a vaga do híbrido: um
+                // segundo deles é duplicado.
+                Range::HdrOnly | Range::DvOnly => {
+                    matches!(range, Range::Hybrid | Range::HdrOnly | Range::DvOnly)
+                }
+                Range::Unknown => false,
             });
             if let Some((range, found)) = clash {
                 return Check::fail(
@@ -1764,6 +1794,16 @@ fn amigos_duplicate(ctx: &Context<'_>) -> Check {
                         ours.label(),
                         range.label(),
                         found.title
+                    ),
+                );
+            }
+            if let Some((_, found)) = theirs.iter().find(|(range, _)| *range == Range::Unknown) {
+                return Check::warn(
+                    "15.3.2",
+                    format!(
+                        "o Amigos já tem 2160p sem a faixa (SDR, HDR ou DV) no título, \"{}\": confira no MediaInfo dele se este ({}) não ocupa a mesma vaga",
+                        found.title,
+                        ours.label()
                     ),
                 );
             }
@@ -3115,7 +3155,8 @@ mod tests {
                 ),
             }],
             original_language: Some(Language::English),
-            english_title: None,
+            catalog_title: None,
+            year: None,
             series_status: None,
             season_episodes: None,
             season_pending: 0,
@@ -3734,10 +3775,16 @@ mod tests {
         let mut facts = two_english_episodes();
         facts.videos[0].media.subtitles = vec![embedded_pt()];
         assert_eq!(status(Site::Amigos, &facts, "15.2.11"), Some(Status::Fail));
-        // Cada um com a sua (embutida num, em arquivo no outro): passa. O
-        // sufixo `.forced` e o idioma `.por` também associam.
+        // A forçada só legenda trechos: não é a legenda PT-BR da 15.2.11.
         facts.files.push(file(
             "Serie.S01.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP/Subs/Serie.S01E02.1080p.WEB-DL.por.forced.srt",
+            1000,
+        ));
+        assert_eq!(status(Site::Amigos, &facts, "15.2.11"), Some(Status::Fail));
+        // Cada um com a sua (embutida num, em arquivo no outro): passa. O
+        // idioma `.por` também associa.
+        facts.files.push(file(
+            "Serie.S01.1080p.WEB-DL.DUAL.DDP5.1.x264-GRP/Subs/Serie.S01E02.1080p.WEB-DL.por.srt",
             1000,
         ));
         assert_eq!(status(Site::Amigos, &facts, "15.2.11"), Some(Status::Ok));
@@ -4590,6 +4637,62 @@ mod tests {
     }
 
     #[test]
+    fn amigos_edicao_que_o_site_nao_escreve_entra_na_comparacao() {
+        // Tenet IMAX, 26/10: o título do site nunca traz a edição.
+        let mut facts = movie();
+        set_video(&mut facts, |m| {
+            m.video = Some(video("hevc", 3840, 2160, Hdr::Hdr10));
+        });
+        rename(
+            &mut facts,
+            "Tenet.2020.IMAX.REPACK.2160p.HDR.BluRay.x265-C4K.DUAL-RK",
+        );
+        facts.destination = vec![dest(
+            "Tenet 2020 2160p HDR Blu-Ray H.265 Dual-Audio Brazilian Original",
+            30 * GB,
+        )];
+        assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Fail));
+        // Edição declarada e diferente convive.
+        facts.destination = vec![dest(
+            "Tenet 2020 Extended 2160p HDR Blu-Ray H.265 Dual-Audio Brazilian Original",
+            30 * GB,
+        )];
+        assert_ne!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Fail));
+    }
+
+    #[test]
+    fn amigos_dolby_vision_por_extenso_no_titulo_do_site() {
+        // Rental Family, Captain America e Avatar Aang passavam em 26/10.
+        assert_eq!(
+            Range::from_title(
+                "Rental Family 2025 2160p Dolby Vision HDR H.265 Dual-Audio",
+                None
+            ),
+            Range::Hybrid
+        );
+        assert_eq!(
+            Range::from_title(
+                "Captain America 2011 2160p Dolby Vision H.265 Dual-Audio",
+                None
+            ),
+            Range::DvOnly
+        );
+        let mut facts = movie();
+        set_video(&mut facts, |m| {
+            m.video = Some(video("hevc", 3840, 2160, Hdr::Hdr10));
+        });
+        rename(
+            &mut facts,
+            "Captain.America.2011.2160p.UHD.BluRay.HDR.x265-G.DUAL-H",
+        );
+        facts.destination = vec![dest(
+            "Captain America: The First Avenger 2011 2160p Dolby Vision H.265 Dual-Audio Brazilian Original",
+            16 * GB,
+        )];
+        assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Fail));
+    }
+
+    #[test]
     fn amigos_15_3_2_720p_e_2160p() {
         let mut facts = movie();
         set_video(&mut facts, |m| {
@@ -4607,8 +4710,10 @@ mod tests {
             m.video = Some(video("hevc", 3840, 2160, Hdr::DolbyVision));
         });
         rename(&mut facts, "Filme.2024.2160p.WEB-DL.DUAL.DV.HDR.H.265-GRP");
+        // Sem a faixa no título do site, não dá para dizer a vaga: avisa
+        // (Shadow Force, 26/10).
         facts.destination = vec![dest("Filme.2024.2160p.WEB-DL.DUAL.H.265-OUTRO", 20 * GB)];
-        assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Ok));
+        assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Warn));
         facts.destination = vec![dest(
             "Filme.2024.2160p.WEB-DL.DUAL.DV.HDR.H.265-OUTRO",
             20 * GB,
