@@ -328,6 +328,33 @@ struct Claims {
     unknown: Vec<String>,
 }
 
+/// Grupos com grafia que não é toda maiúscula, para restaurar a tag de um
+/// nome que veio todo em minúsculas.
+const TAG_CASE: [&str; 14] = [
+    "NTb",
+    "playWEB",
+    "iFT",
+    "PiA",
+    "SiGLA",
+    "TERMiNAL",
+    "KiNGS",
+    "SuccessfulCrab",
+    "BiOMA",
+    "LAPUMiA",
+    "SynysteR",
+    "Lannister",
+    "alfaHD",
+    "xprince00",
+];
+
+/// A tag na grafia do grupo: a conhecida, ou caixa alta.
+fn tag_case(tag: &str) -> String {
+    TAG_CASE
+        .iter()
+        .find(|known| known.eq_ignore_ascii_case(tag))
+        .map_or_else(|| tag.to_ascii_uppercase(), |known| (*known).to_owned())
+}
+
 /// Tags de quem acrescenta o áudio PT ao release de outro grupo (a segunda
 /// tag de 16.12.7), vistas nos releases de 10/2026. Como única tag, o grupo
 /// original foi apagado. O `PiA` também aparece como segunda tag, mas a staff
@@ -765,6 +792,17 @@ pub(crate) fn standard(subject: &Subject<'_>) -> Result<Standard, Vec<String>> {
     let mut gaps = Vec::new();
     let mut warnings = Vec::new();
     let (body, tags) = split_tags(subject.original.trim());
+    // Arquivo da cena todo em minúsculas (`…h264-cakes`) perdeu a grafia da
+    // tag: vale a conhecida do grupo, ou caixa alta (CAKES, S.W.A.T. Exiles
+    // em 26/10). Com alguma maiúscula no nome, a tag fica como veio.
+    let tags = if subject.original.chars().any(|c| c.is_ascii_uppercase()) {
+        tags
+    } else {
+        Tags {
+            first: tags.first.as_deref().map(tag_case),
+            second: tags.second.map(|(repack, tag)| (repack, tag_case(&tag))),
+        }
+    };
     let tokens: Vec<&str> = body
         .split(['.', ' ', '_'])
         .filter(|t| !t.is_empty())
@@ -1568,6 +1606,32 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn tag_de_nome_todo_minusculo_volta_a_grafia_do_grupo() {
+        // S.W.A.T. Exiles S01E04, 26/10: a staff pediu CAKES.
+        let run = |original| {
+            standard(&Subject {
+                original,
+                media: &web_1080(),
+                original_language: Some(Language::English),
+                series: true,
+                dual: false,
+                brrip: false,
+                catalog_title: Some("S.W.A.T. Exiles"),
+                year: None,
+            })
+            .unwrap()
+            .name
+        };
+        assert_eq!(
+            run("s.w.a.t.exiles.s01e04.1080p.web.h264-cakes"),
+            "SWAT.Exiles.S01E04.1080p.WEB-DL.DDP5.1.H.264-CAKES"
+        );
+        assert!(run("s.w.a.t.exiles.s01e04.1080p.web.h264-ntb").ends_with("-NTb"));
+        // Com maiúscula no nome, a tag fica como veio.
+        assert!(run("S.W.A.T.Exiles.S01E04.1080p.WEB.h264-cakes").ends_with("-cakes"));
     }
 
     #[test]
