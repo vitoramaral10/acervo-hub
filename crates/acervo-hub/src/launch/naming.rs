@@ -444,7 +444,12 @@ const TECHNICAL: [&str; 62] = [
 /// Termo que a parte técnica pode ter sem perder informação no padrão.
 fn is_technical(word: &str) -> bool {
     let bare = word.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
-    bare.is_empty() || TECHNICAL.contains(&bare) || NOISE.contains(&word)
+    // O termo inteiro também: tirar o dígito do fim de `ac3`, `mp3`, `av1` ou
+    // `vc-1` deixa um pedaço que não está na lista (Resident Evil 2, 26/10).
+    bare.is_empty()
+        || TECHNICAL.contains(&bare)
+        || TECHNICAL.contains(&word)
+        || NOISE.contains(&word)
 }
 
 /// Termos que não são nome de episódio e o padrão não usa.
@@ -1530,6 +1535,33 @@ mod tests {
         assert!(
             name(
                 "Let.It.Snow.2019.1080p.NF.WEB-DL.DD5.1.H.264.DUAL-PiA",
+                &media,
+                false,
+                true
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn codec_com_digito_no_fim_e_tecnico() {
+        for word in [
+            "ac3", "eac3", "mp3", "av1", "vc-1", "mpeg-2", "e-ac-3", "ddp5", "aac2",
+        ] {
+            assert!(is_technical(word), "{word}");
+        }
+        assert!(!is_technical("flame"));
+        // Resident Evil 2, 26/10: AC3 no meio do nome não é tag.
+        let media = media(
+            video("hevc", 3840, 2160, Hdr::Hdr10),
+            vec![
+                track(Language::English, "truehd", 8),
+                track(Language::Portuguese, "ac3", 6),
+            ],
+        );
+        assert!(
+            name(
+                "Resident.Evil.Apocalypse.2004.2160p.UHD.Bluray.HDR10.AC3.5.1.DTS-HDM.5.1.H265-d3g.DUAL-Daryl007",
                 &media,
                 false,
                 true
