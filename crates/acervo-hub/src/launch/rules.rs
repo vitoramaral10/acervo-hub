@@ -1232,11 +1232,10 @@ fn bj(ctx: &Context<'_>, checks: &mut Vec<Check>) {
 fn torrent_limits(ctx: &Context<'_>) -> Check {
     const RULE: &str = "4.1.8 / 4.1.10";
     let files = ctx.facts.files.len();
-    let bluray = ctx
-        .facts
-        .files
-        .iter()
-        .any(|f| has_extension(&f.path, &["m2ts"]));
+    // Só o Blu-ray de verdade: M2TS dentro de BDMV/STREAM.
+    let bluray = ctx.facts.files.iter().any(|f| {
+        has_extension(&f.path, &["m2ts"]) && parent(&f.path).to_uppercase().ends_with("BDMV/STREAM")
+    });
     if files > BJ_MAX_FILES && !bluray {
         return Check::fail(
             RULE,
@@ -1258,16 +1257,9 @@ fn torrent_limits(ctx: &Context<'_>) -> Check {
 /// 4.1.11: os vídeos principais (sem amostra nem extras) não misturam
 /// resolução nem áudio. Ter ou não áudio PT reprova; Dual ao lado de dublado
 /// é aviso, porque uma faixa sem tag de idioma já basta para separá-los.
+/// Amostra só pelo nome: o tamanho esconderia um episódio curto da mistura.
 fn mixed_videos(ctx: &Context<'_>) -> Option<Check> {
     const RULE: &str = "4.1.11";
-    let size_of = |path: &str| {
-        ctx.facts
-            .files
-            .iter()
-            .find(|f| f.path == path)
-            .map_or(0, |f| f.size)
-    };
-    let median = median(ctx.facts.videos.iter().map(|v| size_of(&v.path)).collect());
     let main: Vec<&ProbedVideo> = ctx
         .facts
         .videos
@@ -1276,7 +1268,7 @@ fn mixed_videos(ctx: &Context<'_>) -> Option<Check> {
             let in_extras = parent(&v.path)
                 .split('/')
                 .any(|dir| EXTRA_FOLDERS.contains(&dir.to_lowercase().as_str()));
-            !in_extras && !is_sample(file_name(&v.path), size_of(&v.path), median)
+            !in_extras && !file_name(&v.path).to_lowercase().contains("sample")
         })
         .collect();
     if main.len() < 2 {
@@ -1310,18 +1302,24 @@ fn mixed_videos(ctx: &Context<'_>) -> Option<Check> {
             "vídeos na mesma resolução e com o mesmo áudio",
         ));
     };
+    // Com PT de um lado e sem PT do outro, a mensagem cita os dois lados.
+    let subbed = kinds.contains(&AudioKind::Legendado);
+    let (a, b) = if subbed {
+        let pt = kinds.iter().copied().find(|k| *k != AudioKind::Legendado);
+        (AudioKind::Legendado, pt.unwrap_or(other))
+    } else {
+        (first, other)
+    };
     let message = format!(
         "vídeos {} ao lado de vídeos {}: o BJ não aceita áudios misturados no mesmo torrent",
-        first.label(),
-        other.label()
+        a.label(),
+        b.label()
     );
-    Some(
-        if first == AudioKind::Legendado || other == AudioKind::Legendado {
-            Check::fail(RULE, message)
-        } else {
-            Check::warn(RULE, format!("{message}; confira as faixas"))
-        },
-    )
+    Some(if subbed {
+        Check::fail(RULE, message)
+    } else {
+        Check::warn(RULE, format!("{message}; confira as faixas"))
+    })
 }
 
 /// 4.1.10.2: só MKV.
@@ -2840,6 +2838,11 @@ mod tests {
             status(Site::Bj, &facts, "4.1.8 / 4.1.10"),
             Some(Status::Fail)
         );
+        facts.files.push(file("Filme/solto.m2ts", GB));
+        assert_eq!(
+            status(Site::Bj, &facts, "4.1.8 / 4.1.10"),
+            Some(Status::Fail)
+        );
         facts.files.push(file("Filme/BDMV/STREAM/00001.m2ts", GB));
         assert_eq!(status(Site::Bj, &facts, "4.1.8 / 4.1.10"), Some(Status::Ok));
     }
@@ -2858,7 +2861,7 @@ mod tests {
     fn bj_reprova_temporada_com_resolucao_misturada() {
         let mut facts = season(3);
         set_video(&mut facts, |m| {
-            m.video = Some(video("h264", 1280, 720, Hdr::Sdr))
+            m.video = Some(video("h264", 1280, 720, Hdr::Sdr));
         });
         assert_eq!(status(Site::Bj, &facts, "4.1.11"), Some(Status::Fail));
     }
@@ -2870,6 +2873,22 @@ mod tests {
         set_video(&mut facts, |m| m.audio = vec![por()]);
         assert_eq!(status(Site::Bj, &facts, "4.1.11"), Some(Status::Warn));
         set_video(&mut facts, |m| m.audio = vec![eng()]);
+        assert_eq!(status(Site::Bj, &facts, "4.1.11"), Some(Status::Fail));
+    }
+
+    #[test]
+    fn bj_legendado_reprova_mesmo_depois_de_dual_e_dublado() {
+        let mut facts = season(3);
+        facts.videos[1].media.audio = vec![por()];
+        facts.videos[2].media.audio = vec![eng()];
+        assert_eq!(status(Site::Bj, &facts, "4.1.11"), Some(Status::Fail));
+    }
+
+    #[test]
+    fn bj_episodio_curto_conta_na_mistura() {
+        let mut facts = season(2);
+        facts.files[1].size = GB / 10;
+        facts.videos[1].media.audio = vec![eng()];
         assert_eq!(status(Site::Bj, &facts, "4.1.11"), Some(Status::Fail));
     }
 
