@@ -1682,11 +1682,6 @@ fn amigos_duplicate(ctx: &Context<'_>) -> Check {
         .copied()
         .filter(|d| maybe_same_resolution(ctx, d))
         .collect();
-    let gib = |bytes: u64| {
-        #[allow(clippy::cast_precision_loss)]
-        let value = bytes as f64 / f64::from(1u32 << 30);
-        value
-    };
     match ctx.resolution {
         720 => {
             if let Some(found) = same_resolution.first() {
@@ -1714,44 +1709,28 @@ fn amigos_duplicate(ctx: &Context<'_>) -> Check {
             Check::warn("15.3.5", TRUMPABLE_720)
         }
         1080 if source == Source::WebDl => {
-            let family: Vec<&DestinationRelease> = same_resolution
-                .iter()
-                .copied()
-                .filter(|d| d.quality.source() == Source::WebDl)
-                .filter(|d| match (ctx.codec, d.codec) {
-                    (Some(a), Some(b)) => a == b,
-                    _ => true,
-                })
-                .collect();
+            // Uma vaga para H.264 e uma para H.265, em filme e em série, sem
+            // olhar o tamanho: a staff apagou o Cangaço Novo S01 (H.264, 10 GB
+            // maior) contra outro H.264 em 26/10. Título do site sem codec
+            // ocupa a vaga: não dá para provar que é do outro.
             let codec = ctx.codec.map_or("o mesmo codec", Codec::label);
-            if family.len() >= 2 {
+            if let Some(found) = same_resolution.iter().find(|d| {
+                d.quality.source() == Source::WebDl
+                    && match (ctx.codec, d.codec) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => true,
+                    }
+            }) {
                 return Check::fail(
                     "15.3.2",
                     format!(
-                        "o Amigos já tem dois 1080p WEB-DL em {codec}, o limite: \"{}\" e \"{}\"",
-                        family[0].title, family[1].title
-                    ),
-                );
-            }
-            let gap: u64 = if ctx.facts.kind == Kind::Season { 6 } else { 2 };
-            if let Some(found) = family.first() {
-                let diff = ctx.size.abs_diff(found.size);
-                if diff < gap << 30 {
-                    return Check::fail(
-                        "15.3.2",
-                        format!(
-                            "o segundo 1080p WEB-DL em {codec} precisa de {gap} GB de diferença, e a de \"{}\" é de {:.2} GB",
-                            found.title,
-                            gib(diff)
-                        ),
-                    );
-                }
-                return Check::ok(
-                    "15.3.2",
-                    format!(
-                        "segundo 1080p WEB-DL em {codec}, {:.2} GB diferente de \"{}\"",
-                        gib(diff),
-                        found.title
+                        "1080p WEB-DL tem uma vaga para H.264 e uma para H.265, e a de {codec} já é de \"{}\"{}",
+                        found.title,
+                        if found.codec.is_none() {
+                            " (o título do site não diz o codec)"
+                        } else {
+                            ""
+                        }
                     ),
                 );
             }
@@ -4515,20 +4494,16 @@ mod tests {
     }
 
     #[test]
-    fn amigos_15_3_2_web_dl_1080p_ate_dois_por_codec_com_2_gb() {
+    fn amigos_15_3_2_web_dl_1080p_uma_vaga_por_codec() {
         let mut facts = movie();
-        let other = |size| dest("Filme.2024.1080p.WEB-DL.DUAL.x264-OUTRO", size);
-        facts.destination = vec![other(10 * GB + GB / 2)];
+        // O nosso é H.264: um H.264 no site ocupa a vaga, qualquer tamanho.
+        facts.destination = vec![dest("Filme.2024.1080p.WEB-DL.DUAL.x264-OUTRO", 4 * GB)];
         let report = check(Site::Amigos, &facts);
         assert_eq!(report.status_of("15.3.2"), Some(Status::Fail), "{report:?}");
-        facts.destination = vec![other(4 * GB)];
-        assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Ok));
-        facts.destination = vec![other(4 * GB), other(16 * GB)];
-        assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Fail));
-        // x265 é outra vaga.
+        // x265 é a outra vaga.
         facts.destination = vec![dest("Filme.2024.1080p.WEB-DL.DUAL.x265-OUTRO", 7 * GB)];
         assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Ok));
-        // Edição diferente convive.
+        // Edição declarada diferente convive.
         facts.destination = vec![dest(
             "Filme.2024.Extended.1080p.WEB-DL.DUAL.x264-OUTRO",
             10 * GB,
@@ -4537,16 +4512,17 @@ mod tests {
     }
 
     #[test]
-    fn amigos_15_3_2_pack_de_serie_pede_6_gb() {
+    fn amigos_15_3_2_serie_sem_codec_no_titulo_ocupa_a_vaga() {
+        // Cangaço Novo S01, 26/10: apagado contra um WEB-DL sem codec no
+        // título e 10 GB menor.
         let mut facts = season(3);
         facts.season_episodes = Some(aired(3));
         facts.series_status = Some(SeriesStatus::Ended);
         facts.destination = vec![DestinationRelease::new(
-            "Serie.S01.1080p.WEB-DL.DUAL.x264-OUTRO",
-            7 * GB,
+            "Cangaço Novo 2023 S01 1080p WEB-DL Nacional",
+            16 * GB,
             Kind::Season,
         )];
-        // 3 GB contra 7 GB: 4 GB de diferença, abaixo dos 6.
         assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Fail));
     }
 

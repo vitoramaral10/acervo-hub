@@ -1877,6 +1877,34 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
         .iter()
         .map(|r| DestinationRelease::new(&r.title, r.size, kind))
         .collect();
+    // O Amigos busca só pelo IMDb quando a consulta o traz, e o envio antigo
+    // sem o IMDb ligado não aparece (The Grinch, torrent 64, apagado como
+    // duplicado em 26/10). Filme também é buscado pelo título original e pelo
+    // em português, sem o IMDb, e só entra o que começa pelo título e o ano.
+    if kind == Kind::Movie
+        && let Some(year) = work.year
+    {
+        let mut titles: Vec<&str> = vec![work.title.as_str()];
+        titles.extend(work.original_title.as_deref());
+        titles.dedup_by(|a, b| naming::squash(a) == naming::squash(b));
+        for title in titles {
+            let text =
+                acervo_indexers::SearchQuery::movie(title).with_categories([crate::decide::MOVIES]);
+            let found = catalog
+                .search(&indexer, &text)
+                .await
+                .map_err(|error| anyhow!("buscando no {} pelo título: {error}", site.label()))?;
+            for release in &found.releases {
+                if naming::title_year_match(&release.title, title, year)
+                    && !destination
+                        .iter()
+                        .any(|d| d.title == release.title && d.size == release.size)
+                {
+                    destination.push(DestinationRelease::new(&release.title, release.size, kind));
+                }
+            }
+        }
+    }
     // Episódio avulso: a busca por "S01E03" não traz o pacote da temporada, e é
     // ele que a 4.2.1.13 compara. Uma segunda busca pela temporada inteira,
     // só para episódio.

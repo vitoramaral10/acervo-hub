@@ -257,6 +257,12 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
   REMUX), com a mesma resolução e áudio, codec que não diverge e tamanho a
   menos de 10% → Fail: a staff trata como a mesma versão (torrents 58396 e
   Ted 2, apagado em 26/10).
+- **Busca no destino:** o Amigos busca só pelo IMDb quando a consulta o traz,
+  e o envio antigo sem o IMDb ligado não aparece (The Grinch, torrent 64,
+  apagado como duplicado em 26/10). No filme, o preparo também busca pelo
+  título em português e pelo original, sem o IMDb, e só soma o release do site
+  que começa pelo título e pelo ano (um de folga), para não puxar continuação
+  nem outra obra de mesmo nome (`naming::title_year_match`).
 - **15.3** duplicidade e substituição contra os releases do destino de mesma
   edição (16.14; edição declarada diferente convive; o título do site nunca
   escreve a edição, então o sem edição entra na comparação). Um DUAL completo (com legenda PT
@@ -269,10 +275,10 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
   - **15.3.3** só dublado ou só legendado com DUAL na mesma resolução → Fail;
   - **15.3.2** 720p: já há 720p → Fail; há 1080p/2160p com áudio igual ou
     melhor → Fail **15.3.5**; senão Warn **15.3.5** (Trumpable);
-  - **15.3.2** 1080p WEB-DL: até dois por codec (x264 e x265 são vagas
-    separadas); o terceiro → Fail; o segundo precisa de 2 GB de diferença (6 GB
-    no pack de temporada) → Fail abaixo disso. x265 só dublado ou só legendado
-    com DUAL no site → Fail;
+  - **15.3.2** 1080p WEB-DL: uma vaga para H.264 e uma para H.265, em filme e
+    em série, sem olhar o tamanho (a staff, em 26/10, sobre o Cangaço Novo
+    S01). A vaga do nosso codec ocupada → Fail; título do site sem codec ocupa
+    a vaga. x265 só dublado ou só legendado com DUAL no site → Fail;
   - **15.3.2** 2160p: uma vaga SDR e uma DV + HDR, pela faixa dinâmica do
     título (e do arquivo, no nosso; "Dolby Vision" por extenso conta). Mesma
     vaga ocupada → Fail; só HDR ou só DV contra híbrido, só HDR ou só DV no site
