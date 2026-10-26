@@ -270,6 +270,82 @@ struct Claims {
     h_codec: bool,
     /// O que sobrou entre o identificador e a parte técnica (nome do episódio).
     loose: Vec<String>,
+    /// O que a parte técnica traz e o acervo não reconhece. Pode ser a tag de
+    /// um grupo fora do lugar (`x264 FLAME DUAL-OUTRO`): descartar seria retag.
+    unknown: Vec<String>,
+}
+
+/// Termos técnicos que o nome original pode trazer e o nome no padrão refaz
+/// a partir do arquivo, sem os dígitos de canais colados (`DDP5`, `AAC2`).
+const TECHNICAL: [&str; 62] = [
+    "dd",
+    "dd+",
+    "ddp",
+    "ddpa",
+    "eac3",
+    "e-ac-3",
+    "ac3",
+    "aac",
+    "dts",
+    "dts-hd",
+    "dts-hdma",
+    "dts-hdm",
+    "dts-x",
+    "dts-es",
+    "ma",
+    "hra",
+    "truehd",
+    "flac",
+    "opus",
+    "lpcm",
+    "pcm",
+    "mp3",
+    "ch",
+    "xvid",
+    "vc-1",
+    "mpeg-2",
+    "av1",
+    "10bit",
+    "8bit",
+    "hdr10plus",
+    "dual-audio",
+    "audio",
+    "dual",
+    "multi",
+    "dublado",
+    "legendado",
+    "nacional",
+    "pt-br",
+    "ptbr",
+    "internal",
+    "limited",
+    "rerip",
+    "h",
+    "-",
+    "french",
+    "english",
+    "spanish",
+    "portuguese",
+    "italian",
+    "german",
+    "japanese",
+    "korean",
+    "latino",
+    "castellano",
+    "ita",
+    "fre",
+    "spa",
+    "ger",
+    "jpn",
+    "subs",
+    "subbed",
+    "dubbed",
+];
+
+/// Termo que a parte técnica pode ter sem perder informação no padrão.
+fn is_technical(word: &str) -> bool {
+    let bare = word.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    bare.is_empty() || TECHNICAL.contains(&bare) || NOISE.contains(&word)
 }
 
 /// Termos que não são nome de episódio e o padrão não usa.
@@ -353,6 +429,8 @@ impl Claims {
                         claims.service.get_or_insert(service);
                     } else if !technical && !NOISE.contains(&word) {
                         claims.loose.push(token.to_owned());
+                    } else if technical && !is_technical(word) {
+                        claims.unknown.push(token.to_owned());
                     }
                 }
             }
@@ -606,6 +684,22 @@ pub(crate) fn standard(subject: &Subject<'_>) -> Result<Standard, Vec<String>> {
         .position(|t| is_resolution(t) || source_of(t).is_some())
         .unwrap_or(rest.len());
     let claims = Claims::read(rest, technical_from);
+    if !claims.unknown.is_empty() {
+        gaps.push(format!(
+            "o nome tem na parte técnica o que o acervo não reconhece ({}): pode ser a tag de um grupo, e renomear a perderia (retag, 15.2.26)",
+            claims.unknown.join(", ")
+        ));
+    }
+    for tag in tags
+        .first
+        .iter()
+        .chain(tags.second.iter().map(|(_, tag)| tag))
+        .filter(|tag| tag.contains('@'))
+    {
+        gaps.push(format!(
+            "a tag {tag} cita outro site, o que o Amigos proíbe (1.4 e 15.1.8)"
+        ));
+    }
 
     let Some(video) = subject.media.video.as_ref() else {
         return Err(vec![
@@ -781,6 +875,7 @@ mod tests {
             bit_depth: None,
             hdr,
             frame_rate: Some(23.976),
+            bit_rate: None,
         }
     }
 
@@ -997,6 +1092,44 @@ mod tests {
         )
         .unwrap_err();
         assert!(gaps[0].contains("segunda tag"));
+    }
+
+    #[test]
+    fn tag_fora_do_lugar_nao_some() {
+        let media = media(
+            video("h264", 1920, 1080, Hdr::Sdr),
+            vec![
+                track(Language::English, "dts", 6),
+                track(Language::Portuguese, "ac3", 6),
+            ],
+        );
+        for original in [
+            "Covil de Ladroes (2018) 1080p BluRay x264 FLAME DUAL-SynysteR",
+            "Irresistible.2020.1080p.BluRay.DTS.x264-iFT.DUAL.THYRSO10",
+            "Nefarious.2023.BluRay.1080p.x264.Dual - By Tontom",
+        ] {
+            let gaps = name(original, &media, false, true).unwrap_err();
+            assert!(gaps[0].contains("retag"), "{original}: {gaps:?}");
+        }
+        let gaps = name(
+            "Os.Descendentes.2011.1080p.BluRay.DTS.x264-EPiC@HDArea.DUAL-GMN",
+            &media,
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(gaps[0].contains("outro site"), "{gaps:?}");
+        // O que é só técnico continua indo para o padrão.
+        assert_eq!(
+            name(
+                "Ted.2012.1080p.BluRay.DTS-HD.MA.5.1.10bit.x264-DAA.DUAL-3LT0N",
+                &media,
+                false,
+                true
+            )
+            .unwrap(),
+            "Ted.2012.1080p.BluRay.DTS-HD.MA5.1.x264-DAA.DUAL-3LT0N"
+        );
     }
 
     #[test]

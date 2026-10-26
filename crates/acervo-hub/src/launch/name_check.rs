@@ -518,6 +518,7 @@ mod tests {
             bit_depth: Some(8),
             hdr,
             frame_rate: None,
+            bit_rate: None,
         }
     }
 
