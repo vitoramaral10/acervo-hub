@@ -639,6 +639,42 @@ struct TmdbText {
     credits: Credits,
 }
 
+/// O título en-US do TMDB para obra estrangeira fora do inglês (16.2.1).
+/// Falha de rede ou falta de chave não derruba o preparo: fica a lacuna.
+async fn english_title(store: &Store, work: &Catalogued) -> Option<String> {
+    let fetched = async {
+        let Some(tmdb) = crate::metadata::english_tmdb(store).await? else {
+            return Ok(None);
+        };
+        let details = tmdb.discover_details(work.tmdb_kind, work.tmdb_id).await?;
+        anyhow::Ok(Some((details.item.title, details.item.original_title)))
+    }
+    .await;
+    match fetched {
+        // O original da própria resposta, e o do catálogo, que pode faltar.
+        Ok(found) => {
+            let (title, original) = found?;
+            accept_english_title(&title, Some(&original))
+                .and_then(|t| accept_english_title(&t, work.original_title.as_deref()))
+        }
+        Err(error) => {
+            tracing::warn!("título em inglês no TMDB: {error:#}");
+            None
+        }
+    }
+}
+
+/// O TMDB devolve o título original quando não há tradução: igual a ele
+/// (fora pontuação e caixa) não é título em inglês.
+/// O que some na limpeza do nome (título só em outro alfabeto) também não
+/// serve.
+fn accept_english_title(english: &str, original: Option<&str>) -> Option<String> {
+    let english = english.trim();
+    let squashed = naming::squash(english);
+    let same = original.is_some_and(|o| naming::squash(o) == squashed);
+    (!squashed.is_empty() && !same).then(|| english.to_owned())
+}
+
 /// Ficha e sinopse em pt-BR: do filme, ou do episódio/temporada, senão a da
 /// série.
 async fn tmdb_text(store: &Store, work: &Catalogued) -> Result<TmdbText> {
@@ -1930,18 +1966,20 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
     job.step("conferindo as regras").await;
     let sniffs = sniff_subtitles(&torrent.save_path, &files, &videos).await;
     let release = release_name(&files);
+    let catalog_title = match work.original_language {
+        Some(Language::English | Language::Portuguese | Language::PortugueseBr) => {
+            work.original_title.clone()
+        }
+        Some(Language::Unknown) | None => None,
+        Some(_) => english_title(store, &work).await,
+    };
     let facts = Facts {
         kind,
         release_name: release.clone(),
         files: files.clone(),
         videos,
         original_language: work.original_language,
-        catalog_title: work.original_title.clone().filter(|_| {
-            matches!(
-                work.original_language,
-                Some(Language::English | Language::Portuguese | Language::PortugueseBr)
-            )
-        }),
+        catalog_title,
         year: work.year,
         series_status: work.series_status,
         season_episodes: work.season_episodes.clone(),
@@ -2168,6 +2206,31 @@ async fn mediainfo_for(site: Site, video: &Path) -> Result<(String, Option<rules
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn titulo_em_ingles_traduzido_e_aceito() {
+        assert_eq!(
+            accept_english_title("Your Fault", Some("Culpa Tuya")).as_deref(),
+            Some("Your Fault")
+        );
+    }
+
+    #[test]
+    fn titulo_em_ingles_igual_ao_original_e_recusado() {
+        assert_eq!(accept_english_title("Culpa Tuya", Some("Culpa Tuya")), None);
+        assert_eq!(
+            accept_english_title("culpa-tuya!", Some("Culpa Tuya")),
+            None
+        );
+    }
+
+    #[test]
+    fn titulo_em_ingles_vazio_e_recusado() {
+        assert_eq!(accept_english_title("  ", Some("Culpa Tuya")), None);
+        assert_eq!(accept_english_title("", None), None);
+        // Só em outro alfabeto: some na limpeza do nome.
+        assert_eq!(accept_english_title("ユア・フォルト", None), None);
+    }
 
     #[tokio::test]
     async fn falha_do_mediainfo_reprova_o_amigos_e_so_avisa_no_bj() {
