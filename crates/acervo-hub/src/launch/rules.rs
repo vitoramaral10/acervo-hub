@@ -1755,34 +1755,32 @@ fn amigos_duplicate(ctx: &Context<'_>) -> Check {
                 .iter()
                 .map(|d| (Range::from_title(&d.title, None), *d))
                 .collect();
+            // A vaga do SDR e a do híbrido. Só HDR e só DV ocupam, provisórios,
+            // a do híbrido, e a 15.3.2 deixa o híbrido substituí-los, mas a
+            // staff apagou como duplicado o Avatar Aang DV + HDR contra um 4K
+            // do site que o título ora dizia DV + HDR, ora só HDR10 (26/10).
+            // Título do site sem faixa pode ser qualquer uma: ocupa as duas.
             let clash = theirs.iter().find(|(range, _)| match ours {
-                Range::Sdr => *range == Range::Sdr,
-                Range::Hybrid => *range == Range::Hybrid,
-                // Só HDR e só DV ocupam, provisórios, a vaga do híbrido: um
-                // segundo deles é duplicado.
-                Range::HdrOnly | Range::DvOnly => {
-                    matches!(range, Range::Hybrid | Range::HdrOnly | Range::DvOnly)
+                Range::Sdr => matches!(range, Range::Sdr | Range::Unknown),
+                Range::Hybrid | Range::HdrOnly | Range::DvOnly | Range::Unknown => {
+                    !matches!(range, Range::Sdr)
                 }
-                Range::Unknown => false,
             });
             if let Some((range, found)) = clash {
+                let replace =
+                    ours == Range::Hybrid && matches!(range, Range::HdrOnly | Range::DvOnly);
                 return Check::fail(
                     "15.3.2",
                     format!(
-                        "2160p tem um SDR e um DV + HDR; este é {} e o Amigos já tem {}: \"{}\"",
+                        "2160p tem um SDR e um DV + HDR; este é {} e o Amigos já tem {}: \"{}\"{}",
                         ours.label(),
                         range.label(),
-                        found.title
-                    ),
-                );
-            }
-            if let Some((_, found)) = theirs.iter().find(|(range, _)| *range == Range::Unknown) {
-                return Check::warn(
-                    "15.3.2",
-                    format!(
-                        "o Amigos já tem 2160p sem a faixa (SDR, HDR ou DV) no título, \"{}\": confira no MediaInfo dele se este ({}) não ocupa a mesma vaga",
                         found.title,
-                        ours.label()
+                        if replace {
+                            ". A regra deixa o híbrido substituir, mas a staff tratou como duplicado: se quiser, lance à mão e peça a substituição"
+                        } else {
+                            ""
+                        }
                     ),
                 );
             }
@@ -4686,10 +4684,23 @@ mod tests {
             m.video = Some(video("hevc", 3840, 2160, Hdr::DolbyVision));
         });
         rename(&mut facts, "Filme.2024.2160p.WEB-DL.DUAL.DV.HDR.H.265-GRP");
-        // Sem a faixa no título do site, não dá para dizer a vaga: avisa
-        // (Shadow Force, 26/10).
+        // Sem a faixa no título do site, pode ser qualquer vaga: ocupa as
+        // duas (Shadow Force e Avatar Aang, 26/10).
         facts.destination = vec![dest("Filme.2024.2160p.WEB-DL.DUAL.H.265-OUTRO", 20 * GB)];
-        assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Warn));
+        assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Fail));
+        // Híbrido contra só HDR: a regra deixa substituir, a staff não.
+        facts.destination = vec![dest(
+            "Avatar Aang: The Last Airbender 2026 HDR10 WEB-DL H.265 Dual-Audio Brazilian Original",
+            5 * GB,
+        )];
+        let report = check(Site::Amigos, &facts);
+        assert_eq!(report.status_of("15.3.2"), Some(Status::Fail));
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.message.contains("lance à mão"))
+        );
         facts.destination = vec![dest(
             "Filme.2024.2160p.WEB-DL.DUAL.DV.HDR.H.265-OUTRO",
             20 * GB,
@@ -4704,7 +4715,17 @@ mod tests {
         facts.destination.clear();
         assert_eq!(status(Site::Amigos, &facts, "15.3"), Some(Status::Ok));
         facts.destination = vec![dest("Filme.2024.2160p.WEB-DL.DUAL.H.265-OUTRO", 20 * GB)];
-        assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Warn));
+        assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Fail));
+        // SDR nosso contra HDR declarado no site: vagas diferentes.
+        set_video(&mut facts, |m| {
+            m.video = Some(video("hevc", 3840, 2160, Hdr::Sdr));
+        });
+        rename(&mut facts, "Filme.2024.2160p.WEB-DL.DUAL.H.265-GRP");
+        facts.destination = vec![dest(
+            "Filme.2024.2160p.WEB-DL.DUAL.HDR.H.265-OUTRO",
+            20 * GB,
+        )];
+        assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Ok));
     }
 
     #[test]
