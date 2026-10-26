@@ -188,7 +188,9 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
 
 - **15.1.6** arquivo compactado → Fail.
 - **15.2.27** nome do vídeo contra o arquivo (ver "Nome contra o arquivo"):
-  no máximo Warn, porque o nome no padrão sai do arquivo.
+  no máximo Warn, porque o nome no padrão sai do arquivo. No pack de
+  temporada cujos episódios dariam nomes diferentes à pasta → Fail (ver
+  Estrutura).
 - **16.1.4** nome no padrão (`launch/naming.rs`, função pura): título, ano ou
   `SxxEyy`, edição, Hybrid, REPACK, source, sigla de streaming e tags vêm do
   nome original; resolução (16.10), áudio da faixa no idioma original com
@@ -226,7 +228,8 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
   de cada um, com o mesmo nome do vídeo (16.19.2); o resto fica de fora
   (Ok **15.2.16** listando). Filme e episódio sem legenda solta vão **sem
   pasta** (15.2.17); temporada vai na pasta do pack, nome padrão da pasta da
-  origem (16.19.4). Em DUAL a regra pede a legenda embutida (16.19.3), mas
+  origem (16.19.4); episódios com características diferentes (que dariam
+  nomes diferentes à pasta) → Fail **15.2.27**. Em DUAL a regra pede a legenda embutida (16.19.3), mas
   embutir seria remux e DUAL sem legenda PT-BR a staff recusa (Big Hero,
   26/10): a solta vai junto (Ok **16.19.3**). Legenda PT necessária em `.sub`/`.idx`/`.ssa` → Fail
   **15.2.12**. Filme ou episódio com mais de um vídeo principal → Fail
