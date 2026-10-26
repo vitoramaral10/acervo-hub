@@ -52,12 +52,23 @@ pub(crate) struct Subject<'a> {
 }
 
 /// Só letras e dígitos, minúsculos: para comparar títulos sem pontuação.
-fn squash(text: &str) -> String {
+pub(crate) fn squash(text: &str) -> String {
     clean_title(text)
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .map(|c| c.to_ascii_lowercase())
         .collect()
+}
+
+/// O release do site começa pelo título e pelo ano da obra (o do catálogo,
+/// com um de folga para o `IMDb`): é a mesma obra, não uma continuação nem
+/// outra de mesmo nome.
+pub(crate) fn title_year_match(release: &str, title: &str, year: u16) -> bool {
+    let release = squash(release);
+    let title = squash(title);
+    !title.is_empty()
+        && (year.saturating_sub(1)..=year.saturating_add(1))
+            .any(|y| release.starts_with(&format!("{title}{y}")))
 }
 
 /// As palavras do título do catálogo no padrão: `Spider-Man: Across the
@@ -1568,6 +1579,24 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn titulo_e_ano_no_comeco_do_release_do_site() {
+        let hit = |release, title, year| title_year_match(release, title, year);
+        assert!(hit(
+            "O Grinch 2018 1080p BluRay Dual-Audio",
+            "O Grinch",
+            2018
+        ));
+        assert!(hit("The Grinch 2018 1080p BluRay", "The Grinch", 2018));
+        // O IMDb e o TMDB às vezes diferem em um ano.
+        assert!(hit("The Grinch 2019 1080p WEB-DL", "The Grinch", 2018));
+        // Outra obra com o mesmo nome, ou continuação.
+        assert!(!hit("O Grinch 2000 1080p BluRay", "O Grinch", 2018));
+        assert!(!hit("Ted 2 2015 1080p WEB-DL", "Ted", 2012));
+        assert!(hit("Ted 2012 1080p WEB-DL Dual-Audio", "Ted", 2012));
+        assert!(hit("Cangaço Novo 2023 S01 1080p", "Cangaço Novo", 2023));
     }
 
     #[test]
