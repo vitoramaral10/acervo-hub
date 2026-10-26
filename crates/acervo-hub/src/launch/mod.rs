@@ -2222,6 +2222,7 @@ mod tests {
                     bit_depth: None,
                     hdr: crate::mediainfo::Hdr::Sdr,
                     frame_rate: None,
+                    bit_rate: None,
                 }),
                 audio: Vec::new(),
                 subtitles: Vec::new(),

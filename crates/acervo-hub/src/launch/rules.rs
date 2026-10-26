@@ -1330,11 +1330,12 @@ fn amigos_series_scope(ctx: &Context<'_>) -> Option<Check> {
 }
 
 /// Bitrate mínimo do vídeo num encode de Blu-ray (15.2.5), em kbps: o geral
-/// e o de animação.
+/// e o de animação. A regra não traz número para 2160p; a staff aplica o de
+/// 1080p (resposta de 26/10, sobre o Frozen II 2160p com 5998 kbps).
 fn bluray_minimum(resolution: u16) -> Option<(u64, u64)> {
     match resolution {
         720 => Some((5000, 3500)),
-        1080 => Some((8000, 6000)),
+        1080 | 2160 => Some((8000, 6000)),
         _ => None,
     }
 }
@@ -1346,12 +1347,12 @@ fn amigos_source(ctx: &Context<'_>) -> Vec<Check> {
         return checks;
     };
     let remux = ctx.quality.modifier() == Modifier::Remux;
-    // 15.2.5: o bitrate médio do arquivo inteiro (vídeo + áudio) é teto para
-    // o do vídeo. Abaixo do mínimo de animação, nem animação passa.
+    // 15.2.5: o bitrate do vídeo; sem ele, o médio do arquivo inteiro, que é
+    // teto para o do vídeo (o áudio sem perda pesa: no Frozen II o TrueHD era
+    // 8,4 de 15,8 Mb/s) e só reprova abaixo do mínimo de animação.
     if ctx.quality.source() == Source::Bluray
         && !remux
         && let Some((general, animation)) = bluray_minimum(ctx.resolution)
-        && let Some(duration) = main.media.duration_seconds.filter(|d| *d > 0.0)
     {
         let size = ctx
             .facts
@@ -1364,24 +1365,44 @@ fn amigos_source(ctx: &Context<'_>) -> Vec<Check> {
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss
         )]
-        let kbps = (size as f64 * 8.0 / duration / 1000.0) as u64;
+        let whole = main
+            .media
+            .duration_seconds
+            .filter(|d| *d > 0.0)
+            .map(|duration| (size as f64 * 8.0 / duration / 1000.0) as u64);
+        let video = ctx.video().and_then(|v| v.bit_rate).map(|bps| bps / 1000);
         let rule = "15.2.5";
-        if kbps < animation {
-            checks.push(Check::fail(
-                rule,
-                format!(
-                    "encode de Blu-ray em {}p com {kbps} kbps no arquivo inteiro: abaixo do mínimo de vídeo ({general} kbps, {animation} em animação), é BRRip",
-                    ctx.resolution
-                ),
-            ));
-        } else if kbps < general {
-            checks.push(Check::warn(
-                rule,
-                format!(
-                    "encode de Blu-ray em {}p com {kbps} kbps no arquivo inteiro: só passa se for animação (mínimo {animation}); fora disso é BRRip ({general})",
-                    ctx.resolution
-                ),
-            ));
+        let what = if video.is_some() {
+            "no vídeo"
+        } else {
+            "no arquivo inteiro"
+        };
+        if let Some(kbps) = video.or(whole) {
+            if kbps < animation {
+                checks.push(Check::fail(
+                    rule,
+                    format!(
+                        "encode de Blu-ray em {}p com {kbps} kbps {what}: abaixo do mínimo de vídeo ({general} kbps, {animation} em animação), é BRRip",
+                        ctx.resolution
+                    ),
+                ));
+            } else if kbps < general && video.is_some() {
+                checks.push(Check::warn(
+                    rule,
+                    format!(
+                        "encode de Blu-ray em {}p com {kbps} kbps no vídeo: só passa se for animação (mínimo {animation}); fora disso é BRRip ({general})",
+                        ctx.resolution
+                    ),
+                ));
+            } else if kbps < general {
+                checks.push(Check::warn(
+                    rule,
+                    format!(
+                        "encode de Blu-ray em {}p com {kbps} kbps no arquivo inteiro e sem o bitrate do vídeo: confira no MediaInfo se o vídeo passa de {general} kbps ({animation} em animação)",
+                        ctx.resolution
+                    ),
+                ));
+            }
         }
     }
     if remux && !main.media.audio.iter().any(is_portuguese_audio) {
@@ -1534,6 +1555,33 @@ fn amigos_duplicate(ctx: &Context<'_>) -> Check {
                 ctx.resolution_label(),
                 audio.label(),
                 dual.title
+            ),
+        );
+    }
+    // Só a source difere (WEB-DL contra encode de Blu-ray), com o mesmo áudio
+    // e o mesmo tamanho: a staff trata como a mesma versão e apaga (15.3.1 e
+    // 15.3.6). Foi o caso dos torrents 58396 e do Ted 2 em 26/10.
+    let plain = |q: Quality| {
+        matches!(q.source(), Source::WebDl | Source::Bluray) && q.modifier() != Modifier::Remux
+    };
+    if plain(ctx.quality)
+        && let Some(found) = same_cut.iter().find(|d| {
+            plain(d.quality)
+                && d.quality.source() != source
+                && maybe_same_resolution(ctx, d)
+                && comparable_audio(audio, d)
+                && !matches!((ctx.codec, d.codec), (Some(a), Some(b)) if a != b)
+                && size_difference(ctx.size, d.size) < DUPLICATE_SIZE_TOLERANCE
+        })
+    {
+        return Check::fail(
+            "15.3.6",
+            format!(
+                "só a source difere de \"{}\" ({} contra {}), com o mesmo áudio e {:.1}% de diferença de tamanho: o Amigos trata como a mesma versão",
+                found.title,
+                source_label(source),
+                source_label(found.quality.source()),
+                size_difference(ctx.size, found.size) * 100.0
             ),
         );
     }
@@ -2943,6 +2991,7 @@ mod tests {
             bit_depth: Some(8),
             hdr,
             frame_rate: None,
+            bit_rate: None,
         }
     }
 
@@ -4440,9 +4489,25 @@ mod tests {
         let mut facts = movie();
         facts.destination = vec![
             dest("Filme.2024.720p.WEB-DL.DUAL.x264-OUTRO", 10 * GB),
-            dest("Filme.2024.1080p.BluRay.DUAL.x264-OUTRO", 10 * GB),
+            dest("Filme.2024.1080p.BluRay.DUAL.x264-OUTRO", 4 * GB),
         ];
         assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Ok));
+    }
+
+    #[test]
+    fn amigos_so_a_source_diferente_com_mesmo_tamanho_e_duplicado() {
+        // Ted 2, apagado em 26/10: BluRay 8,8 GB contra WEB-DL 8,4 GB.
+        let mut facts = movie();
+        rename(&mut facts, "Ted.2.2015.1080p.BluRay.x264-BLOW.DUAL-RK");
+        facts.files[0].size = 8_800_000_000;
+        facts.destination = vec![dest(
+            "Ted 2 2015 1080p WEB-DL Dual-Audio Brazilian Original",
+            8_416_497_042,
+        )];
+        assert_eq!(status(Site::Amigos, &facts, "15.3.6"), Some(Status::Fail));
+        // Tamanho bem diferente: outra versão.
+        facts.files[0].size = 12 * GB;
+        assert_eq!(status(Site::Amigos, &facts, "15.3.6"), None);
     }
 
     #[test]
@@ -4708,5 +4773,19 @@ mod tests {
         assert_eq!(status(Site::Amigos, &facts, "15.2.5"), Some(Status::Warn));
         facts.files[0].size = 10 * GB;
         assert_eq!(status(Site::Amigos, &facts, "15.2.5"), None);
+        // Com o bitrate do vídeo, vale ele, e o 2160p usa o mínimo do 1080p:
+        // o Frozen II tinha 15,8 Mb/s no arquivo e 5998 kb/s no vídeo.
+        set_video(&mut facts, |m| {
+            m.video = Some(VideoFacts {
+                bit_rate: Some(5_998_000),
+                ..video("hevc", 3840, 1608, Hdr::Hdr10)
+            });
+        });
+        rename(
+            &mut facts,
+            "Frozen.II.2019.2160p.UHD.BluRay.x265-TERMiNAL.DUAL-Lannister",
+        );
+        facts.files[0].size = 12 * GB;
+        assert_eq!(status(Site::Amigos, &facts, "15.2.5"), Some(Status::Fail));
     }
 }

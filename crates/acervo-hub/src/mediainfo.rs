@@ -83,6 +83,9 @@ pub struct VideoFacts {
     pub hdr: Hdr,
     /// Quadros por segundo (`avg_frame_rate`); `None` sem a medida.
     pub frame_rate: Option<f64>,
+    /// Bitrate do vídeo em bit/s: o `bit_rate` do stream ou, no MKV, a
+    /// estatística `BPS` que o mkvmerge grava (a que o `MediaInfo` mostra).
+    pub bit_rate: Option<u64>,
 }
 
 /// Uma faixa de áudio.
@@ -241,6 +244,15 @@ fn bit_depth(stream: &Value) -> Option<u8> {
     Some(8)
 }
 
+/// `bit_rate` do stream, ou a tag `BPS` (`BPS-eng` em mkvmerge antigo).
+fn bit_rate(stream: &Value) -> Option<u64> {
+    let tags = &stream["tags"];
+    [&stream["bit_rate"], &tags["BPS"], &tags["BPS-eng"]]
+        .into_iter()
+        .find_map(|v| v.as_str()?.trim().parse::<u64>().ok())
+        .filter(|bps| *bps > 0)
+}
+
 /// `24000/1001` → 23.976; `0/0` (sem medida) → `None`.
 fn frame_rate(stream: &Value) -> Option<f64> {
     let (num, den) = stream["avg_frame_rate"].as_str()?.split_once('/')?;
@@ -285,6 +297,7 @@ pub fn facts_from_ffprobe(value: &Value) -> MediaFacts {
         bit_depth: bit_depth(s),
         hdr: hdr(s),
         frame_rate: frame_rate(s),
+        bit_rate: bit_rate(s),
     });
     let audio = streams(value, "audio")
         .map(|s| {
@@ -682,6 +695,23 @@ mod tests {
         assert_eq!(rate("50/1"), Some(50.0));
         assert_eq!(rate("0/0"), None);
         assert_eq!(frame_rate(&json!({})), None);
+    }
+
+    #[test]
+    fn le_o_bitrate_do_video() {
+        assert_eq!(
+            bit_rate(&json!({ "bit_rate": "14105340" })),
+            Some(14_105_340)
+        );
+        assert_eq!(
+            bit_rate(&json!({ "tags": { "BPS": "5998123" } })),
+            Some(5_998_123)
+        );
+        assert_eq!(
+            bit_rate(&json!({ "tags": { "BPS-eng": "6000000" } })),
+            Some(6_000_000)
+        );
+        assert_eq!(bit_rate(&json!({})), None);
     }
 
     /// Amostra: filme 4K HEVC com HDR10, uma faixa PT e uma original.

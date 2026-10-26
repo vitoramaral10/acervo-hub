@@ -198,6 +198,9 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
   ffprobe. Ordem dos campos da 16.4 (REMUX põe o codec antes do áudio). Título
   sem acento e sem `, : ; ! ? * " ' ( ) / \ | < >`, `&` vira `and` (16.2.4).
   Sem grupo: `NoGroup`. Segunda tag (`-GRUPO.DUAL-OUTRO`, 16.12.7) é mantida.
+  Termo na parte técnica que o acervo não reconhece (`x264 FLAME DUAL-OUTRO`,
+  `x264-iFT.DUAL.THYRSO10`, `- By Fulano`) é lacuna: pode ser tag de grupo,
+  e descartá-la seria retag (15.2.26). Tag com `@` cita outro site → lacuna.
   O que o padrão pede e nenhum dos dois diz é lacuna → Fail: filme sem ano,
   "WEB" sem `H.264`/`x264` no nome (não dá para separar WEB-DL de WEBRip),
   nome sem source, codec sem grafia (AV1 fora de WEB-DL, 15.2.4). Sigla de
@@ -223,11 +226,19 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
   Temporada já exibida: pack completo (o que não cobre os episódios exibidos
   → Fail), episódio → Fail. Série em andamento sem episódio futuro no catálogo
   (a data pode só não ter saído) → Warn nos dois.
-- **15.2.5** encode de Blu-ray (não REMUX) em 720p/1080p: bitrate médio do
-  arquivo inteiro abaixo do mínimo de animação (3500/6000 kbps) → Fail (é
-  BRRip); abaixo do geral (5000/8000) → Warn (só animação passa).
+- **15.2.5** encode de Blu-ray (não REMUX) em 720p, 1080p e 2160p (a regra
+  não tem número para 2160p; a staff aplica o de 1080p, resposta de 26/10):
+  pelo bitrate do vídeo (`bit_rate` ou a tag `BPS` do MKV), abaixo do mínimo
+  de animação (3500/6000 kbps) → Fail (é BRRip), abaixo do geral (5000/8000)
+  → Warn (só animação passa). Sem o bitrate do vídeo, vale o médio do arquivo
+  inteiro, que o áudio infla: só reprova abaixo do de animação e avisa abaixo
+  do geral. O Frozen II 2160p tinha 15,8 Mb/s no arquivo e 5998 kb/s no vídeo.
 - **15.2.6** REMUX sem áudio PT → Warn (só se a obra nunca teve dublagem).
 - **15.2.8** vídeo fora de MKV → Warn (Trumpable).
+- **15.3.6** só a source difere (WEB-DL contra encode de Blu-ray, nenhum
+  REMUX), com a mesma resolução e áudio, codec que não diverge e tamanho a
+  menos de 10% → Fail: a staff trata como a mesma versão (torrents 58396 e
+  Ted 2, apagado em 26/10).
 - **15.3** duplicidade e substituição contra os releases do destino de mesma
   edição (16.14; edição diferente convive). Um DUAL completo (com legenda PT
   embutida) não disputa vaga com só dublado e só legendado (15.3.3). Na ordem:
