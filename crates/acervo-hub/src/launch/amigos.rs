@@ -199,8 +199,8 @@ pub(crate) struct Choice {
 /// opção. `audio` troca a sugestão do site para o áudio: Nacional para a obra
 /// brasileira, que o `MediaInfo` do site sugere como Dublado. Dual sem
 /// legenda continua Dual (15.2.15). `quality` vem antes da sugestão do site
-/// na Qualidade: o site lê o encode de Blu-ray de animação como BRRip, e a
-/// staff confirmou que é BluRay (Big Hero, 26/10).
+/// na Qualidade: o site lê o encode de Blu-ray de animação como `BRRip`, e a
+/// staff confirmou que é `BluRay` (Big Hero, 26/10).
 pub(crate) fn choose(
     profile: &Profile,
     media: &MediaRead,
