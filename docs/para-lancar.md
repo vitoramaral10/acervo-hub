@@ -281,10 +281,12 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
     a vaga. x265 só dublado ou só legendado com DUAL no site → Fail;
   - **15.3.2** 2160p: uma vaga SDR e uma DV + HDR, pela faixa dinâmica do
     título (e do arquivo, no nosso; "Dolby Vision" por extenso conta). Mesma
-    vaga ocupada → Fail; só HDR ou só DV contra híbrido, só HDR ou só DV no site
-    → Fail (os provisórios disputam a vaga do híbrido); título do site sem
-    faixa → Warn para conferir no MediaInfo dele; só HDR ou só DV com a vaga
-    livre → Warn;
+    vaga ocupada → Fail. Só HDR e só DV ocupam, provisórios, a vaga do
+    híbrido, e o nosso não-SDR contra qualquer não-SDR do site → Fail; a regra
+    deixa o híbrido substituir um só HDR, mas a staff apagou o Avatar Aang
+    assim (26/10), então a substituição fica para o usuário fazer à mão.
+    Título do site sem faixa (o site nunca escreve "SDR") ocupa as duas vagas
+    → Fail. Só HDR ou só DV com a vaga livre → Warn;
   - outras resoluções e 1080p fora de WEB-DL: a comparação genérica (mesma
     resolução, source e áudio; tamanho a menos de 10% e mesmo codec → Fail
     "duplicado provável", senão Warn), na regra **15.3.1**;
