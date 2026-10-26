@@ -1232,7 +1232,11 @@ fn bj(ctx: &Context<'_>, checks: &mut Vec<Check>) {
 fn torrent_limits(ctx: &Context<'_>) -> Check {
     const RULE: &str = "4.1.8 / 4.1.10";
     let files = ctx.facts.files.len();
-    let bluray = ctx.facts.files.iter().any(|f| has_extension(&f.path, &["m2ts"]));
+    let bluray = ctx
+        .facts
+        .files
+        .iter()
+        .any(|f| has_extension(&f.path, &["m2ts"]));
     if files > BJ_MAX_FILES && !bluray {
         return Check::fail(
             RULE,
@@ -1301,18 +1305,23 @@ fn mixed_videos(ctx: &Context<'_>) -> Option<Check> {
         .collect();
     let first = kinds[0];
     let Some(other) = kinds.iter().copied().find(|k| *k != first) else {
-        return Some(Check::ok(RULE, "vídeos na mesma resolução e com o mesmo áudio"));
+        return Some(Check::ok(
+            RULE,
+            "vídeos na mesma resolução e com o mesmo áudio",
+        ));
     };
     let message = format!(
         "vídeos {} ao lado de vídeos {}: o BJ não aceita áudios misturados no mesmo torrent",
         first.label(),
         other.label()
     );
-    Some(if first == AudioKind::Legendado || other == AudioKind::Legendado {
-        Check::fail(RULE, message)
-    } else {
-        Check::warn(RULE, format!("{message}; confira as faixas"))
-    })
+    Some(
+        if first == AudioKind::Legendado || other == AudioKind::Legendado {
+            Check::fail(RULE, message)
+        } else {
+            Check::warn(RULE, format!("{message}; confira as faixas"))
+        },
+    )
 }
 
 /// 4.1.10.2: só MKV.
@@ -2827,7 +2836,10 @@ mod tests {
         for n in 0..BJ_MAX_FILES {
             facts.files.push(file(&format!("Filme/extra{n}.nfo"), 1));
         }
-        assert_eq!(status(Site::Bj, &facts, "4.1.8 / 4.1.10"), Some(Status::Fail));
+        assert_eq!(
+            status(Site::Bj, &facts, "4.1.8 / 4.1.10"),
+            Some(Status::Fail)
+        );
         facts.files.push(file("Filme/BDMV/STREAM/00001.m2ts", GB));
         assert_eq!(status(Site::Bj, &facts, "4.1.8 / 4.1.10"), Some(Status::Ok));
     }
@@ -2836,13 +2848,18 @@ mod tests {
     fn bj_reprova_torrent_acima_de_200_gib() {
         let mut facts = movie();
         facts.files[0].size = BJ_MAX_SIZE + 1;
-        assert_eq!(status(Site::Bj, &facts, "4.1.8 / 4.1.10"), Some(Status::Fail));
+        assert_eq!(
+            status(Site::Bj, &facts, "4.1.8 / 4.1.10"),
+            Some(Status::Fail)
+        );
     }
 
     #[test]
     fn bj_reprova_temporada_com_resolucao_misturada() {
         let mut facts = season(3);
-        set_video(&mut facts, |m| m.video = Some(video("h264", 1280, 720, Hdr::Sdr)));
+        set_video(&mut facts, |m| {
+            m.video = Some(video("h264", 1280, 720, Hdr::Sdr))
+        });
         assert_eq!(status(Site::Bj, &facts, "4.1.11"), Some(Status::Fail));
     }
 
@@ -2863,7 +2880,11 @@ mod tests {
         facts.files.push(file(&path, GB / 50));
         facts.videos.push(ProbedVideo {
             path,
-            media: media("matroska,webm", video("h264", 1280, 720, Hdr::Sdr), vec![eng()]),
+            media: media(
+                "matroska,webm",
+                video("h264", 1280, 720, Hdr::Sdr),
+                vec![eng()],
+            ),
         });
         assert_eq!(status(Site::Bj, &facts, "4.1.11"), Some(Status::Ok));
     }
