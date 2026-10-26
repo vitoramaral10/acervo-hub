@@ -305,11 +305,24 @@ fn split_tags(stem: &str) -> (&str, Tags) {
 
 /// Sem acento, sem os caracteres que 16.2.4 manda tirar, `&` vira `and`.
 fn clean_title(token: &str) -> String {
+    // Só letra e número ASCII e o hífen (16.2.4, 16.3.2): o título do TMDB
+    // traz apóstrofo e travessão tipográficos (`Schumacher ’94 – The Birth`).
+    // As letras que não se decompõem viram as suas equivalentes.
     token
         .replace('&', "and")
+        .replace('ß', "ss")
+        .replace(['æ'], "ae")
+        .replace(['Æ'], "AE")
+        .replace(['œ'], "oe")
+        .replace(['Œ'], "OE")
+        .replace(['ø'], "o")
+        .replace(['Ø'], "O")
+        .replace(['ł'], "l")
+        .replace(['Ł'], "L")
+        .replace(['đ'], "d")
+        .replace(['Đ'], "D")
         .nfd()
-        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
-        .filter(|c| !",:;!?*\"'()/\\|<>[]{}".contains(*c))
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
         .collect::<String>()
         // Hífen só dentro do nome (16.3.2): o solto de "Nome - Subtítulo" sai.
         .trim_matches('-')
@@ -1664,6 +1677,19 @@ mod tests {
         assert!(!hit("Ted 2 2015 1080p WEB-DL", "Ted", 2012));
         assert!(hit("Ted 2012 1080p WEB-DL Dual-Audio", "Ted", 2012));
         assert!(hit("Cangaço Novo 2023 S01 1080p", "Cangaço Novo", 2023));
+    }
+
+    #[test]
+    fn titulo_so_com_ascii() {
+        // Schumacher ’94, 26/10: o TMDB usa apóstrofo e travessão tipográficos.
+        assert_eq!(
+            title_words("Schumacher ’94 – The Birth of a Legend").join("."),
+            "Schumacher.94.The.Birth.of.a.Legend"
+        );
+        assert_eq!(clean_title("Coração"), "Coracao");
+        assert_eq!(clean_title("Straße"), "Strasse");
+        assert_eq!(clean_title("Spider-Man:"), "Spider-Man");
+        assert_eq!(clean_title("–"), "");
     }
 
     #[test]
