@@ -264,9 +264,16 @@ distingue pt-BR de pt-PT: aceitar os dois). "Dual" = áudio PT + original.
   mesma resolução, fonte e áudio → Warn (o preparo faz uma segunda busca, pela
   temporada, só para episódio).
 - **4.1.20** destino tem Dual e este não é Dual → Fail (obra nacional: Ok).
+  Sem Dual: legendado com dublado no destino → Fail; dublado com legendado
+  no destino → Warn (prefira um Dual).
 - **4.2.1.2** duplicidade: mesma resolução, fonte e áudio, tamanho a menos de
   10% → Fail; mesma resolução e fonte com diferença pequena → Warn.
 - **4.1.7** compactado → Fail.
+- **4.1.8 / 4.1.10** mais de 999 arquivos (fora Blu-ray em M2TS) ou mais
+  de 200 GiB → Fail.
+- **4.1.11** vídeos principais (sem amostra nem extras) em resoluções
+  diferentes, ou uns com áudio PT e outros sem → Fail; Dual ao lado de
+  dublado → Warn.
 
 ## Texto (`Fields`)
 
