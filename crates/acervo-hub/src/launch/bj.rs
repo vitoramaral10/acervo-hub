@@ -28,6 +28,11 @@ use crate::api::{Catalog, SearchError};
 /// O indexador do BJ no catálogo.
 pub(crate) const INDEXER: &str = "bjsharecustom";
 
+/// O `source` que o BJ grava no `.torrent` recebido. Gerado sem ele, o hash
+/// muda no site (o semeado não registra no tracker) e o envio volta 200 com
+/// o torrent novo para baixar, em vez do redirect para o criado.
+pub(crate) const TORRENT_SOURCE: &str = "BJ";
+
 const UPLOAD_PAGE: &str = "/upload.php";
 
 /// Base das imagens do TMDB, para o pôster que vier como caminho relativo.
@@ -1415,10 +1420,27 @@ pub(crate) fn created(response: &SiteResponse) -> Result<String, Refusal> {
             });
         }
     }
+    // O título da página diz o que ela é sem levar nada dela ao log.
+    let title = page_title(&response.text())
+        .map(|title| format!(", página \"{title}\""))
+        .unwrap_or_default();
     Err(Refusal::unknown(format!(
-        "resposta inesperada do BJ ao envio (HTTP {})",
+        "resposta inesperada do BJ ao envio (HTTP {}{title})",
         response.status
     )))
+}
+
+/// O `<title>` da página, com os espaços juntados e no máximo 80 caracteres.
+fn page_title(page: &str) -> Option<String> {
+    let lower = page.to_ascii_lowercase();
+    let open = lower.find("<title")?;
+    let start = open + page[open..].find('>')? + 1;
+    let end = start + lower[start..].find("</title>")?;
+    let title = page[start..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!title.is_empty()).then(|| title.chars().take(80).collect())
 }
 
 // ------------------------------------------------------------ com o site
@@ -1936,6 +1958,14 @@ Language                                 : English
             !created(&response(302, Some("index.php"), ""))
                 .unwrap_err()
                 .certain
+        );
+        // A página que não é o formulário leva o título à mensagem.
+        let page = "<html><head><TITLE>\n  Envio  :: BJ-Share\n</TITLE></head><body>x</body>";
+        let titled = created(&response(200, None, page)).unwrap_err();
+        assert!(!titled.certain);
+        assert_eq!(
+            titled.message,
+            "resposta inesperada do BJ ao envio (HTTP 200, página \"Envio :: BJ-Share\")"
         );
     }
 

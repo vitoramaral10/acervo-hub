@@ -954,8 +954,17 @@ async fn adopt_site_torrent(
             .await
             .map_err(bad)?;
     }
+    // O gerado que o site trocou sai do cliente (os arquivos ficam) antes de o
+    // do site entrar: senão é adotado no lugar dele e nada semeia no tracker.
+    // Sem tirá-lo, o do site não entra, e reenviá-lo tenta de novo.
+    let dropped = match store.launch_torrent(hash, indexer).await.map_err(bad)? {
+        Some(generated) => {
+            super::drop_replaced(&web.config(), store, launch, &generated, &site_hash).await
+        }
+        None => Ok(()),
+    };
     // Falha ao adicionar não desfaz o envio: vira erro do pacote e aviso.
-    Ok(seed_or_warn(web, store, launch, Ok(bytes)).await)
+    Ok(seed_or_warn(web, store, launch, dropped.map(|()| bytes)).await)
 }
 
 // ---------------------------------------------------------------- envio ao site
@@ -1355,6 +1364,8 @@ async fn discard(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
 
     fn fonte(hash: &str, indexer: &str) -> Source {
@@ -2351,6 +2362,249 @@ mod tests {
         )
         .await;
         assert_eq!(status, 409);
+        db.drop().await;
+    }
+
+    /// Um `.torrent` com peças de verdade (`piece length` e `pieces`), e o
+    /// `source` que o site grava quando dado: o mesmo conteúdo, outro hash.
+    fn torrent_with_source(source: Option<&str>) -> Vec<u8> {
+        let announce = "https://t.exemplo/announce?passkey=PASSKEY123";
+        let mut out = format!("d8:announce{}:{announce}4:infod5:filesl", announce.len());
+        for (path, size) in FILES {
+            let _ = write!(out, "d6:lengthi{size}e4:pathl{}:{path}ee", path.len());
+        }
+        out.push_str("e4:name4:Raiz12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaa");
+        if let Some(source) = source {
+            let _ = write!(out, "6:source{}:{source}", source.len());
+        }
+        out.push_str("ee");
+        out.into_bytes()
+    }
+
+    const BJ_TRACKER: &str = "https://t.exemplo/announce?passkey=PASSKEY123";
+
+    /// A lista do cliente de mentira: a origem e, até ser apagado, o
+    /// `.torrent` gerado, com as tags dadas.
+    struct Listing {
+        origin: String,
+        generated: String,
+        tags: String,
+        deleted: Arc<AtomicBool>,
+    }
+    impl wiremock::Respond for Listing {
+        fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let entry = |hash: &str, tags: &str| {
+                json!({
+                    "hash": hash, "name": "Raiz", "state": "stalledUP", "tags": tags,
+                    "save_path": "/downloads/filmes", "category": "acervo", "progress": 1.0,
+                    "content_path": "/downloads/filmes/Raiz",
+                })
+            };
+            let mut torrents = vec![entry(&self.origin, "")];
+            if !self.deleted.load(Ordering::SeqCst) {
+                torrents.push(entry(&self.generated, &self.tags));
+            }
+            wiremock::ResponseTemplate::new(200).set_body_json(torrents)
+        }
+    }
+    struct Delete(Arc<AtomicBool>);
+    impl wiremock::Respond for Delete {
+        fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+            self.0.store(true, Ordering::SeqCst);
+            wiremock::ResponseTemplate::new(200)
+        }
+    }
+
+    /// Um qBittorrent com o `.torrent` gerado semeando (tags `tags`, só o
+    /// tracker `tracker`, mesmas peças), que exporta o gerado e conta os
+    /// deletes do gerado (sem os arquivos) e os adds.
+    async fn qbit_with_generated(
+        origin: &str,
+        generated: &[u8],
+        (tags, tracker): (&str, &str),
+        removals: u64,
+        adds: u64,
+    ) -> wiremock::MockServer {
+        use wiremock::matchers::{body_string_contains, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hash = acervo_clients::info_hash(generated).unwrap();
+        let deleted = Arc::new(AtomicBool::new(false));
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/auth/login"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/info"))
+            .respond_with(Listing {
+                origin: origin.to_owned(),
+                generated: hash.clone(),
+                tags: tags.to_owned(),
+                deleted: deleted.clone(),
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "index": 0, "name": "Raiz/Filme.mkv", "size": 100, "progress": 1.0, "priority": 1 },
+                { "index": 1, "name": "Raiz/Filme.srt", "size": 5, "progress": 1.0, "priority": 1 },
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/trackers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "url": tracker, "status": 2, "msg": "" },
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/torrents/export"))
+            .and(query_param("hash", hash.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(generated.to_vec()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/torrents/delete"))
+            .and(body_string_contains(format!("hashes={hash}")))
+            .and(body_string_contains("deleteFiles=false"))
+            .respond_with(Delete(deleted))
+            .expect(removals)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/torrents/add"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+            .expect(adds)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .with_priority(10)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn torrent_do_site_tira_o_gerado_trocado_e_semeia_o_do_site() {
+        let Some(db) = acervo_store::testing::TestDb::new("para_lancar_gerado_trocado").await
+        else {
+            return;
+        };
+        let (web, base) = serve(&db).await;
+        insert_bj(&db.store).await;
+        let origin = "4".repeat(40);
+        // O gerado já semeia para o BJ, mas o site gravou `source` e trocou o
+        // hash: sem tirá-lo, ele seria adotado como o do site.
+        let generated = torrent_with_source(None);
+        ready(&db.store, &origin, &generated).await;
+        // Marcado como enviado à mão, e o cross-seed já tinha achado o gerado
+        // como irmão do par.
+        db.store
+            .mark_launch_sent(&origin, BJ, "2026-10-27T00:00:00Z")
+            .await
+            .unwrap();
+        let generated_hash = acervo_clients::info_hash(&generated).unwrap();
+        db.store
+            .record_cross_seed_check(
+                &origin,
+                BJ,
+                "2026-10-27T00:00:00Z",
+                Some(&generated_hash),
+                CrossSeedOutcome::Found,
+            )
+            .await
+            .unwrap();
+        let tag = acervo_core::seed_tag(BJ);
+        let server = qbit_with_generated(&origin, &generated, (&tag, BJ_TRACKER), 1, 1).await;
+        point_to(&web, &server).await;
+
+        let route = format!("{base}/{origin}/{BJ}/torrent-do-site");
+        let do_site = torrent_with_source(Some("BJ"));
+        let (status, body) = send_torrent(&reqwest::Client::new(), &route, do_site).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains(r#""adicionado":true"#), "{body}");
+        // O par volta a ser procurado: o achado apontava para o que saiu.
+        let checks = db.store.cross_seed_checks().await.unwrap();
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.hash == origin && c.indexer == BJ && c.found.is_none())
+        );
+        // Os `expect` do delete e do add são conferidos ao soltar o servidor.
+        drop(server);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn torrent_do_site_nao_tira_o_gerado_que_semeia_para_outro_site() {
+        let Some(db) = acervo_store::testing::TestDb::new("para_lancar_gerado_dividido").await
+        else {
+            return;
+        };
+        let (web, base) = serve(&db).await;
+        insert_bj(&db.store).await;
+        let origin = "5".repeat(40);
+        // O mesmo hash também semeia para o Amigos: apagá-lo pararia o Amigos.
+        let generated = torrent_with_source(None);
+        ready(&db.store, &origin, &generated).await;
+        let tags = format!(
+            "{}, {}",
+            acervo_core::seed_tag("amigosshare"),
+            acervo_core::seed_tag(BJ)
+        );
+        let server = qbit_with_generated(&origin, &generated, (&tags, BJ_TRACKER), 0, 0).await;
+        point_to(&web, &server).await;
+
+        let route = format!("{base}/{origin}/{BJ}/torrent-do-site");
+        let do_site = torrent_with_source(Some("BJ"));
+        let (status, body) = send_torrent(&reqwest::Client::new(), &route, do_site).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains(r#""adicionado":false"#), "{body}");
+        assert!(body.contains("outro destino"), "{body}");
+        let launch = db.store.launch(&origin, BJ).await.unwrap().unwrap();
+        assert!(
+            launch
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("outro destino"))
+        );
+        drop(server);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn torrent_do_site_semeia_depois_que_o_tracker_sai_do_gerado_dividido() {
+        let Some(db) = acervo_store::testing::TestDb::new("para_lancar_gerado_sem_tracker").await
+        else {
+            return;
+        };
+        let (web, base) = serve(&db).await;
+        insert_bj(&db.store).await;
+        let origin = "6".repeat(40);
+        // O usuário seguiu o erro: o gerado dividido com o Amigos ficou só com
+        // o tracker do Amigos. Não é mais adotado, nada sai e o do site entra.
+        let generated = torrent_with_source(None);
+        ready(&db.store, &origin, &generated).await;
+        let tags = format!(
+            "{}, {}",
+            acervo_core::seed_tag("amigosshare"),
+            acervo_core::seed_tag(BJ)
+        );
+        let amigos = "https://amigos.exemplo/announce/abc";
+        let server = qbit_with_generated(&origin, &generated, (&tags, amigos), 0, 1).await;
+        point_to(&web, &server).await;
+
+        let route = format!("{base}/{origin}/{BJ}/torrent-do-site");
+        let do_site = torrent_with_source(Some("BJ"));
+        let (status, body) = send_torrent(&reqwest::Client::new(), &route, do_site).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains(r#""adicionado":true"#), "{body}");
+        drop(server);
         db.drop().await;
     }
 
