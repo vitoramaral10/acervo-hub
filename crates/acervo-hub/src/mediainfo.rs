@@ -433,6 +433,10 @@ fn next_attempt(done: Attempt, size: usize) -> Option<Attempt> {
 /// devolve a menor e registra o aviso. Devolve os bytes e o formato gerado.
 ///
 /// `-ss` antes de `-i` busca pelo índice, sem decodificar o arquivo até lá.
+/// `-noaccurate_seek` com `-fps_mode passthrough` entrega o quadro-chave do
+/// ponto (o de antes do instante): sem os dois, o ffmpeg decodifica do
+/// quadro-chave até o instante exato, e num 4K HEVC com meia CPU isso passa
+/// de 3 minutos por captura.
 /// `-threads 1` antes de `-i` limita o decodificador (depois do `-i` só
 /// valeria para o encoder): sem ele o ffmpeg sobe uma thread por núcleo do
 /// host, ignorando a cota de CPU do container, e a memória estoura.
@@ -508,11 +512,13 @@ async fn encode_frame(path: &Path, at_seconds: f64, attempt: Attempt) -> anyhow:
     let output = tokio::time::timeout(
         Duration::from_secs(120),
         tokio::process::Command::new(ffmpeg_binary())
-            .args(["-nostdin", "-loglevel", "error", "-threads", "1", "-ss"])
+            .args(["-nostdin", "-loglevel", "error", "-threads", "1"])
+            .args(["-noaccurate_seek", "-ss"])
             .arg(format!("{at_seconds:.3}"))
             .arg("-i")
             .arg(path)
-            .args(["-frames:v", "1", "-threads", "2", "-f", "image2pipe"])
+            .args(["-frames:v", "1", "-fps_mode", "passthrough"])
+            .args(["-threads", "2", "-f", "image2pipe"])
             .args(encoder)
             .args(["-pix_fmt", pix_fmt, "-"])
             .stdin(Stdio::null())
@@ -1096,8 +1102,9 @@ mod tests {
         let (png, formato) = screenshot(&video, 1.0).await.expect("quadro");
         assert_eq!(formato, CaptureFormat::Png);
         assert!(png.starts_with(&PNG_SIGNATURE));
-        // Além do fim não sai quadro: erro claro, não PNG vazio.
-        assert!(screenshot(&video, 600.0).await.is_err());
+        // Além do fim sai o último quadro-chave, nunca um PNG vazio.
+        let (fim, _) = screenshot(&video, 600.0).await.expect("quadro");
+        assert!(fim.starts_with(&PNG_SIGNATURE));
         // O PNG rápido do BJ também é PNG.
         let rapido = screenshot_png(&video, 1.0).await.expect("quadro");
         assert!(rapido.starts_with(&PNG_SIGNATURE));
