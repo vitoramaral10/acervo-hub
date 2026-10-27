@@ -1098,6 +1098,13 @@ fn report_json(report: &Report, facts: &rules::Facts, main: &str) -> Result<Valu
     if let Some(audio) = rules::package_audio(facts) {
         value["audio"] = json!(audio);
     }
+    // O idioma do catálogo (TMDB), para o envio ao BJ quando o IMDB de lá não diz.
+    if let Some(language) = facts
+        .original_language
+        .filter(|l| !matches!(l, Language::Unknown))
+    {
+        value["idioma_original"] = json!(language.name());
+    }
     Ok(value)
 }
 
@@ -2170,8 +2177,9 @@ async fn host_screens(
         let number = index + 1;
         job.step(&format!("captura {number} de {}", times.len()))
             .await;
-        // PNG, ou JPEG na mesma resolução se o PNG passar do limite do Amigos.
-        let (image, format) = crate::mediainfo::screenshot(video, *at).await?;
+        // O ImgBB aceita 32 MB, como o BJ: o PNG rápido do envio ao BJ basta.
+        let image = crate::mediainfo::screenshot_png(video, *at).await?;
+        let format = crate::mediainfo::CaptureFormat::Png;
         let name = format!("captura-{number}.{}", format.extension());
         let screen = imgbb
             .upload(&key, image, &name, format.mime())

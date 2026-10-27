@@ -1022,6 +1022,8 @@ pub(crate) struct Package {
     pub(crate) audio: Option<String>,
     /// A duração do vídeo pelo laudo, em segundos, para quando o IMDB não diz.
     pub(crate) duration: Option<f64>,
+    /// `report.idioma_original`: o nome em inglês do idioma pelo catálogo.
+    pub(crate) original_language: Option<String>,
     pub(crate) has_subtitle_file: bool,
     pub(crate) screenshots: usize,
 }
@@ -1089,6 +1091,11 @@ pub(crate) fn package(
             .report
             .pointer("/capturas/duracao")
             .and_then(Value::as_f64),
+        original_language: launch
+            .report
+            .get("idioma_original")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         has_subtitle_file,
         screenshots,
     })
@@ -1234,7 +1241,15 @@ pub(crate) fn draft_from(package: &Package, lookup: &Lookup, auth: String) -> Dr
     }
     work(&mut form, package, lookup, &imdb, minutes);
     form.text("traileryoutube", "");
-    technical(&mut form, package, &media, lookup.language_choice());
+    // Sem idioma no IMDB do site, o do catálogo ("Portuguese (Brazil)" vira "Portuguese").
+    let language = lookup.language_choice().or_else(|missing| {
+        package
+            .original_language
+            .as_deref()
+            .and_then(|name| language_by_english(name.split(" (").next().unwrap_or(name)))
+            .ok_or(missing)
+    });
+    technical(&mut form, package, &media, language);
     // A sinopse do pacote é a PT-BR do TMDB que o usuário revisou (4.1.6);
     // sem ela, a que o IMDB do site trouxe.
     let synopsis = Some(package.synopsis.clone())
@@ -1558,6 +1573,7 @@ Language                                 : English
             synopsis: "Sinopse do pacote.".into(),
             audio: Some(audio.into()),
             duration: Some(5400.0),
+            original_language: None,
             has_subtitle_file: has_file,
             screenshots: 4,
         }
@@ -2106,6 +2122,33 @@ Language                                 : English
         assert_eq!(
             read_lookup(&none).unwrap().language_choice(),
             Err("o IMDB do BJ não disse o idioma original".to_owned())
+        );
+        // Nesse caso vale o idioma do catálogo.
+        let mut pack = package(
+            "Filme.2015.1080p.AMZN.WEB-DL.H.264-GRP",
+            WEB_DL,
+            "dual",
+            false,
+        );
+        let lookup = read_lookup(&none).unwrap();
+        let draft = draft_from(&pack, &lookup, "abc".into());
+        assert!(
+            draft
+                .faltando
+                .iter()
+                .any(|m| m.starts_with("Idioma original")),
+            "{:?}",
+            draft.faltando
+        );
+        pack.original_language = Some("Portuguese (Brazil)".into());
+        let draft = draft_from(&pack, &lookup, "abc".into());
+        assert!(
+            !draft
+                .faltando
+                .iter()
+                .any(|m| m.starts_with("Idioma original")),
+            "{:?}",
+            draft.faltando
         );
     }
 

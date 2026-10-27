@@ -402,6 +402,10 @@ impl CaptureFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Attempt {
     Png,
+    /// PNG na compressão padrão do ffmpeg, para o BJ: no 4K com meia CPU a
+    /// máxima custa ~65 s a mais por quadro para encolher ~16%, e só o limite
+    /// do Amigos precisa disso.
+    PngQuick,
     Jpeg(u8),
 }
 
@@ -413,7 +417,7 @@ fn next_attempt(done: Attempt, size: usize) -> Option<Attempt> {
         return None;
     }
     match done {
-        Attempt::Png => Some(Attempt::Jpeg(QUALIDADES_JPEG[0])),
+        Attempt::Png | Attempt::PngQuick => Some(Attempt::Jpeg(QUALIDADES_JPEG[0])),
         Attempt::Jpeg(q) => QUALIDADES_JPEG
             .iter()
             .copied()
@@ -444,7 +448,7 @@ pub async fn screenshot(path: &Path, at_seconds: f64) -> anyhow::Result<(Vec<u8>
     loop {
         let bytes = encode_frame(path, at_seconds, attempt).await?;
         let format = match attempt {
-            Attempt::Png => CaptureFormat::Png,
+            Attempt::Png | Attempt::PngQuick => CaptureFormat::Png,
             Attempt::Jpeg(_) => CaptureFormat::Jpg,
         };
         let next = next_attempt(attempt, bytes.len());
@@ -474,7 +478,7 @@ pub async fn screenshot(path: &Path, at_seconds: f64) -> anyhow::Result<(Vec<u8>
 /// Passou disso (um PNG 4K de 8 bits fica bem abaixo), é erro.
 pub async fn screenshot_png(path: &Path, at_seconds: f64) -> anyhow::Result<Vec<u8>> {
     let _turn = ONE_AT_A_TIME.acquire().await?;
-    let bytes = encode_frame(path, at_seconds, Attempt::Png).await?;
+    let bytes = encode_frame(path, at_seconds, Attempt::PngQuick).await?;
     anyhow::ensure!(
         bytes.len() <= LIMITE_CAPTURA_BJ,
         "captura em PNG com {} bytes, acima do limite de 32 MB do BJ",
@@ -493,6 +497,7 @@ async fn encode_frame(path: &Path, at_seconds: f64, attempt: Attempt) -> anyhow:
                 .into(),
             "rgb24",
         ),
+        Attempt::PngQuick => (["-c:v", "png"].map(str::to_owned).into(), "rgb24"),
         Attempt::Jpeg(q) => (
             ["-c:v", "mjpeg", "-q:v", &q.to_string()]
                 .map(str::to_owned)
@@ -527,7 +532,7 @@ async fn encode_frame(path: &Path, at_seconds: f64, attempt: Attempt) -> anyhow:
         );
     }
     let signature_ok = match attempt {
-        Attempt::Png => output.stdout.starts_with(&PNG_SIGNATURE),
+        Attempt::Png | Attempt::PngQuick => output.stdout.starts_with(&PNG_SIGNATURE),
         Attempt::Jpeg(_) => output.stdout.starts_with(&[0xff, 0xd8, 0xff]),
     };
     if !signature_ok {
@@ -1093,6 +1098,9 @@ mod tests {
         assert!(png.starts_with(&PNG_SIGNATURE));
         // Além do fim não sai quadro: erro claro, não PNG vazio.
         assert!(screenshot(&video, 600.0).await.is_err());
+        // O PNG rápido do BJ também é PNG.
+        let rapido = screenshot_png(&video, 1.0).await.expect("quadro");
+        assert!(rapido.starts_with(&PNG_SIGNATURE));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
