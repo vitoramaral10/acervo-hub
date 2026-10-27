@@ -356,6 +356,15 @@ fn ffmpeg_binary() -> String {
 
 const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
+/// Um ffmpeg por vez, no preparo, na rota de download e no envio: um quadro
+/// 4K ocupa dezenas de MiB e o hub divide a máquina com o resto. Quem chega
+/// depois espera a vez.
+static ONE_AT_A_TIME: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// O maior arquivo que o upload de imagem do BJ aceita (`maxFilesize: 32` do
+/// Dropzone; aqui 32 MB decimais, a leitura mais estrita).
+pub const LIMITE_CAPTURA_BJ: usize = 32_000_000;
+
 /// O maior arquivo que o formulário do Amigos aceita numa imagem (5 MB; aqui
 /// 5 MiB, a leitura segura). Passou disso, o site recusa o anexo.
 pub const LIMITE_CAPTURA: usize = 5 * 1024 * 1024;
@@ -429,10 +438,6 @@ fn next_attempt(done: Attempt, size: usize) -> Option<Attempt> {
 /// PNG 4K de ~40 MB que passa do limite e ocupa dezenas de MiB a mais na
 /// memória do hub.
 pub async fn screenshot(path: &Path, at_seconds: f64) -> anyhow::Result<(Vec<u8>, CaptureFormat)> {
-    // Um ffmpeg por vez, no preparo e na rota de download: um quadro 4K ocupa
-    // dezenas de MiB e o hub divide a máquina com o resto. Quem chega depois
-    // espera a vez.
-    static ONE_AT_A_TIME: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
     let _turn = ONE_AT_A_TIME.acquire().await?;
     let mut attempt = Attempt::Png;
     let mut smallest: Option<(Vec<u8>, CaptureFormat)> = None;
@@ -462,6 +467,20 @@ pub async fn screenshot(path: &Path, at_seconds: f64) -> anyhow::Result<(Vec<u8>
         );
     }
     Ok((bytes, format))
+}
+
+/// Um quadro em PNG sem perda na resolução original, sem o recuo para JPEG de
+/// [`screenshot`]: é o que vai ao BJ, que aceita até [`LIMITE_CAPTURA_BJ`].
+/// Passou disso (um PNG 4K de 8 bits fica bem abaixo), é erro.
+pub async fn screenshot_png(path: &Path, at_seconds: f64) -> anyhow::Result<Vec<u8>> {
+    let _turn = ONE_AT_A_TIME.acquire().await?;
+    let bytes = encode_frame(path, at_seconds, Attempt::Png).await?;
+    anyhow::ensure!(
+        bytes.len() <= LIMITE_CAPTURA_BJ,
+        "captura em PNG com {} bytes, acima do limite de 32 MB do BJ",
+        bytes.len()
+    );
+    Ok(bytes)
 }
 
 async fn encode_frame(path: &Path, at_seconds: f64, attempt: Attempt) -> anyhow::Result<Vec<u8>> {

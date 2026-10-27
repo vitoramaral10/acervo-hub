@@ -1,5 +1,6 @@
 //! "Para lançar": prepara o pacote de um release que existe num tracker e não
-//! no outro, para o usuário enviar à mão (ver `docs/para-lancar.md`).
+//! no outro, para o usuário enviar à mão ou pelo formulário do site, pelo
+//! acervo (ver `docs/para-lancar.md`).
 //!
 //! O preparo é um job em fundo, um por vez no processo: sonda, busca no
 //! destino, regras, texto, capturas e `.torrent`. Cada passo grava o
@@ -16,6 +17,7 @@
 
 pub(crate) mod adapt;
 pub(crate) mod amigos;
+pub(crate) mod bj;
 pub(crate) mod folder;
 pub(crate) mod imgbb;
 pub(crate) mod name_check;

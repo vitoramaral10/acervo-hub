@@ -5,10 +5,13 @@ o usuário fazer à mão. O acervo prepara o pacote (checagem de regras, título
 descrição, capturas e `.torrent`), o usuário revisa e envia pelo site, e a
 tarefa `cross-seed` acha o torrent publicado e semeia sozinha.
 
-No BJ, nada aqui envia ao site: ele proíbe navegação automatizada (regra
-1.12), e o envio é sempre do usuário. No Amigos, que não proíbe automação, o
-acervo também pode enviar pelo formulário do site, sempre depois da
-confirmação do usuário na tela (ver "Envio ao Amigos pelo acervo").
+Nos dois sites o acervo também pode enviar pelo formulário do próprio site,
+sempre depois da confirmação do usuário na tela (ver "Envio ao Amigos pelo
+acervo" e "Envio ao BJ pelo acervo"). No BJ, o envio pelo acervo é decisão do
+usuário em 26/10/2026, ciente de que a regra 1.12 do BJ proíbe navegação
+automatizada: as requisições são as normais do formulário, com a sessão do
+indexador, sem nada para disfarçar a automação. O envio à mão continua
+disponível ("Marquei como enviado").
 
 ## Princípios
 
@@ -677,3 +680,99 @@ que vai ao Amigos". Ele carrega a prévia: tipo, nome, ano, IMDB, resolução,
 cada lista com a opção escolhida, legenda, capa e capturas, mais o que falta.
 O botão "Enviar ao Amigos" fica desligado enquanto falta algo.
 
+## Envio ao BJ pelo acervo
+
+Decisão do usuário em 26/10/2026, ciente de que a regra 1.12 do BJ proíbe
+navegação automatizada. O formulário do BJ (`upload.php`, Gazelle) é refeito
+com a sessão do indexador `bjsharecustom`, pelo mesmo
+`Catalog::site_request` do Amigos e com as mesmas guardas: pacote `pronto`,
+sem `site_id`, que o cross-seed não achou no destino, e nada sai antes da
+confirmação na tela. Código em `launch/bj.rs`.
+
+### Prévia: `GET …/envio-ao-site`
+
+Duas leituras, sem publicar nada:
+
+1. `GET /upload.php`: o `auth` do formulário (`<input type="hidden"
+   name="auth">`). Sem ele a sessão caiu, e a prévia falha pedindo para
+   conferir o login do indexador.
+2. `GET /ajax.php?action=imdb_title&category=movie|tv&imdbid=tt…&auth=…`, o
+   mesmo pedido do `upload.js` ao colar o IMDB (no episódio avulso, também
+   `&season=&episode=`). A resposta é JSON no formato do OMDb, com o achado do
+   TMDB (`tmdbData.movie_results[0]` no filme, `seriesData` e
+   `tmdbSeriesData.tv_results[0]` na série). Valores `N/A` contam como
+   ausentes. O log de falha do `site_request` sai sem a query, que leva o
+   `auth`.
+
+O tipo vem de `report.tipo` (`filme` → `type=0`; `episodio`/`temporada` →
+`type=1`, `tipo=episode|season`, temporada e episódio pelo nome do release).
+
+| Campo | De onde vem |
+| --- | --- |
+| `title`, `tags`, `year`, `elenco`, `diretorserie`, `datalancamento`, `imdbrating` | `Title` (na série, `seriesData.Title`), `Genre`, `Year` (4 dígitos), `Actors`, `Director`, `Released`, `imdbRating` |
+| `titulobrasileiro` | `title` (filme) ou `name` (série) do TMDB, quando difere do original |
+| `duracaoHR`, `duracaoMIN` (`duracaotipo=selectbox`) | `Runtime` ("93 min"); sem ele, a duração do laudo (`report.capturas.duracao`) |
+| `image` (capa) | `poster_path` do TMDB (caminho relativo ganha `https://image.tmdb.org/t/p/original`); a capa não é enviada pelo acervo |
+| `sinopse` | a `sinopse` do pacote (PT-BR do TMDB, 4.1.6); sem ela, o `overview` do TMDB |
+| `fichatecnica` | o relatório do MediaInfo do pacote (`fields.mediainfo`) |
+| `imdblink`, `validimdb=yes`, `adulto=2` (filme) | o IMDB do pacote; no episódio, o `seriesID` |
+| série: `pais`, `avaliacao`, `numtemporadas`, `diretor`, `network` | `Country`, `Rated`, `totalSeasons`, `Writer` (como o `upload.js`), vazio |
+| `formato` | `Format` da seção General do MediaInfo: Matroska → MKV, MPEG-4 → MP4 |
+| `qualidade` | source do nome, lida só depois do ano, do `SxxEyy` ou da resolução: encode e REMUX de BluRay (`BluRay`, `Blu-ray`, `BDRemux` no nome) → `Blu-ray`, `WEB-DL`, `WEBRip`, `WEB`, `HDTV`, `BRRip`, `BDRip`... REMUX de DVD (ou sem BluRay no nome) bloqueia: "escolha a qualidade à mão" |
+| `release` (Streaming) | sigla depois da resolução no nome, por extenso: AMZN Amazon, NF Netflix, DSNP Disney+, iT iTunes, ATVP Apple TV+, HMAX HBO Max, MAX Max, GLBO Globoplay, PCOK Peacock, PMTP Paramount+, HULU Hulu; sem sigla, vazio |
+| `audio` | `report.audio`: Dual Áudio, Dublado, Legendado ou Nacional |
+| `tipolegenda` | Arquivos Separados quando o torrent leva `.srt`/`.ass`/`.ssa`/`.sub`/`.idx`; Embutida quando há legenda PT só embutida (seção Text do MediaInfo); senão Nenhuma |
+| `codecvideo` | a família (264, 265, AV1, VC-1, MPEG-2...) sai do nome e, sem nada nele, do `Format` do vídeo no MediaInfo (AVC/HEVC/AV1); a grafia vem da qualidade: WEB-DL, WEB e REMUX → `H.264`/`H.265`; encode de Blu-ray, WEBRip, HDTV e o resto → `x264`/`x265` |
+| `codecaudio` | as faixas do vídeo principal no MediaInfo: um codec só é ele; dois que a lista combina (`AC3/DTS`, `AC3/E-AC-3`, `AC3/AAC`) vão combinados; senão, o da faixa original (a primeira que não é PT). DTS XLL/XBR é `DTS-HD`, `DTS:X` pelo nome comercial, MLP FBA é `TrueHD` |
+| `idioma` | `original_language` do TMDB (ou, sem ele, o primeiro de `Language`), na grafia da lista; código sem opção bloqueia citando o código; `pt` com Portugal em `Country` é `Português (pt)`; obra nacional é Português |
+| `repack` | `on` quando o nome tem REPACK ou PROPER (checkbox desmarcado não vai) |
+| `remaster_title` | `Remux` (REMUX), as edições do nome depois do ano (Director's Cut, Extended Edition, IMAX, Open Matte, Theatrical Cut, Final Cut, Noir Edition, Unrated, Uncut...) e os recursos do MediaInfo do vídeo principal, nesta ordem: `10-bit`, `Dolby Vision`, `HDR10`, `HDR10+` (não leva também HDR10), `HLG`, `Dolby Atmos` (JOC ou nome comercial), `Ultrawide` (largura maior que 2 × altura), separados por ` / `; vazio sem nenhuma; mais de 80 caracteres bloqueia. O checkbox "remaster" da página não tem `name` e não vai |
+| `resolucaow`, `resolucaoh` | `Width` e `Height` do vídeo no MediaInfo |
+| `anonymous` | desligado (não vai) |
+
+Os valores das listas são texto e saem sempre das opções exatas da página,
+fixas em `bj.rs`. A prévia lista em `faltando` o que impede o envio: valor sem
+opção que bata (com o motivo), título, ano, gêneros, elenco, data de
+lançamento, criador (série), duração, sinopse ou capa ausentes, anime (Animation
+com idioma original japonês: vai na categoria Animes, que o acervo não envia), IMDB de outro tipo e menos de 2 capturas. Fica no mesmo formato da
+prévia do Amigos (`tipo`, `nome`, `ano`, `imdb`, `largura`, `altura`, `capa`,
+`campos`, `capturas`, `faltando`; o tipo de legenda vai em `campos`), e o
+`auth` nunca sai nela.
+
+### Envio: `POST …/envio-ao-site`
+
+Toma a posse do par, refaz o rascunho (a prévia não é confiada) e recusa com
+409 se algo falta. Depois:
+
+1. Tira as `SCREEN_COUNT` capturas do vídeo de origem, nos instantes do
+   preparo, em **PNG puro na resolução cheia** (`mediainfo::screenshot_png`,
+   sem o recuo para JPEG dos 5 MiB do Amigos; o limite do BJ é 32 MB,
+   `LIMITE_CAPTURA_BJ`, e passar dele é erro), e as sobe uma a uma em
+   `POST /ajax.php?action=screen_up` (multipart, campo `file`, como o
+   Dropzone). A resposta `{url}` vai em `screenshots[]`.
+2. Faz o `POST /upload.php` multipart: `submit=true`, `auth`, `file_input` (o
+   `.torrent` gerado), os campos acima na ordem da página, `screenshots` vazio
+   e um `screenshots[]` por captura.
+3. A marca `pendente` em `site_id` antes do `POST`, como no Amigos.
+4. A resposta:
+   - **Sucesso:** redirect para `torrents.php?id=<grupo>[&torrentid=<torrent>]`.
+     O `site_id` é o `torrentid` quando vem, senão o id do grupo, gravado com
+     o estado `enviado` numa escrita só.
+   - **Recusa certa:** só a página do formulário de volta (`id="upload_table"`)
+     com o erro que o Gazelle escreve em `<p style="color: red">` lido. A marca
+     é limpa e a mensagem vira o erro do pacote.
+   - **Incerta:** qualquer outra resposta, incluindo o formulário sem erro lido
+     e o redirect para `upload.php`, além de rede ou sessão. A marca fica, e o
+     erro pede para conferir os envios no BJ, como no Amigos. Num redirect
+     inesperado a mensagem traz só o caminho do `Location`, sem a query (pode
+     levar `authkey` ou `torrent_pass`).
+5. Semeia o `.torrent` **gerado** (o mesmo caminho de "Marquei como
+   enviado"): o BJ só entrega o `.torrent` publicado com passkey. Se o site
+   trocar o hash, o cross-seed adota o publicado (o par voltou a ser
+   procurado, urgente). Falha ao semear é aviso, nunca erro.
+
+### Tela
+
+O pacote pronto do BJ ganha a mesma seção "Enviar pelo acervo" do Amigos:
+"Ver o que vai ao BJ" carrega a prévia (cada campo com o valor, o que falta)
+e "Enviar ao BJ" fica desligado enquanto falta algo.

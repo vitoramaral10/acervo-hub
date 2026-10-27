@@ -398,12 +398,13 @@ const TRACKER_TONES: Record<LaunchTrackerStatus, 'success' | 'warning' | 'danger
 const SUBTITLE_LABELS: Record<string, string> = { embedded: 'Embutida', separate: 'Separada', none: 'Sem legenda' }
 
 /**
- * O envio ao Amigos pelo acervo: a prévia (só leituras no site) e, confirmada, o envio de verdade. O botão de enviar
- * só aparece depois da prévia, e fica desligado enquanto falta algo.
+ * O envio pelo acervo (Amigos e BJ): a prévia (só leituras no site) e, confirmada, o envio de verdade. O botão de
+ * enviar só aparece depois da prévia, e fica desligado enquanto falta algo.
  */
 function UploadSection({ detail }: { detail: LaunchDetail }) {
   const refresh = useRefreshLaunch()
   const [asked, setAsked] = useState(false)
+  const bj = detail.site === 'bj'
   const preview = useQuery({
     queryKey: [...detailKey(detail.hash, detail.indexer), 'envio-ao-site'],
     queryFn: () => launchApi.uploadPreview(detail.hash, detail.indexer),
@@ -415,7 +416,10 @@ function UploadSection({ detail }: { detail: LaunchDetail }) {
     mutationFn: () => launchApi.upload(detail.hash, detail.indexer),
     onSuccess: (data) => {
       if (data.aviso) toast.warning(data.aviso)
-      else toast.success(`Enviado ao ${detail.destino} (torrent ${data.site_id}): o .torrent do site entrou no cliente`)
+      else
+        toast.success(
+          `Enviado ao ${detail.destino} (torrent ${data.site_id}): o .torrent ${bj ? 'gerado' : 'do site'} entrou no cliente`,
+        )
       refresh(detail)
     },
     onError: (error: Error) => toast.error(error.message),
@@ -428,8 +432,10 @@ function UploadSection({ detail }: { detail: LaunchDetail }) {
         Enviar pelo acervo
       </h3>
       <p className="text-sm text-content-muted">
-        O acervo preenche o formulário do {detail.destino} como o site faz: título e capa pelo IMDB, listas pelo
-        MediaInfo e as {draft?.capturas ?? 4} capturas hospedadas lá. Confira a prévia antes de enviar.
+        {bj
+          ? `O acervo preenche o formulário do ${detail.destino} como o site faz: título, capa e duração pelo IMDB do site, listas pelo nome do release e pelo MediaInfo, e as ${draft?.capturas ?? 4} capturas em PNG hospedadas lá.`
+          : `O acervo preenche o formulário do ${detail.destino} como o site faz: título e capa pelo IMDB, listas pelo MediaInfo e as ${draft?.capturas ?? 4} capturas hospedadas lá.`}{' '}
+        Confira a prévia antes de enviar.
       </p>
       {!asked ? (
         <div>
@@ -690,7 +696,7 @@ function Package({ detail, item }: { detail: LaunchDetail; item: LaunchItem }) {
         </p>
       )}
 
-      {detail.site === 'amigos' && detail.estado === 'pronto' && !detail.site_id && <UploadSection detail={detail} />}
+      {detail.estado === 'pronto' && !detail.site_id && <UploadSection detail={detail} />}
 
       {(detail.estado === 'enviado' || detail.estado === 'semeando') && <SeedSection detail={detail} />}
 

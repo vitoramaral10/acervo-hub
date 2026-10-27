@@ -533,7 +533,9 @@ impl Catalog {
             return Err(waiting(name, until));
         }
         entry.indexer.site_request(request).await.map_err(|error| {
-            tracing::warn!(indexer = name, path = request.path, %error, "requisição ao site falhou");
+            // Sem a query: o `imdb_title` do BJ leva o `auth` da sessão nela.
+            let path = request.path.split('?').next().unwrap_or_default();
+            tracing::warn!(indexer = name, path, %error, "requisição ao site falhou");
             self.record(name, Err(&error));
             match self.waiting_until(name) {
                 Some(until) if error.rate_limited().is_some() => waiting(name, until),
