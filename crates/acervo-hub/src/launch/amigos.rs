@@ -351,7 +351,7 @@ pub(crate) struct Package {
 }
 
 /// O código `tt…` (5 dígitos ou mais) num texto, como a URL do IMDB.
-fn imdb_id(text: &str) -> Option<&str> {
+pub(crate) fn imdb_id(text: &str) -> Option<&str> {
     text.match_indices("tt").find_map(|(at, _)| {
         let digits = text[at + 2..]
             .bytes()
@@ -573,14 +573,14 @@ pub(crate) struct Refusal {
 }
 
 impl Refusal {
-    fn certain(message: impl Into<String>) -> Self {
+    pub(crate) fn certain(message: impl Into<String>) -> Self {
         Self {
             certain: true,
             message: message.into(),
         }
     }
 
-    fn unknown(message: impl Into<String>) -> Self {
+    pub(crate) fn unknown(message: impl Into<String>) -> Self {
         Self {
             certain: false,
             message: message.into(),

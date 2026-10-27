@@ -960,16 +960,15 @@ async fn adopt_site_torrent(
 
 // ---------------------------------------------------------------- envio ao site
 
-/// O pacote pronto que pode ir ao site pelo formulário: hoje só o Amigos (o BJ
-/// proíbe envio automatizado, regra 1.12), pronto, sem envio anterior e que o
-/// cross-seed não achou lá.
-async fn uploadable(store: &Store, hash: &str, indexer: &str) -> Result<Launch, Response> {
-    if indexer != super::amigos::INDEXER {
-        return Err(fail(WebError(
-            StatusCode::BAD_REQUEST,
-            "o envio pelo acervo é só para o Amigos: no BJ o envio é manual (regra 1.12)".into(),
-        )));
-    }
+/// O pacote pronto que pode ir ao site pelo formulário (Amigos e BJ; o BJ por
+/// decisão do usuário em 26/10/2026, ciente da regra 1.12): pronto, sem envio
+/// anterior e que o cross-seed não achou lá.
+async fn uploadable(
+    store: &Store,
+    hash: &str,
+    indexer: &str,
+    site: Site,
+) -> Result<Launch, Response> {
     let launch = store
         .launch(hash, indexer)
         .await
@@ -977,11 +976,12 @@ async fn uploadable(store: &Store, hash: &str, indexer: &str) -> Result<Launch, 
         .ok_or_else(|| not_found("prepare o pacote antes de enviá-lo"))?;
     match launch.site_id.as_deref() {
         Some(super::amigos::PENDING_SITE_ID) => {
-            return Err(conflict(
+            return Err(conflict(format!(
                 "um envio anterior ficou sem resposta e pode ter chegado ao site: confira os seus \
-                 envios no Amigos. Se o torrent está lá, baixe o .torrent e use \"Enviar o .torrent \
+                 envios no {}. Se o torrent está lá, baixe o .torrent e use \"Enviar o .torrent \
                  do site\"; se não está, prepare o pacote de novo para liberar o envio",
-            ));
+                site.label()
+            )));
         }
         Some(id) => {
             return Err(conflict(format!(
@@ -1005,19 +1005,37 @@ async fn uploadable(store: &Store, hash: &str, indexer: &str) -> Result<Launch, 
     Ok(launch)
 }
 
-/// O que o pacote dá ao envio, com o arquivo de legenda lido do layout.
-async fn upload_package(web: &Web, launch: &Launch) -> Result<super::amigos::Package, Response> {
+/// O torrent do pacote leva arquivo de legenda (lido do layout).
+async fn has_subtitle_file(web: &Web, launch: &Launch) -> Result<bool, Response> {
     let layout = super::package_layout(&web.config(), launch)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
-    let has_subtitle_file = layout.iter().any(|(path, _)| {
+    Ok(layout.iter().any(|(path, _)| {
         let lower = path.to_ascii_lowercase();
         [".srt", ".ass", ".ssa", ".sub", ".idx"]
             .iter()
             .any(|ext| lower.ends_with(ext))
-    });
-    super::amigos::package(launch, has_subtitle_file, super::SCREEN_COUNT)
-        .map_err(|e| fail(WebError(StatusCode::CONFLICT, format!("{e:#}"))))
+    }))
+}
+
+/// O que o pacote dá ao envio ao Amigos.
+async fn upload_package(web: &Web, launch: &Launch) -> Result<super::amigos::Package, Response> {
+    super::amigos::package(
+        launch,
+        has_subtitle_file(web, launch).await?,
+        super::SCREEN_COUNT,
+    )
+    .map_err(|e| fail(WebError(StatusCode::CONFLICT, format!("{e:#}"))))
+}
+
+/// O que o pacote dá ao envio ao BJ.
+async fn bj_package(web: &Web, launch: &Launch) -> Result<super::bj::Package, Response> {
+    super::bj::package(
+        launch,
+        has_subtitle_file(web, launch).await?,
+        super::SCREEN_COUNT,
+    )
+    .map_err(|e| fail(WebError(StatusCode::CONFLICT, format!("{e:#}"))))
 }
 
 fn site_error(error: &anyhow::Error) -> Response {
@@ -1025,15 +1043,23 @@ fn site_error(error: &anyhow::Error) -> Response {
 }
 
 /// A prévia do envio: o que vai a cada campo do formulário, montado com as
-/// leituras do site (página, `MediaInfo`, IMDB). Nada é publicado.
+/// leituras do site (Amigos: página, `MediaInfo` e IMDB; BJ: página e IMDB).
+/// Nada é publicado.
 async fn upload_preview(
     State(web): Shared,
     headers: HeaderMap,
     Path((hash, indexer)): Path<(String, String)>,
 ) -> WebResult {
     let store = enter_live(&web, &headers, &Method::GET).await?;
-    let (hash, _) = pair(&hash, &indexer).map_err(fail)?;
-    let launch = uploadable(store, &hash, &indexer).await?;
+    let (hash, site) = pair(&hash, &indexer).map_err(fail)?;
+    let launch = uploadable(store, &hash, &indexer, site).await?;
+    if site == Site::Bj {
+        let package = bj_package(&web, &launch).await?;
+        let draft = super::bj::draft(&web.catalog, &package)
+            .await
+            .map_err(|e| site_error(&e))?;
+        return ok(&json!({ "previa": draft }));
+    }
     let package = upload_package(&web, &launch).await?;
     let draft = super::amigos::draft(&web.catalog, &package)
         .await
@@ -1050,9 +1076,12 @@ async fn upload(
     Path((hash, indexer)): Path<(String, String)>,
 ) -> WebResult {
     let store = enter_live(&web, &headers, &Method::POST).await?;
-    let (hash, _) = pair(&hash, &indexer).map_err(fail)?;
+    let (hash, site) = pair(&hash, &indexer).map_err(fail)?;
     let _claim = own_pair(&hash, &indexer)?;
-    let launch = uploadable(store, &hash, &indexer).await?;
+    let launch = uploadable(store, &hash, &indexer, site).await?;
+    if site == Site::Bj {
+        return upload_bj(&web, store, &launch).await;
+    }
     let package = upload_package(&web, &launch).await?;
     let draft = super::amigos::draft(&web.catalog, &package)
         .await
@@ -1068,62 +1097,11 @@ async fn upload(
         .await
         .map_err(|e| fail(bad(e)))?
         .ok_or_else(|| conflict("o pacote não tem .torrent: prepare de novo"))?;
-    let screenshots = host_screenshots(&web, &launch, draft.capturas).await?;
-    let release = launch
-        .fields
-        .get("release")
-        .and_then(Value::as_str)
-        .filter(|r| !r.trim().is_empty())
-        .unwrap_or("lancamento");
+    let screenshots = host_screenshots(&web, &launch, draft.capturas, Site::Amigos).await?;
     // A descrição vai sem imagem: as capturas aparecem no campo delas.
-    let parts =
-        super::amigos::upload_parts(&draft, torrent, &format!("{release}.torrent"), &screenshots);
-    // A marca vai ao banco antes do POST: se o acervo cai com o envio no ar,
-    // ele pode ter chegado ao site, e a marca impede outro por cima.
-    store
-        .save_launch_site_id(&hash, &indexer, Some(super::amigos::PENDING_SITE_ID))
-        .await
-        .map_err(|e| fail(bad(e)))?;
-    let id = match super::amigos::publish(&web.catalog, parts).await {
-        Ok(id) => id,
-        Err(refusal) => {
-            let message = if refusal.certain {
-                // O site disse que não aceitou: nada foi criado, e o envio fica
-                // livre para ser refeito depois de corrigido.
-                if let Err(e) = store.save_launch_site_id(&hash, &indexer, None).await {
-                    tracing::warn!(indexer, "marca de envio não limpa: {e}");
-                }
-                format!("envio ao Amigos recusado: {}", refusal.message)
-            } else {
-                format!(
-                    "o envio ao Amigos ficou sem resposta legível ({}) e pode ter chegado ao site: \
-                     confira os seus envios lá antes de qualquer outra coisa",
-                    refusal.message
-                )
-            };
-            if let Err(e) = store
-                .set_launch_error(&hash, &indexer, Some(&message))
-                .await
-            {
-                tracing::warn!(indexer, "erro do envio não gravado: {e}");
-            }
-            return Err(fail(WebError(StatusCode::BAD_GATEWAY, message)));
-        }
-    };
-    tracing::info!(indexer, site_id = id, "pacote enviado ao site");
-    // O id e o estado `enviado` numa escrita só: nunca fica um sem o outro.
-    store
-        .mark_launch_uploaded(&hash, &indexer, &id, &crate::decide::now_rfc3339())
-        .await
-        .map_err(|e| fail(bad(e)))?;
-    if let Err(e) = store.reset_cross_seed_pair(&hash, &indexer).await {
-        tracing::warn!(indexer, "par do cross-seed não reposto: {e}");
-    }
-    let launch = store
-        .launch(&hash, &indexer)
-        .await
-        .map_err(|e| fail(bad(e)))?
-        .ok_or_else(|| not_found("o pacote sumiu durante o envio"))?;
+    let parts = super::amigos::upload_parts(&draft, torrent, &torrent_name(&launch), &screenshots);
+    let publishing = super::amigos::publish(&web.catalog, parts);
+    let (id, launch) = publish_and_mark(store, &launch, Site::Amigos, publishing).await?;
     // Daqui em diante o envio existe: falha ao semear é aviso, nunca erro, ou a
     // tela não veria o pacote enviado.
     let adopted = match super::amigos::site_torrent(&web.catalog, &id).await {
@@ -1157,12 +1135,118 @@ async fn upload(
     }))
 }
 
+/// O nome do `.torrent` no envio: o do release.
+fn torrent_name(launch: &Launch) -> String {
+    let release = launch
+        .fields
+        .get("release")
+        .and_then(Value::as_str)
+        .filter(|r| !r.trim().is_empty())
+        .unwrap_or("lancamento");
+    format!("{release}.torrent")
+}
+
+/// Marca o envio como pendente, faz o `POST` e grava o desfecho: o id e o
+/// estado `enviado` no sucesso; na recusa certa, a marca sai e o erro fica no
+/// pacote; sem resposta legível, a marca fica. Devolve o id e o pacote relido.
+async fn publish_and_mark(
+    store: &Store,
+    launch: &Launch,
+    site: Site,
+    publishing: impl Future<Output = Result<String, super::amigos::Refusal>>,
+) -> Result<(String, Launch), Response> {
+    let (hash, indexer) = (launch.hash.as_str(), launch.indexer.as_str());
+    // A marca vai ao banco antes do POST: se o acervo cai com o envio no ar,
+    // ele pode ter chegado ao site, e a marca impede outro por cima.
+    store
+        .save_launch_site_id(hash, indexer, Some(super::amigos::PENDING_SITE_ID))
+        .await
+        .map_err(|e| fail(bad(e)))?;
+    let id = match publishing.await {
+        Ok(id) => id,
+        Err(refusal) => {
+            let message = if refusal.certain {
+                // O site disse que não aceitou: nada foi criado, e o envio fica
+                // livre para ser refeito depois de corrigido.
+                if let Err(e) = store.save_launch_site_id(hash, indexer, None).await {
+                    tracing::warn!(indexer, "marca de envio não limpa: {e}");
+                }
+                format!("envio ao {} recusado: {}", site.label(), refusal.message)
+            } else {
+                format!(
+                    "o envio ao {} ficou sem resposta legível ({}) e pode ter chegado ao site: \
+                     confira os seus envios lá antes de qualquer outra coisa",
+                    site.label(),
+                    refusal.message
+                )
+            };
+            if let Err(e) = store.set_launch_error(hash, indexer, Some(&message)).await {
+                tracing::warn!(indexer, "erro do envio não gravado: {e}");
+            }
+            return Err(fail(WebError(StatusCode::BAD_GATEWAY, message)));
+        }
+    };
+    tracing::info!(indexer, site_id = id, "pacote enviado ao site");
+    // O id e o estado `enviado` numa escrita só: nunca fica um sem o outro.
+    store
+        .mark_launch_uploaded(hash, indexer, &id, &crate::decide::now_rfc3339())
+        .await
+        .map_err(|e| fail(bad(e)))?;
+    if let Err(e) = store.reset_cross_seed_pair(hash, indexer).await {
+        tracing::warn!(indexer, "par do cross-seed não reposto: {e}");
+    }
+    let launch = store
+        .launch(hash, indexer)
+        .await
+        .map_err(|e| fail(bad(e)))?
+        .ok_or_else(|| not_found("o pacote sumiu durante o envio"))?;
+    Ok((id, launch))
+}
+
+/// O envio ao BJ, depois da confirmação na tela: refaz o rascunho, sobe as
+/// capturas em PNG ao `screen_up`, envia e semeia o `.torrent` gerado. O BJ não
+/// devolve o `.torrent` publicado sem passkey: se ele trocar o hash, o
+/// cross-seed adota o publicado (o par volta a ser procurado, urgente).
+async fn upload_bj(web: &Web, store: &Store, launch: &Launch) -> WebResult {
+    let package = bj_package(web, launch).await?;
+    let draft = super::bj::draft(&web.catalog, &package)
+        .await
+        .map_err(|e| site_error(&e))?;
+    if !draft.faltando.is_empty() {
+        return Err(conflict(format!(
+            "o envio não sai: {}",
+            draft.faltando.join("; ")
+        )));
+    }
+    let torrent = store
+        .launch_torrent(&launch.hash, &launch.indexer)
+        .await
+        .map_err(|e| fail(bad(e)))?
+        .ok_or_else(|| conflict("o pacote não tem .torrent: prepare de novo"))?;
+    let screenshots = host_screenshots(web, launch, draft.capturas, Site::Bj).await?;
+    let parts = super::bj::parts(&draft, torrent.clone(), &torrent_name(launch), &screenshots);
+    let publishing = super::bj::publish(&web.catalog, parts);
+    let (id, launch) = publish_and_mark(store, launch, Site::Bj, publishing).await?;
+    // Daqui em diante o envio existe: falha ao semear é aviso, nunca erro.
+    let (seeded, warning) = seed_or_warn(web, store, &launch, Ok(torrent)).await;
+    ok(&json!({
+        "ok": true,
+        "estado": LaunchState::Enviado.as_str(),
+        "site_id": id,
+        "adicionado": seeded == Some(super::Seeded::Added),
+        "aviso": warning,
+    }))
+}
+
 /// As capturas do pacote, tiradas do vídeo de origem nos mesmos instantes do
-/// preparo e hospedadas no site, na ordem. Devolve os caminhos do site.
+/// preparo e hospedadas no site, na ordem. Devolve os caminhos do site. O BJ
+/// recebe PNG puro (aceita até 32 MB); o Amigos, o PNG ou o JPEG que coube nos
+/// 5 MiB dele.
 async fn host_screenshots(
     web: &Web,
     launch: &Launch,
     count: usize,
+    site: Site,
 ) -> Result<Vec<String>, Response> {
     let (relative, video) = source_video(web, &launch.hash).await?;
     let recorded = launch
@@ -1181,23 +1265,31 @@ async fn host_screenshots(
     for number in 1..=count {
         let at = super::screen_time(duration, number)
             .ok_or_else(|| fail(bad("instante de captura fora do vídeo")))?;
-        let (image, format) = crate::mediainfo::screenshot(&video, at)
-            .await
-            .map_err(|error| {
-                tracing::warn!(launch.indexer, number, "captura para o envio: {error:#}");
-                fail(WebError(
-                    StatusCode::BAD_GATEWAY,
-                    "não deu para tirar a captura (detalhe no log do hub)".into(),
-                ))
-            })?;
+        let captured = match site {
+            Site::Bj => crate::mediainfo::screenshot_png(&video, at)
+                .await
+                .map(|image| (image, crate::mediainfo::CaptureFormat::Png)),
+            Site::Amigos => crate::mediainfo::screenshot(&video, at).await,
+        };
+        let (image, format) = captured.map_err(|error| {
+            tracing::warn!(launch.indexer, number, "captura para o envio: {error:#}");
+            fail(WebError(
+                StatusCode::BAD_GATEWAY,
+                "não deu para tirar a captura (detalhe no log do hub)".into(),
+            ))
+        })?;
         let name = format!(
             "{}.captura-{number}.{}",
             capture_stem(&relative),
             format.extension()
         );
-        let path = super::amigos::host_screenshot(&web.catalog, image, &name, format.mime())
-            .await
-            .map_err(|e| site_error(&e))?;
+        let path = match site {
+            Site::Bj => super::bj::host_screenshot(&web.catalog, image, &name).await,
+            Site::Amigos => {
+                super::amigos::host_screenshot(&web.catalog, image, &name, format.mime()).await
+            }
+        }
+        .map_err(|e| site_error(&e))?;
         paths.push(path);
     }
     Ok(paths)
@@ -2756,14 +2848,222 @@ mod tests {
         let (status, body) = call(&http, reqwest::Method::POST, &url).await;
         assert_eq!(status, 409, "{body}");
 
-        // O BJ não tem envio pelo acervo.
+        // O BJ também envia pelo acervo, mas só pacote preparado.
         let (status, _) = call(
             &http,
             reqwest::Method::GET,
             &format!("{base}/{hash}/{BJ}/envio-ao-site"),
         )
         .await;
-        assert_eq!(status, 400);
+        assert_eq!(status, 404);
+        std::fs::remove_dir_all(&dir).ok();
+        db.drop().await;
+    }
+
+    /// Um BJ de mentira: responde ao `upload.php` e ao `ajax.php` como o site
+    /// e guarda o que recebeu, sem nada de rede.
+    #[derive(Debug, Default)]
+    struct FakeBj {
+        seen: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl acervo_indexers::Indexer for FakeBj {
+        fn name(&self) -> &str {
+            super::super::bj::INDEXER
+        }
+
+        async fn search(
+            &self,
+            _: &acervo_indexers::SearchQuery,
+        ) -> Result<Vec<acervo_indexers::Release>, acervo_indexers::IndexerError> {
+            Ok(Vec::new())
+        }
+
+        async fn site_request(
+            &self,
+            request: &acervo_indexers::SiteRequest,
+        ) -> Result<acervo_indexers::SiteResponse, acervo_indexers::IndexerError> {
+            use acervo_indexers::{SiteBody, SitePartValue};
+            let body = match &request.body {
+                SiteBody::Multipart(parts) => parts
+                    .iter()
+                    .map(|p| match &p.value {
+                        SitePartValue::Text(t) => format!("{}={t}", p.name),
+                        SitePartValue::File {
+                            file_name,
+                            content_type,
+                            ..
+                        } => format!("{}=@{file_name}({content_type})", p.name),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("&"),
+                _ => String::new(),
+            };
+            let shots = {
+                let mut seen = self.seen.lock().unwrap();
+                seen.push((request.path.clone(), body));
+                seen.iter().filter(|(p, _)| p.contains("screen_up")).count()
+            };
+            let reply = |status: u16, location: Option<&str>, body: String| {
+                Ok(acervo_indexers::SiteResponse {
+                    url: format!("https://bj.invalid{}", request.path),
+                    status,
+                    location: location.map(str::to_owned),
+                    body: body.into_bytes(),
+                })
+            };
+            let lookup = r#"{"Title":"Film","Year":"2024","Runtime":"95 min","Genre":"Drama","Actors":"A, B","Director":"D","Released":"01 Jan 2024","imdbRating":"7.0","Type":"movie","Response":"True","tmdbData":{"movie_results":[{"title":"Filme","overview":"Sinopse.","poster_path":"/capa.jpg","original_language":"en"}]}}"#;
+            match (request.post, request.path.as_str()) {
+                (false, "/upload.php") => reply(
+                    200,
+                    None,
+                    r#"<form id="upload_table"><input type="hidden" name="auth" value="abc123">"#
+                        .to_owned(),
+                ),
+                (false, path) if path.starts_with("/ajax.php?action=imdb_title&") => {
+                    reply(200, None, lookup.to_owned())
+                }
+                (true, "/ajax.php?action=screen_up") => reply(
+                    200,
+                    None,
+                    format!(r#"{{"url":"https://img.invalid/{shots}.png"}}"#),
+                ),
+                (true, "/upload.php") => {
+                    reply(302, Some("torrents.php?id=10&torrentid=20"), String::new())
+                }
+                _ => reply(404, None, String::new()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Um cenário de ponta a ponta, pela API.
+    async fn envio_ao_bj_mostra_a_previa_envia_e_semeia_o_torrent_gerado() {
+        let Some(db) = acervo_store::testing::TestDb::new("para_lancar_envio_bj").await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("acervo-envio-bj-{}", std::process::id()));
+        let content = dir.join("Raiz");
+        std::fs::create_dir_all(&content).unwrap();
+        if small_video(&content.join("Filme.mkv")).is_none() {
+            db.drop().await;
+            return;
+        }
+        let store = &db.store;
+        let (web, base) = serve(&db).await;
+        let fake = Arc::new(FakeBj::default());
+        web.catalog
+            .insert(crate::api::Entry {
+                indexer: Arc::clone(&fake) as Arc<dyn acervo_indexers::Indexer>,
+                capabilities: acervo_indexers::Capabilities::default(),
+            })
+            .unwrap();
+        // Hash só deste teste: a posse do par é do processo, e outro teste usa
+        // o "e" no BJ.
+        let hash = "0".repeat(40);
+        let server = qbit_with_files(&hash, dir.to_str().unwrap(), &["Raiz/Filme.mkv"]).await;
+        {
+            use wiremock::matchers::method;
+            use wiremock::{Mock, ResponseTemplate};
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+                .with_priority(10)
+                .mount(&server)
+                .await;
+        }
+        point_to(&web, &server).await;
+        let generated = torrent("Raiz", &[("Filme.mkv", 100)], "gerado");
+        store
+            .upsert_launch_state(&hash, BJ, LaunchState::Pronto, None, None)
+            .await
+            .unwrap();
+        store
+            .save_launch_torrent(&hash, BJ, &generated)
+            .await
+            .unwrap();
+        let mediainfo = "General\nFormat : Matroska\n\nVideo\nFormat : AVC\nWidth : 1 920 pixels\nHeight : 1 080 pixels\n\nAudio\nFormat : AC-3\nLanguage : English\n";
+        store
+            .save_launch_fields(
+                &hash,
+                BJ,
+                &json!({
+                    "release": "Film.2024.1080p.AMZN.WEB-DL.DDP5.1.H.264-GRP", "ano": "2024",
+                    "imdb": "https://www.imdb.com/title/tt1234567/", "mediainfo": mediainfo,
+                    "sinopse": "Sinopse do pacote.",
+                }),
+            )
+            .await
+            .unwrap();
+        store
+            .save_launch_report(
+                &hash,
+                BJ,
+                &json!({ "tipo": "filme", "audio": "legendado", "checks": [] }),
+            )
+            .await
+            .unwrap();
+        let http = reqwest::Client::new();
+        let url = format!("{base}/{hash}/{BJ}/envio-ao-site");
+
+        // A prévia: só leituras do site, nada publicado.
+        let (status, body) = call(&http, reqwest::Method::GET, &url).await;
+        assert_eq!(status, 200, "{body}");
+        let draft = &body["previa"];
+        assert_eq!(draft["faltando"], json!([]), "{body}");
+        assert_eq!(draft["nome"], "Film");
+        assert!(
+            !body.to_string().contains("abc123"),
+            "o auth não sai: {body}"
+        );
+        // A página do formulário e o IMDb: nenhuma captura, nenhum envio.
+        assert_eq!(fake.seen.lock().unwrap().len(), 2);
+
+        // O envio: capturas PNG no site, o POST e o .torrent gerado semeado.
+        let (status, body) = call(&http, reqwest::Method::POST, &url).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["site_id"], "20");
+        assert_eq!(body["aviso"], Value::Null, "{body}");
+        let launch = store.launch(&hash, BJ).await.unwrap().unwrap();
+        assert_eq!(launch.state, LaunchState::Enviado);
+        assert_eq!(launch.site_id.as_deref(), Some("20"));
+        let seen = fake.seen.lock().unwrap().clone();
+        let shots: Vec<&String> = seen
+            .iter()
+            .filter(|(p, _)| p.contains("screen_up"))
+            .map(|(_, body)| body)
+            .collect();
+        assert_eq!(shots.len(), super::super::SCREEN_COUNT);
+        assert!(
+            shots.iter().all(|b| b.contains(".png(image/png)")),
+            "{shots:?}"
+        );
+        let (_, sent) = seen
+            .iter()
+            .rfind(|(p, b)| p == "/upload.php" && !b.is_empty())
+            .unwrap();
+        for part in [
+            "submit=true&auth=abc123&file_input=@Film.2024.1080p.AMZN.WEB-DL.DDP5.1.H.264-GRP.torrent(application/x-bittorrent)",
+            "type=0",
+            "imdblink=tt1234567",
+            "title=Film",
+            "titulobrasileiro=Filme",
+            "qualidade=WEB-DL",
+            "release=Amazon",
+            "audio=Legendado",
+            "codecvideo=H.264",
+            "codecaudio=AC3",
+            "idioma=Inglês",
+            "sinopse=Sinopse do pacote.",
+            "image=https://image.tmdb.org/t/p/original/capa.jpg",
+            "screenshots[]=https://img.invalid/4.png",
+        ] {
+            assert!(sent.contains(part), "{part} em {sent}");
+        }
+
+        // Já enviado: não envia de novo.
+        let (status, body) = call(&http, reqwest::Method::POST, &url).await;
+        assert_eq!(status, 409, "{body}");
         std::fs::remove_dir_all(&dir).ok();
         db.drop().await;
     }
