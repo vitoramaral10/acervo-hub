@@ -1508,11 +1508,82 @@ pub(crate) async fn host_screenshot(
 /// O `POST upload.php`. `Ok` com o id do torrent criado. Sem resposta (rede,
 /// sessão, espera do indexador) a recusa não é certa: a requisição pode ter
 /// chegado.
-pub(crate) async fn publish(catalog: &Catalog, parts: Vec<SitePart>) -> Result<String, Refusal> {
+///
+/// O BJ aceita o envio com uma página "Atenção" (HTTP 200), não com o
+/// redirect do Gazelle: sem resposta legível num 200, o torrent é procurado
+/// no grupo do IMDB por um dos `names` (o release e o nome do `.torrent`).
+pub(crate) async fn publish(
+    catalog: &Catalog,
+    imdb_id: &str,
+    names: &[String],
+    parts: Vec<SitePart>,
+) -> Result<String, Refusal> {
     let response = request(catalog, SiteRequest::multipart(UPLOAD_PAGE, parts))
         .await
         .map_err(|error| Refusal::unknown(format!("{error:#}")))?;
-    created(&response)
+    match created(&response) {
+        Err(refusal) if !refusal.certain && response.status == 200 => {
+            match find_uploaded(catalog, imdb_id, names).await {
+                Ok(Some(id)) => Ok(id),
+                Ok(None) => Err(refusal),
+                Err(error) => {
+                    tracing::warn!("conferindo o envio no grupo do BJ: {error:#}");
+                    Err(refusal)
+                }
+            }
+        }
+        outcome => outcome,
+    }
+}
+
+/// O id do torrent enviado, no grupo que a busca pelo IMDB abre (com um só
+/// grupo, `searchstr` redireciona para ele). `None` se não estiver lá.
+async fn find_uploaded(
+    catalog: &Catalog,
+    imdb_id: &str,
+    names: &[String],
+) -> Result<Option<String>> {
+    let search = format!("/torrents.php?searchstr={imdb_id}");
+    let mut response = request(catalog, SiteRequest::get(search)).await?;
+    if (300..400).contains(&response.status) {
+        let Some(group) = response.location.as_deref().and_then(group_path) else {
+            return Ok(None);
+        };
+        response = request(catalog, SiteRequest::get(group)).await?;
+    }
+    if response.status != 200 {
+        return Ok(None);
+    }
+    let page = response.text();
+    Ok(names.iter().find_map(|name| uploaded_id(&page, name)))
+}
+
+/// O caminho do grupo no `Location` da busca (`torrents.php?id=<grupo>`).
+fn group_path(location: &str) -> Option<String> {
+    let query = location.split_once("torrents.php?")?.1;
+    query
+        .starts_with("id=")
+        .then(|| format!("/torrents.php?{query}"))
+}
+
+/// O id da linha do grupo cujo `data-torrentname` é `name`, escapado como o
+/// site escreve (`htmlspecialchars`): `id="torrent<id>"` vem antes, na mesma
+/// tag.
+fn uploaded_id(page: &str, name: &str) -> Option<String> {
+    let escaped = name
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#039;");
+    let at = page.find(&format!(r#" data-torrentname="{escaped}""#))?;
+    let tag = &page[page[..at].rfind('<')?..at];
+    let start = tag.rfind(r#"id="torrent"#)? + r#"id="torrent"#.len();
+    let id: String = tag[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    (!id.is_empty() && tag[start + id.len()..].starts_with('"')).then_some(id)
 }
 
 #[cfg(test)]
@@ -1897,6 +1968,54 @@ Language                                 : English
             &parts[1].value,
             acervo_indexers::SitePartValue::Text(t) if t == "abc123"
         ));
+    }
+
+    /// Duas linhas do grupo como o BJ as escreve: um release de um arquivo só
+    /// (com a extensão e o apóstrofo escapado) e um de pasta.
+    const GROUP_ROWS: &str = r#"<tr class="torrent_row releases_0 groupid_445908 group_torrent "
+        style="font-weight: normal; " id="torrent770856" data-torrentname="Now.You.See.Me.Now.You.Don&#039;t.2025.UHD.BluRay.2160p.REMUX-FraMeSToR.mkv">
+        <td><span>[ <a href="torrents.php?action=download&amp;id=770856">DL</a></span></td></tr>
+        <tr class="torrent_row releases_0 groupid_445908 group_torrent "
+        style="font-weight: normal; " id="torrent815102" data-torrentname="Now.You.See.Me.Now.You.Dont.2025.UHD.BluRay.2160p.x265-hallowed">
+        <td>x</td></tr>"#;
+
+    #[test]
+    fn envio_sem_redirect_e_achado_pelo_nome_no_grupo() {
+        assert_eq!(
+            uploaded_id(
+                GROUP_ROWS,
+                "Now.You.See.Me.Now.You.Dont.2025.UHD.BluRay.2160p.x265-hallowed"
+            ),
+            Some("815102".into())
+        );
+        // O nome com apóstrofo vem escapado no atributo.
+        assert_eq!(
+            uploaded_id(
+                GROUP_ROWS,
+                "Now.You.See.Me.Now.You.Don't.2025.UHD.BluRay.2160p.REMUX-FraMeSToR.mkv"
+            ),
+            Some("770856".into())
+        );
+        // Prefixo de outro nome não é o release.
+        assert_eq!(
+            uploaded_id(GROUP_ROWS, "Now.You.See.Me.Now.You.Dont.2025.UHD"),
+            None
+        );
+        assert_eq!(uploaded_id(GROUP_ROWS, "Outro.Filme.2025"), None);
+        // O id tem de estar na mesma tag do nome.
+        let apart = r#"<tr id="torrent1"></tr><tr data-torrentname="Filme">"#;
+        assert_eq!(uploaded_id(apart, "Filme"), None);
+
+        assert_eq!(
+            group_path("https://bj-share.info/torrents.php?id=445908"),
+            Some("/torrents.php?id=445908".into())
+        );
+        assert_eq!(
+            group_path("torrents.php?id=540653"),
+            Some("/torrents.php?id=540653".into())
+        );
+        assert_eq!(group_path("torrents.php?searchstr=tt1"), None);
+        assert_eq!(group_path("login.php"), None);
     }
 
     #[test]

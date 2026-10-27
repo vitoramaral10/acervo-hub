@@ -766,7 +766,12 @@ Toma a posse do par, refaz o rascunho (a prévia não é confiada) e recusa com
 4. A resposta:
    - **Sucesso:** redirect para `torrents.php?id=<grupo>[&torrentid=<torrent>]`.
      O `site_id` é o `torrentid` quando vem, senão o id do grupo, gravado com
-     o estado `enviado` numa escrita só.
+     o estado `enviado` numa escrita só. O BJ, na prática, aceita com uma
+     página "Atenção" (HTTP 200) e sem redirect: aí o acervo busca o IMDB
+     (`torrents.php?searchstr=<imdb>`, que com um só grupo redireciona para
+     ele) e acha a linha do grupo cujo `data-torrentname` é o release ou o
+     nome do `.torrent` (`id="torrent<id>"`). Achou, é o `site_id`; não
+     achou (busca com vários grupos, rede), segue incerta.
    - **Recusa certa:** só a página do formulário de volta (`id="upload_table"`)
      com o erro que o Gazelle escreve em `<p style="color: red">` lido. A marca
      é limpa e a mensagem vira o erro do pacote.

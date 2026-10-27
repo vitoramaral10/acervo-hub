@@ -1234,7 +1234,14 @@ async fn upload_bj(web: &Web, store: &Store, launch: &Launch) -> WebResult {
         .ok_or_else(|| conflict("o pacote não tem .torrent: prepare de novo"))?;
     let screenshots = host_screenshots(web, launch, draft.capturas, Site::Bj).await?;
     let parts = super::bj::parts(&draft, torrent.clone(), &torrent_name(launch), &screenshots);
-    let publishing = super::bj::publish(&web.catalog, parts);
+    // O nome que o site mostra: o release, ou o do `.torrent` (no de um
+    // arquivo só, o arquivo com a extensão).
+    let mut names = vec![package.release.clone()];
+    names.extend(
+        acervo_clients::layout(&torrent)
+            .and_then(|files| Some(files.first()?.0.split('/').next()?.to_owned())),
+    );
+    let publishing = super::bj::publish(&web.catalog, &package.imdb_id, &names, parts);
     let (id, launch) = publish_and_mark(store, launch, Site::Bj, publishing).await?;
     // Daqui em diante o envio existe: falha ao semear é aviso, nunca erro.
     let (seeded, warning) = seed_or_warn(web, store, &launch, Ok(torrent)).await;
@@ -2886,15 +2893,15 @@ mod tests {
                     );
                 }
             }
-            // A duração gravada no laudo manda: 400 s de duração levam ao fim
-            // do vídeo de 4 s, que não tem quadro, e a rota diz que falhou.
+            // A duração gravada no laudo manda: 4000 s levam além do fim do
+            // vídeo de 4 s, e a captura é o último quadro-chave dele, em PNG.
             store
                 .save_launch_report(&hash, BJ, &json!({ "capturas": { "duracao": 4000.0 } }))
                 .await
                 .unwrap();
-            let (status, body) = call(&http, reqwest::Method::GET, &url("1.png")).await;
-            assert_eq!(status, 502, "{body}");
-            assert!(!body.to_string().contains(dir.to_str().unwrap()), "{body}");
+            let response = get("1.png").send().await.unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            assert_eq!(response.headers()["content-type"], "image/png");
             // Nada foi gravado ao lado do vídeo.
             let after: Vec<_> = std::fs::read_dir(&content).unwrap().flatten().collect();
             assert_eq!(before.len(), after.len());
@@ -3115,10 +3122,13 @@ mod tests {
     }
 
     /// Um BJ de mentira: responde ao `upload.php` e ao `ajax.php` como o site
-    /// e guarda o que recebeu, sem nada de rede.
+    /// e guarda o que recebeu, sem nada de rede. Com `warning`, aceita o envio
+    /// como o BJ de verdade: página "Atenção" (200), e o torrent no grupo que
+    /// a busca pelo IMDB abre.
     #[derive(Debug, Default)]
     struct FakeBj {
         seen: std::sync::Mutex<Vec<(String, String)>>,
+        warning: bool,
     }
 
     #[async_trait::async_trait]
@@ -3183,12 +3193,110 @@ mod tests {
                     None,
                     format!(r#"{{"url":"https://img.invalid/{shots}.png"}}"#),
                 ),
+                (true, "/upload.php") if self.warning => reply(
+                    200,
+                    None,
+                    "<html><head><title>Atenção :: BJ-Share</title></head></html>".to_owned(),
+                ),
                 (true, "/upload.php") => {
                     reply(302, Some("torrents.php?id=10&torrentid=20"), String::new())
                 }
+                (false, "/torrents.php?searchstr=tt1234567") if self.warning => reply(
+                    302,
+                    Some("https://bj.invalid/torrents.php?id=30"),
+                    String::new(),
+                ),
+                (false, "/torrents.php?id=30") if self.warning => reply(
+                    200,
+                    None,
+                    r#"<tr class="group_torrent" id="torrent31" data-torrentname="Outro.2024.1080p-X">
+                    <tr class="group_torrent" id="torrent32" data-torrentname="Raiz">"#
+                        .to_owned(),
+                ),
                 _ => reply(404, None, String::new()),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn envio_ao_bj_aceito_com_pagina_de_atencao_acha_o_torrent_no_grupo() {
+        let Some(db) = acervo_store::testing::TestDb::new("para_lancar_envio_bj_atencao").await
+        else {
+            return;
+        };
+        let dir =
+            std::env::temp_dir().join(format!("acervo-envio-bj-atencao-{}", std::process::id()));
+        let content = dir.join("Raiz");
+        std::fs::create_dir_all(&content).unwrap();
+        if small_video(&content.join("Filme.mkv")).is_none() {
+            db.drop().await;
+            return;
+        }
+        let store = &db.store;
+        let (web, base) = serve(&db).await;
+        let fake = Arc::new(FakeBj {
+            warning: true,
+            ..FakeBj::default()
+        });
+        web.catalog
+            .insert(crate::api::Entry {
+                indexer: Arc::clone(&fake) as Arc<dyn acervo_indexers::Indexer>,
+                capabilities: acervo_indexers::Capabilities::default(),
+            })
+            .unwrap();
+        let hash = "7".repeat(40);
+        let server = qbit_with_files(&hash, dir.to_str().unwrap(), &["Raiz/Filme.mkv"]).await;
+        {
+            use wiremock::matchers::method;
+            use wiremock::{Mock, ResponseTemplate};
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+                .with_priority(10)
+                .mount(&server)
+                .await;
+        }
+        point_to(&web, &server).await;
+        store
+            .upsert_launch_state(&hash, BJ, LaunchState::Pronto, None, None)
+            .await
+            .unwrap();
+        store
+            .save_launch_torrent(&hash, BJ, &torrent("Raiz", &[("Filme.mkv", 100)], "gerado"))
+            .await
+            .unwrap();
+        let mediainfo = "General\nFormat : Matroska\n\nVideo\nFormat : AVC\nWidth : 1 920 pixels\nHeight : 1 080 pixels\n\nAudio\nFormat : AC-3\nLanguage : English\n";
+        store
+            .save_launch_fields(
+                &hash,
+                BJ,
+                &json!({
+                    "release": "Film.2024.1080p.AMZN.WEB-DL.DDP5.1.H.264-GRP", "ano": "2024",
+                    "imdb": "https://www.imdb.com/title/tt1234567/", "mediainfo": mediainfo,
+                    "sinopse": "Sinopse do pacote.",
+                }),
+            )
+            .await
+            .unwrap();
+        store
+            .save_launch_report(
+                &hash,
+                BJ,
+                &json!({ "tipo": "filme", "audio": "legendado", "checks": [] }),
+            )
+            .await
+            .unwrap();
+
+        // O site mostra o torrent pelo nome do `.torrent` ("Raiz"): é a linha
+        // dele no grupo, não a de outro release.
+        let url = format!("{base}/{hash}/{BJ}/envio-ao-site");
+        let (status, body) = call(&reqwest::Client::new(), reqwest::Method::POST, &url).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["site_id"], "32", "{body}");
+        let launch = store.launch(&hash, BJ).await.unwrap().unwrap();
+        assert_eq!(launch.state, LaunchState::Enviado);
+        assert_eq!(launch.site_id.as_deref(), Some("32"));
+        std::fs::remove_dir_all(&dir).ok();
+        db.drop().await;
     }
 
     #[tokio::test]
