@@ -821,6 +821,15 @@ async fn clear_orphans(client: &QbitClient, source_path: &str) -> HashSet<String
         .unwrap_or_default()
 }
 
+/// O `source` do `.torrent` gerado: o que o site grava nele ao receber, para
+/// o hash do semeado ser o do site.
+const fn torrent_source(site: Site) -> Option<&'static str> {
+    match site {
+        Site::Bj => Some(bj::TORRENT_SOURCE),
+        Site::Amigos => None,
+    }
+}
+
 /// Cria o `.torrent` no qBittorrent e apaga a tarefa em qualquer desfecho,
 /// inclusive o desligamento (`cancel`). Tarefas do mesmo pacote deixadas por
 /// uma queda anterior saem antes. Se o `addTask` falha sem resposta
@@ -831,11 +840,13 @@ async fn create_torrent(
     job: &mut Job<'_>,
     source_path: &str,
     announce: String,
+    source: Option<&str>,
     cancel: &Cancel,
 ) -> Result<Vec<u8>> {
     ensure!(!cancel.is_cancelled(), INTERRUPTED);
     let before = clear_orphans(client, source_path).await;
-    let options = CreateTorrentOptions::new(source_path, vec![announce]);
+    let mut options = CreateTorrentOptions::new(source_path, vec![announce]);
+    options.source = source.map(str::to_owned);
     let task = match client.create_torrent_task(&options).await {
         Ok(task) => task,
         Err(error) => {
@@ -1590,6 +1601,73 @@ pub(crate) async fn seed_package(
     .await
 }
 
+/// Tira do cliente, sem os arquivos, o `.torrent` gerado do pacote quando o
+/// site entregou outro hash: o gerado não registra no tracker, e
+/// [`seed_into`] o tomaria pelo do site (mesmo tracker, mesmos arquivos).
+///
+/// Só sai o que é só deste destino. O hash da origem, ou um que também semeia
+/// para outro site (sem `source`, o gerado do BJ podia sair igual ao do
+/// Amigos), fica, e o erro pede para tirar o tracker à mão; sem o tracker
+/// deste site ele não é mais adotado, e nada precisa sair.
+pub(crate) async fn drop_replaced(
+    config: &Config,
+    store: &Store,
+    launch: &Launch,
+    generated: &[u8],
+    site_hash: &str,
+) -> Result<()> {
+    let Some(hash) = acervo_clients::info_hash(generated) else {
+        return Ok(());
+    };
+    let Some(key) = acervo_clients::announce(generated).and_then(|url| tracker_key(&url)) else {
+        return Ok(());
+    };
+    if hash.eq_ignore_ascii_case(site_hash) {
+        return Ok(());
+    }
+    let client = crate::grab::qbit(config).await?;
+    let torrents = client.torrents().await.context("lendo o cliente")?;
+    let Some(stale) = torrents.iter().find(|t| t.hash.eq_ignore_ascii_case(&hash)) else {
+        return Ok(());
+    };
+    let trackers = client
+        .trackers(&stale.hash)
+        .await
+        .context("lendo os trackers do .torrent gerado")?;
+    let keys: Vec<Option<String>> = trackers
+        .iter()
+        .filter(|t| t.is_real())
+        .map(|t| tracker_key(&t.url))
+        .collect();
+    if !keys.iter().any(|k| k.as_deref() == Some(key.as_str())) {
+        return Ok(());
+    }
+    let own_tag = acervo_core::seed_tag(&launch.indexer);
+    let other_site = stale
+        .tags
+        .split(',')
+        .map(str::trim)
+        .any(|tag| tag.starts_with(acervo_core::SEED_TAG_PREFIX) && tag != own_tag);
+    let other_tracker = keys.iter().any(|k| k.as_deref() != Some(key.as_str()));
+    ensure!(
+        !hash.eq_ignore_ascii_case(&launch.hash) && !other_site && !other_tracker,
+        "o .torrent gerado ({}) também semeia para outro destino: tire dele o tracker \
+         deste site à mão e envie de novo o .torrent do site",
+        &hash[..8]
+    );
+    // O par que o cross-seed achou nele volta a ser procurado: apontando para
+    // um torrent que saiu, o pacote nunca chegaria a `semeando`.
+    store
+        .forget_cross_seed(&stale.hash)
+        .await
+        .context("esquecendo o irmão do .torrent gerado")?;
+    client
+        .delete(&[DownloadHash::new(stale.hash.clone())], false)
+        .await
+        .context("tirando do cliente o .torrent gerado que o site trocou")?;
+    Ok(())
+}
+
 /// [`seed_package`] sobre um cliente já aberto e sua lista de torrents.
 async fn seed_into(
     client: &QbitClient,
@@ -2133,7 +2211,15 @@ async fn prepare(config: &Config, catalog: &Catalog, job: &mut Job<'_>) -> Resul
         ),
         None => (source_path(torrent, &files), origin_layout(&files)),
     };
-    let bytes = create_torrent(&client, job, &path, announce, &SHUTDOWN).await?;
+    let bytes = create_torrent(
+        &client,
+        job,
+        &path,
+        announce,
+        torrent_source(site),
+        &SHUTDOWN,
+    )
+    .await?;
     ensure!(
         has_layout(&bytes, &expected),
         "o .torrent gerado não tem os mesmos arquivos da {}; nada foi guardado",
@@ -2578,6 +2664,7 @@ mod tests {
             &mut job,
             "/media/Filme",
             "https://t.exemplo/announce".into(),
+            None,
             &cancel,
         )
         .await;
@@ -2588,9 +2675,16 @@ mod tests {
         // O `expect(1)` do deleteTask é conferido ao soltar o servidor.
         drop(server);
         // Já desligado, nem cria a tarefa.
-        let again = create_torrent(&client, &mut job, "/media/Filme", "x".into(), &cancel).await;
+        let again =
+            create_torrent(&client, &mut job, "/media/Filme", "x".into(), None, &cancel).await;
         assert!(again.is_err());
         db.drop().await;
+    }
+
+    #[test]
+    fn torrent_do_bj_sai_com_o_source_que_o_site_grava() {
+        assert_eq!(torrent_source(Site::Bj), Some("BJ"));
+        assert_eq!(torrent_source(Site::Amigos), None);
     }
 
     /// Um qBittorrent de mentira com login e a lista de tarefas dada.
@@ -2663,6 +2757,7 @@ mod tests {
             &mut job,
             "/media/Filme",
             "https://t.exemplo/announce".into(),
+            None,
             &cancel,
         )
         .await;
@@ -2734,6 +2829,7 @@ mod tests {
             &mut job,
             "/media/Filme",
             "https://t.exemplo/announce".into(),
+            None,
             &Cancel::default(),
         )
         .await;

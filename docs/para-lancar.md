@@ -127,7 +127,9 @@ gravação do desfecho que falhou) é resgatado para `falhou` pelas rotas.
    para ler o announce". Cria pelo qBittorrent:
    `torrentcreator/addTask` com `sourcePath = content_path`, `format = v1`,
    `pieceSize = 0` (automático), `optimizeAlignment = false`, `private = true`,
-   `startSeeding = false`, `trackers = announce`; acompanha
+   `startSeeding = false`, `trackers = announce` e, no BJ, `source = BJ` (o
+   campo que o BJ grava no `.torrent` recebido: sem ele o hash muda no site);
+   acompanha
    `torrentcreator/status` a cada 5 s (teto 2 h); baixa
    `torrentcreator/torrentFile`; apaga a tarefa (`deleteTask`, com repetição) em qualquer
    desfecho, e antes de criar apaga tarefas do mesmo `sourcePath` que uma queda
@@ -562,7 +564,12 @@ torrent não privado, e então o hash publicado tende a ser o mesmo.
   `layout(bytes)` igual ao do pacote (origem ou pasta adaptada); diferente →
   400 dizendo o que difere. Igual → adiciona do mesmo jeito (parado,
   conferido, só inicia com 100%) e passa o pacote a `enviado` se ainda não
-  estava.
+  estava. Antes, o `.torrent` gerado de outro hash que ainda tem o tracker do
+  destino sai do cliente (sem os arquivos) e o achado do cross-seed nele é
+  esquecido: senão ele seria adotado no lugar do do site. Se o gerado também
+  semeia para outro destino (a origem, tag de semear ou tracker de outro
+  site), nada sai nem entra, e o erro pede para tirar dele o tracker deste
+  site à mão e enviar de novo.
 - **Status do tracker no pacote:** o detalhe mostra, para o torrent semeado
   (o gerado ou o do site), o status do tracker do destino (funcionando, não
   registrado, erro), sem a URL. "Não registrado" logo após o envio é
@@ -767,11 +774,15 @@ Toma a posse do par, refaz o rascunho (a prévia não é confiada) e recusa com
      e o redirect para `upload.php`, além de rede ou sessão. A marca fica, e o
      erro pede para conferir os envios no BJ, como no Amigos. Num redirect
      inesperado a mensagem traz só o caminho do `Location`, sem a query (pode
-     levar `authkey` ou `torrent_pass`).
+     levar `authkey` ou `torrent_pass`); numa página que não é o formulário,
+     o `<title>` dela.
 5. Semeia o `.torrent` **gerado** (o mesmo caminho de "Marquei como
-   enviado"): o BJ só entrega o `.torrent` publicado com passkey. Se o site
-   trocar o hash, o cross-seed adota o publicado (o par voltou a ser
-   procurado, urgente). Falha ao semear é aviso, nunca erro.
+   enviado"): o BJ só entrega o `.torrent` publicado com passkey. O gerado
+   sai do preparo com `source = BJ`, então o hash é o do site. Sem o
+   `source` (pacote preparado antes de 27/10/2026), o BJ grava o campo, o
+   hash muda, a resposta é 200 com a página do torrent novo (envio incerto)
+   e o gerado fica "Torrent não registrado" no tracker: o conserto é
+   "Enviar o .torrent do site". Falha ao semear é aviso, nunca erro.
 
 ### Tela
 
