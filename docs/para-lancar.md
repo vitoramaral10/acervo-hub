@@ -255,12 +255,12 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
   Temporada já exibida: pack completo (o que não cobre os episódios exibidos
   → Fail), episódio → Fail. Série em andamento sem episódio futuro no catálogo
   (a data pode só não ter saído) → Warn nos dois.
-- **15.2.5** encode de Blu-ray (não REMUX) em 720p, 1080p e 2160p (a regra
-  não tem número para 2160p; a staff aplica o de 1080p, resposta de 26/10):
+- **15.2.5** encode de Blu-ray (não REMUX) em 720p, 1080p e 2160p (o 2160p
+  tem número próprio desde 28/10: 10000/7000):
   pelo bitrate do vídeo (`bit_rate` ou a tag `BPS` do MKV), abaixo do mínimo
-  de animação (3500/6000 kbps) → Warn e a source vai como **BRRip** no nome
+  de animação (3500/6000/7000 kbps) → Warn e a source vai como **BRRip** no nome
   (16.6; a staff mandou renomear e lançar o Frozen II), abaixo do geral
-  (5000/8000) → Warn (só animação passa como BluRay). Sem o bitrate do vídeo, vale o médio do arquivo
+  (5000/8000/10000) → Warn (só animação passa como BluRay). Sem o bitrate do vídeo, vale o médio do arquivo
   inteiro, que o áudio infla: só reprova abaixo do de animação e avisa abaixo
   do geral. O Frozen II 2160p tinha 15,8 Mb/s no arquivo e 5998 kb/s no vídeo.
 - **15.2.6** REMUX sem áudio PT → Warn (só se a obra nunca teve dublagem).
@@ -283,25 +283,30 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
     arquivo, qualquer que seja a etiqueta do site (Balls Up, 26/10);
   - **15.3.4** source inferior (abaixo de WEB-DL/Blu-ray, BRRip pela 15.2.5,
     ou abaixo de 720p) com uma superior de mesma resolução ou maior no site →
-    Fail;
+    Fail. Título do site sem source (o parser lê HDTV) ou sem resolução (lê
+    480p) conta como superior: o Toy Story 4 BRRip foi apagado contra um
+    "HDR WEB-DL" sem resolução (28/10);
   - **15.3.3** só dublado ou só legendado com DUAL na mesma resolução → Fail;
-  - **15.3.2** 720p: já há 720p → Fail; há 1080p/2160p com áudio igual ou
-    melhor → Fail **15.3.5**; senão Warn **15.3.5** (Trumpable);
-  - **15.3.2** 1080p WEB-DL: uma vaga para H.264 e uma para H.265, em filme e
-    em série, sem olhar o tamanho (a staff, em 26/10, sobre o Cangaço Novo
-    S01). A vaga do nosso codec ocupada → Fail; título do site sem codec ocupa
-    a vaga. x265 só dublado ou só legendado com DUAL no site → Fail;
-  - **15.3.2** 2160p: uma vaga SDR e uma DV + HDR, pela faixa dinâmica do
-    título (e do arquivo, no nosso; "Dolby Vision" por extenso conta). Mesma
-    vaga ocupada → Fail. Só HDR e só DV ocupam, provisórios, a vaga do
-    híbrido, e o nosso não-SDR contra qualquer não-SDR do site → Fail; a regra
-    deixa o híbrido substituir um só HDR, mas a staff apagou o Avatar Aang
-    assim (26/10), então a substituição fica para o usuário fazer à mão.
-    Título do site sem faixa (o site nunca escreve "SDR") ocupa as duas vagas
-    → Fail. Só HDR ou só DV com a vaga livre → Warn;
-  - outras resoluções e 1080p fora de WEB-DL: a comparação genérica (mesma
-    resolução, source e áudio; tamanho a menos de 10% e mesmo codec → Fail
-    "duplicado provável", senão Warn), na regra **15.3.1**;
+  - **15.3.2** (regra de 28/10) cada título tem vagas por resolução, source e
+    codec: 2160p Full Disc 1, REMUX 1, encode 1 (só x265; x264 → Fail),
+    WEB-DL 2 (H.265 e H.264); 1080p Full Disc 1, REMUX 1, encode 2 (x264 e
+    x265), WEB-DL 2 (H.264 e H.265); 720p 1, qualquer source. Ocupa a vaga o
+    release do site na mesma linha e no mesmo codec; título sem codec ou sem
+    source ocupa (Cangaço Novo S01, 26/10). O nosso só entra se for melhor
+    que cada ocupante, nesta ordem: DUAL completo contra não DUAL; HDR contra
+    SDR (fora do 2160p; título sem faixa é SDR); pelo menos 1,5 vez o
+    tamanho. Senão → Fail, e a vaga fica com o mais antigo. Entrando, Ok com
+    quem ele substitui;
+  - **15.3.2** em 2160p o nível da faixa vem antes: DV + HDR, depois só HDR
+    ou só DV, depois SDR (pelo título e, no nosso, pelo arquivo; "Dolby
+    Vision" por extenso conta). Nível abaixo → Fail; título do site sem faixa
+    conta como o nível mais alto. SDR com qualquer HDR da obra no site em
+    2160p → Fail. DV + HDR sobre um só HDR ou só DV → Warn: a regra manda
+    substituir, mas o título do site já trocou a faixa (Avatar Aang, 26/10);
+  - BRRip, WEBRip, HDTV e afins (sem vaga) e resoluções fora de 720p, 1080p e
+    2160p: a comparação genérica (mesma resolução, source e áudio; tamanho a
+    menos de 10% e mesmo codec → Fail "duplicado provável", senão Warn), na
+    regra **15.3.1**;
   - release do destino sem resolução no título conta como de resolução
     desconhecida e entra na comparação (torrent 52763).
 - Sai a antiga 3.9: DUAL sem legenda é DUAL (15.2.15), e o envio não troca

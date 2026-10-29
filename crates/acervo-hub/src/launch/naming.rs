@@ -88,7 +88,7 @@ fn title_words(title: &str) -> Vec<String> {
 /// 16.7, na grafia da regra.
 const SERVICES: [&str; 27] = [
     "AMZN", "ATVP", "ATV", "BAND", "BELA", "BP", "CTVP", "DSNP", "GLBO", "CR", "ADN", "iT", "FUNI",
-    "B-Global", "HMAX", "HULU", "ITAU", "MPL", "NF", "PCOK", "PLTV", "PMTP", "RCRD", "TLBR",
+    "B-Global", "HMAX", "HULU", "ITAU", "MPL", "NF", "PCOK", "BCORE", "PMTP", "RCRD", "TLBR",
     "VIKI", "MAX", "AO",
 ];
 
@@ -96,7 +96,7 @@ const SERVICES: [&str; 27] = [
 /// (a sigla do release original é preservada, 16.6), com aviso.
 const OTHER_SERVICES: [&str; 22] = [
     "STAN", "CRAV", "iP", "SHO", "HTSR", "JC", "ROKU", "TUBI", "MUBI", "CC", "AMC", "DCU", "SKST",
-    "NOW", "BCORE", "CRKL", "VRV", "HBO", "DSNY", "APTN", "RED", "PCOCK",
+    "NOW", "PLTV", "CRKL", "VRV", "HBO", "DSNY", "APTN", "RED", "PCOCK",
 ];
 
 /// Edições de 16.14, como aparecem no nome (minúsculas, em tokens) e como o
