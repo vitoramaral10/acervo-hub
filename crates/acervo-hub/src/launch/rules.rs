@@ -1444,7 +1444,8 @@ fn amigos_series_scope(ctx: &Context<'_>) -> Option<Check> {
 fn bluray_minimum(resolution: u16) -> Option<(u64, u64)> {
     match resolution {
         720 => Some((5000, 3500)),
-        1080 | 2160 => Some((8000, 6000)),
+        1080 => Some((8000, 6000)),
+        2160 => Some((10000, 7000)),
         _ => None,
     }
 }
@@ -1594,22 +1595,17 @@ fn editions(title: &str) -> Vec<&'static str> {
 
 /// Duplicidade e substituição no Amigos (15.3). Na ordem: fonte inferior
 /// com uma superior no site (15.3.4); dublado ou legendado com DUAL na mesma
-/// resolução (15.3.3); e o limite por resolução (15.3.2): 720p só um, 1080p
-/// WEB-DL até dois por codec com 2 GB de diferença (6 GB no pack), 2160p um
-/// SDR e um DV + HDR. Edição diferente nunca é duplicidade.
+/// resolução (15.3.3); e as vagas da 15.3.2, por resolução, source e codec,
+/// em que o novo só entra se for melhor que o ocupante. Edição diferente
+/// nunca é duplicidade.
 #[allow(clippy::too_many_lines)]
 fn amigos_duplicate(ctx: &Context<'_>) -> Check {
     const RULE: &str = "15.3";
-    const TRUMPABLE_720: &str = "720p entra como Trumpable: sai quando chegar 1080p ou 2160p";
     let Some(audio) = ctx.audio else {
         return Check::warn(RULE, "sem vídeo lido, não dá para comparar com o destino");
     };
     if ctx.facts.destination.is_empty() {
-        return if ctx.resolution == 720 {
-            Check::warn("15.3.5", TRUMPABLE_720)
-        } else {
-            Check::ok(RULE, "o Amigos não tem outro release desta obra")
-        };
+        return Check::ok(RULE, "o Amigos não tem outro release desta obra");
     }
     let ours_editions = editions(&ctx.facts.release_name);
     // DUAL completo (com a legenda PT, que em DUAL vai embutida) substitui o
@@ -1640,7 +1636,14 @@ fn amigos_duplicate(ctx: &Context<'_>) -> Check {
     // lugar de um 2160p BRRip.
     if (ctx.brrip || inferior(source, ctx.resolution))
         && let Some(better) = same_cut.iter().find(|d| {
-            !inferior(d.quality.source(), d.quality.resolution())
+            // Sem source no título, pode ser WEB-DL; sem resolução, o parser
+            // lê 480p: os dois contam como superior (Toy Story 4, 28/10).
+            let resolution = if title_has_resolution(&d.title) {
+                d.quality.resolution()
+            } else {
+                0
+            };
+            (!inferior(d.quality.source(), resolution) || site_source_unknown(d))
                 && (d.quality.resolution() >= ctx.resolution || !title_has_resolution(&d.title))
         })
     {
@@ -1721,51 +1724,89 @@ fn amigos_duplicate(ctx: &Context<'_>) -> Check {
         .copied()
         .filter(|d| maybe_same_resolution(ctx, d))
         .collect();
-    match ctx.resolution {
-        720 => {
-            if let Some(found) = same_resolution.first() {
-                return Check::fail(
-                    "15.3.2",
-                    format!(
-                        "720p só tem um lançamento no Amigos, e ele já existe: \"{}\"",
-                        found.title
-                    ),
-                );
-            }
-            let rank = |a: AudioKind| u8::from(a == AudioKind::Dual);
-            if let Some(found) = same_cut
-                .iter()
-                .find(|d| d.quality.resolution() >= 1080 && rank(d.audio) >= rank(audio))
-            {
-                return Check::fail(
-                    "15.3.5",
-                    format!(
-                        "720p é substituído por 1080p ou 2160p com áudio igual ou melhor, e o Amigos tem \"{}\"",
-                        found.title
-                    ),
-                );
-            }
-            Check::warn("15.3.5", TRUMPABLE_720)
-        }
-        1080 if source == Source::WebDl => {
-            // Uma vaga para H.264 e uma para H.265, em filme e em série, sem
-            // olhar o tamanho: a staff apagou o Cangaço Novo S01 (H.264, 10 GB
-            // maior) contra outro H.264 em 26/10. Título do site sem codec
-            // ocupa a vaga: não dá para provar que é do outro.
-            let codec = ctx.codec.map_or("o mesmo codec", Codec::label);
-            if let Some(found) = same_resolution.iter().find(|d| {
-                d.quality.source() == Source::WebDl
-                    && match (ctx.codec, d.codec) {
-                        (Some(a), Some(b)) => a == b,
-                        _ => true,
+    if !matches!(ctx.resolution, 720 | 1080 | 2160) {
+        return duplicate(ctx, Site::Amigos, "15.3.1");
+    }
+    let Some(slot) = Slot::of(ctx.quality) else {
+        // BRRip, WEBRip, HDTV e afins não têm vaga: a 15.3.4 já barrou o que
+        // tem superior no site.
+        return duplicate(ctx, Site::Amigos, "15.3.1");
+    };
+    let range_of = |d: &DestinationRelease| Range::from_title(&d.title, None);
+    let ours_range = Range::from_title(&ctx.facts.release_name, ctx.video().map(|v| v.hdr));
+    if ctx.resolution == 2160 && ours_range == Range::Sdr {
+        // Título do site sem faixa conta como HDR: o 4K de streaming quase
+        // sempre tem (Shadow Force, 26/10).
+        if let Some(found) = same_resolution.iter().find(|d| range_of(d) != Range::Sdr) {
+            return Check::fail(
+                "15.3.2",
+                format!(
+                    "2160p SDR só entra enquanto a obra não tem versão HDR, e o Amigos tem \"{}\"{}",
+                    found.title,
+                    if range_of(found) == Range::Unknown {
+                        " (sem a faixa no título, conta como HDR)"
+                    } else {
+                        ""
                     }
-            }) {
+                ),
+            );
+        }
+    }
+    // A linha da tabela: no 720p qualquer source divide a única vaga.
+    let row = if ctx.resolution == 720 {
+        "720p".to_owned()
+    } else {
+        format!("{} {}", ctx.resolution_label(), slot.label())
+    };
+    // Por codec só no encode 1080p e no WEB-DL; o encode 2160p é só x265.
+    let by_codec = ctx.resolution != 720
+        && (slot == Slot::WebDl || (slot == Slot::Encode && ctx.resolution == 1080));
+    if slot == Slot::Encode && ctx.resolution == 2160 && ctx.codec == Some(Codec::H264) {
+        return Check::fail("15.3.2", "o encode 2160p só tem vaga em x265");
+    }
+    // Título do site sem source ou sem codec ocupa a vaga: não dá para
+    // provar que é de outra (Cangaço Novo S01, 26/10).
+    let occupants: Vec<&DestinationRelease> = same_resolution
+        .iter()
+        .copied()
+        .filter(|d| {
+            ctx.resolution == 720 || site_source_unknown(d) || Slot::of(d.quality) == Some(slot)
+        })
+        .filter(|d| {
+            !by_codec
+                || match (ctx.codec, d.codec) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => true,
+                }
+        })
+        .collect();
+    let vaga = if by_codec {
+        format!(
+            "a vaga {row} {}",
+            ctx.codec.map_or("do mesmo codec", Codec::label)
+        )
+    } else {
+        format!("a vaga {row}")
+    };
+    let mut replaced: Vec<String> = Vec::new();
+    let mut hybrid_over_title = None;
+    for found in &occupants {
+        match slot_winner(ctx, audio, complete, ours_range, found) {
+            Some(why) => {
+                if ours_range == Range::Hybrid
+                    && matches!(range_of(found), Range::HdrOnly | Range::DvOnly)
+                {
+                    hybrid_over_title = Some(*found);
+                }
+                replaced.push(format!("\"{}\" ({why})", found.title));
+            }
+            None => {
                 return Check::fail(
                     "15.3.2",
                     format!(
-                        "1080p WEB-DL tem uma vaga para H.264 e uma para H.265, e a de {codec} já é de \"{}\"{}",
+                        "{vaga} já é de \"{}\"{}, e este não é melhor (DUAL, depois HDR, depois 1,5 vez o tamanho)",
                         found.title,
-                        if found.codec.is_none() {
+                        if found.codec.is_none() && by_codec {
                             " (o título do site não diz o codec)"
                         } else {
                             ""
@@ -1773,72 +1814,120 @@ fn amigos_duplicate(ctx: &Context<'_>) -> Check {
                     ),
                 );
             }
-            if ctx.codec == Some(Codec::H265)
-                && matches!(audio, AudioKind::Dublado | AudioKind::Legendado)
-                && let Some(dual) = same_cut.iter().find(|d| d.audio == AudioKind::Dual)
-            {
-                return Check::fail(
-                    "15.3.2",
-                    format!(
-                        "com DUAL no Amigos, o 1080p em x265 não pode ser só {}: \"{}\"",
-                        audio.label(),
-                        dual.title
-                    ),
-                );
-            }
-            Check::ok("15.3.2", format!("primeiro 1080p WEB-DL em {codec}"))
         }
-        2160 => {
-            let ours = Range::from_title(&ctx.facts.release_name, ctx.video().map(|v| v.hdr));
-            let theirs: Vec<(Range, &DestinationRelease)> = same_resolution
-                .iter()
-                .map(|d| (Range::from_title(&d.title, None), *d))
-                .collect();
-            // A vaga do SDR e a do híbrido. Só HDR e só DV ocupam, provisórios,
-            // a do híbrido, e a 15.3.2 deixa o híbrido substituí-los, mas a
-            // staff apagou como duplicado o Avatar Aang DV + HDR contra um 4K
-            // do site que o título ora dizia DV + HDR, ora só HDR10 (26/10).
-            // Título do site sem faixa pode ser qualquer uma: ocupa as duas.
-            let clash = theirs.iter().find(|(range, _)| match ours {
-                Range::Sdr => matches!(range, Range::Sdr | Range::Unknown),
-                Range::Hybrid | Range::HdrOnly | Range::DvOnly | Range::Unknown => {
-                    !matches!(range, Range::Sdr)
-                }
-            });
-            if let Some((range, found)) = clash {
-                let replace =
-                    ours == Range::Hybrid && matches!(range, Range::HdrOnly | Range::DvOnly);
-                return Check::fail(
-                    "15.3.2",
-                    format!(
-                        "2160p tem um SDR e um DV + HDR; este é {} e o Amigos já tem {}: \"{}\"{}",
-                        ours.label(),
-                        range.label(),
-                        found.title,
-                        if replace {
-                            ". A regra deixa o híbrido substituir, mas a staff tratou como duplicado: se quiser, lance à mão e peça a substituição"
-                        } else {
-                            ""
-                        }
-                    ),
-                );
-            }
-            if matches!(ours, Range::HdrOnly | Range::DvOnly) {
-                return Check::warn(
-                    "15.3.2",
-                    format!(
-                        "2160p {} é substituído por um DV + HDR de qualidade igual ou superior",
-                        ours.label()
-                    ),
-                );
-            }
-            Check::ok(
-                "15.3.2",
-                format!("2160p {}: a vaga está livre", ours.label()),
-            )
-        }
-        _ => duplicate(ctx, Site::Amigos, "15.3.1"),
     }
+    if let Some(found) = hybrid_over_title {
+        // A regra deixa o híbrido subir, mas o título do site alterna as
+        // faixas: o Avatar Aang DV + HDR foi apagado contra um "HDR10" (26/10).
+        return Check::warn(
+            "15.3.2",
+            format!(
+                "DV + HDR substitui o {} \"{}\", mas o título do site já trocou a faixa antes: confira no MediaInfo dele se não é DV + HDR",
+                range_of(found).label(),
+                found.title
+            ),
+        );
+    }
+    if replaced.is_empty() {
+        Check::ok("15.3.2", format!("{vaga} está livre"))
+    } else {
+        Check::ok(
+            "15.3.2",
+            format!(
+                "{vaga} passa para este, que substitui {}",
+                replaced.join(" e ")
+            ),
+        )
+    }
+}
+
+/// O título do site não diz a source. Sem ela, o parser cai em HDTV
+/// ("Captain America 2011 2160p Dolby Vision H.265" é `Hdtv2160p`).
+fn site_source_unknown(dest: &DestinationRelease) -> bool {
+    match dest.quality.source() {
+        Source::Unknown => true,
+        Source::Tv => !dest
+            .title
+            .to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|t| matches!(t, "hdtv" | "pdtv" | "sdtv" | "tvrip" | "dsr")),
+        _ => false,
+    }
+}
+
+/// A source da tabela da 15.3.2. `None` é o que não tem vaga própria
+/// (15.3.4): `BRRip`, `WEBRip`, `DVDRip`, HDTV e abaixo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    FullDisc,
+    Remux,
+    Encode,
+    WebDl,
+}
+
+impl Slot {
+    fn of(quality: Quality) -> Option<Self> {
+        match (quality.source(), quality.modifier()) {
+            (_, Modifier::BrDisk) => Some(Self::FullDisc),
+            (Source::Bluray, Modifier::Remux) => Some(Self::Remux),
+            (Source::Bluray, _) => Some(Self::Encode),
+            (Source::WebDl, _) => Some(Self::WebDl),
+            _ => None,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::FullDisc => "Full Disc",
+            Self::Remux => "REMUX",
+            Self::Encode => "encode",
+            Self::WebDl => "WEB-DL",
+        }
+    }
+}
+
+/// 15.3.2: por que o nosso tira o ocupante da vaga, ou `None` se a vaga fica
+/// com ele. `complete` é o DUAL com legenda PT. Em 2160p vale antes o nível da faixa (DV + HDR, depois só HDR ou
+/// só DV, depois SDR); depois DUAL, HDR e 1,5 vez o tamanho, nessa ordem.
+fn slot_winner(
+    ctx: &Context<'_>,
+    audio: AudioKind,
+    complete: bool,
+    ours: Range,
+    theirs: &DestinationRelease,
+) -> Option<&'static str> {
+    let their_range = Range::from_title(&theirs.title, None);
+    if ctx.resolution == 2160 {
+        // Título sem faixa pode ser o nível mais alto.
+        let level = |r: Range| match r {
+            Range::Sdr => 0,
+            Range::HdrOnly | Range::DvOnly => 1,
+            Range::Hybrid | Range::Unknown => 2,
+        };
+        match level(ours).cmp(&level(their_range)) {
+            std::cmp::Ordering::Greater => return Some("nível de HDR acima"),
+            std::cmp::Ordering::Less => return None,
+            std::cmp::Ordering::Equal if their_range == Range::Unknown => return None,
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    // O DUAL que ganha a vaga é o completo (15.3.3); o sem legenda empata
+    // com o dublado e o legendado.
+    let their_dual = theirs.audio == AudioKind::Dual;
+    if complete && !their_dual {
+        return Some("DUAL");
+    }
+    if their_dual && audio != AudioKind::Dual {
+        return None;
+    }
+    // Abaixo de 2160p, título sem faixa é SDR.
+    let hdr = |r: Range| !matches!(r, Range::Sdr | Range::Unknown);
+    if ctx.resolution != 2160 && hdr(ours) != hdr(their_range) {
+        return hdr(ours).then_some("HDR");
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let bigger = theirs.size > 0 && ctx.size as f64 >= theirs.size as f64 * 1.5;
+    bigger.then_some("1,5 vez o tamanho")
 }
 
 // ---------------------------------------------------------------------------
@@ -4566,10 +4655,21 @@ mod tests {
     #[test]
     fn amigos_15_3_2_web_dl_1080p_uma_vaga_por_codec() {
         let mut facts = movie();
-        // O nosso é H.264: um H.264 no site ocupa a vaga, qualquer tamanho.
-        facts.destination = vec![dest("Filme.2024.1080p.WEB-DL.DUAL.x264-OUTRO", 4 * GB)];
+        // O nosso é H.264 de 10 GB: um H.264 de tamanho parecido no site
+        // fica com a vaga, a de quem chegou primeiro.
+        facts.destination = vec![dest("Filme.2024.1080p.WEB-DL.DUAL.x264-OUTRO", 8 * GB)];
         let report = check(Site::Amigos, &facts);
         assert_eq!(report.status_of("15.3.2"), Some(Status::Fail), "{report:?}");
+        // Com 1,5 vez o tamanho, o nosso é melhor e substitui.
+        facts.destination = vec![dest("Filme.2024.1080p.WEB-DL.DUAL.x264-OUTRO", 6 * GB)];
+        let report = check(Site::Amigos, &facts);
+        assert_eq!(report.status_of("15.3.2"), Some(Status::Ok), "{report:?}");
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.message.contains("substitui"))
+        );
         // x265 é a outra vaga.
         facts.destination = vec![dest("Filme.2024.1080p.WEB-DL.DUAL.x265-OUTRO", 7 * GB)];
         assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Ok));
@@ -4731,11 +4831,18 @@ mod tests {
             &mut facts,
             "Captain.America.2011.2160p.UHD.BluRay.HDR.x265-G.DUAL-H",
         );
+        // Sem source no título (o parser lê HDTV), pode ser a vaga do encode.
         facts.destination = vec![dest(
             "Captain America: The First Avenger 2011 2160p Dolby Vision H.265 Dual-Audio Brazilian Original",
-            16 * GB,
+            9 * GB,
         )];
         assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Fail));
+        // Com a source do site dita, o WEB-DL é outra vaga.
+        facts.destination = vec![dest(
+            "Captain America: The First Avenger 2011 2160p Dolby Vision WEB-DL H.265 Dual-Audio Brazilian Original",
+            9 * GB,
+        )];
+        assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Ok));
     }
 
     #[test]
@@ -4745,11 +4852,13 @@ mod tests {
             m.video = Some(video("h264", 1280, 720, Hdr::Sdr));
         });
         rename(&mut facts, "Filme.2024.720p.WEB-DL.DUAL.x264-GRP");
-        assert_eq!(status(Site::Amigos, &facts, "15.3.5"), Some(Status::Warn));
-        facts.destination = vec![dest("Filme.2024.720p.WEB-DL.DUAL.x264-OUTRO", 3 * GB)];
+        // Desde 28/10 o 720p não é Trumpable.
+        assert_eq!(status(Site::Amigos, &facts, "15.3.5"), None);
+        // Uma vaga só, qualquer source.
+        facts.destination = vec![dest("Filme.2024.720p.BluRay.DUAL.x265-OUTRO", 8 * GB)];
         assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Fail));
         facts.destination = vec![dest("Filme.2024.1080p.WEB-DL.DUAL.x264-OUTRO", 3 * GB)];
-        assert_eq!(status(Site::Amigos, &facts, "15.3.5"), Some(Status::Fail));
+        assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Ok));
 
         let mut facts = movie();
         set_video(&mut facts, |m| {
@@ -4760,18 +4869,19 @@ mod tests {
         // duas (Shadow Force e Avatar Aang, 26/10).
         facts.destination = vec![dest("Filme.2024.2160p.WEB-DL.DUAL.H.265-OUTRO", 20 * GB)];
         assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Fail));
-        // Híbrido contra só HDR: a regra deixa substituir, a staff não.
+        // Híbrido contra só HDR: a regra manda substituir, mas o título do
+        // site já trocou a faixa (Avatar Aang): aviso.
         facts.destination = vec![dest(
             "Avatar Aang: The Last Airbender 2026 HDR10 WEB-DL H.265 Dual-Audio Brazilian Original",
             5 * GB,
         )];
         let report = check(Site::Amigos, &facts);
-        assert_eq!(report.status_of("15.3.2"), Some(Status::Fail));
+        assert_eq!(report.status_of("15.3.2"), Some(Status::Warn));
         assert!(
             report
                 .checks
                 .iter()
-                .any(|c| c.message.contains("lance à mão"))
+                .any(|c| c.message.contains("MediaInfo"))
         );
         facts.destination = vec![dest(
             "Filme.2024.2160p.WEB-DL.DUAL.DV.HDR.H.265-OUTRO",
@@ -4788,15 +4898,14 @@ mod tests {
         assert_eq!(status(Site::Amigos, &facts, "15.3"), Some(Status::Ok));
         facts.destination = vec![dest("Filme.2024.2160p.WEB-DL.DUAL.H.265-OUTRO", 20 * GB)];
         assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Fail));
-        // SDR nosso contra HDR declarado no site: vagas diferentes.
+        // SDR só entra enquanto a obra não tem HDR, em qualquer vaga.
         set_video(&mut facts, |m| {
             m.video = Some(video("hevc", 3840, 2160, Hdr::Sdr));
         });
         rename(&mut facts, "Filme.2024.2160p.WEB-DL.DUAL.H.265-GRP");
-        facts.destination = vec![dest(
-            "Filme.2024.2160p.WEB-DL.DUAL.HDR.H.265-OUTRO",
-            20 * GB,
-        )];
+        facts.destination = vec![dest("Filme.2024.2160p.REMUX.DUAL.HDR.HEVC-OUTRO", 60 * GB)];
+        assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Fail));
+        facts.destination = vec![dest("Filme.2024.1080p.WEB-DL.DUAL.H.264-OUTRO", 5 * GB)];
         assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Ok));
     }
 
@@ -5096,6 +5205,66 @@ mod tests {
             20 * GB,
         )];
         assert_eq!(status(Site::Amigos, &facts, "15.3.4"), Some(Status::Fail));
+        // Desde 28/10 o 2160p tem mínimo próprio: 10000, 7000 em animação.
+        // O Toy Story 4 (73915) tinha 5925 e foi apagado como BRRip contra
+        // um WEB-DL 2160p cujo título não diz a resolução.
+        facts.destination = vec![dest(
+            "Toy Story 4 2019 HDR WEB-DL H.265 Dual-Audio Brazilian Original",
+            20 * GB,
+        )];
+        set_video(&mut facts, |m| {
+            m.video = Some(VideoFacts {
+                bit_rate: Some(6_500_000),
+                ..video("hevc", 3840, 2160, Hdr::Hdr10)
+            });
+        });
+        assert_eq!(status(Site::Amigos, &facts, "15.3.4"), Some(Status::Fail));
+        set_video(&mut facts, |m| {
+            m.video = Some(VideoFacts {
+                bit_rate: Some(9_000_000),
+                ..video("hevc", 3840, 2160, Hdr::Hdr10)
+            });
+        });
+        assert_eq!(status(Site::Amigos, &facts, "15.3.4"), None);
+        assert_eq!(status(Site::Amigos, &facts, "15.2.5"), Some(Status::Warn));
+    }
+
+    #[test]
+    fn amigos_15_3_2_vagas_de_28_10() {
+        let mut facts = movie();
+        // HDR desempata a 1080p, antes do tamanho.
+        set_video(&mut facts, |m| {
+            m.video = Some(video("h264", 1920, 1080, Hdr::Hdr10));
+        });
+        rename(&mut facts, "Filme.2024.1080p.WEB-DL.DUAL.HDR.H.264-GRP");
+        facts.destination = vec![dest("Filme.2024.1080p.WEB-DL.DUAL.H.264-OUTRO", 9 * GB)];
+        assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Ok));
+        // O encode 2160p só tem vaga em x265.
+        set_video(&mut facts, |m| {
+            m.video = Some(VideoFacts {
+                bit_rate: Some(20_000_000),
+                ..video("h264", 3840, 2160, Hdr::Hdr10)
+            });
+        });
+        rename(&mut facts, "Filme.2024.2160p.UHD.BluRay.DUAL.HDR.x264-GRP");
+        facts.destination = vec![dest("Filme.2024.1080p.WEB-DL.DUAL.H.264-OUTRO", 9 * GB)];
+        assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Fail));
+        // O encode 1080p tem uma vaga por codec, e o WEB-DL é outra linha.
+        let mut facts = movie();
+        rename(&mut facts, "Filme.2024.1080p.BluRay.DUAL.x264-GRP");
+        set_video(&mut facts, |m| {
+            m.video = Some(VideoFacts {
+                bit_rate: Some(9_000_000),
+                ..video("h264", 1920, 1080, Hdr::Sdr)
+            });
+        });
+        facts.destination = vec![
+            dest("Filme.2024.1080p.BluRay.DUAL.x265-OUTRO", 8 * GB),
+            dest("Filme.2024.1080p.WEB-DL.DUAL.x264-OUTRO", 8 * GB),
+        ];
+        assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Ok));
+        facts.destination = vec![dest("Filme.2024.1080p.BluRay.DUAL.x264-OUTRO", 8 * GB)];
+        assert_eq!(status(Site::Amigos, &facts, "15.3.2"), Some(Status::Fail));
     }
 
     #[test]
