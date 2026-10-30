@@ -418,8 +418,7 @@ fn torrent_inodes(inventory: &acervo_core::Inventory) -> (HashSet<Inode>, HashSe
     let mut owed: HashSet<Inode> = inventory
         .unreadable
         .iter()
-        .filter_map(|u| std::fs::metadata(&u.path).ok())
-        .map(|meta| (meta.dev(), meta.ino()))
+        .flat_map(unreadable_inodes)
         .collect();
     let mut seen = HashSet::new();
     let downloads = &inventory.downloads;
@@ -435,6 +434,37 @@ fn torrent_inodes(inventory: &acervo_core::Inventory) -> (HashSet<Inode>, HashSe
         }
     }
     (owed, seen)
+}
+
+/// Os arquivos com outro link de um torrent ilegível. O `path` é a pasta de
+/// salvar (o cliente não listou os arquivos) ou o arquivo que falhou no
+/// `stat`; o conteúdo do torrent é a entrada `name` dentro da pasta, ou o
+/// ancestral do arquivo com esse nome. Bloqueia.
+fn unreadable_inodes(unreadable: &acervo_core::UnreadableDownload) -> HashSet<Inode> {
+    use std::os::unix::fs::MetadataExt;
+    let path = &unreadable.path;
+    let mut roots = vec![path.clone(), path.join(&unreadable.name)];
+    roots.extend(
+        path.ancestors()
+            .filter(|a| a.file_name().is_some_and(|n| *n == *unreadable.name))
+            .map(std::path::Path::to_path_buf),
+    );
+    let mut inodes = HashSet::new();
+    for root in roots {
+        match std::fs::metadata(&root) {
+            Ok(meta) if meta.is_file() && meta.nlink() > 1 => {
+                inodes.insert((meta.dev(), meta.ino()));
+            }
+            // A pasta de salvar sozinha não é do torrent: só o nome dentro dela.
+            Ok(meta) if meta.is_dir() && root != *path => {
+                if let Ok(found) = crate::library::linked_inodes(&root) {
+                    inodes.extend(found);
+                }
+            }
+            _ => {}
+        }
+    }
+    inodes
 }
 
 /// O título da marca e os arquivos dela com outro link. Bloqueia.
@@ -1486,19 +1516,32 @@ mod tests {
     fn arquivo_de_torrent_ilegivel_conta_como_devendo() {
         use std::os::unix::fs::MetadataExt;
 
-        let path = std::env::temp_dir().join(format!("acervo-ilegivel-{}.mkv", std::process::id()));
-        std::fs::write(&path, b"video").unwrap();
+        // O cliente não listou os arquivos: `path` é a pasta de salvar, e o
+        // conteúdo é `name` dentro dela, com hardlink na biblioteca.
+        let root = std::env::temp_dir().join(format!("acervo-ilegivel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let file = root.join("downloads/Serie.S01/Serie.S01E01.mkv");
+        write(&file);
+        std::fs::hard_link(&file, root.join("biblioteca.mkv")).unwrap();
+        let solto = root.join("downloads/Outro.mkv");
+        write(&solto);
+        std::fs::hard_link(&solto, root.join("outro-na-biblioteca.mkv")).unwrap();
         let mut inventory = acervo_core::Inventory::new(acervo_core::Allocated::ZERO);
         inventory.unreadable.push(acervo_core::UnreadableDownload {
             hash: acervo_core::DownloadHash::new("ilegivel"),
-            name: "Ilegivel".into(),
-            path: path.clone(),
-            reason: "outro arquivo sumiu".into(),
+            name: "Serie.S01".into(),
+            path: root.join("downloads"),
+            reason: "arquivos não listados".into(),
         });
-        let meta = std::fs::metadata(&path).unwrap();
+        let inode = |path: &Path| {
+            let meta = std::fs::metadata(path).unwrap();
+            (meta.dev(), meta.ino())
+        };
         let (owed, seen) = torrent_inodes(&inventory);
-        assert!(owed.contains(&(meta.dev(), meta.ino())));
+        assert!(owed.contains(&inode(&file)));
+        // O resto da pasta de salvar é de outros torrents.
+        assert!(!owed.contains(&inode(&solto)));
         assert!(seen.is_empty());
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -181,7 +181,7 @@ function MarkedSection({ onOpen }: { onOpen: (item: ItemRef) => void }) {
           <p className="font-medium">Nada marcado</p>
           <p className="max-w-md text-sm text-content-muted">
             Marque filmes, temporadas ou séries inteiras no detalhe de cada um, ou pelas sugestões abaixo. A limpeza
-            apaga o marcado assim que o torrent cumprir o seed que o tracker exige.
+            apaga o marcado quando nenhum torrent ligado a ele ainda dever seed; sem torrent, no ciclo seguinte.
           </p>
         </div>
       ) : (
@@ -377,7 +377,7 @@ export function ToDeletePage() {
     <>
       <PageHeader
         title="Para apagar"
-        description="O que você marcou para tirar do disco, com o espaço que cada item libera. A limpeza apaga cada um assim que o torrent cumprir o seed que o tracker exige; para tirar na hora, apague aqui."
+        description="O que você marcou para tirar do disco, com o espaço que cada item libera. A limpeza apaga cada um quando nenhum torrent ligado a ele ainda dever seed (sem torrent, no ciclo seguinte); para tirar na hora, apague aqui."
       />
       <MarkedSection onOpen={setOpen} />
       <SuggestionsSection onOpen={setOpen} />
