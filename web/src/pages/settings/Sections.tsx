@@ -461,7 +461,7 @@ export function JellyfinSettings() {
     <SectionCard
       name="jellyfin"
       title="Jellyfin"
-      description="Diz o que já foi assistido. Com ele, a tela “Para apagar” sugere o filme ou a temporada vista há mais que a carência; nada sai sem você marcar e confirmar."
+      description="Diz o que já foi assistido. Com ele, a tela “Para apagar” sugere o filme ou a temporada vista há mais que a carência; nada sai sem você marcar."
       status={(data: JellyfinSection) => data.url !== ''}
       Form={JellyfinForm}
     />

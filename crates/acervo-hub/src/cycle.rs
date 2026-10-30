@@ -26,6 +26,8 @@ pub struct CycleReport {
     pub pulados: Vec<SkippedLine>,
     pub executadas: Option<usize>,
     pub falharam: Option<usize>,
+    /// O que saiu da tela Para apagar, e o que segue esperando o tracker.
+    pub marcas: crate::marks::Due,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -56,20 +58,45 @@ impl CycleReport {
         if let Some(reason) = &self.abortado {
             return (false, format!("abortado por trava: {reason}"));
         }
-        if self.acoes.is_empty() {
+        let mut parts = Vec::new();
+        let failed = self.falharam.unwrap_or(0);
+        if !self.acoes.is_empty() {
+            let actions = match self.acoes.len() {
+                1 => "1 ação".to_owned(),
+                n => format!("{n} ações"),
+            };
+            parts.push(if failed > 0 {
+                format!("{actions}, {} liberados, {failed} falharam", self.espaco)
+            } else {
+                format!("{actions}, {} liberados", self.espaco)
+            });
+        }
+        let mut marks_failed = 0;
+        if let Some(purge) = &self.marcas.apagado {
+            marks_failed = purge.falhas.len();
+            if !purge.apagados.is_empty() {
+                parts.push(format!("{} marcado(s) apagado(s)", purge.apagados.len()));
+            }
+            if marks_failed > 0 {
+                parts.push(format!("{marks_failed} marcado(s) com falha"));
+            }
+        }
+        if !self.marcas.esperando.is_empty() {
+            parts.push(format!(
+                "{} marcado(s) esperando o seed",
+                self.marcas.esperando.len()
+            ));
+        }
+        if let Some(error) = &self.marcas.erro {
+            parts.push(format!("marcados não conferidos: {error}"));
+        }
+        if parts.is_empty() {
             return (true, "nada a limpar".into());
         }
-        let actions = match self.acoes.len() {
-            1 => "1 ação".to_owned(),
-            n => format!("{n} ações"),
-        };
-        let failed = self.falharam.unwrap_or(0);
-        let line = if failed > 0 {
-            format!("{actions}, {} liberados, {failed} falharam", self.espaco)
-        } else {
-            format!("{actions}, {} liberados", self.espaco)
-        };
-        (failed == 0, line)
+        (
+            failed == 0 && marks_failed == 0 && self.marcas.erro.is_none(),
+            parts.join("; "),
+        )
     }
 }
 
@@ -96,6 +123,7 @@ impl CycleReport {
             pulados: Vec::new(),
             executadas: None,
             falharam: None,
+            marcas: crate::marks::Due::default(),
         }
     }
 }
@@ -175,5 +203,77 @@ pub async fn run(config: &Config, store: &acervo_store::Store) -> Result<CycleRe
     let outcome = apply::execute(&session, &plan).await;
     result.executadas = Some(outcome.done);
     result.falharam = Some(outcome.failed);
+
+    // As marcas da tela Para apagar saem quando o tracker deixa. Falha aqui
+    // não desfaz a limpeza dos torrents: vira aviso e tenta no próximo ciclo.
+    match crate::marks::purge_due(config, store, inventory).await {
+        Ok(due) => {
+            if !due.esperando.is_empty() {
+                tracing::info!(marcas = ?due.esperando, "marcados esperando o seed");
+            }
+            result.marcas = due;
+        }
+        Err(error) => {
+            tracing::warn!("marcados não conferidos: {error:#}");
+            result.marcas.erro = Some(format!("{error:#}"));
+        }
+    }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::marks::{Due, Purge, Purged};
+
+    fn report() -> CycleReport {
+        CycleReport {
+            quando: String::new(),
+            torrents: 0,
+            ilegiveis: Vec::new(),
+            biblioteca: String::new(),
+            abortado: None,
+            acoes: Vec::new(),
+            espaco: "0 B".into(),
+            pulados: Vec::new(),
+            executadas: Some(0),
+            falharam: Some(0),
+            marcas: Due::default(),
+        }
+    }
+
+    #[test]
+    fn resumo_conta_os_marcados() {
+        assert_eq!(report().summary(), (true, "nada a limpar".into()));
+        let mut r = report();
+        r.marcas = Due {
+            apagado: Some(Purge {
+                apagados: vec![Purged {
+                    chave: "filme-1".into(),
+                    titulo: "Tenet (2020)".into(),
+                    tamanho: 1,
+                }],
+                ..Purge::default()
+            }),
+            esperando: vec!["O Grinch (2018): o torrent ainda deve seed ao tracker".into()],
+            erro: None,
+        };
+        assert_eq!(
+            r.summary(),
+            (
+                true,
+                "1 marcado(s) apagado(s); 1 marcado(s) esperando o seed".into()
+            )
+        );
+    }
+
+    #[test]
+    fn marcas_nao_conferidas_nao_viram_nada_a_limpar() {
+        let mut r = report();
+        r.marcas.erro = Some("banco fora".into());
+        assert_eq!(
+            r.summary(),
+            (false, "marcados não conferidos: banco fora".into())
+        );
+    }
 }

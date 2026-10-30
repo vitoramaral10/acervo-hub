@@ -418,7 +418,7 @@ pub(crate) async fn downloads_of(
 
 /// Inodes dos arquivos da pasta que têm outro link — só esses podem ser de
 /// um download. Pasta inexistente não tem nenhum.
-fn linked_inodes(folder: &Path) -> std::io::Result<HashSet<(u64, u64)>> {
+pub(crate) fn linked_inodes(folder: &Path) -> std::io::Result<HashSet<(u64, u64)>> {
     let mut inodes = HashSet::new();
     let mut pending = vec![folder.to_path_buf()];
     while let Some(dir) = pending.pop() {

@@ -198,7 +198,7 @@ pub struct Failed {
 }
 
 /// O resultado de apagar os marcados.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Purge {
     pub apagados: Vec<Purged>,
     pub falhas: Vec<Failed>,
@@ -371,6 +371,180 @@ pub async fn purge(config: &Config, store: &Store, targets: &[MarkTarget]) -> Re
         }
     }
     Ok(report)
+}
+
+// ------------------------------------------------------ apagar sozinho
+
+/// Um arquivo pelo `stat(2)`: dispositivo e inode.
+type Inode = (u64, u64);
+
+/// O que a limpeza fez com as marcas no ciclo.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Due {
+    /// O resultado de apagar as marcas liberadas; `None` se nenhuma estava.
+    pub apagado: Option<Purge>,
+    /// "Título: motivo" das marcas que seguem esperando.
+    pub esperando: Vec<String>,
+    /// O passo falhou antes de conferir as marcas; nenhuma saiu.
+    pub erro: Option<String>,
+}
+
+/// Por que a marca ainda não sai, ou `None` se já pode sair.
+///
+/// `linked` são os arquivos da marca com outro link (só esses podem ser de um
+/// torrent); `owed`, os arquivos de torrent que ainda devem seed ao tracker
+/// ou cuja obrigação não se sabe (o de torrent ilegível); `seen`, os de todos
+/// os torrents lidos. Arquivo ligado que nenhum torrent
+/// lido explica, com torrent ilegível no cliente, pode ser dele: espera.
+fn hold(
+    linked: &HashSet<Inode>,
+    owed: &HashSet<Inode>,
+    seen: &HashSet<Inode>,
+    unreadable: bool,
+) -> Option<&'static str> {
+    if !linked.is_disjoint(owed) {
+        return Some("o torrent ainda deve seed ao tracker");
+    }
+    if unreadable && !linked.is_subset(seen) {
+        return Some("há torrent ilegível no cliente que pode ser dele");
+    }
+    None
+}
+
+/// Inodes dos arquivos dos torrents: os que devem seed (ou de torrent
+/// ilegível, cuja obrigação não se sabe) e os de todos os lidos. Bloqueia.
+fn torrent_inodes(inventory: &acervo_core::Inventory) -> (HashSet<Inode>, HashSet<Inode>) {
+    use std::os::unix::fs::MetadataExt;
+    let mut owed: HashSet<Inode> = inventory
+        .unreadable
+        .iter()
+        .filter_map(|u| std::fs::metadata(&u.path).ok())
+        .map(|meta| (meta.dev(), meta.ino()))
+        .collect();
+    let mut seen = HashSet::new();
+    let downloads = &inventory.downloads;
+    for download in downloads {
+        for file in &download.files {
+            if let Ok(meta) = std::fs::metadata(&file.path) {
+                let inode = (meta.dev(), meta.ino());
+                seen.insert(inode);
+                if download.owes_seed() {
+                    owed.insert(inode);
+                }
+            }
+        }
+    }
+    (owed, seen)
+}
+
+/// O título da marca e os arquivos dela com outro link. Bloqueia.
+fn mark_files(
+    target: MarkTarget,
+    movies: &[CatalogMovie],
+    series: &[CatalogSeries],
+) -> (String, std::io::Result<HashSet<Inode>>) {
+    use std::os::unix::fs::MetadataExt;
+    match target {
+        MarkTarget::Movie(id) => match movies.iter().find(|m| m.id == id) {
+            Some(entry) => (
+                crate::events::label(&entry.movie.title, entry.movie.year),
+                crate::library::linked_inodes(std::path::Path::new(&entry.movie.path)),
+            ),
+            None => (key(target), Ok(HashSet::new())),
+        },
+        MarkTarget::Series { series_id, season } => {
+            let Some(entry) = series.iter().find(|s| s.id == series_id) else {
+                return (key(target), Ok(HashSet::new()));
+            };
+            let title = format!(
+                "{} · {}",
+                crate::events::label(&entry.series.title, entry.series.year),
+                season.map_or_else(|| "série inteira".into(), season_name)
+            );
+            let file_ids: BTreeSet<i64> = entry
+                .episodes
+                .iter()
+                .filter(|e| season.is_none_or(|s| s == e.episode.season))
+                .filter_map(|e| e.file_id)
+                .collect();
+            let root = std::path::Path::new(&entry.series.path);
+            let mut linked = HashSet::new();
+            let relatives = entry
+                .files
+                .iter()
+                .filter(|f| file_ids.contains(&f.id))
+                .flat_map(|f| {
+                    std::iter::once(f.file.relative_path.clone())
+                        .chain(crate::series::subtitle_paths(entry, f.id))
+                });
+            for relative in relatives {
+                // Arquivo que já não está lá não liga a torrent nenhum; outro
+                // erro de leitura segura a marca.
+                match std::fs::metadata(root.join(relative)) {
+                    Ok(meta) if meta.nlink() > 1 => {
+                        linked.insert((meta.dev(), meta.ino()));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return (title, Err(error)),
+                }
+            }
+            (title, Ok(linked))
+        }
+    }
+}
+
+/// O passo da limpeza: apaga as marcas cujo torrent já cumpriu o que o
+/// tracker exige (ou que não têm torrent), pelo mesmo caminho do botão.
+///
+/// # Errors
+///
+/// Banco ilegível.
+pub async fn purge_due(
+    config: &Config,
+    store: &Store,
+    inventory: &acervo_core::Inventory,
+) -> Result<Due> {
+    let marks = store.deletion_marks().await?;
+    if marks.is_empty() {
+        return Ok(Due::default());
+    }
+    let (movies, series) = tokio::try_join!(store.movies(), store.series_list())?;
+    let unreadable = !inventory.unreadable.is_empty();
+    let inventory = inventory.clone();
+    let checked = tokio::task::spawn_blocking(move || {
+        let (owed, seen) = torrent_inodes(&inventory);
+        marks
+            .into_iter()
+            .map(|mark| {
+                let (title, linked) = mark_files(mark.target, &movies, &series);
+                let reason = match &linked {
+                    Ok(linked) => hold(linked, &owed, &seen, unreadable),
+                    Err(_) => Some("arquivos da biblioteca ilegíveis"),
+                };
+                (mark.target, title, reason)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await?;
+    let mut due = Vec::new();
+    let mut waiting = Vec::new();
+    for (target, title, reason) in checked {
+        match reason {
+            None => due.push(target),
+            Some(reason) => waiting.push(format!("{title}: {reason}")),
+        }
+    }
+    let apagado = if due.is_empty() {
+        None
+    } else {
+        Some(purge(config, store, &due).await?)
+    };
+    Ok(Due {
+        apagado,
+        esperando: waiting,
+        erro: None,
+    })
 }
 
 // ---------------------------------------------------------------- rotas
@@ -1187,5 +1361,144 @@ mod tests {
             3
         );
         db.drop().await;
+    }
+
+    #[test]
+    fn marca_espera_o_torrent_que_deve_seed() {
+        let set = |inodes: &[u64]| inodes.iter().map(|i| (1, *i)).collect::<HashSet<_>>();
+        let linked = set(&[10, 11]);
+        // Um arquivo da marca é de torrent que ainda deve: espera.
+        assert!(hold(&linked, &set(&[11]), &set(&[10, 11]), false).is_some());
+        // Torrent cumpriu (ou o indexador não exige nada): sai.
+        assert_eq!(hold(&linked, &set(&[]), &set(&[10, 11]), false), None);
+        // Sem torrent nenhum ligado: sai.
+        assert_eq!(hold(&set(&[]), &set(&[]), &set(&[]), true), None);
+        // Arquivo ligado que nenhum torrent lido explica, com ilegível no
+        // cliente: pode ser do ilegível, espera.
+        assert!(hold(&linked, &set(&[]), &set(&[10]), true).is_some());
+        assert_eq!(hold(&linked, &set(&[]), &set(&[10]), false), None);
+    }
+
+    #[tokio::test]
+    async fn limpeza_apaga_o_marcado_livre_e_espera_o_que_deve_seed() {
+        use std::time::{Duration, SystemTime};
+
+        use acervo_core::{
+            Allocated, Apparent, Download, DownloadHash, DownloadState, FileFacts, Inventory,
+            SeedObligation,
+        };
+
+        let Some(db) = acervo_store::testing::TestDb::new("para_apagar_limpeza").await else {
+            return;
+        };
+        let store = &db.store;
+        let root =
+            std::env::temp_dir().join(format!("acervo-para-apagar-limpeza-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let livre = root.join("movies/Livre (2024)/Livre.mkv");
+        let devendo = root.join("movies/Devendo (2024)/Devendo.mkv");
+        let seed = root.join("downloads/Devendo.2024.1080p.WEB-DL.mkv");
+        write(&livre);
+        write(&seed);
+        std::fs::create_dir_all(devendo.parent().unwrap()).unwrap();
+        std::fs::hard_link(&seed, &devendo).unwrap();
+        let settings = Settings::load(store.clone()).await.unwrap();
+        settings
+            .save_section(
+                crate::config::BIBLIOTECA,
+                json!({ "root_folders": [root.join("movies")] }),
+            )
+            .await
+            .unwrap();
+        let config = settings.get();
+        let add = |tmdb_id: u32, title: &str| {
+            let folder = root.join(format!("movies/{title} (2024)"));
+            Movie {
+                tmdb_id,
+                path: folder.display().to_string(),
+                ..movie(title, 4000)
+            }
+        };
+        let livre_id = store
+            .add_movie(&add(21, "Livre"), &MovieExtras::default())
+            .await
+            .unwrap();
+        let devendo_id = store
+            .add_movie(&add(22, "Devendo"), &MovieExtras::default())
+            .await
+            .unwrap();
+        store
+            .mark_for_deletion(
+                &[MarkTarget::Movie(livre_id), MarkTarget::Movie(devendo_id)],
+                "2026-10-30T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        // O torrent do `Devendo` tem 10 h de seed e ratio 0,2: o Amigos pede
+        // 72 h ou ratio 1.0.
+        let hour = Duration::from_secs(3600);
+        let mut inventory = Inventory::new(Allocated::ZERO);
+        inventory.downloads.push(Download {
+            hash: DownloadHash::new("devendo"),
+            name: "Devendo.2024.1080p.WEB-DL.mkv".into(),
+            state: DownloadState::Seeding,
+            private: true,
+            category: "movies".into(),
+            tags: Vec::new(),
+            complete: true,
+            ratio: 0.2,
+            seeded_for: 10 * hour,
+            idle_for: None,
+            obligation: Some(SeedObligation {
+                min_seed: Some(72 * hour),
+                min_ratio: Some(1.0),
+            }),
+            files: vec![FileFacts {
+                path: seed.clone(),
+                links: 2,
+                allocated: Allocated::ZERO,
+                apparent: Apparent::from_bytes(5),
+                modified: SystemTime::UNIX_EPOCH,
+            }],
+        });
+
+        let due = purge_due(&config, store, &inventory).await.unwrap();
+
+        let purged = due.apagado.expect("o livre sai");
+        assert_eq!(purged.apagados.len(), 1, "{purged:?}");
+        assert!(!livre.exists());
+        assert!(devendo.exists(), "o que deve seed fica");
+        assert_eq!(due.esperando.len(), 1, "{:?}", due.esperando);
+        assert!(
+            due.esperando[0].starts_with("Devendo"),
+            "{:?}",
+            due.esperando
+        );
+        assert_eq!(
+            store.deletion_marks().await.unwrap()[0].target,
+            MarkTarget::Movie(devendo_id)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        db.drop().await;
+    }
+
+    #[test]
+    fn arquivo_de_torrent_ilegivel_conta_como_devendo() {
+        use std::os::unix::fs::MetadataExt;
+
+        let path = std::env::temp_dir().join(format!("acervo-ilegivel-{}.mkv", std::process::id()));
+        std::fs::write(&path, b"video").unwrap();
+        let mut inventory = acervo_core::Inventory::new(acervo_core::Allocated::ZERO);
+        inventory.unreadable.push(acervo_core::UnreadableDownload {
+            hash: acervo_core::DownloadHash::new("ilegivel"),
+            name: "Ilegivel".into(),
+            path: path.clone(),
+            reason: "outro arquivo sumiu".into(),
+        });
+        let meta = std::fs::metadata(&path).unwrap();
+        let (owed, seen) = torrent_inodes(&inventory);
+        assert!(owed.contains(&(meta.dev(), meta.ino())));
+        assert!(seen.is_empty());
+        let _ = std::fs::remove_file(&path);
     }
 }

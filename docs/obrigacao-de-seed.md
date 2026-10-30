@@ -46,9 +46,12 @@ Se o banco não responde, a coleta falha e a limpeza não roda.
 - importação de filme: grab que perdeu o motivo, arquivos sumidos e torrent sem
   seeds;
 - importação de série: arquivos sumidos, sem seeds e sem arquivo útil.
+- marcados para apagar (`crates/acervo-hub/src/marks.rs`, `purge_due`): a limpeza
+  só apaga o filme, a temporada ou a série marcada quando nenhum torrent com
+  hardlink nos arquivos dela deve seed; o resto espera o próximo ciclo.
 
 Nesses três últimos o torrent completo com obrigação pendente fica no cliente,
-com aviso no log. Apagamentos que você pede na tela não passam por essa regra.
+com aviso no log. O botão "Apagar" da tela Para apagar e os outros apagamentos que você pede na tela não passam por essa regra.
 
 Desligar o modo ratio tira a tag de semear dos torrents do indexador, menos a
 dos lançamentos, que continuam marcados.
