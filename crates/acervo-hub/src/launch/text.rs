@@ -165,7 +165,7 @@ fn missing_synopsis(site: Site) -> Check {
             "sinopse em PT não encontrada: escreva à mão; tradutor automático não é aceito no BJ",
         ),
         Site::Amigos => (
-            "5.4.2",
+            "6.11",
             "sinopse em PT não encontrada: escreva à mão, ela é obrigatória na descrição",
         ),
     };
@@ -275,7 +275,7 @@ fn sheet(input: &Input) -> String {
         };
         lines.push(format!("{label}: {}", credits.countries.join(", ")));
     }
-    // O original entra sempre na ficha (Amigos 5.4.2), mesmo igual ao título.
+    // O original entra sempre na ficha (Amigos 6.11), mesmo igual ao título.
     let original = input
         .original_title
         .as_deref()
@@ -660,7 +660,7 @@ mod tests {
         nacional.national = true;
         let fields = build(&nacional);
         assert_eq!(fields.title, "Cidade de Deus");
-        // A ficha ainda traz o original (Amigos 5.4.2).
+        // A ficha ainda traz o original (Amigos 6.11).
         assert!(
             fields
                 .sheet
@@ -847,7 +847,7 @@ mod tests {
         assert_eq!(bj.warnings[0].status, Status::Warn);
         assert!(bj.warnings[0].message.contains("tradutor automático"));
         let amigos = build_fields(Site::Amigos, &sem);
-        assert_eq!(amigos.warnings[0].rule, "5.4.2");
+        assert_eq!(amigos.warnings[0].rule, "6.11");
         assert!(build_fields(Site::Bj, &input()).warnings.is_empty());
     }
 
