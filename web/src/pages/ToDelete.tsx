@@ -180,8 +180,8 @@ function MarkedSection({ onOpen }: { onOpen: (item: ItemRef) => void }) {
           <Trash2 className="size-8 text-content-subtle" aria-hidden="true" />
           <p className="font-medium">Nada marcado</p>
           <p className="max-w-md text-sm text-content-muted">
-            Marque filmes, temporadas ou séries inteiras no detalhe de cada um, ou pelas sugestões abaixo. Nada sai
-            do disco antes de confirmar aqui.
+            Marque filmes, temporadas ou séries inteiras no detalhe de cada um, ou pelas sugestões abaixo. A limpeza
+            apaga o marcado quando nenhum torrent ligado a ele ainda dever seed; sem torrent, no ciclo seguinte.
           </p>
         </div>
       ) : (
@@ -311,7 +311,7 @@ function SuggestionsSection({ onOpen }: { onOpen: (item: ItemRef) => void }) {
       </div>
       <p className="mb-4 max-w-[65ch] text-sm text-content-muted">
         O que alguém já assistiu no Jellyfin, passada a carência, que ninguém marcou como favorito. Séries entram por
-        temporada, quando todos os episódios dela no disco foram assistidos. Marcar não apaga.
+        temporada, quando todos os episódios dela no disco foram assistidos. Marcar já pede para apagar.
       </p>
 
       {suggestions.isPending ? (
@@ -377,7 +377,7 @@ export function ToDeletePage() {
     <>
       <PageHeader
         title="Para apagar"
-        description="O que você marcou para tirar do disco, com o espaço que cada item libera. Nada sai antes de confirmar aqui; a limpeza de seeds segue sozinha, como sempre."
+        description="O que você marcou para tirar do disco, com o espaço que cada item libera. A limpeza apaga cada um quando nenhum torrent ligado a ele ainda dever seed (sem torrent, no ciclo seguinte); para tirar na hora, apague aqui."
       />
       <MarkedSection onOpen={setOpen} />
       <SuggestionsSection onOpen={setOpen} />

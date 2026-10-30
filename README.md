@@ -184,8 +184,11 @@ precedência. Não há tarefa diária de atualização das definições.
 
 Assistido não sai sozinho. Na tela **Para apagar** fica o que o usuário marcou — um filme,
 uma temporada ou a série inteira, pelo botão "Marcar para apagar" no detalhe de cada um —,
-com o espaço que cada item libera e o total. Nada sai antes de confirmar ali: apagar os
-selecionados ou todos pede confirmação com o total. O filme sai como no "Remover" com
+com o espaço que cada item libera e o total. Marcar é pedir para apagar: a `limpeza`
+apaga o marcado no ciclo seguinte, assim que nenhum torrent ligado a ele deve seed ao
+tracker (a obrigação do indexador, ver `docs/obrigacao-de-seed.md`); o que ainda deve
+espera e aparece no resumo da tarefa. Para tirar na hora, sem esperar o tracker, apagar
+os selecionados ou todos ali pede confirmação com o total. O filme sai como no "Remover" com
 arquivos (catálogo, pasta e download); a temporada e a série, como no "Apagar temporada"
 (os arquivos e os torrents que ficam sem uso; a série continua no catálogo, com os
 episódios apagados fora da busca). Falha num item não segura os outros, e a marca só some
@@ -198,7 +201,7 @@ como favorito, e a temporada em que todos os episódios no disco passam nessa re
 entra o arquivo que chegou antes de assistirem: o Jellyfin lembra o assistido de um título
 apagado, e o mesmo título adicionado de novo seria sugerido assim que importado. Assistido
 sem data, ou arquivo sem data de adição, fica de fora. Cada sugestão se marca num clique,
-ou todas de uma vez; marcar não apaga.
+ou todas de uma vez.
 
 ### Limpeza
 
@@ -208,6 +211,9 @@ ou todas de uma vez; marcar não apaga.
   tempo de seed;
 - o **download sem dono** — sem grab em andamento, sem seed e sem hardlink — depois de
   aparecer assim em ciclos seguidos.
+- o **marcado para apagar** cujo torrent já cumpriu a obrigação de seed do indexador
+  (ou que não tem torrent), pelo mesmo caminho do botão da tela Para apagar. Com torrent
+  ilegível no cliente, o marcado com arquivo que nenhum torrent lido explica espera.
 
 Só na categoria de `biblioteca.category`. A política é fixa: 3 strikes; privados têm
 7 dias de seed antes de sair, mesmo pausados (a regra de hit&run comum: ratio

@@ -48,7 +48,7 @@ export function MarkButton({
       variant="ghost"
       aria-pressed={marked}
       loading={busy}
-      title={marked ? 'Tirar da lista "Para apagar"' : 'Pôr na lista "Para apagar"; nada sai antes de confirmar lá'}
+      title={marked ? 'Tirar da lista "Para apagar"' : 'Pôr na lista "Para apagar"; a limpeza apaga quando o tracker deixar'}
       className={cn(marked && 'text-danger', className)}
       onClick={() => toggle.mutate({ targets: [target], mark: !marked, label })}
       {...props}
