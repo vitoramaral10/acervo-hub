@@ -1270,6 +1270,12 @@ export const launchApi = {
       'POST',
       `${launchPair(hash, indexer)}/descartar`,
     ),
+  /**
+   * O envio foi apagado no site: tira do cliente os torrents do publicado, zera o envio e o cross-seed do par,
+   * apaga a pasta adaptada e prepara de novo. 409 diz por que não (não enviado, preparando, pasta que ficou).
+   */
+  resend: (hash: string, indexer: string) =>
+    request<{ ok: boolean; estado: LaunchState }>('POST', `${launchPair(hash, indexer)}/reenviar`),
   /** O download não passa por `request` (que só lê JSON): é um `<a href download>` com a sessão. */
   torrentUrl: (hash: string, indexer: string) => `${launchPair(hash, indexer)}/torrent`,
   mediainfoUrl: (hash: string, indexer: string) => `${launchPair(hash, indexer)}/mediainfo.txt`,

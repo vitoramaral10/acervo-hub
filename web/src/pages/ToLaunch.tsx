@@ -8,12 +8,14 @@ import {
   Download,
   FolderOpen,
   PackageOpen,
+  RefreshCw,
   Rocket,
   Send,
   Upload,
 } from 'lucide-react'
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
+import { ConfirmButton } from '@/components/ConfirmButton'
 import { CopyButton } from '@/components/CopyButton'
 import { PageHeader } from '@/components/PageHeader'
 import { Button } from '@/components/ui/button'
@@ -644,6 +646,14 @@ function Package({ detail, item }: { detail: LaunchDetail; item: LaunchItem }) {
     },
     onError: (error: Error) => toast.error(error.message),
   })
+  const resend = useMutation({
+    mutationFn: () => launchApi.resend(detail.hash, detail.indexer),
+    onSuccess: () => {
+      toast.success('Reenvio liberado: o pacote está sendo preparado de novo')
+      refresh(detail)
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
   const discard = useMutation({
     mutationFn: () => launchApi.discard(detail.hash, detail.indexer),
     onSuccess: (data) => {
@@ -761,6 +771,20 @@ function Package({ detail, item }: { detail: LaunchDetail; item: LaunchItem }) {
           >
             Preparar de novo
           </Button>
+        )}
+        {!preparing && (detail.enviado_em || detail.site_id) && (
+          <ConfirmButton
+            variant="ghost"
+            loading={resend.isPending}
+            disabled={!item.no_cliente}
+            title="Apagado no site: liberar o reenvio?"
+            description={`Use quando o envio foi apagado no ${detail.destino}. O acervo tira do cliente o torrent publicado (os arquivos da origem ficam), esquece o envio e o que o cross-seed achou, apaga a pasta do pacote e prepara de novo, com as regras de agora. Depois, confira e envie como de costume.`}
+            confirmLabel="Liberar e preparar"
+            onConfirm={() => resend.mutate()}
+          >
+            <RefreshCw aria-hidden="true" />
+            Apagado no site
+          </ConfirmButton>
         )}
         {!preparing && detail.estado !== 'descartado' && !sentToSite && (
           <Button variant="ghost" loading={discard.isPending} onClick={() => discard.mutate()}>

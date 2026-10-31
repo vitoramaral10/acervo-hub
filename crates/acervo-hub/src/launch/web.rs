@@ -78,6 +78,10 @@ pub(crate) fn routes() -> Router<Arc<Web>> {
             "/ui/api/biblioteca/para-lancar/{hash}/{indexer}/descartar",
             post(discard),
         )
+        .route(
+            "/ui/api/biblioteca/para-lancar/{hash}/{indexer}/reenviar",
+            post(resend),
+        )
 }
 
 // ---------------------------------------------------------------- candidatos
@@ -448,6 +452,17 @@ async fn prepare(
                 .map_err(|e| fail(bad(e)))?;
         }
     }
+    start(&web, store, hash, indexer, claim).await
+}
+
+/// Põe o pacote na fila do preparo, do zero, com a posse do par.
+async fn start(
+    web: &Arc<Web>,
+    store: &Store,
+    hash: String,
+    indexer: String,
+    claim: super::Claim,
+) -> WebResult {
     store
         .upsert_launch_state(
             &hash,
@@ -461,8 +476,109 @@ async fn prepare(
     super::reset(store, &hash, &indexer)
         .await
         .map_err(|e| fail(anyhow_bad(&e)))?;
-    tokio::spawn(super::run(Arc::clone(&web), hash, indexer, claim));
+    tokio::spawn(super::run(Arc::clone(web), hash, indexer, claim));
     ok(&json!({ "ok": true, "estado": LaunchState::Preparando.as_str() }))
+}
+
+/// Os torrents do publicado no cliente: o `.torrent` gerado, o do site e o
+/// irmão que o cross-seed achou. Nunca a origem, de onde o pacote sai de novo.
+fn published_hashes(
+    hash: &str,
+    indexer: &str,
+    generated: Option<&[u8]>,
+    site_hash: Option<&str>,
+    checks: &[CrossSeedCheck],
+) -> Vec<String> {
+    let mut hashes: Vec<String> = generated
+        .and_then(acervo_clients::info_hash)
+        .into_iter()
+        .chain(site_hash.map(str::to_owned))
+        .chain(
+            checks
+                .iter()
+                .filter(|c| c.hash.eq_ignore_ascii_case(hash) && c.indexer == indexer)
+                .filter_map(|c| c.found.clone()),
+        )
+        .map(|h| h.to_ascii_lowercase())
+        .filter(|h| !h.eq_ignore_ascii_case(hash))
+        .collect();
+    hashes.sort();
+    hashes.dedup();
+    hashes
+}
+
+/// O envio foi apagado no site e o usuário quer reenviar: tira do cliente os
+/// torrents do publicado (que o tracker não reconhece mais), zera o envio e o
+/// cross-seed do par, apaga a pasta adaptada pela limpeza segura e prepara de
+/// novo, com as regras de agora.
+async fn resend(
+    State(web): Shared,
+    headers: HeaderMap,
+    Path((hash, indexer)): Path<(String, String)>,
+) -> WebResult {
+    let store = enter_live(&web, &headers, &Method::POST).await?;
+    let (hash, _) = pair(&hash, &indexer).map_err(fail)?;
+    let claim = own_pair(&hash, &indexer)?;
+    let launch = store
+        .launch(&hash, &indexer)
+        .await
+        .map_err(|e| fail(bad(e)))?
+        .ok_or_else(|| not_found("o pacote não existe"))?;
+    if launch.state == LaunchState::Preparando {
+        return Err(conflict("o pacote está sendo preparado"));
+    }
+    if launch.sent_at.is_none() && launch.site_id.is_none() {
+        return Err(conflict(
+            "o pacote não foi enviado ao site: para refazê-lo, use Preparar",
+        ));
+    }
+    let generated = store
+        .launch_torrent(&hash, &indexer)
+        .await
+        .map_err(|e| fail(bad(e)))?;
+    let checks = store.cross_seed_checks().await.map_err(|e| fail(bad(e)))?;
+    let published = published_hashes(
+        &hash,
+        &indexer,
+        generated.as_deref(),
+        launch.site_hash.as_deref(),
+        &checks,
+    );
+    let config = web.config();
+    if !published.is_empty() {
+        let client = crate::grab::qbit(&config)
+            .await
+            .map_err(|e| fail(anyhow_bad(&e)))?;
+        let hashes: Vec<DownloadHash> = published.iter().map(DownloadHash::new).collect();
+        // Os arquivos ficam: a pasta adaptada sai abaixo, pela limpeza que
+        // confere os hardlinks com a origem.
+        client
+            .delete(&hashes, false)
+            .await
+            .map_err(|e| fail(bad(format!("tirando o publicado do cliente: {e}"))))?;
+    }
+    store
+        .release_launch(&hash, &indexer)
+        .await
+        .map_err(|e| fail(bad(e)))?;
+    tracing::info!(
+        indexer,
+        torrents = published.len(),
+        "envio apagado no site: reenvio liberado"
+    );
+    let released = store
+        .launch(&hash, &indexer)
+        .await
+        .map_err(|e| fail(bad(e)))?
+        .ok_or_else(|| not_found("o pacote não existe"))?;
+    if released.adapted_path.is_some()
+        && let Some(warning) = super::discard_folder(&config, store, &released).await
+    {
+        return Err(conflict(format!(
+            "o envio foi liberado, mas {warning}. Apague a pasta e use Preparar"
+        )));
+    }
+    start(&web, store, hash, indexer, claim).await
 }
 
 /// `filename` em ASCII (o que todo navegador lê) e `filename*` em UTF-8
@@ -3666,6 +3782,113 @@ mod tests {
         assert_eq!(launch.site_id.as_deref(), Some("77"));
         assert_eq!(launch.error.as_deref(), Some(aviso));
         std::fs::remove_dir_all(&dir).ok();
+        db.drop().await;
+    }
+
+    #[test]
+    fn publicado_junta_gerado_site_e_irmao_sem_a_origem() {
+        let origin = "a".repeat(40);
+        let generated = torrent("Raiz", &FILES, "");
+        let generated_hash = acervo_clients::info_hash(&generated).unwrap();
+        let check = |hash: &str, indexer: &str, found: Option<&str>| CrossSeedCheck {
+            hash: hash.into(),
+            indexer: indexer.into(),
+            checked_at: "2026-10-30T18:23:46Z".into(),
+            attempts: 1,
+            found: found.map(str::to_owned),
+            outcome: CrossSeedOutcome::Found,
+        };
+        let checks = [
+            check(&origin, BJ, Some("CCCC")),
+            // Outro par, outro destino e a própria origem ficam de fora.
+            check(&"b".repeat(40), BJ, Some("dddd")),
+            check(&origin, "amigosshare", Some("eeee")),
+            check(&origin, BJ, Some(&origin.to_uppercase())),
+        ];
+        let mut expected = vec![generated_hash, "bbbb".to_owned(), "cccc".to_owned()];
+        expected.sort();
+        assert_eq!(
+            published_hashes(&origin, BJ, Some(&generated), Some("BBBB"), &checks),
+            expected
+        );
+        assert!(published_hashes(&origin, BJ, None, None, &[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn apagado_no_site_tira_o_publicado_zera_o_envio_e_prepara_de_novo() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(db) = acervo_store::testing::TestDb::new("para_lancar_reenvio").await else {
+            return;
+        };
+        let store = &db.store;
+        let (web, base) = serve(&db).await;
+        insert_bj(store).await;
+        let http = reqwest::Client::new();
+        let post = reqwest::Method::POST;
+        let generated = torrent("Raiz", &FILES, "");
+        let generated_hash = acervo_clients::info_hash(&generated).unwrap();
+        let origin = "6".repeat(40);
+        let site_hash = "7".repeat(40);
+        let url = |hash: &str, action: &str| format!("{base}/{hash}/{BJ}{action}");
+
+        let server = qbit(&origin, &[&generated_hash, &site_hash], 0, 200).await;
+        // Sai do cliente o gerado e o do site, sem apagar arquivo; a origem fica.
+        Mock::given(method("POST"))
+            .and(path("/api/v2/torrents/delete"))
+            .and(body_string_contains(generated_hash.as_str()))
+            .and(body_string_contains(site_hash.as_str()))
+            .and(body_string_contains("deleteFiles=false"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        point_to(&web, &server).await;
+
+        // Não enviado: não há o que liberar.
+        ready(store, &origin, &generated).await;
+        let (status, body) = call(&http, post.clone(), &url(&origin, "/reenviar")).await;
+        assert_eq!(status, 409, "{body}");
+
+        store
+            .mark_launch_uploaded(&origin, BJ, "74313", "2026-10-30T17:20:47Z")
+            .await
+            .unwrap();
+        store
+            .save_launch_site_hash(&origin, BJ, &site_hash)
+            .await
+            .unwrap();
+        store
+            .record_cross_seed_check(
+                &origin,
+                BJ,
+                "2026-10-30T18:23:46Z",
+                Some(&site_hash),
+                CrossSeedOutcome::Found,
+            )
+            .await
+            .unwrap();
+        // Enviado, preparar continua recusado: o caminho é o reenvio.
+        let (status, _) = call(&http, post.clone(), &url(&origin, "/preparar")).await;
+        assert_eq!(status, 409);
+
+        let (status, body) = call(&http, post.clone(), &url(&origin, "/reenviar")).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["estado"], "preparando", "{body}");
+        let launch = store.launch(&origin, BJ).await.unwrap().unwrap();
+        assert_eq!(launch.sent_at, None);
+        assert_eq!(launch.site_id, None);
+        assert_eq!(launch.site_hash, None);
+        assert!(
+            store
+                .cross_seed_checks()
+                .await
+                .unwrap()
+                .iter()
+                .all(|c| !c.hash.eq_ignore_ascii_case(&origin)),
+        );
+        server.verify().await;
         db.drop().await;
     }
 }
