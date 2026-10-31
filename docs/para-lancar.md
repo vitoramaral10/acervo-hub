@@ -206,8 +206,9 @@ a única mudança permitida, sempre mantendo a tag original (16.12.8). Retag
   sem acento e sem `, : ; ! ? * " ' ( ) / \ | < >`, `&` vira `and` (16.2.4).
   O título vem do catálogo (16.2.1; `Facts.catalog_title`): o original na
   obra em inglês (`Deixe.A.Neve.Cair` vira `Let.It.Snow`) e na brasileira
-  (`New.Bandits` vira `Cangaco.Novo`), na grafia do catálogo e sem os pontos
-  de sigla (`s.w.a.t.exiles` vira `SWAT.Exiles`). Na série, o do release fica
+  (`New.Bandits` vira `Cangaco.Novo`), na grafia do catálogo; a sigla fica
+  com os pontos (`s.w.a.t.exiles` vira `S.W.A.T.Exiles`), como a staff pediu
+  em 30/10 apesar da 16.2.4, e o ponto fora de sigla sai (`Mr.` vira `Mr`). Na série, o do release fica
   quando começa pelo do catálogo e é mais longo (ano ou país que separa
   séries de mesmo nome). Obra estrangeira de outro idioma: o preparo busca o
   título en-US no TMDB (Sua.Culpa vira Your.Fault); é lacuna quando o TMDB

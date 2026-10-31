@@ -79,10 +79,26 @@ pub(crate) fn title_year_match(release: &str, title: &str, year: u16) -> bool {
 fn title_words(title: &str) -> Vec<String> {
     title
         .split(char::is_whitespace)
-        // 16.2.4 tira o ponto: a sigla `S.W.A.T.` vira `SWAT`.
-        .map(|word| clean_title(&word.replace('.', "")))
+        .map(title_word)
         .filter(|t| !t.is_empty())
         .collect()
+}
+
+/// Uma palavra do título no padrão. A sigla com ponto fica com os pontos
+/// (`S.W.A.T.` vira `S.W.A.T`, e o separador completa): a staff pediu assim em
+/// 30/10, embora a 16.2.4 mande tirar o ponto. Fora da sigla, o ponto sai
+/// (`Mr.` vira `Mr`).
+fn title_word(word: &str) -> String {
+    let letters: Vec<String> = word
+        .split('.')
+        .filter(|p| !p.is_empty())
+        .map(clean_title)
+        .collect();
+    if letters.len() > 1 && letters.iter().all(|l| l.chars().count() == 1) {
+        letters.join(".")
+    } else {
+        clean_title(&word.replace('.', ""))
+    }
 }
 
 /// 16.7, na grafia da regra.
@@ -1006,7 +1022,7 @@ pub(crate) fn standard(subject: &Subject<'_>) -> Result<Standard, Vec<String>> {
     if let Some(catalog) = subject.catalog_title.filter(|t| !squash(t).is_empty()) {
         let ours = squash(&parts.join("."));
         let theirs = squash(catalog);
-        // Igual, vale a grafia do catálogo (`s.w.a.t.exiles` vira SWAT.Exiles).
+        // Igual, vale a grafia do catálogo (`s.w.a.t.exiles` vira S.W.A.T.Exiles).
         let keep = subject.series && ours.starts_with(&theirs) && ours != theirs;
         if !keep {
             parts = title_words(catalog);
@@ -1521,7 +1537,7 @@ mod tests {
         .unwrap();
         assert!(rental.name.contains(".2160p.MA.WEB-DL."), "{}", rental.name);
         assert!(rental.warnings.iter().any(|w| w.contains("MA")));
-        // A grafia vem do catálogo, sem os pontos da sigla (16.2.4).
+        // A grafia vem do catálogo; a sigla fica com os pontos (staff, 30/10).
         assert!(
             run(
                 "s.w.a.t.exiles.s01e04.1080p.web.h264-cakes",
@@ -1532,7 +1548,7 @@ mod tests {
             )
             .unwrap()
             .name
-            .starts_with("SWAT.Exiles.S01E04.")
+            .starts_with("S.W.A.T.Exiles.S01E04.")
         );
         // Tag com nome de site de torrent, mesmo como segunda tag.
         let gaps = run(
@@ -1677,7 +1693,7 @@ mod tests {
         };
         assert_eq!(
             run("s.w.a.t.exiles.s01e04.1080p.web.h264-cakes"),
-            "SWAT.Exiles.S01E04.1080p.WEB-DL.DDP5.1.H.264-CAKES"
+            "S.W.A.T.Exiles.S01E04.1080p.WEB-DL.DDP5.1.H.264-CAKES"
         );
         assert!(run("s.w.a.t.exiles.s01e04.1080p.web.h264-ntb").ends_with("-NTb"));
         // Com maiúscula no nome, a tag fica como veio.
@@ -1773,5 +1789,16 @@ mod tests {
             .unwrap(),
             "Tom.and.Jerry.O.Filme.2021.1080p.WEB-DL.DDP5.1.HFR.H.264-X"
         );
+    }
+
+    #[test]
+    fn sigla_com_ponto_fica_e_o_resto_perde_o_ponto() {
+        assert_eq!(title_words("S.W.A.T. Exiles"), ["S.W.A.T", "Exiles"]);
+        assert_eq!(
+            title_words("Mr. & Mrs. Smith"),
+            ["Mr", "and", "Mrs", "Smith"]
+        );
+        assert_eq!(title_words("U.S. Marshals"), ["U.S", "Marshals"]);
+        assert_eq!(title_words("Dr. No"), ["Dr", "No"]);
     }
 }
