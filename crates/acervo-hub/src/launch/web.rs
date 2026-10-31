@@ -524,6 +524,28 @@ fn published_hashes(
     hashes
 }
 
+/// Dos hashes do publicado, os que podem sair do cliente: os que não semeiam
+/// para outro destino (tag de semear de outro indexador), como em
+/// `drop_replaced`. O que o cliente não tem não precisa sair.
+fn only_this_site(published: &[String], torrents: &[TorrentInfo], indexer: &str) -> Vec<String> {
+    let own_tag = acervo_core::seed_tag(indexer);
+    published
+        .iter()
+        .filter(|hash| {
+            torrents
+                .iter()
+                .find(|t| t.hash.eq_ignore_ascii_case(hash))
+                .is_some_and(|t| {
+                    !t.tags
+                        .split(',')
+                        .map(str::trim)
+                        .any(|tag| tag.starts_with(acervo_core::SEED_TAG_PREFIX) && tag != own_tag)
+                })
+        })
+        .cloned()
+        .collect()
+}
+
 /// O envio foi apagado no site e o usuário quer reenviar: tira do cliente os
 /// torrents do publicado (que o tracker não reconhece mais), zera o envio e o
 /// cross-seed do par, apaga a pasta adaptada pela limpeza segura e prepara de
@@ -568,7 +590,14 @@ async fn resend(
         let client = crate::grab::qbit(&config)
             .await
             .map_err(|e| fail(anyhow_bad(&e)))?;
-        let hashes: Vec<DownloadHash> = published.iter().map(DownloadHash::new).collect();
+        let torrents = client
+            .torrents()
+            .await
+            .map_err(|e| fail(bad(format!("lendo o cliente: {e}"))))?;
+        let hashes: Vec<DownloadHash> = only_this_site(&published, &torrents, &indexer)
+            .into_iter()
+            .map(DownloadHash::new)
+            .collect();
         // Os arquivos ficam: a pasta adaptada sai abaixo, pela limpeza que
         // confere os hardlinks com a origem.
         client
@@ -3917,5 +3946,29 @@ mod tests {
         );
         server.verify().await;
         db.drop().await;
+    }
+
+    #[test]
+    fn reenvio_poupa_o_torrent_que_semeia_para_outro_destino() {
+        let info = |hash: &str, tags: &str| {
+            serde_json::from_value::<TorrentInfo>(json!({
+                "hash": hash, "name": "Raiz", "state": "stalledUP",
+                "save_path": "/downloads", "tags": tags,
+            }))
+            .unwrap()
+        };
+        let torrents = [
+            info("aaaa", "acervo:cross-seed, acervo:semear:amigosshare"),
+            info(
+                "BBBB",
+                "acervo:semear:amigosshare,acervo:semear:bjsharecustom",
+            ),
+            info("cccc", ""),
+        ];
+        let published = ["aaaa", "bbbb", "cccc", "dddd"].map(str::to_owned);
+        assert_eq!(
+            only_this_site(&published, &torrents, "amigosshare"),
+            ["aaaa", "cccc"]
+        );
     }
 }
