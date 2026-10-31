@@ -152,6 +152,13 @@ gravação do desfecho que falhou) é resgatado para `falhou` pelas rotas.
   procurado primeiro).
 - `POST .../descartar` → `descartado` (some da lista padrão; filtro "todos"
   mostra).
+- `POST .../reenviar` → o envio foi apagado no site: tira do cliente os
+  torrents do publicado (o `.torrent` gerado, o do site e o irmão que o
+  cross-seed achou; nunca a origem, e sem apagar arquivo), zera `sent_at`,
+  `site_id`, `site_hash` e a linha do par em `cross_seed_checks` (que barraria
+  o envio como "já existe no destino"), apaga a pasta adaptada pela limpeza
+  segura e prepara de novo, com as regras de agora. 409 se o pacote não foi
+  enviado, está preparando ou a pasta ficou no disco.
 
 ### Cross-seed depois do envio
 
@@ -433,7 +440,8 @@ Página "Para lançar" (`#lancar`), entre as principais.
   releases do destino; campos com botão copiar; seção "Capturas" com 4 botões
   "Baixar captura N" (link para `/capturas/N`, sem extensão; resolução real ao lado, ex.: "3840×2024 — resolução
   original") e, havendo ImgBB, os links diretos `i.ibb.co` com botão copiar;
-  "Baixar .torrent"; "Marquei como enviado"; "Descartar"; enquanto
+  "Baixar .torrent"; "Marquei como enviado"; "Descartar"; no enviado,
+  "Apagado no site" (com confirmação) libera o reenvio; enquanto
   `preparando`, o andamento com polling de 3 s.
 - Configurações → Imagens: chave do ImgBB (opcional).
 

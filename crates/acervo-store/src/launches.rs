@@ -513,6 +513,38 @@ impl Store {
         Ok(updated > 0)
     }
 
+    /// O envio foi apagado no site: o pacote volta a `descartado`, sem a
+    /// marca de enviado, o id e o hash do site, e o par sai do cross-seed (a
+    /// consulta que achou o publicado barraria o reenvio como "já existe no
+    /// destino"). Numa transação, para não ficar um sem o outro. Devolve se o
+    /// par existe.
+    ///
+    /// # Errors
+    ///
+    /// Banco inalcançável.
+    pub async fn release_launch(&self, hash: &str, indexer: &str) -> Result<bool> {
+        let hash = hash.to_ascii_lowercase();
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let updated = tx
+            .execute(
+                &format!(
+                    "UPDATE launches SET state = 'descartado', sent_at = NULL, site_id = NULL,
+                       site_hash = NULL, error = NULL, updated_at = {NOW}
+                     WHERE hash = $1 AND indexer = $2"
+                ),
+                &[&hash, &indexer],
+            )
+            .await?;
+        tx.execute(
+            "DELETE FROM cross_seed_checks WHERE hash = $1 AND indexer = $2",
+            &[&hash, &indexer],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(updated > 0)
+    }
+
     /// Marca como enviado ao site, em `at` (RFC 3339, UTC). Devolve se o par
     /// existe.
     ///
@@ -970,6 +1002,47 @@ mod tests {
                 .await
                 .unwrap()
         );
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn liberar_o_reenvio_zera_o_envio_e_o_cross_seed() {
+        let Some(db) = TestDb::new("launch_liberar_reenvio").await else {
+            return;
+        };
+        let store = &db.store;
+        store
+            .upsert_launch_state("abcd", "amigos", LaunchState::Pronto, None, None)
+            .await
+            .unwrap();
+        store
+            .mark_launch_uploaded("abcd", "amigos", "74313", "2026-10-30T17:20:47Z")
+            .await
+            .unwrap();
+        store
+            .save_launch_site_hash("abcd", "amigos", "74110cb1")
+            .await
+            .unwrap();
+        store
+            .record_cross_seed_check(
+                "abcd",
+                "amigos",
+                "2026-10-30T18:23:46Z",
+                Some("74110cb1"),
+                crate::CrossSeedOutcome::Found,
+            )
+            .await
+            .unwrap();
+
+        assert!(store.release_launch("ABCD", "amigos").await.unwrap());
+
+        let launch = store.launch("abcd", "amigos").await.unwrap().unwrap();
+        assert_eq!(launch.state, LaunchState::Descartado);
+        assert_eq!(launch.sent_at, None);
+        assert_eq!(launch.site_id, None);
+        assert_eq!(launch.site_hash, None);
+        assert!(store.cross_seed_checks().await.unwrap().is_empty());
+        assert!(!store.release_launch("ffff", "amigos").await.unwrap());
         db.drop().await;
     }
 }
