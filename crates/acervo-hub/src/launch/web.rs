@@ -480,10 +480,10 @@ async fn start(
     ok(&json!({ "ok": true, "estado": LaunchState::Preparando.as_str() }))
 }
 
-/// Os torrents do publicado no cliente: o `.torrent` gerado, o do site e o
-/// irmão que o cross-seed achou. Nunca a origem, de onde o pacote sai de novo,
-/// nem hash que outro par usa (o do site ou o irmão de outro pacote ou de
-/// outro destino), que seguiria valendo lá.
+/// Os torrents do publicado: o `.torrent` gerado, o do site e o irmão que o
+/// cross-seed achou, nunca a origem, de onde o pacote sai de novo. Devolve os
+/// só deste par e, à parte, os que outro par também usa (o do site ou o irmão
+/// de outro pacote ou de outro destino), que seguem valendo lá.
 fn published_hashes(
     hash: &str,
     indexer: &str,
@@ -491,7 +491,7 @@ fn published_hashes(
     site_hash: Option<&str>,
     checks: &[CrossSeedCheck],
     launches: &[Launch],
-) -> Vec<String> {
+) -> (Vec<String>, Vec<String>) {
     let ours = |h: &str, i: &str| h.eq_ignore_ascii_case(hash) && i == indexer;
     let others: HashSet<String> = launches
         .iter()
@@ -517,33 +517,90 @@ fn published_hashes(
                 .filter_map(|c| c.found.clone()),
         )
         .map(|h| h.to_ascii_lowercase())
-        .filter(|h| !h.eq_ignore_ascii_case(hash) && !others.contains(h))
+        .filter(|h| !h.eq_ignore_ascii_case(hash))
         .collect();
     hashes.sort();
     hashes.dedup();
-    hashes
+    hashes.into_iter().partition(|h| !others.contains(h))
 }
 
-/// Dos hashes do publicado, os que podem sair do cliente: os que não semeiam
-/// para outro destino (tag de semear de outro indexador), como em
-/// `drop_replaced`. O que o cliente não tem não precisa sair.
-fn only_this_site(published: &[String], torrents: &[TorrentInfo], indexer: &str) -> Vec<String> {
+/// O torrent tem a tag de semear de outro indexador: semeia para outro
+/// destino, como em `drop_replaced`.
+fn other_site_tag(torrent: &TorrentInfo, indexer: &str) -> bool {
     let own_tag = acervo_core::seed_tag(indexer);
-    published
-        .iter()
-        .filter(|hash| {
-            torrents
+    torrent
+        .tags
+        .split(',')
+        .map(str::trim)
+        .any(|tag| tag.starts_with(acervo_core::SEED_TAG_PREFIX) && tag != own_tag)
+}
+
+/// Tira do cliente os torrents do publicado, sem os arquivos, e devolve
+/// quantos saíram. Recusa, sem tirar nada, se algum também semeia para outro
+/// destino (`shared`, ou com a tag ou o tracker de outro site): ele semeia da
+/// pasta do pacote, que o reenvio apaga.
+async fn drop_published(
+    config: &crate::config::Config,
+    indexer: &str,
+    generated: Option<&[u8]>,
+    published: &[String],
+    mut shared: Vec<String>,
+) -> Result<usize, Response> {
+    if published.is_empty() && shared.is_empty() {
+        return Ok(0);
+    }
+    let client = crate::grab::qbit(config)
+        .await
+        .map_err(|e| fail(anyhow_bad(&e)))?;
+    let torrents = client
+        .torrents()
+        .await
+        .map_err(|e| fail(bad(format!("lendo o cliente: {e}"))))?;
+    let in_client = |h: &str| torrents.iter().find(|t| t.hash.eq_ignore_ascii_case(h));
+    // O tracker deste site, pelo `.torrent` gerado: outro tracker no
+    // publicado é outro destino semeando dele.
+    let key = generated
+        .and_then(acervo_clients::announce)
+        .and_then(|url| super::tracker_key(&url));
+    shared.retain(|h| in_client(h).is_some());
+    let mut present: Vec<DownloadHash> = Vec::new();
+    for hash in published {
+        let Some(torrent) = in_client(hash) else {
+            continue;
+        };
+        let other_tracker = match &key {
+            Some(key) => client
+                .trackers(&torrent.hash)
+                .await
+                .map_err(|e| fail(bad(format!("lendo os trackers do publicado: {e}"))))?
                 .iter()
-                .find(|t| t.hash.eq_ignore_ascii_case(hash))
-                .is_some_and(|t| {
-                    !t.tags
-                        .split(',')
-                        .map(str::trim)
-                        .any(|tag| tag.starts_with(acervo_core::SEED_TAG_PREFIX) && tag != own_tag)
-                })
-        })
-        .cloned()
-        .collect()
+                .filter(|t| t.is_real())
+                .any(|t| super::tracker_key(&t.url).as_deref() != Some(key.as_str())),
+            None => false,
+        };
+        if other_site_tag(torrent, indexer) || other_tracker {
+            shared.push(hash.clone());
+        } else {
+            present.push(DownloadHash::new(hash));
+        }
+    }
+    // Torrent do publicado que também semeia para outro destino semeia da
+    // pasta do pacote: tirar um e apagar a pasta derrubaria o outro.
+    if !shared.is_empty() {
+        let short: Vec<&str> = shared.iter().map(|h| &h[..h.len().min(8)]).collect();
+        return Err(conflict(format!(
+            "o publicado ({}) também semeia para outro destino: nada foi mexido. Tire dele \
+             o tracker deste site à mão (ou o torrent, se não serve mais) e tente de novo",
+            short.join(", ")
+        )));
+    }
+    // Os arquivos ficam: a pasta adaptada sai abaixo, pela limpeza que
+    // confere os hardlinks com a origem.
+    client
+        .delete(&present, false)
+        .await
+        .map_err(|e| fail(bad(format!("tirando o publicado do cliente: {e}"))))?;
+    Ok(present.len())
 }
 
 /// O envio foi apagado no site e o usuário quer reenviar: tira do cliente os
@@ -577,7 +634,7 @@ async fn resend(
         .map_err(|e| fail(bad(e)))?;
     let checks = store.cross_seed_checks().await.map_err(|e| fail(bad(e)))?;
     let launches = store.launches().await.map_err(|e| fail(bad(e)))?;
-    let published = published_hashes(
+    let (published, shared) = published_hashes(
         &hash,
         &indexer,
         generated.as_deref(),
@@ -586,32 +643,15 @@ async fn resend(
         &launches,
     );
     let config = web.config();
-    if !published.is_empty() {
-        let client = crate::grab::qbit(&config)
-            .await
-            .map_err(|e| fail(anyhow_bad(&e)))?;
-        let torrents = client
-            .torrents()
-            .await
-            .map_err(|e| fail(bad(format!("lendo o cliente: {e}"))))?;
-        let hashes: Vec<DownloadHash> = only_this_site(&published, &torrents, &indexer)
-            .into_iter()
-            .map(DownloadHash::new)
-            .collect();
-        // Os arquivos ficam: a pasta adaptada sai abaixo, pela limpeza que
-        // confere os hardlinks com a origem.
-        client
-            .delete(&hashes, false)
-            .await
-            .map_err(|e| fail(bad(format!("tirando o publicado do cliente: {e}"))))?;
-    }
+    let dropped =
+        drop_published(&config, &indexer, generated.as_deref(), &published, shared).await?;
     store
         .release_launch(&hash, &indexer)
         .await
         .map_err(|e| fail(bad(e)))?;
     tracing::info!(
         indexer,
-        torrents = published.len(),
+        torrents = dropped,
         "envio apagado no site: reenvio liberado"
     );
     let released = store
@@ -3857,16 +3897,19 @@ mod tests {
         expected.sort();
         assert_eq!(
             published_hashes(&origin, BJ, Some(&generated), Some("BBBB"), &checks, &[]),
-            expected
+            (expected, Vec::new())
         );
-        assert!(published_hashes(&origin, BJ, None, None, &[], &[]).is_empty());
+        assert_eq!(
+            published_hashes(&origin, BJ, None, None, &[], &[]),
+            (Vec::new(), Vec::new())
+        );
         // O irmão que outro destino também achou fica: lá ele segue valendo.
         let shared = [check(&origin, "amigosshare", Some("cccc"))];
         let mut checks_shared = checks.to_vec();
         checks_shared.extend(shared);
         assert_eq!(
             published_hashes(&origin, BJ, None, Some("BBBB"), &checks_shared, &[]),
-            ["bbbb"]
+            (vec!["bbbb".to_owned()], vec!["cccc".to_owned()])
         );
     }
 
@@ -3944,31 +3987,56 @@ mod tests {
                 .iter()
                 .all(|c| !c.hash.eq_ignore_ascii_case(&origin)),
         );
+
+        // O do site também é de outro pacote: nada é mexido, nem o cliente
+        // (o `delete` acima foi o único).
+        let other = "4".repeat(40);
+        let neighbor = "3".repeat(40);
+        ready(store, &other, &generated).await;
+        store
+            .mark_launch_uploaded(&other, BJ, "74400", "2026-10-31T10:00:00Z")
+            .await
+            .unwrap();
+        store
+            .save_launch_site_hash(&other, BJ, &site_hash)
+            .await
+            .unwrap();
+        ready(store, &neighbor, &generated).await;
+        store
+            .save_launch_site_hash(&neighbor, BJ, &site_hash)
+            .await
+            .unwrap();
+        let (status, body) = call(&http, post.clone(), &url(&other, "/reenviar")).await;
+        assert_eq!(status, 409, "{body}");
+        assert!(
+            body["erro"].as_str().unwrap().contains("outro destino"),
+            "{body}"
+        );
+        let launch = store.launch(&other, BJ).await.unwrap().unwrap();
+        assert_eq!(launch.state, LaunchState::Enviado);
+        assert_eq!(launch.site_id.as_deref(), Some("74400"));
         server.verify().await;
         db.drop().await;
     }
 
     #[test]
-    fn reenvio_poupa_o_torrent_que_semeia_para_outro_destino() {
-        let info = |hash: &str, tags: &str| {
+    fn tag_de_semear_de_outro_destino() {
+        let info = |tags: &str| {
             serde_json::from_value::<TorrentInfo>(json!({
-                "hash": hash, "name": "Raiz", "state": "stalledUP",
+                "hash": "aaaa", "name": "Raiz", "state": "stalledUP",
                 "save_path": "/downloads", "tags": tags,
             }))
             .unwrap()
         };
-        let torrents = [
-            info("aaaa", "acervo:cross-seed, acervo:semear:amigosshare"),
-            info(
-                "BBBB",
-                "acervo:semear:amigosshare,acervo:semear:bjsharecustom",
-            ),
-            info("cccc", ""),
-        ];
-        let published = ["aaaa", "bbbb", "cccc", "dddd"].map(str::to_owned);
-        assert_eq!(
-            only_this_site(&published, &torrents, "amigosshare"),
-            ["aaaa", "cccc"]
-        );
+        let site = "amigosshare";
+        assert!(!other_site_tag(
+            &info("acervo:cross-seed, acervo:semear:amigosshare"),
+            site
+        ));
+        assert!(!other_site_tag(&info(""), site));
+        assert!(other_site_tag(
+            &info("acervo:semear:amigosshare,acervo:semear:bjsharecustom"),
+            site
+        ));
     }
 }
