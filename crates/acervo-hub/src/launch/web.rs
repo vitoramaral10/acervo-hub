@@ -481,14 +481,31 @@ async fn start(
 }
 
 /// Os torrents do publicado no cliente: o `.torrent` gerado, o do site e o
-/// irmão que o cross-seed achou. Nunca a origem, de onde o pacote sai de novo.
+/// irmão que o cross-seed achou. Nunca a origem, de onde o pacote sai de novo,
+/// nem hash que outro par usa (o do site ou o irmão de outro pacote ou de
+/// outro destino), que seguiria valendo lá.
 fn published_hashes(
     hash: &str,
     indexer: &str,
     generated: Option<&[u8]>,
     site_hash: Option<&str>,
     checks: &[CrossSeedCheck],
+    launches: &[Launch],
 ) -> Vec<String> {
+    let ours = |h: &str, i: &str| h.eq_ignore_ascii_case(hash) && i == indexer;
+    let others: HashSet<String> = launches
+        .iter()
+        .filter(|l| !ours(&l.hash, &l.indexer))
+        .flat_map(|l| [Some(l.hash.clone()), l.site_hash.clone()])
+        .chain(
+            checks
+                .iter()
+                .filter(|c| !ours(&c.hash, &c.indexer))
+                .flat_map(|c| [Some(c.hash.clone()), c.found.clone()]),
+        )
+        .flatten()
+        .map(|h| h.to_ascii_lowercase())
+        .collect();
     let mut hashes: Vec<String> = generated
         .and_then(acervo_clients::info_hash)
         .into_iter()
@@ -500,7 +517,7 @@ fn published_hashes(
                 .filter_map(|c| c.found.clone()),
         )
         .map(|h| h.to_ascii_lowercase())
-        .filter(|h| !h.eq_ignore_ascii_case(hash))
+        .filter(|h| !h.eq_ignore_ascii_case(hash) && !others.contains(h))
         .collect();
     hashes.sort();
     hashes.dedup();
@@ -537,12 +554,14 @@ async fn resend(
         .await
         .map_err(|e| fail(bad(e)))?;
     let checks = store.cross_seed_checks().await.map_err(|e| fail(bad(e)))?;
+    let launches = store.launches().await.map_err(|e| fail(bad(e)))?;
     let published = published_hashes(
         &hash,
         &indexer,
         generated.as_deref(),
         launch.site_hash.as_deref(),
         &checks,
+        &launches,
     );
     let config = web.config();
     if !published.is_empty() {
@@ -3808,10 +3827,18 @@ mod tests {
         let mut expected = vec![generated_hash, "bbbb".to_owned(), "cccc".to_owned()];
         expected.sort();
         assert_eq!(
-            published_hashes(&origin, BJ, Some(&generated), Some("BBBB"), &checks),
+            published_hashes(&origin, BJ, Some(&generated), Some("BBBB"), &checks, &[]),
             expected
         );
-        assert!(published_hashes(&origin, BJ, None, None, &[]).is_empty());
+        assert!(published_hashes(&origin, BJ, None, None, &[], &[]).is_empty());
+        // O irmão que outro destino também achou fica: lá ele segue valendo.
+        let shared = [check(&origin, "amigosshare", Some("cccc"))];
+        let mut checks_shared = checks.to_vec();
+        checks_shared.extend(shared);
+        assert_eq!(
+            published_hashes(&origin, BJ, None, Some("BBBB"), &checks_shared, &[]),
+            ["bbbb"]
+        );
     }
 
     #[tokio::test]

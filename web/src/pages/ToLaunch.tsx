@@ -652,7 +652,11 @@ function Package({ detail, item }: { detail: LaunchDetail; item: LaunchItem }) {
       toast.success('Reenvio liberado: o pacote está sendo preparado de novo')
       refresh(detail)
     },
-    onError: (error: Error) => toast.error(error.message),
+    // O envio pode ter sido liberado antes da falha (a pasta que ficou): a tela relê o estado.
+    onError: (error: Error) => {
+      toast.error(error.message)
+      refresh(detail)
+    },
   })
   const discard = useMutation({
     mutationFn: () => launchApi.discard(detail.hash, detail.indexer),
