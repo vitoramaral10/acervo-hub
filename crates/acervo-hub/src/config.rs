@@ -396,12 +396,12 @@ impl Config {
         Policy {
             orphan_strikes: 3,
             delete_private_orphans: true,
-            private_seed_grace: Some(Duration::from_secs(7 * 24 * 3600)),
+            private_seed_grace: Some(Duration::from_hours(168)),
             private_seed_ratio: None,
             private_seed_idle: None,
             managed_categories: vec![self.library.category.clone()],
             guards: Guards {
-                recent_change_grace: Duration::from_secs(24 * 3600),
+                recent_change_grace: Duration::from_hours(24),
                 max_batch: Allocated::from_bytes(300 * 1024 * 1024 * 1024),
                 max_batch_fraction: 0.3,
             },

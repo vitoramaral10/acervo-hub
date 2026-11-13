@@ -72,8 +72,7 @@ impl Proxy {
         let decode = |text: &str| {
             url::form_urlencoded::parse(format!("v={}", text.replace('+', "%2B")).as_bytes())
                 .next()
-                .map(|(_, value)| value.into_owned())
-                .unwrap_or_default()
+                .map_or_default(|(_, value)| value.into_owned())
         };
         let username = (!self.url.username().is_empty()).then(|| decode(self.url.username()));
         let password = self.url.password().map(decode);

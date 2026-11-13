@@ -42,7 +42,7 @@ const SUMMARY_CHARS: usize = 300;
 /// serviço que não responde e não desiste): a execução é dada como falha e
 /// a tarefa segue agendada. Generoso: a busca de todos os que faltam, pelo
 /// botão, leva bem menos.
-const CEILING: Duration = Duration::from_secs(2 * 60 * 60);
+const CEILING: Duration = Duration::from_hours(2);
 
 /// Maior atraso aleatório da primeira execução das tarefas que começam na
 /// subida: sem ele, todas batem juntas no banco, nos indexadores e no cliente
@@ -1176,7 +1176,7 @@ impl Job for Metadata {
 }
 
 /// De quanto em quanto tempo a limpeza também poda o banco.
-const PRUNE_EVERY: Duration = Duration::from_secs(24 * 3600);
+const PRUNE_EVERY: Duration = Duration::from_hours(24);
 
 /// Até que idade uma busca fica guardada (a mais recente de cada obra fica
 /// sempre).

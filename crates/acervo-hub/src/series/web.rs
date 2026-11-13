@@ -542,7 +542,7 @@ async fn search(
     body: Option<axum::Json<SearchBody>>,
 ) -> WebResult {
     let store = enter(&web, &headers, &Method::POST).await?;
-    let body = body.map(|b| b.0).unwrap_or_default();
+    let body = body.map_or_default(|b| b.0);
     let entry = store
         .series(id)
         .await

@@ -267,7 +267,7 @@ fn eval(expr: &Expr, vars: &Vars, dot: Option<&str>) -> Value {
                 Func::Not => Value::Bool(!values.next().unwrap_or(Value::Null).truthy()),
                 Func::Join => {
                     let list = values.next().unwrap_or(Value::Null);
-                    let separator = values.next().map(|value| value.text()).unwrap_or_default();
+                    let separator = values.next().map_or_default(|value| value.text());
                     match list {
                         Value::List(items) => Value::Str(items.join(&separator)),
                         other => Value::Str(other.text()),

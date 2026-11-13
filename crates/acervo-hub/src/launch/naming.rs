@@ -206,7 +206,7 @@ fn season_id(token: &str) -> Option<String> {
     }
     let mut tail = &rest[digits..];
     while !tail.is_empty() {
-        tail = tail.strip_prefix('-').unwrap_or(tail);
+        tail = tail.trim_prefix('-');
         let after = tail.strip_prefix('E')?;
         let n = after.bytes().take_while(u8::is_ascii_digit).count();
         if n < 2 {
@@ -1118,7 +1118,7 @@ pub(crate) fn standard(subject: &Subject<'_>) -> Result<Standard, Vec<String>> {
         ),
         (first, _, language) => format!(
             "{body}{}-{}",
-            language.map(|l| format!(".{l}")).unwrap_or_default(),
+            language.map_or_default(|l| format!(".{l}")),
             first.as_deref().unwrap_or("NoGroup")
         ),
     };

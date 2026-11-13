@@ -449,7 +449,7 @@ fn attribute_end(text: &str) -> Option<usize> {
 /// Identificador CSS simples: letra ou `_` (ou `-` e letra) seguido de letras,
 /// dígitos, `-` e `_`.
 fn is_identifier(text: &str) -> bool {
-    let body = text.strip_prefix('-').unwrap_or(text);
+    let body = text.trim_prefix('-');
     let mut chars = body.chars();
     chars
         .next()

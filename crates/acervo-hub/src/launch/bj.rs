@@ -1154,12 +1154,12 @@ fn work(form: &mut Form, package: &Package, lookup: &Lookup, imdb: &str, minutes
         form.shown(
             "season",
             "Temporada",
-            package.season.map(|s| s.to_string()).unwrap_or_default(),
+            package.season.map_or_default(|s| s.to_string()),
         );
         form.shown(
             "episode",
             "Episódio",
-            package.episode.map(|e| e.to_string()).unwrap_or_default(),
+            package.episode.map_or_default(|e| e.to_string()),
         );
         form.text("imdblink", imdb);
         form.text("network", "");
@@ -1421,9 +1421,8 @@ pub(crate) fn created(response: &SiteResponse) -> Result<String, Refusal> {
         }
     }
     // O título da página diz o que ela é sem levar nada dela ao log.
-    let title = page_title(&response.text())
-        .map(|title| format!(", página \"{title}\""))
-        .unwrap_or_default();
+    let title =
+        page_title(&response.text()).map_or_default(|title| format!(", página \"{title}\""));
     Err(Refusal::unknown(format!(
         "resposta inesperada do BJ ao envio (HTTP {}{title})",
         response.status

@@ -113,7 +113,7 @@ impl CardigannDefinition {
             return Err(invalid("yaml", "limite de 1 MiB excedido"));
         }
         // Há definição com BOM, que o YAML não aceita antes do `---`.
-        let yaml = yaml.strip_prefix('\u{feff}').unwrap_or(yaml);
+        let yaml = yaml.trim_prefix('\u{feff}');
         let document: Document = serde_yaml_ng::from_str(yaml).map_err(|error| {
             // A mensagem do desserializador pode citar valores — inclusive de
             // settings. Só o nome de uma chave desconhecida é repassado.
@@ -544,7 +544,7 @@ impl CardigannClient {
         });
         let keywords = [
             term.clone(),
-            year.map(|year| year.to_string()).unwrap_or_default(),
+            year.map_or_default(|year| year.to_string()),
             episode_string.clone(),
         ]
         .into_iter()
@@ -1485,8 +1485,7 @@ impl CardigannClient {
             ".DownloadUri.Port",
             Value::Str(
                 link.port_or_known_default()
-                    .map(|port| port.to_string())
-                    .unwrap_or_default(),
+                    .map_or_default(|port| port.to_string()),
             ),
         );
         let path_and_query = match link.query() {
@@ -1496,11 +1495,7 @@ impl CardigannClient {
         vars.set(".DownloadUri.PathAndQuery", Value::Str(path_and_query));
         vars.set(
             ".DownloadUri.Query",
-            Value::Str(
-                link.query()
-                    .map(|query| format!("?{query}"))
-                    .unwrap_or_default(),
-            ),
+            Value::Str(link.query().map_or_default(|query| format!("?{query}"))),
         );
         let mut seen = Vec::new();
         for (key, value) in link.query_pairs() {
@@ -1576,8 +1571,7 @@ impl CardigannClient {
                 None => before
                     .path
                     .as_ref()
-                    .map(|path| path.render(&vars))
-                    .unwrap_or_default(),
+                    .map_or_default(|path| path.render(&vars)),
             };
             let mut target = same_origin(&self.base, &path, "download.before.path")?;
             let pairs: Vec<(String, String)> = before

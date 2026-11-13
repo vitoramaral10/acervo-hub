@@ -2,7 +2,7 @@
 
 # Estágio descartável: toolchain, musl e o registry do cargo ficam aqui e não
 # chegam à imagem final.
-FROM rust:1.98-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa AS builder
+FROM rust:1.100-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS builder
 
 # Alvo musl para produzir binário estático. Só é possível porque o TLS vem do
 # rustls, em Rust puro — com OpenSSL, a ligação estática seria dor.

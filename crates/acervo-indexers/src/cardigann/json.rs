@@ -31,7 +31,7 @@ impl JsonPath {
     /// `None` para sintaxe fora do subconjunto.
     pub fn parse(source: &str) -> Option<Self> {
         let source = source.trim();
-        let mut rest = source.strip_prefix('$').unwrap_or(source);
+        let mut rest = source.trim_prefix('$');
         let mut steps = Vec::new();
         let mut first = !source.starts_with('$');
         while !rest.is_empty() {

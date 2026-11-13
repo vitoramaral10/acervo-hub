@@ -635,7 +635,7 @@ fn strip_dot_slash(report: &str) -> String {
         .lines()
         .map(|line| match line.split_once(" : ") {
             Some((key, value)) if key.trim_end() == "Complete name" => {
-                format!("{key} : {}", value.strip_prefix("./").unwrap_or(value))
+                format!("{key} : {}", value.trim_prefix("./"))
             }
             _ => line.to_owned(),
         })

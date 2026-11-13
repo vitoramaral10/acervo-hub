@@ -214,8 +214,7 @@ impl RawMovie {
             physical_release: release(dates, 5),
             alternate_titles: self
                 .alternative_titles
-                .map(|a| a.titles.into_iter().map(|t| t.title).collect())
-                .unwrap_or_default(),
+                .map_or_default(|a| a.titles.into_iter().map(|t| t.title).collect()),
             poster: self.poster_path.map(|p| format!("{IMAGES}{p}")),
             fanart: self.backdrop_path.map(|p| format!("{IMAGES}{p}")),
             title: self.title,
@@ -430,14 +429,12 @@ impl Tmdb {
             params.push(("year", year.as_str()));
         }
         let page: Option<Page> = self.get("search/movie", &params).await?;
-        Ok(page
-            .map(|p| {
-                p.results
-                    .into_iter()
-                    .map(RawSummary::into_summary)
-                    .collect()
-            })
-            .unwrap_or_default())
+        Ok(page.map_or_default(|p| {
+            p.results
+                .into_iter()
+                .map(RawSummary::into_summary)
+                .collect()
+        }))
     }
 }
 

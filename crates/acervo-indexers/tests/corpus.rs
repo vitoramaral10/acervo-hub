@@ -37,8 +37,7 @@ fn corpus_real_carrega_ou_e_recusado_sem_panico() {
             .unwrap_or_else(|_| panic!("{}: o loader entrou em pânico", path.display()));
         let stem = path
             .file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map_or_default(|stem| stem.to_string_lossy().into_owned());
         let reason = match outcome {
             Ok(definition) => {
                 loaded.push(definition.id().to_owned());
