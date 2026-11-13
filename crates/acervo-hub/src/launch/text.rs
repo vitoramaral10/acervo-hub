@@ -126,25 +126,20 @@ pub fn build_fields(site: Site, input: &Input) -> Built {
     let synopsis = input
         .synopsis
         .as_deref()
-        .map(str::trim)
-        .unwrap_or_default()
+        .map_or_default(str::trim)
         .to_owned();
     let mut warnings = Vec::new();
     if synopsis.is_empty() {
         warnings.push(missing_synopsis(site));
     }
-    let duration = input
-        .media
-        .duration_seconds
-        .map(format_duration)
-        .unwrap_or_default();
+    let duration = input.media.duration_seconds.map_or_default(format_duration);
     let sheet = sheet(input);
     let technical = technical(input, &duration);
     let description = description(input, &synopsis, &sheet, &technical);
     let fields = Fields {
         title: title(input),
         release: input.release_name.clone(),
-        year: input.year.map(|y| y.to_string()).unwrap_or_default(),
+        year: input.year.map_or_default(|y| y.to_string()),
         imdb: imdb_url(input.imdb_id.as_deref()),
         tmdb: tmdb_url(input.work, input.tmdb_id),
         duration,
@@ -205,8 +200,7 @@ fn title(input: &Input) -> String {
 fn imdb_url(id: Option<&str>) -> String {
     id.map(str::trim)
         .filter(|id| !id.is_empty())
-        .map(|id| format!("https://www.imdb.com/title/{id}/"))
-        .unwrap_or_default()
+        .map_or_default(|id| format!("https://www.imdb.com/title/{id}/"))
 }
 
 fn tmdb_url(work: Work, id: u32) -> String {

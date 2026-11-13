@@ -37,7 +37,7 @@ pub const INDEXER_FAILURES: u32 = 5;
 const DISK_PERCENT: u64 = 5;
 
 /// De quanto em quanto tempo o monitor confere indexadores e disco.
-const MONITOR_EVERY: Duration = Duration::from_secs(5 * 60);
+const MONITOR_EVERY: Duration = Duration::from_mins(5);
 
 /// Espera antes da primeira conferência: a subida ainda está acontecendo.
 const MONITOR_FIRST: Duration = Duration::from_secs(60);

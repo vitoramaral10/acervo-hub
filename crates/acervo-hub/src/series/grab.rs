@@ -109,14 +109,9 @@ fn subtitle_episodes(
     episodes: &[(i64, u16, u16)],
     scene: &[SceneMapping],
 ) -> Vec<i64> {
-    let read = |text: &str| {
-        parse_episode_title(text)
-            .map(|p| episodes_of(&p, episodes, scene))
-            .unwrap_or_default()
-    };
-    let by_path = parse_episode_path(name)
-        .map(|p| episodes_of(&p, episodes, scene))
-        .unwrap_or_default();
+    let read =
+        |text: &str| parse_episode_title(text).map_or_default(|p| episodes_of(&p, episodes, scene));
+    let by_path = parse_episode_path(name).map_or_default(|p| episodes_of(&p, episodes, scene));
     if !by_path.is_empty() {
         return by_path;
     }
@@ -162,8 +157,7 @@ pub fn choose_files(
 ) -> Vec<Choice> {
     let single = parse_episode_title(release)
         .filter(|p| !p.episodes.is_empty() && !p.full_season && !p.multi_season)
-        .map(|p| episodes_of(&p, episodes, scene))
-        .unwrap_or_default();
+        .map_or_default(|p| episodes_of(&p, episodes, scene));
     let candidates: Vec<TorrentFile> = files
         .iter()
         .filter(|f| is_video(&f.name) && !is_sample_or_extra(&f.name))
@@ -188,9 +182,8 @@ pub fn choose_files(
                     subtitle: false,
                 };
             }
-            let mut covered = parse_episode_path(&file.name)
-                .map(|p| episodes_of(&p, episodes, scene))
-                .unwrap_or_default();
+            let mut covered =
+                parse_episode_path(&file.name).map_or_default(|p| episodes_of(&p, episodes, scene));
             if covered.is_empty() && main == Some(file.index) {
                 covered.clone_from(&single);
             }

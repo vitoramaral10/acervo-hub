@@ -79,7 +79,7 @@ const CREATOR_POLL: Duration = Duration::from_secs(5);
 /// (timeout com o qBittorrent ocupado, 5xx) não pode jogar fora horas de hash.
 const CREATOR_FAILURES: u32 = 3;
 /// Teto da criação: o mesmo das tarefas de fundo.
-const CREATOR_LIMIT: Duration = Duration::from_secs(2 * 3600);
+const CREATOR_LIMIT: Duration = Duration::from_hours(2);
 
 /// Torrents do destino que têm o announce lido, no máximo, até achar um
 /// funcionando.

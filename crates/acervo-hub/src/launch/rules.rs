@@ -4464,8 +4464,7 @@ mod tests {
             .checks
             .iter()
             .find(|c| c.rule == rule)
-            .map(|c| c.message.clone())
-            .unwrap_or_default()
+            .map_or_default(|c| c.message.clone())
     }
 
     const BJ_SUB: &str = "4.2.1.5 / 4.2.1.4";

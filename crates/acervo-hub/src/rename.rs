@@ -424,8 +424,7 @@ pub async fn disk_subtitles(folder: &str) -> Vec<String> {
         .await
         .ok()
         .and_then(Result::ok)
-        .map(|f| f.subtitles.into_iter().map(|s| s.relative).collect())
-        .unwrap_or_default()
+        .map_or_default(|f| f.subtitles.into_iter().map(|s| s.relative).collect())
 }
 
 /// Renomeia os arquivos da série do plano. Cada passo diz se foi feito e,

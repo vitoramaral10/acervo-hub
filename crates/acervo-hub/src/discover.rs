@@ -25,9 +25,9 @@ use time::{Date, Weekday};
 use crate::decide::now_rfc3339;
 use crate::web::{Shared, Web, WebResult, anyhow_bad, bad, enter, fail, ok};
 
-const DETAIL_TTL: Duration = Duration::from_secs(6 * 3600);
-const SEARCH_TTL: Duration = Duration::from_secs(10 * 60);
-const WEEK_TTL: Duration = Duration::from_secs(6 * 3600);
+const DETAIL_TTL: Duration = Duration::from_hours(6);
+const SEARCH_TTL: Duration = Duration::from_mins(10);
+const WEEK_TTL: Duration = Duration::from_hours(6);
 const LIST_TTL: Duration = Duration::from_secs(3600);
 /// Títulos visíveis que uma chamada de lista tenta entregar.
 const LIST_FILL: usize = 20;
@@ -35,7 +35,7 @@ const LIST_FILL: usize = 20;
 const LIST_SCAN: u32 = 10;
 /// O TMDB não serve lista além da página 500.
 const LIST_PAGES: u32 = 500;
-const GENRE_TTL: Duration = Duration::from_secs(24 * 3600);
+const GENRE_TTL: Duration = Duration::from_hours(24);
 
 type Cache<T> = LazyLock<Mutex<HashMap<String, (Instant, T)>>>;
 static DETAILS: Cache<DiscoverDetails> = LazyLock::new(|| Mutex::new(HashMap::new()));

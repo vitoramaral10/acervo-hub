@@ -518,10 +518,7 @@ pub async fn series(store: &Store, series_id: i64, apply: bool, mode: Mode) -> R
             quality: episode_quality(&new.arquivo),
             languages: languages(
                 &host,
-                parsed
-                    .as_ref()
-                    .map(|p| p.languages.clone())
-                    .unwrap_or_default(),
+                parsed.as_ref().map_or_default(|p| p.languages.clone()),
             )
             .await,
             release_group: acervo_parser::parse_episode_release_group(file_name),

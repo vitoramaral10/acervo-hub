@@ -159,8 +159,7 @@ impl Imgbb {
             let message = serde_json::from_slice::<Failure>(&body)
                 .ok()
                 .and_then(|f| f.error)
-                .map(|e| e.message)
-                .unwrap_or_default();
+                .map_or_default(|e| e.message);
             // A API responde 400 com "Invalid API v1 key." para chave errada.
             if status == reqwest::StatusCode::FORBIDDEN
                 || message.to_ascii_lowercase().contains("key")

@@ -567,7 +567,7 @@ async fn erro_429_na_pagina_seguinte_para_a_paginacao_e_traz_o_retry_after() {
         .await
         .unwrap_err();
 
-    assert_eq!(error.rate_limited(), Some(Some(Duration::from_secs(900))));
+    assert_eq!(error.rate_limited(), Some(Some(Duration::from_mins(15))));
 }
 
 #[tokio::test]

@@ -176,7 +176,7 @@ fn decode(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         return decode_utf16(rest, u16::from_be_bytes);
     }
-    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    let bytes = bytes.trim_prefix(&[0xEF, 0xBB, 0xBF]);
     match std::str::from_utf8(bytes) {
         Ok(text) => text.to_owned(),
         Err(_) => bytes.iter().map(|b| windows_1252(*b)).collect(),

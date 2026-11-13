@@ -16,7 +16,7 @@ const HORA: Duration = Duration::from_secs(3600);
 const GIB: u64 = 1024 * 1024 * 1024;
 
 fn agora() -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+    SystemTime::UNIX_EPOCH + Duration::from_hours(500_000)
 }
 
 fn arquivo(links: u64, bytes: u64, idade: Duration) -> FileFacts {

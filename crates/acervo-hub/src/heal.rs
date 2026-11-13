@@ -480,8 +480,7 @@ async fn movie_line(
             .movie
             .file
             .as_ref()
-            .map(|f| f.relative_path.clone())
-            .unwrap_or_default(),
+            .map_or_default(|f| f.relative_path.clone()),
         estado: if grab.is_some() {
             "baixando"
         } else {

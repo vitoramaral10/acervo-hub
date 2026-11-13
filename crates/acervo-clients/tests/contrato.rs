@@ -153,7 +153,7 @@ async fn listagem_traz_o_que_a_decisao_precisa() {
     assert_eq!(torrents.len(), 2);
     assert_eq!(state_from_qbit(&torrents[0].state), DownloadState::Seeding);
     assert_eq!(state_from_qbit(&torrents[1].state), DownloadState::Paused);
-    assert_eq!(torrents[0].seeded_for(), Duration::from_secs(432_000));
+    assert_eq!(torrents[0].seeded_for(), Duration::from_hours(120));
     // Ociosidade a partir da última transferência; zero cai no tempo de seed.
     assert_eq!(
         torrents[0].idle_for(1_757_900_000 + 3600),

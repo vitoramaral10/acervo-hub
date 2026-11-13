@@ -401,14 +401,12 @@ impl Tmdb {
                 ],
             )
             .await?;
-        Ok(page
-            .map(|p| {
-                p.results
-                    .into_iter()
-                    .map(RawSeriesSummary::into_summary)
-                    .collect()
-            })
-            .unwrap_or_default())
+        Ok(page.map_or_default(|p| {
+            p.results
+                .into_iter()
+                .map(RawSeriesSummary::into_summary)
+                .collect()
+        }))
     }
 
     /// A série pelo id do TVDB.

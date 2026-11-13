@@ -43,10 +43,10 @@ pub enum CatalogError {
 
 /// Espera depois do primeiro 429 seguido, quando o tracker não diz quanto.
 /// Dobra a cada 429 seguido até `BACKOFF_MAX`.
-const BACKOFF_BASE: Duration = Duration::from_secs(10 * 60);
+const BACKOFF_BASE: Duration = Duration::from_mins(10);
 
 /// Teto do recuo calculado.
-const BACKOFF_MAX: Duration = Duration::from_secs(6 * 60 * 60);
+const BACKOFF_MAX: Duration = Duration::from_hours(6);
 
 /// Falhas seguidas, de qualquer tipo, que abrem o disjuntor: timeout,
 /// Cloudflare e login recusado não dizem "pare" como o 429, mas insistir neles
@@ -55,11 +55,11 @@ const BREAKER_AFTER: u32 = 5;
 
 /// Primeira espera do disjuntor; dobra a cada abertura seguida até
 /// `BACKOFF_MAX`.
-const BREAKER_BASE: Duration = Duration::from_secs(5 * 60);
+const BREAKER_BASE: Duration = Duration::from_mins(5);
 
 /// Teto do `Retry-After` obedecido: um valor absurdo não pode desligar o
 /// indexador até o próximo reinício.
-const RETRY_AFTER_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+const RETRY_AFTER_MAX: Duration = Duration::from_hours(24);
 
 /// O que se sabe da saúde de um indexador desde que o processo subiu.
 ///
@@ -177,12 +177,12 @@ pub struct IndexerView {
 }
 
 /// Por quanto tempo uma busca com termo é reaproveitada.
-const SEARCH_TTL: Duration = Duration::from_secs(30 * 60);
+const SEARCH_TTL: Duration = Duration::from_mins(30);
 
 /// Por quanto tempo o feed recente (busca sem termo, o RSS de filmes e o de
 /// séries) é reaproveitado: menos que o intervalo do RSS, para ninguém ver um
 /// feed envelhecido.
-const RECENT_TTL: Duration = Duration::from_secs(5 * 60);
+const RECENT_TTL: Duration = Duration::from_mins(5);
 
 type Fetch = Shared<BoxFuture<'static, Result<Arc<Vec<Release>>, String>>>;
 

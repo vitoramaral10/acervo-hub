@@ -32,7 +32,7 @@ use crate::serve::Database;
 use crate::settings::Settings;
 
 /// Por quanto tempo uma busca interativa fica guardada para o grab.
-pub(crate) const SEARCH_TTL: Duration = Duration::from_secs(30 * 60);
+pub(crate) const SEARCH_TTL: Duration = Duration::from_mins(30);
 
 pub(crate) type Cached = (Instant, Vec<acervo_indexers::Release>);
 

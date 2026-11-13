@@ -151,7 +151,7 @@ impl Registry {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            .is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(15 * 60));
+            .is_some_and(|(at, _)| at.elapsed() < Duration::from_mins(15));
         let mut warning = None;
         if !fresh {
             match refresh.await {
@@ -427,7 +427,7 @@ mod tests {
             );
         }
         let expired = std::time::Instant::now()
-            .checked_sub(Duration::from_secs(16 * 60))
+            .checked_sub(Duration::from_mins(16))
             .unwrap();
         *registry.remote.write().unwrap() = Some((expired, remote));
         let available = registry
@@ -465,7 +465,7 @@ mod tests {
         );
         *registry.remote.write().unwrap() = Some((
             std::time::Instant::now()
-                .checked_sub(Duration::from_secs(16 * 60))
+                .checked_sub(Duration::from_mins(16))
                 .unwrap(),
             remote,
         ));

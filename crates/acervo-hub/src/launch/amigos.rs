@@ -472,7 +472,7 @@ pub(crate) fn draft_from(
         package.name.clone()
     };
     let year = if package.year.is_empty() {
-        lookup.year.map(|y| y.to_string()).unwrap_or_default()
+        lookup.year.map_or_default(|y| y.to_string())
     } else {
         package.year.clone()
     };
@@ -508,7 +508,7 @@ pub(crate) fn parts(
     torrent_name: &str,
     screenshots: &[String],
 ) -> Vec<SitePart> {
-    let number = |n: Option<u32>| n.map(|n| n.to_string()).unwrap_or_default();
+    let number = |n: Option<u32>| n.map_or_default(|n| n.to_string());
     let mut parts = vec![
         SitePart::file("torrent", torrent_name, "application/x-bittorrent", torrent),
         SitePart::text("name", &draft.nome),
@@ -611,7 +611,7 @@ pub(crate) fn created(response: &SiteResponse) -> Result<String, Refusal> {
         let mut reasons: Vec<String> = body
             .get("errors")
             .and_then(Value::as_object)
-            .map(|errors| {
+            .map_or_default(|errors| {
                 errors
                     .values()
                     .filter_map(Value::as_array)
@@ -619,8 +619,7 @@ pub(crate) fn created(response: &SiteResponse) -> Result<String, Refusal> {
                     .filter_map(Value::as_str)
                     .map(str::to_owned)
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         if reasons.is_empty()
             && let Some(message) = body.get("message").and_then(Value::as_str)
         {

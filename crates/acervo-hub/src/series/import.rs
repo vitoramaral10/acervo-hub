@@ -405,8 +405,7 @@ impl Importer<'_> {
                     .filter(|l| !l.is_empty())
                     .unwrap_or_else(|| {
                         acervo_parser::parse_episode_title(&grab.title)
-                            .map(|p| p.languages)
-                            .unwrap_or_default()
+                            .map_or_default(|p| p.languages)
                             .into_iter()
                             .filter(|l| *l != acervo_parser::Language::Unknown)
                             .collect()

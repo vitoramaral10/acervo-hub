@@ -14,7 +14,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.100"
 license = "GPL-3.0-only"
 repository = "https://github.com/vitoramaral10/acervo-hub"
 
@@ -124,3 +124,6 @@ pedantic = { level = "warn", priority = -1 }
 # `assert!(x.is_empty())` lê melhor que `assert_eq!(x, [] as [T; 0])`, a
 # forma que o lint (clippy 1.99) pede para coleção sem tipo inferível.
 assert_is_empty = "allow"
+
+[workspace.lints.cargo]
+unused_dependencies = "warn"
