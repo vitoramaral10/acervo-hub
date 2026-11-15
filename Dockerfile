@@ -30,7 +30,7 @@ RUN --mount=type=cache,target=/src/target,sharing=locked \
 # quadros das capturas de "Para lançar". Binários únicos, sem bibliotecas; a
 # imagem fixada por digest traz os dois na raiz (`/ffmpeg` e `/ffprobe`,
 # conferido listando o conteúdo dela).
-FROM mwader/static-ffmpeg:7.1.1@sha256:11a44711684c0b9f754c047dcd64235b8b52deab251bd0e0a86f22faa160749c AS ffmpeg
+FROM mwader/static-ffmpeg:9.0.2-1@sha256:f5d100184884eb3e82b0eb14bb5ebf98da99826ac824989720297fb9ef21c822 AS ffmpeg
 
 # MediaInfo CLI estático: o formulário do Amigos exige o relatório do MediaInfo
 # de verdade, e a imagem final (distroless) não tem libc, então o binário sai
