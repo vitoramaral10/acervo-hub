@@ -68,8 +68,10 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml_ng = "0.10"
-scraper = "0.24"
+# yaml_serde (YAML Organization) substitui o serde_yaml_ng, parado desde 2024 sobre o unsafe-libyaml
+# sem manutenção; mesma API do serde_yaml, então o nome antigo fica e o código não muda.
+serde_yaml_ng = { package = "yaml_serde", version = "0.10.7" }
+scraper = "0.29"
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
